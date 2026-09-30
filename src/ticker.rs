@@ -5460,6 +5460,180 @@ mod tests {
     }
 
     #[test]
+    fn parked_local_pi_reopens_with_brief_then_ordered_follow_ups() {
+        parked_pi_reopens_with_brief_then_ordered_follow_ups(false);
+    }
+
+    #[test]
+    fn parked_box_pi_reopens_with_brief_then_ordered_follow_ups() {
+        parked_pi_reopens_with_brief_then_ordered_follow_ups(true);
+    }
+
+    fn parked_pi_reopens_with_brief_then_ordered_follow_ups(remote: bool) {
+        use crate::scenarios::World;
+        let world = World::new();
+        let project = world.project("demo", "a.sock");
+        let folder = world.home.path().join("lane");
+        std::fs::create_dir_all(&folder).unwrap();
+        if remote {
+            let config = world.home.path().join("cfg/config.toml");
+            let existing = std::fs::read_to_string(&config).unwrap();
+            std::fs::write(
+                config,
+                format!(
+                    "{existing}{}\n[[machines.buildbox.repos]]\npath = \"/repo\"\nbox_path = \"/box/repo\"\npublish_url = \"https://example.com/repo.git\"\n",
+                    crate::remote::TEST_MACHINE
+                ),
+            )
+            .unwrap();
+            world.runner.on("machine list --json", ok("[]"));
+            world
+                .runner
+                .on_fn(|cmd| cmd.program == "ssh", |_| Ok(ok("")));
+        }
+        let lane = world.thread(&project, &folder, |t| {
+            t.attempt = 2;
+            t.parked = true;
+            t.prompt_pending = false;
+            t.bootstrap = "acknowledged".into();
+            t.launch.kind = "pi".into();
+            t.launch.brief_hash = "frozen-brief".into();
+            t.agent = "pi".into();
+            if remote {
+                t.machine = "buildbox".into();
+                t.machine_id = "buildbox".into();
+            }
+        });
+        *world.panes.borrow_mut() = format!("[{}]", world.coordinator_pane(&project));
+        world
+            .runner
+            .on("workspace list", ok(r#"{"result":{"workspaces":[]}}"#));
+        let created = ok(
+            r#"{"result":{"root_pane":{"workspace_id":"w1","tab_id":"w1:t2","pane_id":"w1:p2"}}}"#,
+        );
+        world.runner.on("tab create", created.clone());
+        world.runner.on("workspace create", created);
+        let agent = Agent {
+            pane_id: "w1:p2".into(),
+            tab_id: "w1:t2".into(),
+            workspace_id: "w1".into(),
+            name: lane.agent_name.clone(),
+            agent: "pi".into(),
+            agent_status: "idle".into(),
+            cwd: lane.cwd.clone(),
+            ..Agent::default()
+        };
+        let pane = Pane {
+            pane_id: agent.pane_id.clone(),
+            tab_id: agent.tab_id.clone(),
+            workspace_id: agent.workspace_id.clone(),
+            cwd: agent.cwd.clone(),
+        };
+        world.runner.on(
+            "agent start",
+            ok(&format!(
+                r#"{{"result":{{"agent":{}}}}}"#,
+                serde_json::json!({
+                    "pane_id": agent.pane_id,
+                    "tab_id": agent.tab_id,
+                    "workspace_id": agent.workspace_id,
+                    "name": agent.name,
+                    "agent": "pi",
+                    "agent_status": "idle",
+                    "cwd": agent.cwd,
+                })
+            )),
+        );
+        world.runner.on(
+            "pane cwd",
+            ok(&format!(r#"{{"result":{{"cwd":"{}"}}}}"#, lane.cwd)),
+        );
+        world.runner.on("pane parent", ok(r#"{"result":{}}"#));
+        world.runner.on(
+            "pane process-info",
+            ok(r#"{"result":{"process_info":{"foreground_processes":[]}}}"#),
+        );
+        world.runner.on("agent prompt", ok(r#"{"result":{}}"#));
+        let ctx = world.ctx();
+        for text in ["first correction", "second correction"] {
+            assert!(matches!(
+                crate::threads::prompt(&ctx, "demo", &lane.id, text).unwrap(),
+                crate::threads::PromptOutcome::Queued { attempt: 2 }
+            ));
+        }
+        let reopened = thread::load(&project, &lane.id).unwrap();
+        assert!(!reopened.parked);
+        assert!(reopened.prompt_pending);
+        assert!(reopened.bootstrap.is_empty());
+        assert_eq!(reopened.attempt, lane.attempt);
+        assert_eq!(reopened.worktree_path, lane.worktree_path);
+        assert_eq!(world.runner.count("agent start"), 1);
+        assert_eq!(world.runner.count("agent prompt"), 0);
+        if remote {
+            let calls = world.runner.calls.borrow();
+            let card_call = calls
+                .iter()
+                .find(|call| {
+                    call.program == "ssh"
+                        && call
+                            .stdin
+                            .as_ref()
+                            .is_some_and(|text| text.contains("start_line"))
+                })
+                .unwrap();
+            let card: crate::contracts::LaneCard =
+                toml::from_str(card_call.stdin.as_ref().unwrap()).unwrap();
+            assert_eq!(card.pane_id, reopened.pane_id);
+            assert_eq!(card.attempt, 2);
+            assert_eq!(card.brief_hash, "frozen-brief");
+        }
+        let herdr = Herdr::new("herdr", "", &world.runner).on_machine(reopened.machine_route());
+        let run_pass = || {
+            let pass = thread_pass(
+                &LaunchPass {
+                    ctx: &ctx,
+                    project: &project,
+                    herdr: &herdr,
+                    threads: &[thread::load(&project, &lane.id).unwrap()],
+                    agents: std::slice::from_ref(&agent),
+                    panes: std::slice::from_ref(&pane),
+                },
+                "ha",
+                None,
+                false,
+                None,
+            )
+            .unwrap();
+            assert!(pass.error.is_none(), "{:?}", pass.error);
+        };
+        run_pass();
+        assert_eq!(world.runner.count("agent prompt"), 1);
+        // A transported brief still needs this process's skill receipt.
+        run_pass();
+        assert_eq!(world.runner.count("agent prompt"), 1);
+        thread::update(&project, &lane.id, |t| t.bootstrap = "acknowledged".into()).unwrap();
+        run_pass();
+        let calls = world.runner.calls.borrow();
+        let prompts: Vec<_> = calls
+            .iter()
+            .filter(|call| call.display().contains("agent prompt"))
+            .map(|call| call.display())
+            .collect();
+        assert_eq!(prompts.len(), 3);
+        assert!(prompts[0].contains("skill lane"));
+        assert!(prompts[0].contains("brief.md"));
+        assert!(prompts[1].contains("first correction"));
+        assert!(prompts[2].contains("second correction"));
+        let saved = thread::load(&project, &lane.id).unwrap();
+        assert!(
+            saved
+                .follow_ups
+                .iter()
+                .all(|f| f.state == thread::FollowUpState::Delivered && !f.delivered_at.is_empty())
+        );
+    }
+
+    #[test]
     fn follow_ups_queued_during_start_arrive_after_the_brief_in_order() {
         let f = fixture(false);
         let runner = FakeRunner::new();

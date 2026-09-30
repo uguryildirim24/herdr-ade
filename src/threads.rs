@@ -3411,10 +3411,15 @@ fn reopen_parked(
             t.cwd = placed.cwd.clone();
             t.parked = false;
             t.last_group = Group::Working.token().into();
-            // A sealed completion proves the old brief was consumed. Even
-            // older records lacking a bootstrap receipt can now drain this
-            // correction without resending the frozen task.
-            t.bootstrap = "acknowledged".into();
+            // Only a resumed conversation has consumed the frozen brief.
+            // A fresh process must earn a receipt for its new pane before any
+            // queued correction is delivered.
+            t.prompt_pending = !resuming;
+            t.bootstrap = if resuming {
+                "acknowledged".into()
+            } else {
+                String::new()
+            };
             t.follow_ups.push(FollowUp {
                 attempt: t.attempt.max(1),
                 text: if resuming {
@@ -3437,7 +3442,7 @@ fn reopen_parked(
             t.last_state_change = project::now();
             let prior_session = t.identity.agent_session.clone();
             thread::bind_identity(t, &coordinator.socket, &agent, process);
-            if t.identity.agent_session.is_none() {
+            if resuming && t.identity.agent_session.is_none() {
                 t.identity.agent_session = prior_session;
             }
             Ok(())
@@ -5355,6 +5360,12 @@ mod tests {
         );
         let reopened = thread::load(&project, &lane.id).unwrap();
         assert!(!reopened.parked);
+        assert!(!reopened.prompt_pending);
+        assert_eq!(reopened.bootstrap, "acknowledged");
+        assert_eq!(
+            reopened.identity.agent_session.as_deref(),
+            Some("session-42")
+        );
         assert_eq!(reopened.follow_ups.len(), 1);
         assert_eq!(reopened.follow_ups[0].text, "Fix the rejection");
         assert!(!parkable(&project, &reopened));
