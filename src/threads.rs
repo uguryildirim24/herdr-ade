@@ -3550,24 +3550,52 @@ fn park_one(ctx: &Ctx, project: &Project, record: &Thread) -> Result<()> {
     Ok(())
 }
 
+/// Cleanup observes the server that owns the lane, not the coordinator's
+/// availability. A stopped local session has no panes; an unreachable running
+/// session is still unknown and must not authorize removing a checkout.
+fn cleanup_view<'a>(
+    ctx: &'a Ctx,
+    project: &Project,
+    record: &Thread,
+) -> Result<Option<SessionView<'a>>> {
+    let socket = project.coordinator().map(|c| c.socket).unwrap_or_default();
+    if record.is_remote() {
+        let herdr =
+            Herdr::new(ctx.env.herdr_bin(), socket, ctx.runner).on_machine(record.machine_route());
+        let agents = herdr.agent_list()?;
+        let panes = herdr.pane_list()?;
+        return Ok(Some(SessionView {
+            herdr,
+            agents,
+            panes,
+        }));
+    }
+    if let Some(view) = session_view(ctx, project) {
+        return Ok(Some(view));
+    }
+    if crate::herdr::session_list(&ctx.env.herdr_bin(), ctx.runner)?
+        .iter()
+        .any(|session| session.running && session.socket_path == Path::new(&socket))
+    {
+        bail!(
+            "cleanup_session_unreachable: the pane for {} was not closed; the running session of `{}` cannot be checked",
+            record.id,
+            project.slug
+        );
+    }
+    Ok(None)
+}
+
 pub(crate) fn close_pane(ctx: &Ctx, project: &Project, record: &Thread) -> Result<bool> {
     if record.tab_id.is_empty() {
         return Ok(false);
     }
-    let Some(view) = session_view(ctx, project) else {
-        bail!(
-            "cleanup_session_unreachable: the pane for {} was not closed; retry recovery when `{}` is reachable",
-            record.id,
-            project.slug
-        );
+    let Some(view) = cleanup_view(ctx, project, record)? else {
+        return Ok(false);
     };
-    let herdr = view.herdr.on_machine(record.machine_route());
-    let panes = herdr
-        .pane_list()
-        .map_err(|error| anyhow::anyhow!("{error}"))?;
-    let agents = herdr
-        .agent_list()
-        .map_err(|error| anyhow::anyhow!("{error}"))?;
+    let herdr = view.herdr;
+    let panes = view.panes;
+    let agents = view.agents;
     // The terminal may have changed cwd since placement. The three stable
     // Herdr ids still identify the exact tab this attempt created.
     let owns_pane = panes.iter().any(|pane| {
@@ -4428,7 +4456,7 @@ pub(crate) fn remove_kept_worktree(ctx: &Ctx, slug: &str, id: &str) -> Result<St
         bail!("worktree_dirty: {}", inspection.dirty.join(", "));
     }
     // Pin the checked-out branch tip before discarding the checkout. A retained
-    // box branch must also match its published tip.
+    // box branch must also match its published tip or verified immutable seal.
     let tip = crate::branches::require_published_tip(ctx, &project, &record)?;
     removal_in_use_gate(ctx, &project, &record)?;
     close_pane(ctx, &project, &record)?;
@@ -4645,10 +4673,16 @@ fn remove_ade_worktree(ctx: &Ctx, project: &Project, record: &Thread) -> Result<
 /// completion is checked separately by `finished_worktree_reason`; this gate
 /// only prevents closing active work or removing a checkout used elsewhere.
 fn removal_in_use_gate(ctx: &Ctx, project: &Project, record: &Thread) -> Result<()> {
-    let view = require_session(ctx, project)?;
-    let (agents, panes) = lists_for(&view, record)?;
-    let live = thread::live_state(record, &agents, &panes, jiff::Timestamp::now());
-    if record.status != Status::Resolved && live.agent_state.as_deref() == Some("working") {
+    let Some(view) = cleanup_view(ctx, project, record)? else {
+        return Ok(());
+    };
+    let agents = &view.agents;
+    let panes = &view.panes;
+    if agents.iter().any(|agent| {
+        (thread::agent_matches(record, agent)
+            || Path::new(&agent.cwd).starts_with(&record.worktree_path))
+            && !(thread::agent_matches(record, agent) && agent.ready())
+    }) {
         bail!(
             "worktree_in_use: {} is working; not removing the worktree",
             record.id
@@ -4665,7 +4699,7 @@ fn removal_in_use_gate(ctx: &Ctx, project: &Project, record: &Thread) -> Result<
         );
     }
 
-    let herdr = view.herdr.on_machine(record.machine_route());
+    let herdr = view.herdr;
     let own_agent = agents
         .iter()
         .any(|agent| thread::agent_matches(record, agent));

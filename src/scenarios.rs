@@ -460,6 +460,12 @@ fn cancel_reports_pending_cleanup_when_the_session_is_unreachable() {
         t.worktree_path.clear();
     });
     std::fs::remove_file(world.home.path().join("a.sock")).unwrap();
+    *world.sessions.borrow_mut() = serde_json::json!([{
+        "name": "demo",
+        "running": true,
+        "socket_path": world.home.path().join("a.sock"),
+    }])
+    .to_string();
 
     let outcome = threads::cancel(&world.ctx(), "demo", "t-0001", "no longer needed").unwrap();
     assert_eq!(outcome.state, "cleanup_pending");
