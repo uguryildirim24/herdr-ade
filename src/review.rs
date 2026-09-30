@@ -1679,8 +1679,10 @@ pub(crate) fn tick(ctx: &Ctx, project: &Project) -> Result<()> {
         if let Err(error) = advance(ctx, project, &mut record)
             .and_then(|()| watch_no_verdict(ctx, project, &mut record))
         {
-            record.attention = format!("{error:#}");
-            save(project, &record)?;
+            if !crate::remote::is_unreachable(&format!("{error:#}")) {
+                record.attention = format!("{error:#}");
+                save(project, &record)?;
+            }
             first.get_or_insert(error);
         }
     }

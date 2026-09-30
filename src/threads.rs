@@ -353,6 +353,9 @@ fn start_with_ticker(
             )
         }
         Err(error) => {
+            if crate::remote::is_unreachable(&format!("{error:#}")) {
+                return Err(error);
+            }
             crate::launch::dispatch(
                 &project,
                 serde_json::json!({"kind":"placement-refused", "recipe":launch.recipe_id,
@@ -431,6 +434,9 @@ fn start_with_ticker(
         }
         Err(error) => {
             let message = format!("{error:#}");
+            if crate::remote::is_unreachable(&message) {
+                return Err(error);
+            }
             let cleanup = fail_start(
                 ctx,
                 &project,
@@ -586,6 +592,9 @@ fn resolve_placement(
                 });
             }
             Err(missing) => {
+                if crate::remote::is_unreachable(&missing) {
+                    bail!("{missing}");
+                }
                 if missing.contains("disk_low:") {
                     bail!("{missing}");
                 }
@@ -621,6 +630,7 @@ fn resolve_placement(
 /// Do not mistake an unavailable machine or repository for a provider blip.
 fn provider_readiness_error(error: &str) -> bool {
     error.contains("recipe_unavailable:")
+        && !crate::remote::is_unreachable(error)
         && error.contains("pi_not_ready")
         && !error.contains("box_repo_")
         && !error.contains("machine_held:")
@@ -7318,7 +7328,7 @@ mod tests {
     }
 
     #[test]
-    fn an_unreachable_box_falls_back_to_this_mac() {
+    fn an_unreachable_box_defers_without_fallback_or_refusal() {
         let (fx, _remote) = box_fixture();
         write_config(&fx, &lane_config());
         fx.world.runner.on_fn(
@@ -7332,13 +7342,17 @@ mod tests {
             |_| Ok(crate::runner::fake::fail(255, "connection refused")),
         );
         stub_box(&fx);
-        let started = start(
+        let error = start(
             &fx.world.ctx(),
             "demo",
             start_args(Some(fx.repo.to_string_lossy().into_owned()), None),
         )
-        .unwrap();
-        assert!(started.machine.is_empty());
+        .unwrap_err();
+        assert!(crate::remote::is_unreachable(&format!("{error:#}")));
+        assert!(thread::list(&fx.project).is_empty());
+        let dispatch = std::fs::read_to_string(fx.project.state_dir().join("dispatch.jsonl"))
+            .unwrap_or_default();
+        assert!(!dispatch.contains("placement-refused"));
     }
 
     #[test]

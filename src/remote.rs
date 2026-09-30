@@ -398,7 +398,48 @@ fn ssh_command(
     if let Some(text) = stdin {
         cmd = cmd.stdin(text);
     }
-    runner.run(&cmd)
+    checked_transport(runner.run(&cmd))
+}
+
+/// Connection failures are infrastructure evidence, never provider evidence.
+pub(crate) fn is_unreachable(detail: &str) -> bool {
+    let detail = detail.to_ascii_lowercase();
+    [
+        "unreachable:",
+        "(unreachable)",
+        "operation timed out",
+        "connection timed out",
+        "connect timed out",
+        "connection refused",
+        "no route to host",
+        "network is unreachable",
+        "could not resolve hostname",
+        "temporary failure in name resolution",
+        "name or service not known",
+        "could not resolve host",
+        "failed to lookup address",
+        "dns error",
+        "connection reset",
+        "connection closed",
+        "broken pipe",
+    ]
+    .iter()
+    .any(|pattern| detail.contains(pattern))
+}
+
+fn checked_transport(result: Result<Output>) -> Result<Output> {
+    match result {
+        Ok(output)
+            if (output.timed_out && output.stdout.is_empty())
+                || (!output.success() && is_unreachable(&output.error_text())) =>
+        {
+            bail!("unreachable: {}", output.error_text());
+        }
+        Err(error) if is_unreachable(&format!("{error:#}")) => {
+            bail!("unreachable: {error:#}");
+        }
+        other => other,
+    }
 }
 
 /// Give a non-login box shell the exact executable search path declared for
@@ -566,7 +607,7 @@ pub(crate) fn ssh_courier(
     args.push("--".into());
     args.push(target.to_string());
     args.push(format!("sh -c {}", quote(script)));
-    runner.run(&Cmd::new("ssh", timeout).args(args).stdin(cursor))
+    checked_transport(runner.run(&Cmd::new("ssh", timeout).args(args).stdin(cursor)))
 }
 
 /// The courier's multiplexing options (SPEC-remote §4.3): one SSH handshake per
@@ -610,7 +651,7 @@ pub(crate) fn fetch_batch(
         args.push(format!("{target}:{path}"));
     }
     args.push(format!("{}/", local_dir.display()));
-    let out = runner.run(&Cmd::new("scp", COPY_TIMEOUT).args(args))?;
+    let out = checked_transport(runner.run(&Cmd::new("scp", COPY_TIMEOUT).args(args)))?;
     if !out.success() {
         bail!("scp from {target}: {}", out.error_text());
     }
@@ -682,6 +723,31 @@ mod tests {
         );
         let project = std::fs::read_to_string(dir.join("PROJECT.md")).unwrap();
         assert!(project.contains("name = \"demo\""), "{project}");
+    }
+
+    #[test]
+    fn ssh_connection_failures_are_unreachable_not_remote_command_failures() {
+        for reason in [
+            "ssh: connect to host box port 22: Operation timed out",
+            "ssh: connect to host box port 22: No route to host",
+            "ssh: Could not resolve hostname box: nodename nor servname provided",
+        ] {
+            let runner = FakeRunner::new();
+            runner.on("ssh", fail(255, reason));
+            let message = format!(
+                "{:#}",
+                ssh(&runner, "box", "true", None, SSH_TIMEOUT).unwrap_err()
+            );
+            assert!(message.starts_with("unreachable:"), "{message}");
+        }
+        // Evidence from an answering host remains a command/provider result.
+        let runner = FakeRunner::new();
+        runner.on("ssh", fail(1, "sign-in required"));
+        assert!(
+            !ssh(&runner, "box", "true", None, SSH_TIMEOUT)
+                .unwrap()
+                .success()
+        );
     }
 
     #[test]

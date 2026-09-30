@@ -1208,6 +1208,7 @@ pub fn run() -> Result<()> {
         detached_ticker: true,
     };
 
+    let (_awake, _) = crate::awake::enter(&ctx.root, false)?;
     let observed_slug = explicit_slug
         .or_else(|| {
             ctx.env

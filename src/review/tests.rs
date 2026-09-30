@@ -161,6 +161,27 @@ fn idle_reviewer_warns_once_and_a_new_verdict_lands() {
 }
 
 #[test]
+fn sleep_does_not_age_the_stuck_review_notice() {
+    let fx = configured();
+    lane(&fx, 1);
+    let mut review = prepared(&fx);
+    let reviewer = thread::load(&fx.project, review.reviewer.as_deref().unwrap()).unwrap();
+    let now = jiff::Timestamp::now().as_second();
+    review.no_verdict_since = jiff::Timestamp::from_second(now - 2400)
+        .unwrap()
+        .to_string();
+    crate::awake::set_sample(Some((now - 2400, 100)));
+    drop(crate::awake::enter(&fx.world.root, true).unwrap());
+    crate::awake::set_sample(Some((now, 140)));
+    let (_clock, slept) = crate::awake::enter(&fx.world.root, true).unwrap();
+    assert!(slept);
+    watch_no_verdict_state(&fx.world.ctx(), &fx.project, &mut review, &reviewer, "idle").unwrap();
+    assert!(review.notices.is_empty());
+    assert!(!review.no_verdict_since.is_empty());
+    crate::awake::set_sample(None);
+}
+
+#[test]
 fn working_reviewer_does_not_warn() {
     let fx = configured();
     lane(&fx, 1);

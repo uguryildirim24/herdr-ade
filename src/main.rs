@@ -24,6 +24,7 @@ mod actions;
 mod adapters;
 mod adopt;
 mod ask;
+mod awake;
 mod branches;
 mod build;
 mod cli;

@@ -298,7 +298,11 @@ fn decode_call(label: &str, out: crate::runner::Output) -> Result<serde_json::Va
     if let Some(reply) = reply {
         if let Some(error) = reply.get("error") {
             return Err(HerdrError {
-                code: error["code"].as_str().unwrap_or("failed").to_string(),
+                code: if crate::remote::is_unreachable(error["message"].as_str().unwrap_or("")) {
+                    "unreachable".into()
+                } else {
+                    error["code"].as_str().unwrap_or("failed").to_string()
+                },
                 message: error["message"].as_str().unwrap_or("").to_string(),
             });
         }
@@ -313,7 +317,12 @@ fn decode_call(label: &str, out: crate::runner::Output) -> Result<serde_json::Va
         return Ok(serde_json::Value::Null);
     }
     Err(HerdrError {
-        code: "failed".into(),
+        code: if crate::remote::is_unreachable(&out.error_text()) {
+            "unreachable"
+        } else {
+            "failed"
+        }
+        .into(),
         message: format!("`herdr {label}`: {}", out.error_text()),
     })
 }

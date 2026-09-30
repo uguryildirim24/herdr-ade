@@ -648,7 +648,7 @@ impl Outage {
         }
         self.last_error = error.to_string();
         let since = *self.failing_since.get_or_insert(now);
-        if !self.reported && now.as_second() - since.as_second() >= threshold_secs {
+        if !self.reported && crate::awake::elapsed(since, now) >= threshold_secs {
             self.reported = true;
             return Some(OutageEvent::Down);
         }

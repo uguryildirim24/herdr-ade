@@ -437,13 +437,13 @@ pub(crate) fn recipe_ready_on_box(
             None,
             crate::remote::SSH_START_TIMEOUT,
         );
+        let output = output?;
         check_disk_output(
-            output.as_ref().map_or("", |value| value.stdout.as_str()),
+            &output.stdout,
             &profile.label,
             &machine.worktrees,
             crate::launch::doctor_config(&ctx.config_dir)?.min_free_disk_gb,
         )?;
-        let output = output?;
         if !output.success() {
             #[cfg(test)]
             if !output.stdout.contains("disk_free_kb\t") {
@@ -488,13 +488,13 @@ pub(crate) fn recipe_ready_on_box(
         None,
         Duration::from_millis(launch.ready_timeout_ms.max(1_000)),
     );
+    let output = output?;
     check_disk_output(
-        output.as_ref().map_or("", |value| value.stdout.as_str()),
+        &output.stdout,
         &profile.label,
         &machine.worktrees,
         crate::launch::doctor_config(&ctx.config_dir)?.min_free_disk_gb,
     )?;
-    let output = output?;
     if !output.success() {
         anyhow::bail!(probe_error(&probe.kind, &output));
     }
@@ -519,10 +519,12 @@ fn check_disk_output(output: &str, machine: &str, path: &str, floor: f64) -> Res
         .find_map(|line| line.strip_prefix("disk_free_kb\t"))
         .and_then(|kb| kb.trim().parse::<u64>().ok())
         .map(|kb| kb as f64 * 1024.0 / 1_000_000_000.0);
-    if free.is_none_or(|free| free < floor) {
+    let Some(free) = free else {
+        anyhow::bail!("unreachable: disk free space unknown on {machine} under {path}");
+    };
+    if free < floor {
         anyhow::bail!(
-            "disk_low: {machine} has {} GB free under {path}, below [doctor].min_free_disk_gb = {}. Free space on {machine} or lower the floor, then start again.",
-            free.map_or_else(|| "unknown".into(), |value| format!("{value:.1}")),
+            "disk_low: {machine} has {free:.1} GB free under {path}, below [doctor].min_free_disk_gb = {}. Free space on {machine} or lower the floor, then start again.",
             display_gb(floor)
         );
     }
@@ -546,12 +548,7 @@ pub(crate) fn check_start_disk(
             None,
             crate::remote::SSH_START_TIMEOUT,
         );
-        check_disk_output(
-            &output.map_or_else(|_| String::new(), |output| output.stdout),
-            &profile.label,
-            &machine.worktrees,
-            floor,
-        )
+        check_disk_output(&output?.stdout, &profile.label, &machine.worktrees, floor)
     } else {
         let path = repo.unwrap_or(".");
         #[cfg(not(test))]
@@ -2076,7 +2073,11 @@ fn box_rows_with_snapshot(
             return vec![(
                 Some(false),
                 format!("box {label}"),
-                format!("unreachable: {error:#}"),
+                if crate::remote::is_unreachable(&format!("{error:#}")) {
+                    format!("{error:#}")
+                } else {
+                    format!("unreachable: {error:#}")
+                },
             )];
         }
     };
@@ -3252,13 +3253,13 @@ recipe = "claude_fable_xhigh"
     }
 
     #[test]
-    fn unreadable_start_disk_refuses_with_the_same_floor() {
+    fn unreadable_start_disk_is_unreachable_not_low() {
         let error = check_disk_output("disk_free_kb\tunknown\n", "buildbox", "/box/work", 12.0)
             .unwrap_err()
             .to_string();
         assert_eq!(
             error,
-            "disk_low: buildbox has unknown GB free under /box/work, below [doctor].min_free_disk_gb = 12. Free space on buildbox or lower the floor, then start again."
+            "unreachable: disk free space unknown on buildbox under /box/work"
         );
     }
 
@@ -3630,6 +3631,43 @@ recipe = "claude_fable_xhigh"
                 .display();
             assert!(!ssh.contains("login_"), "{ssh}");
             assert!(!ssh.contains("herdr-pi"), "{ssh}");
+        }
+    }
+
+    #[test]
+    fn unreachable_pi_disk_and_readiness_checks_are_not_provider_failures() {
+        let config = machine_config(&["pi"]);
+        let env = Env::for_test(config.path(), &[]);
+        let runner = FakeRunner::new();
+        runner.on(
+            "ssh",
+            fail(255, "ssh: connect to host box port 22: Operation timed out"),
+        );
+        let ctx = Ctx {
+            env: &env,
+            root: config.path().join("root"),
+            config_dir: config.path().to_path_buf(),
+            runner: &runner,
+            detached_ticker: false,
+        };
+        let launch = crate::contracts::Launch {
+            kind: "pi".into(),
+            args: vec![
+                "--provider".into(),
+                "openai-codex".into(),
+                "--model".into(),
+                "gpt-5.4".into(),
+            ],
+            ..Default::default()
+        };
+        for error in [
+            recipe_ready_on_box(&ctx, &box_profile(), &launch).unwrap_err(),
+            check_start_disk(&ctx, Some(&box_profile()), None).unwrap_err(),
+        ] {
+            let message = format!("{error:#}");
+            assert!(message.starts_with("unreachable:"), "{message}");
+            assert!(!message.contains("pi_not_ready"));
+            assert!(!message.contains("disk_low"));
         }
     }
 
