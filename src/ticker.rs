@@ -1591,13 +1591,7 @@ fn thread_pass(
         if t.prompt_pending && ready {
             // The CLI and ticker can observe the same ready agent. Serialize
             // the first prompt and recheck its attempt before either sends it.
-            let lock_path = project.state_dir().join(format!("brief-{}.lock", t.id));
-            let lock = std::fs::File::options()
-                .create(true)
-                .truncate(false)
-                .write(true)
-                .open(lock_path)?;
-            lock.lock()?;
+            let _prompt_lock = thread::prompt_lock(project, &t.id)?;
             let current = thread::load(project, &t.id)?;
             if current.attempt == t.attempt
                 && current.pane_id == t.pane_id
@@ -1632,12 +1626,15 @@ fn thread_pass(
                 }
             }
         } else if !t.prompt_pending && t.bootstrap == "acknowledged" && ready {
-            // The matching bootstrap receipt proves the lane consumed this
-            // attempt's brief. Mark each message uncertain before transport:
-            // a crash or ambiguous transport result must never resend it.
+            // Serialize queue drainage with brief delivery and other callers.
+            // A matching bootstrap receipt proves the brief was consumed, not
+            // that typing into a newly reopened process will start a turn.
+            let _prompt_lock = thread::prompt_lock(project, &t.id)?;
             loop {
                 let current = thread::load(project, &t.id)?;
                 if current.status != thread::Status::Open
+                    || current.pane_id != t.pane_id
+                    || current.attempt != t.attempt
                     || current.prompt_pending
                     || current.bootstrap != "acknowledged"
                 {
@@ -1682,40 +1679,25 @@ fn thread_pass(
                     crate::events::latest_done_event(&crate::events::list(project), &t.id, attempt)
                         .map(|event| event.id.clone())
                         .unwrap_or_default();
-                match herdr.agent_prompt(&current.pane_id, &follow_up.text) {
+                match herdr.agent_prompt_wait_started(
+                    &current.pane_id,
+                    &follow_up.text,
+                    agent_start_timeout(&current.launch),
+                ) {
                     Ok(()) => {
                         delivered = true;
-                        crate::threads::record_answered_wait(
+                        crate::threads::record_follow_up_delivery(
                             project,
                             &t.id,
-                            attempt,
-                            &follow_up.waiting_event,
+                            index,
+                            &follow_up,
+                            &after_seal,
                         )?;
-                        thread::update_checked(project, &t.id, |thread| {
-                            let Some(saved) = thread.follow_ups.get(index) else {
-                                anyhow::bail!("queued follow-up disappeared during delivery");
-                            };
-                            if saved.attempt != attempt
-                                || saved.text != follow_up.text
-                                || saved.state != thread::FollowUpState::Uncertain
-                            {
-                                anyhow::bail!("queued follow-up changed during delivery");
-                            }
-                            thread.follow_ups[index].state = thread::FollowUpState::Delivered;
-                            thread.connection_waiting = false;
-                            thread.connection_resumes.clear();
-                            thread.failure_class = crate::contracts::FailureClass::Unknown;
-                            thread.provider_failure_kind = None;
-                            thread.follow_ups[index].delivered_at = project::now();
-                            thread.follow_ups[index].after_seal = after_seal;
-                            Ok(())
-                        })?;
                     }
-                    Err(error)
-                        if !matches!(error.code.as_str(), "timeout" | "unreachable" | "failed") =>
-                    {
-                        // Herdr refused before typing (for example a newly
-                        // blocked approval prompt), so this remains retryable.
+                    Err(error) if crate::threads::prompt_refused_before_submission(&error) => {
+                        // Only explicit pre-submission refusals are retryable.
+                        // Stalled activity or a PTY error can occur after input
+                        // was written; those must retain the uncertain receipt.
                         thread::update_checked(project, &t.id, |thread| {
                             if let Some(saved) = thread.follow_ups.get_mut(index)
                                 && saved.attempt == attempt
@@ -5460,6 +5442,257 @@ mod tests {
     }
 
     #[test]
+    fn parked_local_pi_reopens_with_brief_then_ordered_follow_ups() {
+        parked_pi_reopens_with_brief_then_ordered_follow_ups(false, false);
+    }
+
+    #[test]
+    fn parked_box_pi_reopens_with_brief_then_ordered_follow_ups() {
+        parked_pi_reopens_with_brief_then_ordered_follow_ups(true, false);
+    }
+
+    #[test]
+    fn resumed_local_and_box_pi_deliver_the_reopening_follow_up_and_record_later_delivery() {
+        for remote in [false, true] {
+            parked_pi_reopens_with_brief_then_ordered_follow_ups(remote, true);
+        }
+    }
+
+    fn parked_pi_reopens_with_brief_then_ordered_follow_ups(remote: bool, resuming: bool) {
+        use crate::scenarios::World;
+        let world = World::new();
+        let project = world.project("demo", "a.sock");
+        let folder = world.home.path().join("lane");
+        std::fs::create_dir_all(&folder).unwrap();
+        if remote {
+            let config = world.home.path().join("cfg/config.toml");
+            let existing = std::fs::read_to_string(&config).unwrap();
+            std::fs::write(
+                config,
+                format!(
+                    "{existing}{}\n[[machines.buildbox.repos]]\npath = \"/repo\"\nbox_path = \"/box/repo\"\npublish_url = \"https://example.com/repo.git\"\n",
+                    crate::remote::TEST_MACHINE
+                ),
+            )
+            .unwrap();
+            world.runner.on("machine list --json", ok("[]"));
+            world
+                .runner
+                .on_fn(|cmd| cmd.program == "ssh", |_| Ok(ok("")));
+        }
+        let lane = world.thread(&project, &folder, |t| {
+            t.attempt = 2;
+            t.parked = true;
+            t.prompt_pending = false;
+            t.bootstrap = "acknowledged".into();
+            t.launch.kind = "pi".into();
+            t.launch.brief_hash = "frozen-brief".into();
+            t.agent = "pi".into();
+            if resuming {
+                t.identity.agent_session = Some("saved-session".into());
+            }
+            if remote {
+                t.machine = "buildbox".into();
+                t.machine_id = "buildbox".into();
+            }
+        });
+        *world.panes.borrow_mut() = format!("[{}]", world.coordinator_pane(&project));
+        world
+            .runner
+            .on("workspace list", ok(r#"{"result":{"workspaces":[]}}"#));
+        let created = ok(
+            r#"{"result":{"root_pane":{"workspace_id":"w1","tab_id":"w1:t2","pane_id":"w1:p2"}}}"#,
+        );
+        world.runner.on("tab create", created.clone());
+        world.runner.on("workspace create", created);
+        let agent = Agent {
+            pane_id: "w1:p2".into(),
+            tab_id: "w1:t2".into(),
+            workspace_id: "w1".into(),
+            name: lane.agent_name.clone(),
+            agent: "pi".into(),
+            agent_status: "idle".into(),
+            cwd: lane.cwd.clone(),
+            ..Agent::default()
+        };
+        let pane = Pane {
+            pane_id: agent.pane_id.clone(),
+            tab_id: agent.tab_id.clone(),
+            workspace_id: agent.workspace_id.clone(),
+            cwd: agent.cwd.clone(),
+        };
+        world.runner.on(
+            "agent start",
+            ok(&format!(
+                r#"{{"result":{{"agent":{}}}}}"#,
+                serde_json::json!({
+                    "pane_id": agent.pane_id,
+                    "tab_id": agent.tab_id,
+                    "workspace_id": agent.workspace_id,
+                    "name": agent.name,
+                    "agent": "pi",
+                    "agent_status": "idle",
+                    "cwd": agent.cwd,
+                })
+            )),
+        );
+        world.runner.on(
+            "pane cwd",
+            ok(&format!(r#"{{"result":{{"cwd":"{}"}}}}"#, lane.cwd)),
+        );
+        world.runner.on("pane parent", ok(r#"{"result":{}}"#));
+        world.runner.on(
+            "pane process-info",
+            ok(r#"{"result":{"process_info":{"foreground_processes":[]}}}"#),
+        );
+        let delivery_project = project.clone();
+        let delivery_id = lane.id.clone();
+        let refuse_first = std::cell::Cell::new(true);
+        world.runner.on_fn(
+            |cmd| cmd.display().contains("agent prompt"),
+            move |cmd| {
+                // A PTY submission alone is not proof that a new process has
+                // consumed its first instruction. Require the activity gate.
+                assert!(cmd.args.iter().any(|arg| arg == "--wait"));
+                let saved = thread::load(&delivery_project, &delivery_id).unwrap();
+                if !cmd.display().contains("skill lane") {
+                    let pending = saved
+                        .follow_ups
+                        .iter()
+                        .find(|f| f.state == thread::FollowUpState::Uncertain)
+                        .unwrap();
+                    assert!(pending.delivered_at.is_empty());
+                    assert!(cmd.args.iter().any(|arg| arg == &pending.text));
+                    if refuse_first.replace(false) {
+                        return Ok(fail(1, r#"{"error":{"code":"agent_not_ready","message":"new process is not ready yet"}}"#));
+                    }
+                }
+                Ok(ok(r#"{"result":{}}"#))
+            },
+        );
+        let ctx = world.ctx();
+        for text in ["first correction", "second correction"] {
+            assert!(matches!(
+                crate::threads::prompt(&ctx, "demo", &lane.id, text).unwrap(),
+                crate::threads::PromptOutcome::Queued { attempt: 2 }
+            ));
+        }
+        let reopened = thread::load(&project, &lane.id).unwrap();
+        assert!(!reopened.parked);
+        assert_eq!(reopened.prompt_pending, !resuming);
+        assert_eq!(reopened.bootstrap == "acknowledged", resuming);
+        assert_eq!(reopened.attempt, lane.attempt);
+        assert_eq!(reopened.worktree_path, lane.worktree_path);
+        assert_eq!(world.runner.count("agent start"), 1);
+        assert_eq!(world.runner.count("agent prompt"), 0);
+        if remote {
+            let calls = world.runner.calls.borrow();
+            let card_call = calls
+                .iter()
+                .find(|call| {
+                    call.program == "ssh"
+                        && call
+                            .stdin
+                            .as_ref()
+                            .is_some_and(|text| text.contains("start_line"))
+                })
+                .unwrap();
+            let card: crate::contracts::LaneCard =
+                toml::from_str(card_call.stdin.as_ref().unwrap()).unwrap();
+            assert_eq!(card.pane_id, reopened.pane_id);
+            assert_eq!(card.attempt, 2);
+            assert_eq!(card.brief_hash, "frozen-brief");
+        }
+        let herdr = Herdr::new("herdr", "", &world.runner).on_machine(reopened.machine_route());
+        let run_pass = || {
+            let pass = thread_pass(
+                &LaunchPass {
+                    ctx: &ctx,
+                    project: &project,
+                    herdr: &herdr,
+                    threads: &[thread::load(&project, &lane.id).unwrap()],
+                    agents: std::slice::from_ref(&agent),
+                    panes: std::slice::from_ref(&pane),
+                },
+                "ha",
+                None,
+                false,
+                None,
+            )
+            .unwrap();
+            pass.error
+        };
+        if !resuming {
+            assert!(run_pass().is_none());
+            assert_eq!(world.runner.count("agent prompt"), 1);
+            // A transported brief still needs this process's skill receipt.
+            assert!(run_pass().is_none());
+            assert_eq!(world.runner.count("agent prompt"), 1);
+            thread::update(&project, &lane.id, |t| t.bootstrap = "acknowledged".into()).unwrap();
+        }
+        // A ready snapshot can go stale just after a reopen. Preserve the
+        // first instruction and do not let the later one overtake it.
+        assert!(run_pass().is_some());
+        let pending = thread::load(&project, &lane.id).unwrap();
+        assert!(
+            pending
+                .follow_ups
+                .iter()
+                .all(|f| f.state == thread::FollowUpState::Queued)
+        );
+        assert!(run_pass().is_none());
+        let expected_prompts = if resuming { 3 } else { 4 };
+        let calls = world.runner.calls.borrow();
+        let prompts: Vec<_> = calls
+            .iter()
+            .filter(|call| call.display().contains("agent prompt"))
+            .map(|call| call.display())
+            .collect();
+        assert_eq!(prompts.len(), expected_prompts);
+        if !resuming {
+            assert!(prompts[0].contains("skill lane"));
+            assert!(prompts[0].contains("brief.md"));
+        }
+        assert!(prompts[expected_prompts - 2].contains("first correction"));
+        assert!(prompts[expected_prompts - 1].contains("second correction"));
+        drop(calls);
+        let saved = thread::load(&project, &lane.id).unwrap();
+        assert!(
+            saved
+                .follow_ups
+                .iter()
+                .all(|f| f.state == thread::FollowUpState::Delivered && !f.delivered_at.is_empty())
+        );
+        // A later message takes the immediate CLI path on this same reopened
+        // pane. It must use the same durable delivery lifecycle as the queue.
+        *world.agents.borrow_mut() = format!(
+            "[{}]",
+            crate::scenarios::agent_json(
+                "w1",
+                "w1:t2",
+                "w1:p2",
+                &lane.cwd,
+                &lane.agent_name,
+                "idle"
+            )
+        );
+        assert!(matches!(
+            crate::threads::prompt(&ctx, "demo", &lane.id, "later correction").unwrap(),
+            crate::threads::PromptOutcome::Sent { attempt: 2, .. }
+        ));
+        let saved = thread::load(&project, &lane.id).unwrap();
+        assert_eq!(saved.follow_ups.len(), 3);
+        assert!(
+            saved
+                .follow_ups
+                .iter()
+                .all(|f| f.state == thread::FollowUpState::Delivered && !f.delivered_at.is_empty())
+        );
+        assert!(run_pass().is_none());
+        assert_eq!(world.runner.count("agent prompt"), expected_prompts + 1);
+    }
+
+    #[test]
     fn follow_ups_queued_during_start_arrive_after_the_brief_in_order() {
         let f = fixture(false);
         let runner = FakeRunner::new();
@@ -5617,42 +5850,59 @@ mod tests {
             });
         })
         .unwrap();
-        let uncertain_runner = FakeRunner::new();
-        uncertain_runner.on("agent prompt", timeout());
-        uncertain_runner.on("report-metadata", ok(r#"{"result":{}}"#));
-        let uncertain_ctx = Ctx {
-            env: &f.env,
-            root: f.root.clone(),
-            config_dir: f.root.join("cfg"),
-            runner: &uncertain_runner,
-            detached_ticker: false,
-        };
-        let uncertain_herdr = Herdr::new("herdr", "", &uncertain_runner);
-        let uncertain_pass = || {
-            thread_pass(
-                &LaunchPass {
-                    ctx: &uncertain_ctx,
-                    project: &f.project,
-                    herdr: &uncertain_herdr,
-                    threads: &[thread::load(&f.project, &lane.id).unwrap()],
-                    agents: std::slice::from_ref(&agent),
-                    panes: std::slice::from_ref(&pane),
-                },
-                "ha",
-                None,
-                true,
-                None,
-            )
-            .unwrap()
-        };
-        assert!(uncertain_pass().error.is_some());
-        assert!(uncertain_pass().error.is_none());
-        assert_eq!(uncertain_runner.count("agent prompt"), 1);
-        assert_eq!(
-            thread::load(&f.project, &lane.id).unwrap().follow_ups[2].state,
-            thread::FollowUpState::Uncertain
-        );
-        assert_eq!(crate::inbox::unhandled(&f.project).len(), 1);
+        for response in [
+            timeout(),
+            fail(
+                1,
+                r#"{"error":{"code":"agent_prompt_failed","message":"PTY closed after input"}}"#,
+            ),
+            fail(
+                1,
+                r#"{"error":{"code":"agent_prompt_stalled","message":"input submitted but no activity observed"}}"#,
+            ),
+        ] {
+            // Each independent scripted transport starts with a queued entry.
+            thread::update(&f.project, &lane.id, |lane| {
+                lane.follow_ups[2].state = thread::FollowUpState::Queued
+            })
+            .unwrap();
+            let uncertain_runner = FakeRunner::new();
+            uncertain_runner.on("agent prompt", response);
+            uncertain_runner.on("report-metadata", ok(r#"{"result":{}}"#));
+            let uncertain_ctx = Ctx {
+                env: &f.env,
+                root: f.root.clone(),
+                config_dir: f.root.join("cfg"),
+                runner: &uncertain_runner,
+                detached_ticker: false,
+            };
+            let uncertain_herdr = Herdr::new("herdr", "", &uncertain_runner);
+            let uncertain_pass = || {
+                thread_pass(
+                    &LaunchPass {
+                        ctx: &uncertain_ctx,
+                        project: &f.project,
+                        herdr: &uncertain_herdr,
+                        threads: &[thread::load(&f.project, &lane.id).unwrap()],
+                        agents: std::slice::from_ref(&agent),
+                        panes: std::slice::from_ref(&pane),
+                    },
+                    "ha",
+                    None,
+                    true,
+                    None,
+                )
+                .unwrap()
+            };
+            assert!(uncertain_pass().error.is_some());
+            assert!(uncertain_pass().error.is_none());
+            assert_eq!(uncertain_runner.count("agent prompt"), 1);
+            assert_eq!(
+                thread::load(&f.project, &lane.id).unwrap().follow_ups[2].state,
+                thread::FollowUpState::Uncertain
+            );
+            assert_eq!(crate::inbox::unhandled(&f.project).len(), 1);
+        }
     }
 
     #[test]

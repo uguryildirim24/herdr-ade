@@ -440,6 +440,18 @@ fn write_record(project: &Project, thread: &Thread) -> Result<()> {
     )
 }
 
+/// Serialize brief and follow-up transport for one lane. The project lock
+/// remains free while an agent consumes the prompt and writes its receipt.
+pub(crate) fn prompt_lock(project: &Project, id: &str) -> Result<std::fs::File> {
+    let lock = std::fs::File::options()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(project.state_dir().join(format!("brief-{id}.lock")))?;
+    lock.lock()?;
+    Ok(lock)
+}
+
 /// Read-modify-write under the project lock: re-reads the record, lets `change`
 /// touch only the fields its step owns, writes.
 pub(crate) fn update(

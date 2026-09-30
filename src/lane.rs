@@ -465,7 +465,10 @@ pub(crate) fn skill(ctx: &Ctx, role: &str) -> Result<()> {
 fn acknowledge_bootstrap(binding: &Binding) -> Result<()> {
     let launch = project::LaunchEnv::from_process()
         .context("bootstrap_mismatch: HERDR_ADE_LAUNCH is missing or malformed")?;
-    let pane = pane_id()?;
+    record_bootstrap(binding, &launch, pane_id()?)
+}
+
+fn record_bootstrap(binding: &Binding, launch: &project::LaunchEnv, pane: String) -> Result<()> {
     let lane = &binding.thread;
     if launch.project != binding.project.slug
         || launch.thread != lane.id
@@ -494,9 +497,15 @@ fn acknowledge_bootstrap(binding: &Binding) -> Result<()> {
             eprintln!("bootstrap already accepted");
             return Ok(());
         }
-        // A restart is a new attempt with a new receipt; an older one is kept
-        // on the record only as history, never as authority.
-        if receipt.attempt >= attempt {
+        // Parking keeps the attempt and frozen task, but a fresh reopen earns
+        // a receipt for the newly bound pane. The binding above, not the old
+        // receipt's pane, is authority for that process.
+        if receipt.attempt > attempt
+            || (receipt.attempt == attempt
+                && (receipt.project != project
+                    || receipt.thread != thread
+                    || receipt.brief_hash != brief_hash))
+        {
             bail!("bootstrap_mismatch: a different receipt is already recorded");
         }
     }
@@ -599,6 +608,63 @@ mod tests {
             card: Some(card),
         };
         assert_eq!(binding.recipient().unwrap().coordinator_attempt, 3);
+    }
+
+    #[test]
+    fn reopened_local_and_box_lanes_replace_the_old_pane_receipt() {
+        for remote in [false, true] {
+            let world = crate::scenarios::World::new();
+            let project = world.project("demo", "a.sock");
+            let lane = world.thread(&project, world.home.path(), |t| {
+                t.attempt = 2;
+                t.launch.brief_hash = "frozen-brief".into();
+                t.bootstrap.clear();
+            });
+            let dir = project.state_dir().join("bootstrap");
+            std::fs::create_dir_all(&dir).unwrap();
+            let path = dir.join(format!("{}.json", lane.id));
+            let receipt = BootstrapReceipt {
+                project: project.slug.clone(),
+                thread: lane.id.clone(),
+                attempt: lane.attempt,
+                brief_hash: lane.launch.brief_hash.clone(),
+                pane: "old:pane".into(),
+                acknowledged: project::now(),
+            };
+            project::write_json(&path, &receipt).unwrap();
+            let launch = project::LaunchEnv {
+                project: project.slug.clone(),
+                thread: lane.id.clone(),
+                attempt: lane.attempt,
+                brief_hash: lane.launch.brief_hash.clone(),
+            };
+            let binding = Binding {
+                project,
+                thread: lane.clone(),
+                card: remote.then(LaneCard::default),
+            };
+            // The obsolete pane cannot authenticate a new process.
+            assert!(record_bootstrap(&binding, &launch, "old:pane".into()).is_err());
+            record_bootstrap(&binding, &launch, lane.pane_id.clone()).unwrap();
+            let saved: BootstrapReceipt = project::read_json(&path).unwrap();
+            assert_eq!(saved.pane, lane.pane_id);
+            assert_eq!(saved.attempt, 2);
+            assert_eq!(saved.brief_hash, "frozen-brief");
+            let current = thread::load(&binding.project, &lane.id).unwrap();
+            if remote {
+                // The box receipt is imported by the courier, not a local
+                // write to the Mac's thread record.
+                assert!(current.bootstrap.is_empty());
+            } else {
+                assert_eq!(current.bootstrap, "acknowledged");
+            }
+            record_bootstrap(&binding, &launch, lane.pane_id.clone()).unwrap();
+            let wrong_launch = project::LaunchEnv {
+                brief_hash: "different-brief".into(),
+                ..launch
+            };
+            assert!(record_bootstrap(&binding, &wrong_launch, lane.pane_id.clone()).is_err());
+        }
     }
 
     #[test]
