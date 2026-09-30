@@ -1113,6 +1113,17 @@ pub(crate) fn install_for_review(ctx: &Ctx, slug: &str, id: &str) -> Result<Inst
     install_for(ctx, Some((slug, id)))
 }
 
+fn review_precedes(left: (&str, &str), right: (&str, &str)) -> bool {
+    let number = |id: &str| id.rsplit_once('-')?.1.parse::<u64>().ok();
+    left.0
+        .cmp(right.0)
+        .then_with(|| match (number(left.1), number(right.1)) {
+            (Some(left), Some(right)) => left.cmp(&right),
+            _ => left.1.cmp(right.1),
+        })
+        .is_lt()
+}
+
 fn defer_to_earlier_reviews(ctx: &Ctx, current: Option<(&str, &str)>) -> Result<()> {
     let mut landing = Vec::new();
     for slug in crate::project::list_slugs(&ctx.root) {
@@ -1121,7 +1132,7 @@ fn defer_to_earlier_reviews(ctx: &Ctx, current: Option<(&str, &str)>) -> Result<
             // Review installs run in project/id order. Never block the ticker
             // waiting for another review that it must itself advance.
             if review.phase == crate::review::Phase::Landing
-                && current.is_none_or(|id| (slug.as_str(), review.id.as_str()) < id)
+                && current.is_none_or(|id| review_precedes((&slug, &review.id), id))
             {
                 landing.push(format!("{slug}/{}", review.id));
             }
@@ -1362,6 +1373,40 @@ mod tests {
     use crate::runner::fake::{FakeRunner, fail, ok};
     use crate::runner::{RealRunner, Runner};
     use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+    #[test]
+    fn review_install_order_uses_project_then_numeric_suffix() {
+        for (earlier, later) in [("review-9", "review-10"), ("review-99", "review-100")] {
+            assert!(review_precedes(("demo", earlier), ("demo", later)));
+            assert!(!review_precedes(("demo", later), ("demo", earlier)));
+            assert!(!review_precedes(("demo", earlier), ("demo", earlier)));
+        }
+        assert!(review_precedes(
+            ("alpha", "review-100"),
+            ("beta", "review-9")
+        ));
+        assert!(!review_precedes(
+            ("beta", "review-9"),
+            ("alpha", "review-100")
+        ));
+        assert!(review_precedes(
+            ("demo", "pile-review-9"),
+            ("demo", "pile-review-10")
+        ));
+    }
+
+    #[test]
+    fn review_install_order_falls_back_to_strings_for_unparseable_ids() {
+        for (earlier, later) in [
+            ("review-10", "review-unknown"),
+            ("review-10", "review-18446744073709551616"),
+            ("10", "9"),
+            ("review-", "review-9"),
+        ] {
+            assert!(review_precedes(("demo", earlier), ("demo", later)));
+            assert!(!review_precedes(("demo", later), ("demo", earlier)));
+        }
+    }
 
     #[test]
     fn install_proof_names_the_lock_holder_not_an_installers_child() {

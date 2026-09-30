@@ -128,13 +128,24 @@ fn parse_status(text: &str) -> (Vec<String>, Vec<String>) {
     let mut dirty = Vec::new();
     let mut ignored = Vec::new();
     let nul_delimited = text.contains('\0');
-    let records: Box<dyn Iterator<Item = &str>> = if nul_delimited {
+    let mut records: Box<dyn Iterator<Item = &str>> = if nul_delimited {
         Box::new(text.split('\0'))
     } else {
         // Scripted tests written before status used `-z` still use lines.
         Box::new(text.lines())
     };
-    for record in records.filter(|record| record.len() > 3) {
+    while let Some(record) = records.next() {
+        if record.len() <= 3 {
+            continue;
+        }
+        if nul_delimited
+            && record.as_bytes()[..2]
+                .iter()
+                .any(|b| matches!(b, b'R' | b'C'))
+        {
+            // In porcelain -z, the destination is followed by the original path.
+            records.next();
+        }
         let path = if nul_delimited {
             record[3..].to_string()
         } else {
@@ -384,6 +395,24 @@ pub(crate) fn inspect_remote(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn nul_status_consumes_rename_and_copy_original_paths() {
+        for status in ["R ", " R", "C ", " C", "RM", "MC"] {
+            let text =
+                format!("{status} new name\0old name\0 M modified\0?? untracked\0!! ignored\0");
+            let (dirty, ignored) = parse_status(&text);
+            assert_eq!(dirty, ["new name", "modified", "untracked"], "{status}");
+            assert_eq!(ignored, ["ignored"], "{status}");
+        }
+    }
+
+    #[test]
+    fn nul_status_keeps_paths_verbatim_and_consumes_short_original_paths() {
+        let (dirty, ignored) = parse_status("R  new\nname \0x\0C  copied\0 M old\0!! cache \0");
+        assert_eq!(dirty, ["new\nname ", "copied"]);
+        assert_eq!(ignored, ["cache "]);
+    }
 
     #[test]
     fn a_disposable_name_matches_that_path_component_only() {
