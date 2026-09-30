@@ -489,6 +489,15 @@ fn successful_commands_keep_human_text_and_return_one_machine_record() {
 fn ticker_start_without_projects_creates_nothing() {
     let home = tempfile::tempdir().unwrap();
     assert!(hp(home.path(), &["ticker", "start"]).status.success());
+    let install = Command::new(BIN)
+        .env_clear()
+        .env("HOME", home.path())
+        .env("HERDR_ADE_INSTALL_TICKER", "1")
+        .args(["ticker", "start"])
+        .output()
+        .unwrap();
+    assert!(install.status.success());
+    assert_eq!(install.stdout, b"HERDR_ADE_TICKER_NO_PROJECTS=1\n");
     assert!(!home.path().join(".herdr-ade").exists());
     assert!(!home.path().join(".config").exists());
 }
