@@ -179,7 +179,8 @@ fn delete_remote(
 }
 
 /// Pin the checked-out branch tip for explicit retained-worktree removal.
-/// Box lanes must also match their published tip; local lanes need no publication.
+/// Box lanes must match their published tip or immutable seal; local lanes
+/// need no publication.
 pub(crate) fn require_published_tip(
     ctx: &Ctx,
     project: &Project,
@@ -226,10 +227,31 @@ pub(crate) fn require_published_tip(
             );
         }
         let tip = tip.to_string();
-        if refs(ctx.runner, &record.repo, Some(&url))?.get(&record.branch) != Some(&tip)
-            || refs(ctx.runner, &record.repo, None)?
+        let remote = refs(ctx.runner, &record.repo, Some(&url))?;
+        let local = refs(ctx.runner, &record.repo, None)?;
+        let events = crate::events::list(project);
+        let latest_seal = events
+            .iter()
+            .filter(|event| event.thread == record.id)
+            .filter_map(|event| event.payload.done.as_ref())
+            .rfind(|done| done.published_ref.is_some());
+        let sealed = latest_seal.is_some_and(|done| {
+            let reference = crate::ops::seal_ref(&record.branch, &done.sha);
+            done.sha == tip
+                && done.published_ref.as_deref() == Some(reference.as_str())
+                && remote.get(&reference) == Some(&tip)
+        });
+        let matches_tip = |actual: &String| {
+            actual == &tip || (sealed && !record.base.is_empty() && actual == &record.base)
+        };
+        if (latest_seal.is_some() && !sealed)
+            || (!sealed && remote.get(&record.branch) != Some(&tip))
+            || remote
                 .get(&record.branch)
-                .is_some_and(|local| local != &tip)
+                .is_some_and(|sha| !matches_tip(sha))
+            || local
+                .get(&record.branch)
+                .is_some_and(|sha| !matches_tip(sha))
         {
             bail!(
                 "branch {} has unpushed commits or has moved since publication",
@@ -313,24 +335,29 @@ pub(crate) fn resolved_thread(ctx: &Ctx, project: &Project, record: &Thread) -> 
         .filter_map(|e| e.payload.done.as_ref())
         .rfind(|d| d.published_ref.is_some());
     let has_seal_refs = last_box_seal.is_some();
-    let expected = record
+    let retained_tip = record
         .cleanup_reason
-        .strip_prefix("retained worktree removal: ")
-        .or(
-            if has_seal_refs && record.is_remote() && !record.base.is_empty() {
-                Some(record.base.as_str())
-            } else if has_seal_refs {
-                None
-            } else {
-                review_pin.as_deref()
-            },
-        );
+        .strip_prefix("retained worktree removal: ");
+    let expected = if has_seal_refs && record.is_remote() && !record.base.is_empty() {
+        Some(record.base.as_str())
+    } else {
+        retained_tip.or(if has_seal_refs {
+            None
+        } else {
+            review_pin.as_deref()
+        })
+    };
     let local = refs(ctx.runner, &record.repo, None)?;
     // The box's mutable published branch can still be at base while the Mac
     // local ref has advanced to the immutable seal used by the landed review.
-    // Accept that exact review member or fast-forwarded reviewer verdict,
-    // not an arbitrary later box seal.
-    let merged_seal = if record.is_remote()
+    // Accept that exact review member, fast-forwarded reviewer verdict, or
+    // verified retained-removal pin, not an arbitrary later box seal.
+    let retained_seal = retained_tip.filter(|tip| {
+        record.is_remote() && Some(*tip) == last_box_seal.map(|done| done.sha.as_str())
+    });
+    let merged_seal = if retained_seal.is_some() {
+        retained_seal
+    } else if record.is_remote()
         && has_seal_refs
         && (!record.merged_review.is_empty() || !record.review_id.is_empty())
     {
@@ -403,6 +430,7 @@ pub(crate) fn resolved_thread(ctx: &Ctx, project: &Project, record: &Thread) -> 
     };
     if let (Some(expected), Some(actual)) = (expected, remote.get(&record.branch))
         && actual != expected
+        && retained_seal != Some(actual.as_str())
     {
         bail!(
             "published branch {} moved beyond its sealed cleanup tip",
@@ -1055,6 +1083,240 @@ mod tests {
             error.contains("unpushed commits or has moved since publication"),
             "{error}"
         );
+    }
+
+    fn sealed_retained_box() -> (crate::testkit::Fx, tempfile::TempDir, Thread, String) {
+        let (fx, bare) = configured();
+        let branch = "hp/demo/sealed-box";
+        let base = run(&fx.repo, &["rev-parse", "HEAD"]);
+        run(&fx.repo, &["branch", branch, &base]);
+        run(
+            &fx.repo,
+            &["push", "-q", bare.path().to_str().unwrap(), branch],
+        );
+        let box_repo = fx.world.home.path().join("box-repo");
+        std::fs::create_dir(&box_repo).unwrap();
+        run(&box_repo, &["init", "-q", "-b", "main"]);
+        run(&box_repo, &["config", "user.name", "Test"]);
+        run(&box_repo, &["config", "user.email", "test@example.com"]);
+        run(
+            &box_repo,
+            &["fetch", "-q", fx.repo.to_str().unwrap(), "main"],
+        );
+        run(&box_repo, &["reset", "--hard", "FETCH_HEAD"]);
+        let wt = fx.world.home.path().join("box-retained");
+        run(
+            &box_repo,
+            &["worktree", "add", "-q", "-b", branch, wt.to_str().unwrap()],
+        );
+        let sha = crate::testkit::commit_file(&wt, "result.txt", "sealed\n", "sealed");
+        let reference = crate::ops::seal_ref(branch, &sha);
+        run(
+            &box_repo,
+            &[
+                "push",
+                "-q",
+                bare.path().to_str().unwrap(),
+                &format!("{sha}:refs/heads/{reference}"),
+            ],
+        );
+        let record = thread::allocate(&fx.project, |t| {
+            t.kind = crate::thread::Kind::Worktree;
+            t.status = Status::Resolved;
+            t.machine = "box".into();
+            t.repo = fx.repo.to_string_lossy().into_owned();
+            t.branch = branch.into();
+            t.base = base;
+            t.merged_sha = sha.clone();
+            t.worktree_path = wt.to_string_lossy().into_owned();
+            t.cwd = t.worktree_path.clone();
+            t.workspace_id = "w2".into();
+            t.tab_id = "w2:t1".into();
+            t.pane_id = "w2:p1".into();
+        })
+        .unwrap();
+        let id = fx.seal_done(&record.id, 1, 1, &sha, "sealed report");
+        let mut event = crate::events::load(&fx.project, &id).unwrap();
+        event.payload.done.as_mut().unwrap().published_ref = Some(reference);
+        std::fs::write(
+            fx.project
+                .state_dir()
+                .join("events")
+                .join(format!("{id}.toml")),
+            toml::to_string(&event).unwrap(),
+        )
+        .unwrap();
+        let (mut settings, body) = fx.project.read_project_md().unwrap();
+        settings.repos[0].box_path = Some(box_repo.to_string_lossy().into_owned());
+        settings.repos[0].publish_url = Some(bare.path().to_string_lossy().into_owned());
+        std::fs::write(
+            fx.project.project_md(),
+            format!("+++\n{}+++\n{body}", toml::to_string(&settings).unwrap()),
+        )
+        .unwrap();
+        fx.world
+            .runner
+            .on("machine list --json", crate::runner::fake::ok("[]"));
+        fx.world.runner.on_fn(
+            |cmd| cmd.program == "ssh",
+            |cmd| {
+                use crate::runner::Runner;
+                crate::runner::RealRunner
+                    .run(&Cmd::new("sh", cmd.timeout).args(["-c", cmd.args.last().unwrap()]))
+            },
+        );
+        // Closing the coordinator must not hide the box's own herdr server.
+        std::fs::remove_file(fx.project.coordinator().unwrap().socket).unwrap();
+        (fx, bare, record, sha)
+    }
+
+    #[test]
+    fn sealed_box_retained_checkout_is_removed_with_mutable_refs_at_base() {
+        for (local_at_seal, published_at_seal) in [(false, false), (true, false), (true, true)] {
+            let (fx, bare, record, sha) = sealed_retained_box();
+            if local_at_seal {
+                run(
+                    &fx.repo,
+                    &[
+                        "fetch",
+                        "-q",
+                        bare.path().to_str().unwrap(),
+                        &crate::ops::seal_ref(&record.branch, &sha),
+                    ],
+                );
+                run(
+                    &fx.repo,
+                    &["update-ref", &format!("refs/heads/{}", record.branch), &sha],
+                );
+            }
+            if published_at_seal {
+                run(
+                    &fx.repo,
+                    &["push", "-q", bare.path().to_str().unwrap(), &record.branch],
+                );
+            }
+            crate::threads::remove_kept_worktree(&fx.world.ctx(), "demo", &record.id).unwrap();
+            assert!(!Path::new(&record.worktree_path).exists());
+            let saved = thread::load(&fx.project, &record.id).unwrap();
+            assert!(saved.worktree_path.is_empty());
+            assert!(!saved.cleanup_pending);
+            assert!(
+                refs(
+                    &crate::runner::RealRunner,
+                    &record.repo,
+                    Some(bare.path().to_str().unwrap())
+                )
+                .unwrap()
+                .is_empty()
+            );
+            assert!(
+                !refs(&crate::runner::RealRunner, &record.repo, None)
+                    .unwrap()
+                    .contains_key(&record.branch)
+            );
+            assert!(fx.world.runner.calls.borrow().iter().any(|cmd| {
+                cmd.args.starts_with(&["--machine".into(), "box".into()])
+                    && cmd.args.iter().any(|arg| arg == "list")
+            }));
+        }
+    }
+
+    #[test]
+    fn sealed_box_retained_checkout_refuses_commit_beyond_seal() {
+        let (fx, _bare, record, _sha) = sealed_retained_box();
+        crate::testkit::commit_file(
+            Path::new(&record.worktree_path),
+            "later.txt",
+            "later\n",
+            "later",
+        );
+        let error = crate::threads::remove_kept_worktree(&fx.world.ctx(), "demo", &record.id)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("unpushed commits or has moved since publication"),
+            "{error}"
+        );
+        assert!(Path::new(&record.worktree_path).exists());
+        assert!(
+            !thread::load(&fx.project, &record.id)
+                .unwrap()
+                .cleanup_pending
+        );
+    }
+
+    #[test]
+    fn sealed_box_retained_checkout_requires_remote_seal() {
+        let (fx, bare, record, sha) = sealed_retained_box();
+        run(
+            &fx.repo,
+            &[
+                "push",
+                "-q",
+                bare.path().to_str().unwrap(),
+                &format!(":refs/heads/{}", crate::ops::seal_ref(&record.branch, &sha)),
+            ],
+        );
+        assert!(crate::threads::remove_kept_worktree(&fx.world.ctx(), "demo", &record.id).is_err());
+        assert!(Path::new(&record.worktree_path).exists());
+    }
+
+    #[test]
+    fn closed_project_retained_checkout_without_pane_is_removed() {
+        let fx = crate::testkit::fixture();
+        let mut record = retained_lane(&fx, "hp/demo/closed");
+        record = thread::update(&fx.project, &record.id, |t| {
+            t.kind = crate::thread::Kind::Worktree;
+            t.tab_id = "w2:t1".into();
+            t.pane_id = "w2:p1".into();
+            t.workspace_id = "w2".into();
+        })
+        .unwrap();
+        fx.seal_done(
+            &record.id,
+            1,
+            1,
+            &run(&fx.repo, &["rev-parse", &record.branch]),
+            "report",
+        );
+        std::fs::remove_file(fx.project.coordinator().unwrap().socket).unwrap();
+        crate::threads::remove_kept_worktree(&fx.world.ctx(), "demo", &record.id).unwrap();
+        assert!(!Path::new(&record.worktree_path).exists());
+        assert!(
+            thread::load(&fx.project, &record.id)
+                .unwrap()
+                .worktree_path
+                .is_empty()
+        );
+        assert!(
+            !fx.world
+                .runner
+                .calls
+                .borrow()
+                .iter()
+                .any(|cmd| cmd.args.iter().any(|arg| arg == "close"))
+        );
+    }
+
+    #[test]
+    fn closed_coordinator_does_not_hide_live_box_agent() {
+        let (fx, _bare, record, _sha) = sealed_retained_box();
+        *fx.world.agents.borrow_mut() = format!(
+            "[{}]",
+            crate::scenarios::agent_json(
+                &record.workspace_id,
+                &record.tab_id,
+                &record.pane_id,
+                &record.cwd,
+                &record.agent_name,
+                "working"
+            )
+        );
+        let error = crate::threads::remove_kept_worktree(&fx.world.ctx(), "demo", &record.id)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("worktree_in_use"), "{error}");
+        assert!(Path::new(&record.worktree_path).exists());
     }
 
     #[test]
