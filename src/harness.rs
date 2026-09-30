@@ -787,7 +787,7 @@ fn box_process_script(
          pid=\n\
          n=0\n\
          while [ $n -lt {attempts} ]; do\n\
-           start_output=$($bin --root \"$root\" ticker start) || start_output=\n\
+           start_output=$(HERDR_ADE_INSTALL_TICKER=1 $bin --root \"$root\" ticker start) || start_output=\n\
            if [ \"$start_output\" = 'HERDR_ADE_TICKER_NO_PROJECTS=1' ]; then\n\
              printf 'HERDR_ADE_BOX_TICKER_NO_PROJECTS=1\\n'\n\
              exit 0\n\
@@ -1974,7 +1974,7 @@ mod tests {
         std::fs::write(
             &bin,
             format!(
-                "#!/bin/sh\nif [ \"$1\" = --version ]; then echo 'herdr-ade {}'; elif [ ! -f \"$2/demo/PROJECT.md\" ]; then echo 'HERDR_ADE_TICKER_NO_PROJECTS=1'; fi\n",
+                "#!/bin/sh\nif [ \"$1\" = --version ]; then echo 'herdr-ade {}'; elif [ \"$HERDR_ADE_INSTALL_TICKER\" = 1 ] && [ ! -f \"$2/demo/PROJECT.md\" ]; then echo 'HERDR_ADE_TICKER_NO_PROJECTS=1'; fi\n",
                 crate::VERSION
             ),
         )
