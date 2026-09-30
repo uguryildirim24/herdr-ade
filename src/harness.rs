@@ -350,7 +350,24 @@ fn mac_path_env(ctx: &Ctx) -> String {
     format!("/bin:{}", ctx.env.var("PATH").unwrap_or_default())
 }
 
-fn local_build(ctx: &Ctx, repo: &str, kind: Kind) -> Result<()> {
+fn local_build(ctx: &Ctx, repo: &str, kind: Kind, source_clean: bool) -> Result<()> {
+    // Cargo does not notice a dirty-to-clean transition caused only by Git
+    // excludes. Invalidate the cached stamp without narrowing build.rs's inputs.
+    if source_clean
+        && kind == Kind::Plugin
+        && binary_version(ctx, &Path::new(repo).join("target/release/herdr-ade"))
+            .is_some_and(|version| version.contains("-dirty"))
+    {
+        let out = ctx
+            .runner
+            .run(&Cmd::new("touch", INSTALL_TIMEOUT).arg("build.rs").cwd(repo))?;
+        if !out.success() {
+            bail!(
+                "harness_build_failed: refresh build stamp in {repo}: {}",
+                out.error_text()
+            );
+        }
+    }
     let mut cmd = Cmd::new("cargo", BUILD_TIMEOUT)
         .args(["build", "--release", "--locked"])
         .cwd(repo)
@@ -531,15 +548,34 @@ fn box_build(
     } else {
         String::new()
     };
+    let refresh_stamp = if kind == Kind::Plugin {
+        "\nif [ -z \"$source_dirty\" ] && [ -x target/release/herdr-ade ]; then\n\
+         case \"$(target/release/herdr-ade --version)\" in\n\
+         *-dirty*) touch build.rs ;;\n\
+         esac\n\
+         fi"
+    } else {
+        ""
+    };
     let mut installs = String::new();
     for bin in kind.binaries() {
+        // A previous clean install may already have recorded this commit while
+        // copying a stale dirty binary. Its record alone cannot justify a skip.
+        let installed_stamp = if kind == Kind::Plugin {
+            "\ncase \"$(\"$install_to\" --version 2>/dev/null || :)\" in\n\
+             *-dirty*) installed_dirty=dirty ;;\n\
+             *) installed_dirty= ;;\n\
+             esac"
+        } else {
+            "\ninstalled_dirty="
+        };
         installs.push_str(&format!(
             "\ninstall_to={to}\n\
              install_record=\"$(dirname \"$install_to\")/.{bin}.installed-commit\"\n\
              install_tmp=\"${{install_to}}.install.$$\"\n\
              record_tmp=\"${{install_record}}.$$\"\n\
-             mkdir -p \"$(dirname \"$install_to\")\"\n\
-             if [ -z \"$source_dirty\" ] && [ -x \"$install_to\" ] && [ \"$(cat \"$install_record\" 2>/dev/null || :)\" = \"$source_head\" ]; then\n\
+             mkdir -p \"$(dirname \"$install_to\")\"{installed_stamp}\n\
+             if [ -z \"$source_dirty\" ] && [ -z \"$installed_dirty\" ] && [ -x \"$install_to\" ] && [ \"$(cat \"$install_record\" 2>/dev/null || :)\" = \"$source_head\" ]; then\n\
                :\n\
              else\n\
                cp target/release/{bin} \"$install_tmp\"\n\
@@ -565,7 +601,7 @@ fn box_build(
          source_head=\"$(git rev-parse HEAD)\"\n\
          source_dirty=\"$(git status --porcelain --untracked-files=normal)\"\n\
          export PATH={build_path}\n\
-         export DEVELOPER_DIR={DEVELOPER_DIR}{zig}\n\
+         export DEVELOPER_DIR={DEVELOPER_DIR}{zig}{refresh_stamp}\n\
          cargo build --release --locked{installs}\n\
          printf 'HERDR_ADE_INSTALLED_HEAD=%s\\n' \"$source_head\"",
         path = remote::quote(box_path),
@@ -1155,7 +1191,7 @@ fn install_for(ctx: &Ctx, current: Option<(&str, &str)>) -> Result<InstallOutcom
         fork |= kind == Kind::Fork;
         let commit = repo_head(ctx, &repo.path)?;
         let clean_before = repo_clean(ctx, &repo.path)?;
-        local_build(ctx, &repo.path, kind)?;
+        local_build(ctx, &repo.path, kind, clean_before)?;
         let after_build = repo_head(ctx, &repo.path)?;
         let source_clean = clean_before && repo_clean(ctx, &repo.path)?;
         if after_build != commit {
@@ -1470,6 +1506,154 @@ mod tests {
         let mut permissions = std::fs::metadata(path).unwrap().permissions();
         permissions.set_mode(0o755);
         std::fs::set_permissions(path, permissions).unwrap();
+    }
+
+    fn dirty_then_clean_install(on_box: bool) {
+        let root = tempfile::tempdir().unwrap();
+        let repo = root.path().join("repo");
+        std::fs::create_dir_all(repo.join("target/release")).unwrap();
+        let stamp = repo.join("build.rs");
+        std::fs::write(&stamp, "// build stamp\n").unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(&stamp)
+            .unwrap()
+            .set_times(std::fs::FileTimes::new().set_modified(std::time::UNIX_EPOCH))
+            .unwrap();
+        std::fs::write(repo.join("dirty"), "untracked files").unwrap();
+        for bin in Kind::Plugin.binaries() {
+            write_version_binary(
+                &repo.join("target/release").join(bin),
+                &format!("{bin} 0.1.0+abc1234-dirty.1"),
+                "cached dirty build",
+            );
+        }
+        let tools = root.path().join("tools");
+        std::fs::create_dir(&tools).unwrap();
+        let cargo = tools.join("cargo");
+        std::fs::write(
+            &cargo,
+            "#!/bin/sh\nset -e\n\
+             # Model Cargo reusing its stamp unless a package file changes.\n\
+             if [ build.rs -nt target/release/herdr-ade ]; then\n\
+               dirty=\n\
+               if [ -f dirty ]; then dirty=-dirty; fi\n\
+               for bin in herdr-ade herdr-pi herdr-rundown; do\n\
+                 printf '#!/bin/sh\\necho \"%s 0.1.0+abc1234%s.2\"\\n' \"$bin\" \"$dirty\" > \"target/release/$bin\"\n\
+                 chmod 755 \"target/release/$bin\"\n\
+               done\n\
+             fi\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&cargo, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let git = tools.join("git");
+        std::fs::write(
+            &git,
+            "#!/bin/sh\ncase \"$1\" in\nrev-parse) echo abc1234 ;;\nstatus) if [ -f dirty ]; then echo '?? dirty'; fi ;;\nesac\nexit 0\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&git, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let path = format!("{}:/usr/bin:/bin", tools.display());
+        let env = crate::paths::Env::for_test(root.path(), &[("PATH", &path)]);
+        let runner = FakeRunner::new();
+        let shell_path = path.clone();
+        runner.on_fn(
+            |cmd| cmd.program == "ssh",
+            move |cmd| {
+                RealRunner.run(
+                    &Cmd::new("/bin/sh", BOX_BUILD_TIMEOUT)
+                        .args(["-c".into(), cmd.args.last().unwrap().clone()])
+                        .env("PATH", &shell_path),
+                )
+            },
+        );
+        runner.on_fn(
+            |cmd| cmd.program == "cargo",
+            move |cmd| {
+                RealRunner.run(&Cmd {
+                    program: cargo.to_string_lossy().into_owned(),
+                    ..cmd.clone()
+                })
+            },
+        );
+        runner.on_fn(|_| true, |cmd| RealRunner.run(cmd));
+        let ctx = Ctx {
+            env: &env,
+            root: root.path().join("root"),
+            config_dir: root.path().join("config"),
+            runner: &runner,
+            detached_ticker: false,
+        };
+        let installed = root.path().join(".local/bin");
+        let machine = crate::remote::MachineDeclaration {
+            path,
+            ade_bin: installed.join("herdr-ade").to_string_lossy().into_owned(),
+            pi_bin: installed.join("herdr-pi").to_string_lossy().into_owned(),
+            ..Default::default()
+        };
+        let install = |clean| {
+            if on_box {
+                assert_eq!(
+                    box_build(&ctx, "box", &machine, repo.to_str().unwrap(), Kind::Plugin)
+                        .unwrap()
+                        .as_deref(),
+                    Some("abc1234")
+                );
+            } else {
+                local_build(&ctx, repo.to_str().unwrap(), Kind::Plugin, clean).unwrap();
+                for bin in Kind::Plugin.binaries() {
+                    local_install(&ctx, repo.to_str().unwrap(), bin, "abc1234", clean).unwrap();
+                }
+            }
+        };
+        install(false);
+        assert_eq!(
+            std::fs::metadata(&stamp).unwrap().modified().unwrap(),
+            std::time::UNIX_EPOCH
+        );
+        for bin in Kind::Plugin.binaries() {
+            assert!(
+                binary_version(&ctx, &installed.join(bin))
+                    .unwrap()
+                    .contains("-dirty")
+            );
+            // Reproduce the old installer recording a clean commit despite
+            // copying the cached dirty image. The next install must repair it.
+            record_installed_commit(&installed, bin, "abc1234").unwrap();
+        }
+        std::fs::remove_file(repo.join("dirty")).unwrap();
+        install(true);
+        for bin in Kind::Plugin.binaries() {
+            assert_eq!(
+                binary_version(&ctx, &installed.join(bin)).unwrap(),
+                format!("{bin} 0.1.0+abc1234.2")
+            );
+        }
+        let refreshed = std::fs::metadata(&stamp).unwrap().modified().unwrap();
+        let inode = std::fs::metadata(installed.join("herdr-ade"))
+            .unwrap()
+            .ino();
+        install(true);
+        assert_eq!(
+            std::fs::metadata(&stamp).unwrap().modified().unwrap(),
+            refreshed
+        );
+        assert_eq!(
+            std::fs::metadata(installed.join("herdr-ade"))
+                .unwrap()
+                .ino(),
+            inode
+        );
+    }
+
+    #[test]
+    fn box_install_refreshes_a_cached_dirty_stamp_after_the_checkout_is_clean() {
+        dirty_then_clean_install(true);
+    }
+
+    #[test]
+    fn mac_install_refreshes_a_cached_dirty_stamp_after_the_checkout_is_clean() {
+        dirty_then_clean_install(false);
     }
 
     /// Write an executable `zig` that answers `zig version` with `version`.

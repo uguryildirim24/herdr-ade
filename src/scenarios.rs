@@ -2839,8 +2839,8 @@ fn harness_install_builds_and_installs_each_repo_kind() {
             .iter()
             .filter(|c| c.display().contains("--version"))
             .count(),
-        12,
-        "each binary is compared before installation, then the installed version is recorded"
+        13,
+        "the cached plugin stamp is checked before building; each binary is compared before installation, then its installed version is recorded"
     );
     assert_eq!(
         calls.iter().filter(|c| c.program == "ssh").count(),
