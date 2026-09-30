@@ -1,7 +1,7 @@
 //! The `thread` subcommands. Each is one deterministic mechanic; the
 //! coordinator decides whether, what and where.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 use std::time::Duration;
 
@@ -16,6 +16,51 @@ use crate::thread::{self, CopyOutcome, FollowUp, FollowUpState, Group, Kind, Sta
 use crate::{coordinator, remote, ticker};
 
 const GIT_TIMEOUT: Duration = Duration::from_secs(5);
+
+// External cleanup is serial and may require several SSH trips per lane.
+// Keep both landing and its retry queue bounded, rather than draining a pile.
+pub(crate) const CLEANUP_BATCH_SIZE: usize = 2;
+
+/// One cleanup slice's live lists. Reused across members and the in-use/close
+/// checks; per-pane process checks still run at the point of removal.
+#[derive(Default)]
+pub(crate) struct CleanupViews {
+    lists: BTreeMap<(String, String), Option<(Vec<Agent>, Vec<Pane>)>>,
+}
+
+impl CleanupViews {
+    fn for_thread<'a>(
+        &mut self,
+        ctx: &'a Ctx,
+        project: &Project,
+        record: &Thread,
+    ) -> Result<Option<SessionView<'a>>> {
+        let socket = project.coordinator().map(|c| c.socket).unwrap_or_default();
+        let key = (socket.clone(), record.machine_route().to_string());
+        if !self.lists.contains_key(&key) {
+            let lists = cleanup_view(ctx, project, record)?.map(|view| (view.agents, view.panes));
+            self.lists.insert(key.clone(), lists);
+        }
+        Ok(self.lists[&key].clone().map(|(agents, panes)| SessionView {
+            herdr: Herdr::new(ctx.env.herdr_bin(), socket, ctx.runner)
+                .on_machine(record.machine_route()),
+            agents,
+            panes,
+        }))
+    }
+
+    fn closed(&mut self, project: &Project, record: &Thread) {
+        // Herdr ids are only unique within a session/machine.
+        let key = (
+            project.coordinator().map(|c| c.socket).unwrap_or_default(),
+            record.machine_route().to_string(),
+        );
+        if let Some(Some((agents, panes))) = self.lists.get_mut(&key) {
+            agents.retain(|a| !thread::agent_matches(record, a));
+            panes.retain(|p| p.tab_id != record.tab_id || p.workspace_id != record.workspace_id);
+        }
+    }
+}
 
 /// The project's session as the binary sees it right now.
 pub struct SessionView<'a> {
@@ -2069,6 +2114,16 @@ pub(crate) fn resolve_automatically(
     id: &str,
     reason: &str,
 ) -> ResolveOutcome {
+    resolve_automatically_with_views(ctx, project, id, reason, &mut CleanupViews::default())
+}
+
+pub(crate) fn resolve_automatically_with_views(
+    ctx: &Ctx,
+    project: &Project,
+    id: &str,
+    reason: &str,
+    views: &mut CleanupViews,
+) -> ResolveOutcome {
     // Record the terminal lifecycle before touching Herdr or a worktree. A
     // process death at any later instruction leaves a ticker-visible retry.
     let before = thread::load(project, id).unwrap_or_default();
@@ -2100,7 +2155,7 @@ pub(crate) fn resolve_automatically(
             branch: before.branch,
         };
     }
-    let attempted = resolve(ctx, &project.slug, id, &ResolveArgs::default());
+    let attempted = resolve_with_views(ctx, &project.slug, id, &ResolveArgs::default(), views);
     match attempted {
         Ok(mut outcome) => {
             let pending = thread::load(project, id).is_ok_and(|t| t.cleanup_pending);
@@ -2144,18 +2199,20 @@ pub(crate) fn resolve_automatically(
     }
 }
 
-/// Retry every durable cleanup left by cancellation or automatic resolution.
-/// The review record separately resumes cleanup after a landed pile.
+/// Retry a bounded slice of durable cleanup, including after a landed pile.
 pub(crate) fn retry_pending_cleanup(ctx: &Ctx, project: &Project) -> Result<()> {
-    for record in thread::list(project)
+    let mut views = CleanupViews::default();
+    let mut pending = thread::list(project)
         .into_iter()
         .filter(|record| record.cleanup_pending)
-    {
+        .filter(|record| !record.cleanup_reason.starts_with("linked_files_not_kept:"))
+        .collect::<Vec<_>>();
+    // Every attempt updates the thread. Oldest first prevents an unreachable
+    // member at the front of the pile from starving the rest of the queue.
+    pending.sort_by(|a, b| a.updated.cmp(&b.updated).then(a.id.cmp(&b.id)));
+    for record in pending.into_iter().take(CLEANUP_BATCH_SIZE) {
         // A moved-tip refusal can become resolvable after a reviewed box seal
         // lands; let the pinned branch checks decide on each retry.
-        if record.cleanup_reason.starts_with("linked_files_not_kept:") {
-            continue;
-        }
         if !record.cancellation_reason.is_empty() {
             if let Err(error) = cancel(ctx, &project.slug, &record.id, &record.cancellation_reason)
             {
@@ -2167,7 +2224,7 @@ pub(crate) fn retry_pending_cleanup(ctx: &Ctx, project: &Project) -> Result<()> 
             } else {
                 &record.cleanup_reason
             };
-            resolve_automatically(ctx, project, &record.id, reason);
+            resolve_automatically_with_views(ctx, project, &record.id, reason, &mut views);
         }
     }
 
@@ -2812,6 +2869,16 @@ impl ResolveOutcome {
 }
 
 pub fn resolve(ctx: &Ctx, slug: &str, id: &str, args: &ResolveArgs) -> Result<ResolveOutcome> {
+    resolve_with_views(ctx, slug, id, args, &mut CleanupViews::default())
+}
+
+fn resolve_with_views(
+    ctx: &Ctx,
+    slug: &str,
+    id: &str,
+    args: &ResolveArgs,
+    views: &mut CleanupViews,
+) -> Result<ResolveOutcome> {
     let project = Project::load(&ctx.root, slug)?;
     let record = thread::load(&project, id)?;
     if args.reopen {
@@ -2919,11 +2986,11 @@ pub fn resolve(ctx: &Ctx, slug: &str, id: &str, args: &ResolveArgs) -> Result<Re
             removal_refusal = inspection.ignored_reason(&record.worktree_path);
         }
         if removal_refusal.is_none() {
-            removal_in_use_gate(ctx, &project, &record)?;
+            removal_in_use_gate(ctx, &project, &record, views)?;
             // Stop the idle agent before removing its current directory. This
             // also makes the raw box-side `git worktree remove` independent of
             // Herdr workspace ownership.
-            pane_closed = close_pane(ctx, &project, &record)?;
+            pane_closed = close_pane_with_views(ctx, &project, &record, views)?;
             remove_worktree(ctx, &project, &record)?;
             thread::update(&project, id, |t| t.worktree_path.clear())?;
             worktree_removed = true;
@@ -2947,13 +3014,13 @@ pub fn resolve(ctx: &Ctx, slug: &str, id: &str, args: &ResolveArgs) -> Result<Re
             String::new()
         };
     })?;
-    if let Some(view) = session_view(ctx, &project) {
+    if let Ok(Some(view)) = views.for_thread(ctx, &project, &resolved) {
         clear_thread_tokens(&view.herdr, &resolved);
     }
     let pane_closed = if args.keep_pane || pane_closed {
         pane_closed
     } else {
-        close_pane(ctx, &project, &resolved)?
+        close_pane_with_views(ctx, &project, &resolved, views)?
     };
     remove_finished_build_folder(ctx, &project, &resolved)?;
     remove_scratch_session(ctx, &resolved)?;
@@ -3587,10 +3654,19 @@ fn cleanup_view<'a>(
 }
 
 pub(crate) fn close_pane(ctx: &Ctx, project: &Project, record: &Thread) -> Result<bool> {
+    close_pane_with_views(ctx, project, record, &mut CleanupViews::default())
+}
+
+fn close_pane_with_views(
+    ctx: &Ctx,
+    project: &Project,
+    record: &Thread,
+    views: &mut CleanupViews,
+) -> Result<bool> {
     if record.tab_id.is_empty() {
         return Ok(false);
     }
-    let Some(view) = cleanup_view(ctx, project, record)? else {
+    let Some(view) = views.for_thread(ctx, project, record)? else {
         return Ok(false);
     };
     let herdr = view.herdr;
@@ -3626,8 +3702,12 @@ pub(crate) fn close_pane(ctx: &Ctx, project: &Project, record: &Thread) -> Resul
         herdr.tab_close(&record.tab_id)
     };
     match result {
-        Ok(()) => Ok(true),
+        Ok(()) => {
+            views.closed(project, record);
+            Ok(true)
+        }
         Err(error) if matches!(error.code.as_str(), "tab_not_found" | "workspace_not_found") => {
+            views.closed(project, record);
             Ok(false)
         }
         Err(error) => Err(anyhow::anyhow!("{error}")),
@@ -4458,7 +4538,7 @@ pub(crate) fn remove_kept_worktree(ctx: &Ctx, slug: &str, id: &str) -> Result<St
     // Pin the checked-out branch tip before discarding the checkout. A retained
     // box branch must also match its published tip or verified immutable seal.
     let tip = crate::branches::require_published_tip(ctx, &project, &record)?;
-    removal_in_use_gate(ctx, &project, &record)?;
+    removal_in_use_gate(ctx, &project, &record, &mut CleanupViews::default())?;
     close_pane(ctx, &project, &record)?;
     // The marker makes ref retirement retryable even if the process dies
     // between removing the checkout and deleting the branch.
@@ -4672,8 +4752,13 @@ fn remove_ade_worktree(ctx: &Ctx, project: &Project, record: &Thread) -> Result<
 /// The D4 in-use gate before the lane's own idle agent is stopped. Durable
 /// completion is checked separately by `finished_worktree_reason`; this gate
 /// only prevents closing active work or removing a checkout used elsewhere.
-fn removal_in_use_gate(ctx: &Ctx, project: &Project, record: &Thread) -> Result<()> {
-    let Some(view) = cleanup_view(ctx, project, record)? else {
+fn removal_in_use_gate(
+    ctx: &Ctx,
+    project: &Project,
+    record: &Thread,
+    views: &mut CleanupViews,
+) -> Result<()> {
+    let Some(view) = views.for_thread(ctx, project, record)? else {
         return Ok(());
     };
     let agents = &view.agents;
@@ -7042,6 +7127,95 @@ mod tests {
                 .iter()
                 .any(|cmd| { cmd.display().contains("--machine oci workspace close w2") })
         );
+    }
+
+    #[test]
+    fn cleanup_slice_reuses_machine_lists_and_drops_closed_tabs() {
+        use crate::scenarios::{World, agent_json, pane_json};
+        let world = World::new();
+        let project = world.project("demo", "a.sock");
+        let first = Thread {
+            id: "t-0001".into(),
+            machine: "oci".into(),
+            workspace_id: "w2".into(),
+            tab_id: "w2:t1".into(),
+            pane_id: "w2:p1".into(),
+            cwd: "/lane1".into(),
+            agent_name: "lane1".into(),
+            ..Thread::default()
+        };
+        let second = Thread {
+            id: "t-0002".into(),
+            tab_id: "w2:t2".into(),
+            pane_id: "w2:p2".into(),
+            cwd: "/lane2".into(),
+            agent_name: "lane2".into(),
+            ..first.clone()
+        };
+        *world.agents.borrow_mut() = format!(
+            "[{},{}]",
+            agent_json("w2", "w2:t1", "w2:p1", "/lane1", "lane1", "idle"),
+            agent_json("w2", "w2:t2", "w2:p2", "/lane2", "lane2", "idle")
+        );
+        *world.panes.borrow_mut() = format!(
+            "[{},{}]",
+            pane_json("w2", "w2:t1", "w2:p1", "/lane1"),
+            pane_json("w2", "w2:t2", "w2:p2", "/lane2")
+        );
+        let mut views = CleanupViews::default();
+        let ctx = world.ctx();
+        assert!(close_pane_with_views(&ctx, &project, &first, &mut views).unwrap());
+        assert!(close_pane_with_views(&ctx, &project, &second, &mut views).unwrap());
+        assert_eq!(world.runner.count("--machine oci agent list"), 1);
+        assert_eq!(world.runner.count("--machine oci pane list"), 1);
+        assert_eq!(world.runner.count("--machine oci tab close w2:t1"), 1);
+        // After closing the first tab, the second owns the rest of its workspace.
+        assert_eq!(world.runner.count("--machine oci workspace close w2"), 1);
+        assert!(!close_pane_with_views(&ctx, &project, &first, &mut views).unwrap());
+        // The next slice observes fresh state, not the previous pass's cache.
+        assert!(
+            close_pane_with_views(&ctx, &project, &first, &mut CleanupViews::default()).unwrap()
+        );
+        assert_eq!(world.runner.count("--machine oci agent list"), 2);
+    }
+
+    #[test]
+    fn cleanup_retries_are_bounded_and_an_unreachable_member_does_not_starve_the_queue() {
+        use crate::scenarios::World;
+        let world = World::new();
+        let project = world.project("demo", "a.sock");
+        let ids = (0..3)
+            .map(|_| {
+                thread::allocate(&project, |t| {
+                    t.status = Status::Resolved;
+                    t.machine = "box".into();
+                    t.cleanup_pending = true;
+                    t.cleanup_reason = "merged".into();
+                    t.created = "2020-01-01T00:00:00Z".into();
+                })
+                .unwrap()
+                .id
+            })
+            .collect::<Vec<_>>();
+        retry_pending_cleanup(&world.ctx(), &project).unwrap();
+        assert_ne!(
+            thread::load(&project, &ids[0]).unwrap().updated,
+            "2020-01-01T00:00:00Z"
+        );
+        assert_ne!(
+            thread::load(&project, &ids[1]).unwrap().updated,
+            "2020-01-01T00:00:00Z"
+        );
+        assert_eq!(
+            thread::load(&project, &ids[2]).unwrap().updated,
+            "2020-01-01T00:00:00Z"
+        );
+        retry_pending_cleanup(&world.ctx(), &project).unwrap();
+        assert_ne!(
+            thread::load(&project, &ids[2]).unwrap().updated,
+            "2020-01-01T00:00:00Z"
+        );
+        assert!(thread::list(&project).iter().all(|t| t.cleanup_pending));
     }
 
     #[test]

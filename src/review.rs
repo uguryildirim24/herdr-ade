@@ -1288,10 +1288,13 @@ fn land_with_install(
     // Idempotent lane markers are written only after the durable FF boundary.
     for member in &review.members {
         if !excluded(review, &member.thread) {
-            thread::update(project, &member.thread, |t| {
-                t.merged_sha = candidate.clone();
-                t.merged_review = review.id.clone();
-            })?;
+            let lane = thread::load(project, &member.thread)?;
+            if lane.merged_sha != candidate || lane.merged_review != review.id {
+                thread::update(project, &member.thread, |t| {
+                    t.merged_sha = candidate.clone();
+                    t.merged_review = review.id.clone();
+                })?;
+            }
         }
     }
     defer_members(project, review)?;
@@ -1327,8 +1330,29 @@ fn land_with_install(
             .map(|m| m.thread.clone())
             .chain(review.reviewer.clone())
             .collect::<Vec<_>>();
+        // The terminal thread marker is the durable per-member cursor. A
+        // crash during external cleanup leaves cleanup_pending for the bounded
+        // retry queue, without replaying earlier members of this landing.
+        let pending = ids
+            .iter()
+            .map(|id| thread::load(project, id))
+            .collect::<Result<Vec<_>>>()?
+            .into_iter()
+            .filter(|lane| lane.status != Status::Resolved)
+            .collect::<Vec<_>>();
+        let mut views = crate::threads::CleanupViews::default();
+        for lane in pending.iter().take(crate::threads::CLEANUP_BATCH_SIZE) {
+            crate::threads::resolve_automatically_with_views(
+                ctx, project, &lane.id, "merged", &mut views,
+            );
+        }
+        if pending.len() > crate::threads::CLEANUP_BATCH_SIZE {
+            return Ok(());
+        }
         for id in &ids {
-            crate::threads::resolve_automatically(ctx, project, id, "merged");
+            if thread::load(project, id)?.status != Status::Resolved {
+                return Ok(());
+            }
         }
         // Cleanup belongs to each merged thread, not to the landing. Its
         // durable cleanup_pending marker lets the ticker retry independently.

@@ -912,6 +912,10 @@ fn whole_pile_lands_pushes_closes_and_prunes_once() {
         .map(|cmd| cmd.args.clone())
         .collect::<Vec<_>>();
     assert_eq!(remote_checks.len(), 2, "{remote_checks:?}");
+    assert_eq!(review.phase, Phase::Landing);
+    assert!(!review.close);
+    review = load(&fx.project, &review.id).unwrap();
+    advance(&fx.world.ctx(), &fx.project, &mut review).unwrap();
     assert_eq!(review.phase, Phase::Complete);
     assert_eq!(review.notices.len(), 1);
     assert!(review.notices[0].line.contains("merged"));
@@ -1263,6 +1267,117 @@ fn persisted_landing_without_remote_completes_on_ticker_pass() {
                 .iter()
                 .any(|arg| ["ls-remote", "fetch", "push"].contains(&arg.as_str()))
     }));
+}
+
+#[test]
+fn large_landing_shares_every_ticker_pass_with_other_projects_due_work() {
+    use crate::runner::fake::ok;
+    use crate::scenarios::agent_json;
+
+    let fx = configured();
+    for n in 1..=58 {
+        lane(&fx, n);
+    }
+    let mut review = prepared(&fx);
+    let candidate = git(&fx.repo, &["rev-parse", &review.candidate_branch]);
+    review.push_remote = Some(String::new());
+    review.verdict = Some(Verdict {
+        verdict: "MERGE".into(),
+        review: review.id.clone(),
+        candidate: candidate.clone(),
+        without: BTreeMap::new(),
+        gates: vec![],
+    });
+    review.phase = Phase::Landing;
+    save(&fx.project, &review).unwrap();
+
+    let other = fx.world.project("other", "b.sock");
+    let coordinator = other.coordinator().unwrap();
+    let agent = agent_json(
+        "w1",
+        "w1:t1",
+        "w1:p1",
+        &coordinator.cwd,
+        &coordinator.agent_name,
+        "idle",
+    );
+    *fx.world.agents.borrow_mut() = format!("[{agent}]");
+    *fx.world.panes.borrow_mut() = format!("[{}]", fx.world.coordinator_pane(&other));
+    fx.world.runner.on("agent prompt", ok(r#"{"result":{}}"#));
+    fx.world.runner.on_fn(
+        |cmd| cmd.program != "ssh" && cmd.display().contains("pane read"),
+        |_| Ok(ok("❯ ")),
+    );
+
+    // Keep another project's machine due on every pass as well as its local
+    // prompt. The machine phase must still run while this review is landing.
+    thread::allocate(&other, |t| {
+        t.status = Status::Open;
+        t.machine = "box".into();
+        t.machine_id = "1".into();
+    })
+    .unwrap();
+    fx.world.runner.on(
+        "machine list --json",
+        ok(r#"[{"id":"1","label":"box","target":"me@box","session":"default","enabled":true}]"#),
+    );
+    fx.world.runner.on_fn(
+        |cmd| cmd.program == "ssh",
+        |_| Ok(ok("boot\tboot-1\nfree\t100\nagents\t{\"result\":{\"agents\":[]}}\npanes\t{\"result\":{\"panes\":[]}}\n")),
+    );
+
+    let ctx = fx.world.ctx();
+    let mut memory = crate::steps::Memory::new(&ctx);
+    let mut previous = 0;
+    let mut passes = 0;
+    loop {
+        other
+            .update_coordinator(|c| {
+                c.prime_pending = true;
+                c.prime_sent = false;
+            })
+            .unwrap();
+        fx.world.runner.calls.borrow_mut().clear();
+        assert!(crate::ticker::tick_for_test(&ctx, &mut memory));
+        passes += 1;
+        let landed = load(&fx.project, &review.id).unwrap();
+        let resolved = thread::list(&fx.project)
+            .into_iter()
+            .filter(|t| t.status == Status::Resolved)
+            .count();
+        assert!(resolved > previous);
+        assert!(resolved - previous <= crate::threads::CLEANUP_BATCH_SIZE);
+        previous = resolved;
+        // This is a real due prompt in the slow phase after reviews, not just
+        // evidence that the ticker entered the next project's cheap phase.
+        assert!(other.coordinator().unwrap().prime_sent);
+        assert!(fx.world.runner.calls.borrow().iter().any(|cmd| {
+            cmd.display().contains("agent list")
+                && cmd
+                    .env
+                    .iter()
+                    .any(|(k, v)| k == "HERDR_SOCKET_PATH" && v == &coordinator.socket)
+        }));
+        assert!(memory.machine_views.contains_key("1"));
+        assert_eq!(crate::events::remote_state(&other, "1").boot_id, "boot-1");
+        if landed.phase == Phase::Complete {
+            assert!(landed.close && landed.prune);
+            break;
+        }
+        assert_eq!(landed.phase, Phase::Landing);
+        assert!(landed.fast_forward && landed.push && landed.install);
+        assert!(!landed.close);
+        assert!(passes < 59);
+    }
+    assert_eq!(previous, 59); // members plus the reviewer
+    assert!(passes > 1);
+    assert_eq!(git(&fx.repo, &["rev-parse", "main"]), candidate);
+    assert!(
+        Git::new(ctx.runner, &fx.repo)
+            .branch_head(&review.candidate_branch)
+            .unwrap()
+            .is_none()
+    );
 }
 
 #[test]
