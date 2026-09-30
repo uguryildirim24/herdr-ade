@@ -995,7 +995,7 @@ pub(crate) struct Live {
 pub(crate) fn seconds_since(timestamp: &str, now: jiff::Timestamp) -> i64 {
     timestamp
         .parse::<jiff::Timestamp>()
-        .map(|then| now.as_second() - then.as_second())
+        .map(|then| crate::awake::elapsed(then, now))
         .unwrap_or(0)
 }
 

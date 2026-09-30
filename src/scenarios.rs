@@ -1730,6 +1730,196 @@ fn is_machine_call(cmd: &Cmd) -> bool {
 }
 
 #[test]
+fn forty_minute_sleep_defers_dark_wakes_and_imports_seals_before_resuming_starts() {
+    let (world, project) = remote_world();
+    let now = jiff::Timestamp::now().as_second();
+    let start = jiff::Timestamp::from_second(now - 2400)
+        .unwrap()
+        .to_string();
+    thread::update(&project, "t-0001", |t| {
+        t.launch.kind = "claude".into();
+        t.launch.ready_timeout_ms = 90_000;
+        t.provider_wait_started = start.clone();
+        t.error = "waiting for provider: old unreachable probe".into();
+        t.created = start.clone();
+        t.progress_since = start.clone();
+        t.no_commit_since = start.clone();
+    })
+    .unwrap();
+    let local = thread::allocate(&project, |t| {
+        t.status = Status::Starting;
+        t.created = start.clone();
+        t.startup_wait_started = start.clone();
+        t.launch.ready_timeout_ms = 90_000;
+    })
+    .unwrap();
+    let review = crate::review::Review {
+        id: "review-1".into(),
+        repo: "/repo".into(),
+        integration: String::new(),
+        base: String::new(),
+        candidate_branch: String::new(),
+        members: vec![],
+        gates: vec![],
+        selected_gates: vec![],
+        reviewer: Some("t-0001".into()),
+        phase: crate::review::Phase::Reviewing,
+        verdict: None,
+        verdict_event: String::new(),
+        reviewer_after: String::new(),
+        checked_event: String::new(),
+        retry_attempt: None,
+        retry_generation: 0,
+        moved: 0,
+        refresh_tip: None,
+        push_remote: None,
+        install_required: false,
+        fast_forward: false,
+        push: false,
+        install: false,
+        close: false,
+        prune: false,
+        attention: String::new(),
+        no_verdict_since: start.clone(),
+        notices: vec![],
+    };
+    crate::review::save(&project, &review).unwrap();
+    let review_path = crate::review::path(&project, "review-1");
+    let review_before = std::fs::read(&review_path).unwrap();
+    let remote_before = toml::to_string(&thread::load(&project, "t-0001").unwrap()).unwrap();
+    let local_before = toml::to_string(&local).unwrap();
+    let offline = Rc::new(RefCell::new(true));
+    let flag = offline.clone();
+    let report = b"finished during sleep\n";
+    let artifact = thread::sha256_hex(report);
+    let event = Event {
+        id: "t-0001-1-1".into(),
+        op: "t-0001-1-1".into(),
+        thread: "t-0001".into(),
+        attempt: 1,
+        recipient: Recipient {
+            pane: "w1:p1".into(),
+            coordinator_attempt: 1,
+        },
+        created: start.clone(),
+        payload: EventPayload {
+            done: Some(DonePayload {
+                has_changes: Some(false),
+                sha: "abc".into(),
+                report_path: ".reports/t-0001.md".into(),
+                artifact: artifact.clone(),
+                attestation: None,
+                published_ref: None,
+            }),
+            waiting: None,
+            failed: None,
+        },
+    };
+    let bytes = crate::events::bytes(&event).unwrap();
+    let hash = thread::sha256_hex(&bytes);
+    let manifest = format!(
+        "boot\tboot-1\nfree\t100\nagents\t{{\"result\":{{\"agents\":[]}}}}\npanes\t{{\"result\":{{\"panes\":[]}}}}\n\
+         event\tdemo\tt-0001-1-1\t/box/events/t-0001-1-1.toml\t{hash}\t/box/artifacts/{artifact}\t{artifact}\n\
+         receipt\tdemo\tt-0001-1-1\t{hash}\t{artifact}\n"
+    );
+    world.runner.on_fn(
+        |cmd| cmd.program == "ssh",
+        move |cmd| {
+            Ok(if *flag.borrow() {
+                fail(255, "ssh: connect to host box: Operation timed out")
+            } else if cmd
+                .args
+                .last()
+                .is_some_and(|script| script.contains("disk_free_kb"))
+            {
+                ok("disk_free_kb\t99999999\nOK\n")
+            } else {
+                ok(&manifest)
+            })
+        },
+    );
+    world.runner.on_fn(
+        |cmd| cmd.program == "scp",
+        move |cmd| {
+            let dir = PathBuf::from(cmd.args.last().unwrap().trim_end_matches('/'));
+            std::fs::create_dir_all(&dir)?;
+            std::fs::write(dir.join("t-0001-1-1.toml"), &bytes)?;
+            std::fs::write(dir.join(&artifact), report)?;
+            Ok(ok(""))
+        },
+    );
+    let ctx = world.ctx();
+    crate::awake::set_sample(Some((now - 2400, 100)));
+    drop(crate::awake::enter(&ctx.root, true).unwrap());
+    let mut memory = Memory::new(&ctx);
+    for n in 1..=7 {
+        crate::awake::set_sample(Some((now - 2400 + n * 300, 100 + n as u64 * 5)));
+        assert!(ticker::tick_for_test(&ctx, &mut memory));
+        assert_eq!(
+            toml::to_string(&thread::load(&project, "t-0001").unwrap()).unwrap(),
+            remote_before
+        );
+        assert_eq!(
+            toml::to_string(&thread::load(&project, &local.id).unwrap()).unwrap(),
+            local_before
+        );
+        assert_eq!(std::fs::read(&review_path).unwrap(), review_before);
+        assert!(crate::events::list(&project).is_empty());
+        assert!(inbox::unhandled(&project).is_empty());
+        // Exercise persistence, not only the process-local clock/tracker.
+        memory = Memory::new(&ctx);
+    }
+    *offline.borrow_mut() = false;
+    // Wake forces a courier poll even if its previous backoff is still due.
+    memory
+        .machines
+        .entry("box".into())
+        .or_default()
+        .skip_until_tick = 100;
+    crate::awake::set_sample(Some((now + 15, 155)));
+    ticker::tick_for_test(&ctx, &mut memory);
+    assert!(crate::events::load(&project, "t-0001-1-1").is_ok());
+    assert!(
+        thread::load(&project, "t-0001")
+            .unwrap()
+            .provider_wait_started
+            .is_empty()
+    );
+    assert_eq!(
+        thread::load(&project, &local.id).unwrap().status,
+        Status::Starting
+    );
+    let (_scope, _) = crate::awake::enter(&ctx.root, false).unwrap();
+    for timer in [
+        &start,
+        &review.no_verdict_since,
+        &local.startup_wait_started,
+    ] {
+        assert_eq!(
+            thread::seconds_since(timer, jiff::Timestamp::from_second(now + 15).unwrap()),
+            55
+        );
+    }
+    crate::awake::set_sample(None);
+    let calls = world.runner.calls.borrow();
+    let import = calls.iter().position(|cmd| cmd.program == "scp").unwrap();
+    let ready = calls
+        .iter()
+        .position(|cmd| {
+            cmd.program == "ssh"
+                && cmd
+                    .args
+                    .last()
+                    .is_some_and(|script| script.contains("disk_free_kb"))
+        })
+        .unwrap();
+    assert!(
+        import < ready,
+        "seals must be imported before waiting starts and timers"
+    );
+}
+
+#[test]
 fn a_failed_machine_call_changes_nothing_and_the_machine_is_skipped_for_eight_ticks() {
     let (world, project) = remote_world();
     let failing = World {
@@ -1898,9 +2088,10 @@ fn a_long_machine_outage_gives_one_item_and_one_recovery_item() {
     let disconnected = thread::load(&project, "t-0001").unwrap();
     assert_eq!(
         disconnected.failure_class,
-        crate::contracts::FailureClass::LostConnection
+        crate::contracts::FailureClass::Unknown
     );
-    assert_eq!(disconnected.last_group, "waiting-on-you");
+    assert!(disconnected.last_failure.is_empty());
+    assert!(disconnected.error.is_empty());
 
     *down.borrow_mut() = false;
     for tick in [28, 32, 36] {

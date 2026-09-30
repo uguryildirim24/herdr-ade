@@ -674,14 +674,51 @@ fn tick_with_steps(
     memory: &mut Memory,
     step: &mut impl FnMut(&str) -> bool,
 ) -> Option<bool> {
+    let (_awake, slept) = match crate::awake::enter(&ctx.root, true) {
+        Ok(clock) => clock,
+        Err(error) => {
+            log.line(&format!("awake clock: {error:#}; deferring pass"));
+            return Some(false);
+        }
+    };
     memory.tick += 1;
+    if slept {
+        for machine in memory.machines.values_mut() {
+            machine.skip_until_tick = 0;
+        }
+    }
+    memory.machine_views.clear();
+    // Import box seals before local timers or waiting starts are considered.
+    // A dark wake must not turn missing connectivity into lane state changes.
+    let projects: Vec<Project> = project::list_slugs(&ctx.root)
+        .iter()
+        .filter_map(|slug| Project::load(&ctx.root, slug).ok())
+        .filter(|project| project.status() == Status::Active)
+        .collect();
+    let project_refs: Vec<&Project> = projects.iter().collect();
+    if !step("machine phase") {
+        return None;
+    }
+    for error in machine_passes_with_steps(ctx, &project_refs, memory, log, step)? {
+        log.line(&format!("{error:#}"));
+    }
+    if memory.machine_views.values().any(|view| {
+        view.as_ref()
+            .err()
+            .is_some_and(|error| crate::remote::is_unreachable(error))
+    }) || memory
+        .machines
+        .values()
+        .any(|machine| crate::remote::is_unreachable(&machine.outage.last_error))
+    {
+        return Some(true);
+    }
     if let Err(error) = crate::review::reclassify_old_changes(ctx, |message| log.line(message)) {
         log.line(&format!("one-time change reclassification: {error:#}"));
     }
     if let Err(error) = crate::branches::sweep_once(ctx, |message| log.line(message)) {
         log.line(&format!("one-time branch sweep: {error:#}"));
     }
-    memory.machine_views.clear();
     let mut reachable = Vec::new();
     let mut readiness = BTreeMap::new();
     for slug in project::list_slugs(&ctx.root) {
@@ -699,9 +736,11 @@ fn tick_with_steps(
             }
             continue;
         }
-        resume_provider_starts(ctx, &project, &mut readiness, |error| {
+        if !resume_provider_starts(ctx, &project, &mut readiness, |error| {
             log.line(&format!("{slug}: {error:#}"));
-        });
+        }) {
+            return Some(true);
+        }
         match tick_cheap(
             ctx,
             &project,
@@ -711,16 +750,6 @@ fn tick_with_steps(
             Ok(None) => {}
             Err(error) => log.line(&format!("{slug}: {error:#}")),
         }
-    }
-    // One courier pass per due machine, covering every project with lanes on
-    // it (SPEC-remote §4.3). This runs before the per-project slow pass so the
-    // first project cannot starve the cadence of the others.
-    let project_refs: Vec<&Project> = reachable.iter().map(|(project, _)| project).collect();
-    if !step("machine phase") {
-        return None;
-    }
-    for error in machine_passes_with_steps(ctx, &project_refs, memory, log, step)? {
-        log.line(&format!("{error:#}"));
     }
     // Courier imports sealed events and their report artifacts together.
     // Check reviews now, before remote state, launches, or plan work can
@@ -823,7 +852,15 @@ fn machine_passes_with_steps(
     let now = jiff::Timestamp::now();
     let mut by_machine: BTreeMap<String, Vec<(Project, Vec<thread::Thread>)>> = BTreeMap::new();
     for project in projects {
-        let remote = open_threads(project, true);
+        let remote: Vec<_> = thread::list(project)
+            .into_iter()
+            .filter(|t| {
+                t.is_remote()
+                    && !t.parked
+                    && (matches!(t.status, thread::Status::Open | thread::Status::Starting)
+                        || t.recovery_pending)
+            })
+            .collect();
         let mut seen_machines: Vec<String> = Vec::new();
         for t in &remote {
             if !seen_machines
@@ -845,6 +882,11 @@ fn machine_passes_with_steps(
                 .push(((*project).clone(), threads));
         }
     }
+    // Forget a machine once none of this pass's projects needs it. A resolved
+    // offline lane must not keep deferring otherwise reachable projects.
+    memory
+        .machines
+        .retain(|machine, _| by_machine.contains_key(machine));
     let mut errors = Vec::new();
     for (machine, entries) in by_machine {
         if !step(&format!("machine {machine}")) {
@@ -879,6 +921,19 @@ fn machine_passes_with_steps(
             }
             continue;
         }
+        if let Err(error) = &outcome
+            && crate::remote::is_unreachable(&format!("{error:#}"))
+        {
+            let detail = format!("{error:#}");
+            let event = memory.record_machine(&machine, Some(&detail), now);
+            if let Some((first, _)) = entries.first()
+                && let Err(error) = steps::write_machine_outage(first, &machine, event, memory)
+            {
+                errors.push(error.context("machine outage"));
+            }
+            memory.machine_views.insert(machine, Err(detail));
+            continue;
+        }
         // A failed check (or a box server that could not supply both lists)
         // interrupts a consecutive pane-absence streak.
         if !outcome
@@ -899,15 +954,7 @@ fn machine_passes_with_steps(
             for (project, threads) in &entries {
                 for lane in threads {
                     let detail = format!("the link to machine {machine} is unreachable");
-                    if let Err(error) = thread::update(project, &lane.id, |record| {
-                        record.failure_class = crate::contracts::FailureClass::LostConnection;
-                        record.provider_failure_kind = None;
-                        record.last_failure = detail.clone();
-                        record.error = detail.clone();
-                        record.last_group = thread::Group::WaitingOnYou.token().into();
-                    }) {
-                        log.line(&format!("{error:#}"));
-                    }
+                    log.line(&detail);
                     let line = format!("BLOCKED {} machine {machine} unreachable", lane.id);
                     if let Err(error) = steps::type_remote_line(ctx, project, &line) {
                         log.line(&format!("{error:#}"));
@@ -961,22 +1008,34 @@ pub(crate) fn tick_project(ctx: &Ctx, project: &Project) -> Result<bool> {
 
 #[cfg(test)]
 pub(crate) fn tick_project_with(ctx: &Ctx, project: &Project, memory: &mut Memory) -> Result<bool> {
-    memory.machine_views.clear();
-    resume_provider_starts(ctx, project, &mut BTreeMap::new(), |_| {});
-    match tick_cheap(ctx, project, true)? {
-        Some(seen) => {
-            let log = Log {
-                path: std::env::temp_dir().join(format!("hp-test-log-{}", std::process::id())),
-            };
-            let projects = [project];
-            for error in machine_passes(ctx, &projects, memory, &log) {
-                log.line(&format!("{error:#}"));
-            }
-            match tick_slow(ctx, project, &seen, memory).into_iter().next() {
-                Some(error) => Err(error),
-                None => Ok(true),
-            }
+    let (_awake, slept) = crate::awake::enter(&ctx.root, true)?;
+    if slept {
+        for machine in memory.machines.values_mut() {
+            machine.skip_until_tick = 0;
         }
+    }
+    memory.machine_views.clear();
+    let log = Log {
+        path: std::env::temp_dir().join(format!("hp-test-log-{}", std::process::id())),
+    };
+    for error in machine_passes(ctx, &[project], memory, &log) {
+        log.line(&format!("{error:#}"));
+    }
+    if memory
+        .machines
+        .values()
+        .any(|machine| crate::remote::is_unreachable(&machine.outage.last_error))
+    {
+        return Ok(true);
+    }
+    if !resume_provider_starts(ctx, project, &mut BTreeMap::new(), |_| {}) {
+        return Ok(true);
+    }
+    match tick_cheap(ctx, project, true)? {
+        Some(seen) => match tick_slow(ctx, project, &seen, memory).into_iter().next() {
+            Some(error) => Err(error),
+            None => Ok(true),
+        },
         None => Ok(false),
     }
 }
@@ -988,7 +1047,8 @@ pub(crate) fn resume_provider_starts(
     project: &Project,
     cache: &mut BTreeMap<(String, String), Result<(), String>>,
     mut report: impl FnMut(anyhow::Error),
-) {
+) -> bool {
+    let mut reachable = true;
     for lane in thread::list(project) {
         if lane.provider_wait_started.is_empty()
             || !matches!(lane.status, thread::Status::Starting | thread::Status::Open)
@@ -997,25 +1057,6 @@ pub(crate) fn resume_provider_starts(
         }
         if let Err(error) = crate::plan::check_attempt_prerequisites(project, &lane.id) {
             if !format!("{error:#}").starts_with("plan_prerequisite:") {
-                report(error);
-            }
-            continue;
-        }
-        if thread::seconds_since(&lane.provider_wait_started, jiff::Timestamp::now()) >= 3600 {
-            let reason = format!(
-                "provider_wait_expired: recipe `{}` on `{}` was not ready after one hour; {}",
-                lane.launch.recipe_id,
-                lane.machine_route(),
-                lane.error
-            );
-            if let Err(error) = threads::fail_start(
-                ctx,
-                project,
-                &lane.id,
-                &reason,
-                crate::contracts::FailureClass::Provider,
-                false,
-            ) {
                 report(error);
             }
             continue;
@@ -1034,7 +1075,29 @@ pub(crate) fn resume_provider_starts(
             };
             result.map_err(|error| format!("{error:#}"))
         });
-        if ready.is_err() {
+        if let Err(error) = ready {
+            if crate::remote::is_unreachable(error) {
+                reachable = false;
+                continue;
+            }
+            if thread::seconds_since(&lane.provider_wait_started, jiff::Timestamp::now()) >= 3600 {
+                let reason = format!(
+                    "provider_wait_expired: recipe `{}` on `{}` was not ready after one hour; {}",
+                    lane.launch.recipe_id,
+                    lane.machine_route(),
+                    lane.error
+                );
+                if let Err(error) = threads::fail_start(
+                    ctx,
+                    project,
+                    &lane.id,
+                    &reason,
+                    crate::contracts::FailureClass::Provider,
+                    false,
+                ) {
+                    report(error);
+                }
+            }
             continue;
         }
         if lane.status == thread::Status::Open {
@@ -1058,6 +1121,11 @@ pub(crate) fn resume_provider_starts(
                 }
             }
             Err(error) => {
+                if crate::remote::is_unreachable(&format!("{error:#}")) {
+                    reachable = false;
+                    report(error);
+                    continue;
+                }
                 if let Err(cleanup) = threads::fail_start(
                     ctx,
                     project,
@@ -1072,6 +1140,7 @@ pub(crate) fn resume_provider_starts(
             }
         }
     }
+    reachable
 }
 
 /// State, pending prompts, group and tokens for a set of threads that live in
@@ -2164,6 +2233,10 @@ fn launch_pass(
         });
         if let Err(error) = disk {
             let message = format!("{error:#}");
+            if crate::remote::is_unreachable(&message) {
+                errors.push(error);
+                continue;
+            }
             errors.extend(
                 thread::update(pass.project, &t.id, |record| record.error = message.clone()).err(),
             );
@@ -2188,6 +2261,10 @@ fn launch_pass(
         };
         if let Err(error) = readiness {
             let message = format!("{error:#}");
+            if crate::remote::is_unreachable(&message) {
+                errors.push(error);
+                continue;
+            }
             if message.contains("pi_not_ready") {
                 errors.extend(
                     thread::update(pass.project, &t.id, |record| {
@@ -2301,6 +2378,21 @@ fn launch_pass(
             Ok(())
         });
         if let Err(error) = launched {
+            if crate::remote::is_unreachable(&format!("{error:#}")) {
+                // Undo only this submission's claim. A lost connection is
+                // not evidence of a failed launch and spends no retry.
+                errors.extend(
+                    thread::update(pass.project, &t.id, |record| {
+                        record.launch_attempts = t.launch_attempts;
+                        record.startup_wait_started = t.startup_wait_started.clone();
+                        record.trust_answered = t.trust_answered;
+                        record.error = t.error.clone();
+                    })
+                    .err(),
+                );
+                errors.push(error);
+                continue;
+            }
             if error.to_string().contains("agent_not_ready") {
                 if let Err(e) =
                     thread::update(pass.project, &t.id, |t| t.status = thread::Status::Starting)
@@ -2328,9 +2420,6 @@ fn open_threads(project: &Project, remote: bool) -> Vec<thread::Thread> {
         .filter(|t| {
             t.is_remote() == remote
                 && !t.parked
-                && (t.provider_wait_started.is_empty()
-                    || t.status == thread::Status::Open
-                    || !remote && t.status == thread::Status::Failed)
                 && (matches!(t.status, thread::Status::Open | thread::Status::Starting)
                     || !remote && t.status == thread::Status::Failed)
         })
@@ -3013,6 +3102,77 @@ fn tick_slow_with_steps(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sleep_does_not_expire_provider_progress_or_outage_timers() {
+        let world = crate::scenarios::World::new();
+        let project = world.project("demo", "a.sock");
+        let now = jiff::Timestamp::now();
+        let before = now.as_second() - 2400;
+        crate::awake::set_sample(Some((before, 100)));
+        drop(crate::awake::enter(&world.root, true).unwrap());
+        crate::awake::set_sample(Some((now.as_second(), 140)));
+        let (_clock, slept) = crate::awake::enter(&world.root, true).unwrap();
+        assert!(slept);
+        let waiting = thread::allocate(&project, |t| {
+            t.status = thread::Status::Open;
+            t.launch.recipe_id = "pi_example".into();
+            // Thirty minutes of genuine provider wait before lid close.
+            t.provider_wait_started = jiff::Timestamp::from_second(before - 1800)
+                .unwrap()
+                .to_string();
+        })
+        .unwrap();
+        let mut cache = BTreeMap::from([(
+            (crate::contracts::MACHINE_LOCAL.into(), "pi_example".into()),
+            Err("pi_not_ready: provider still warming up".into()),
+        )]);
+        assert!(resume_provider_starts(
+            &world.ctx(),
+            &project,
+            &mut cache,
+            |error| panic!("{error:#}")
+        ));
+        assert_eq!(
+            thread::load(&project, &waiting.id).unwrap().status,
+            thread::Status::Open
+        );
+        let timestamp = jiff::Timestamp::from_second(before).unwrap();
+        let mut lane = thread::Thread {
+            repo: "/repo".into(),
+            progress_since: timestamp.to_string(),
+            no_commit_since: timestamp.to_string(),
+            progress_pane: "w:p".into(),
+            progress_screen: "same".into(),
+            progress_head: "same".into(),
+            ..Default::default()
+        };
+        let notices = progress_notices(
+            &mut lane,
+            &steps::LaneProgress {
+                pane: "w:p".into(),
+                screen: "same".into(),
+                head: "same".into(),
+            },
+            now,
+            &ProgressThresholds {
+                stall_minutes: 2,
+                no_commit_minutes: 4,
+            },
+        );
+        assert!(notices.stalled.is_none());
+        assert!(notices.no_commit.is_none());
+        let mut outage = steps::Outage::default();
+        assert_eq!(
+            outage.record(false, "unreachable: ssh timeout", timestamp, 600),
+            None
+        );
+        assert_eq!(
+            outage.record(false, "unreachable: ssh timeout", now, 600),
+            None
+        );
+        crate::awake::set_sample(None);
+    }
 
     #[test]
     fn progress_notices_are_once_per_spell_and_commit_clock_is_independent() {
