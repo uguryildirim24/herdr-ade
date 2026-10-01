@@ -78,6 +78,9 @@ pub(crate) struct Thread {
     pub(crate) status: Status,
     pub(crate) error: String,
     pub(crate) prompt_pending: bool,
+    /// First brief submission staged for this attempt and pane. Pending can
+    /// remain true until activity is observed, without submitting it twice.
+    pub(crate) brief_submitted: bool,
     /// A sealed completion whose pane was closed; its branch and attempt remain live.
     pub(crate) parked: bool,
     /// The current attempt's sealed waiting event answered by the last
@@ -475,6 +478,9 @@ pub(crate) fn update_checked(
     let mut thread = load(project, id)?;
     let before = thread.clone();
     change(&mut thread)?;
+    if thread.attempt != before.attempt || thread.pane_id != before.pane_id {
+        thread.brief_submitted = false;
+    }
     if thread.attempt != before.attempt {
         // A receipt or answered wait proves one exact attempt; a replacement
         // must earn its own.
