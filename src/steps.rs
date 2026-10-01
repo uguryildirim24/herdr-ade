@@ -730,7 +730,7 @@ impl Memory {
 pub(crate) fn write_machine_outage(
     project: &Project,
     machine: &str,
-    event: Option<OutageEvent>,
+    event: Option<&OutageEvent>,
     memory: &Memory,
 ) -> Result<()> {
     match event {

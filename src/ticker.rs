@@ -943,11 +943,7 @@ fn machine_passes_with_steps(
         {
             let detail = format!("{error:#}");
             let event = memory.record_machine(&machine, Some(&detail), now);
-            if let Some((first, _)) = entries.first()
-                && let Err(error) = steps::write_machine_outage(first, &machine, event, memory)
-            {
-                errors.push(error.context("machine outage"));
-            }
+            write_machine_outages(&entries, &machine, event.as_ref(), memory, &mut errors);
             memory.machine_views.insert(machine, Err(detail));
             continue;
         }
@@ -985,12 +981,7 @@ fn machine_passes_with_steps(
         if outcome.is_ok() {
             clear_lost_connections(&entries, log);
         }
-        let Some((first, _)) = entries.first() else {
-            continue;
-        };
-        if let Err(error) = steps::write_machine_outage(first, &machine, event, memory) {
-            errors.push(error.context("machine outage"));
-        }
+        write_machine_outages(&entries, &machine, event.as_ref(), memory, &mut errors);
         for (project, _) in &entries {
             clear_poll_request(project, &machine);
         }
@@ -999,6 +990,23 @@ fn machine_passes_with_steps(
             .insert(machine, outcome.map_err(|e| format!("{e:#}")));
     }
     Some(errors)
+}
+
+fn write_machine_outages(
+    entries: &[(Project, Vec<thread::Thread>)],
+    machine: &str,
+    event: Option<&steps::OutageEvent>,
+    memory: &Memory,
+    errors: &mut Vec<anyhow::Error>,
+) {
+    let mut seen = BTreeSet::new();
+    for (project, _) in entries {
+        if seen.insert(project.state_dir())
+            && let Err(error) = steps::write_machine_outage(project, machine, event, memory)
+        {
+            errors.push(error.context(format!("{}: machine outage", project.slug)));
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1674,7 +1682,7 @@ fn thread_pass(
             }
         }
         let mut delivered = false;
-        if t.prompt_pending && ready {
+        if t.prompt_pending && (ready || t.brief_submitted || t.bootstrap == "acknowledged") {
             // The CLI and ticker can observe the same ready agent. Serialize
             // the first prompt and recheck its attempt before either sends it.
             let _prompt_lock = thread::prompt_lock(project, &t.id)?;
@@ -1684,30 +1692,66 @@ fn thread_pass(
                 && current.status == thread::Status::Open
                 && current.prompt_pending
             {
-                match herdr.agent_prompt_wait_started(
-                    &t.pane_id,
-                    &thread::launch_prompt(prefix, slug, &current),
-                    agent_start_timeout(&t.launch),
-                ) {
-                    Ok(()) => {
-                        delivered = true;
-                        thread::update_checked(project, &t.id, |record| {
+                if current.brief_submitted || current.bootstrap == "acknowledged" {
+                    // A capped wait can finish before activity is observed.
+                    // Keep waiting on this submission, never type it again.
+                    if current.bootstrap == "acknowledged"
+                        || matches!(state.as_str(), "working" | "blocked")
+                    {
+                        thread::update(project, &t.id, |record| {
                             if record.attempt == current.attempt
                                 && record.pane_id == current.pane_id
                             {
                                 record.prompt_pending = false;
                             }
-                            Ok(())
                         })?;
                     }
-                    Err(error) if error.code == "agent_not_ready" => {
-                        // Registration can disappear between the list and the
-                        // prompt. Keep the brief pending for the next pass.
-                    }
-                    Err(error) => {
-                        pass.error = pass
-                            .error
-                            .or(Some(anyhow::anyhow!("{}: brief prompt: {error}", t.id)))
+                } else {
+                    // Persist before calling herdr: interruption or an ambiguous
+                    // transport result must not cause a second submission.
+                    thread::update(project, &t.id, |record| record.brief_submitted = true)?;
+                    match herdr.agent_prompt_wait_started(
+                        &t.pane_id,
+                        &thread::launch_prompt(prefix, slug, &current),
+                        agent_start_timeout(&current.launch)
+                            .min(crate::herdr::AGENT_START_TIMEOUT.as_millis() as u64),
+                    ) {
+                        Ok(()) => {
+                            delivered = true;
+                            thread::update_checked(project, &t.id, |record| {
+                                if record.attempt == current.attempt
+                                    && record.pane_id == current.pane_id
+                                {
+                                    record.prompt_pending = false;
+                                }
+                                Ok(())
+                            })?;
+                        }
+                        Err(error) if crate::threads::prompt_refused_before_submission(&error) => {
+                            // Nothing was typed; registration can disappear between
+                            // the list and the prompt. A later pass may submit it.
+                            thread::update(project, &t.id, |record| {
+                                if record.attempt == current.attempt
+                                    && record.pane_id == current.pane_id
+                                {
+                                    record.brief_submitted = false;
+                                }
+                            })?;
+                        }
+                        Err(error)
+                            if matches!(
+                                error.code.as_str(),
+                                "timeout" | "agent_prompt_stalled"
+                            ) =>
+                        {
+                            // The wait expired, not the attempt. Leave the brief
+                            // pending until activity or its bootstrap receipt arrives.
+                        }
+                        Err(error) => {
+                            pass.error = pass
+                                .error
+                                .or(Some(anyhow::anyhow!("{}: brief prompt: {error}", t.id)))
+                        }
                     }
                 }
             }
@@ -1768,7 +1812,8 @@ fn thread_pass(
                 match herdr.agent_prompt_wait_started(
                     &current.pane_id,
                     &follow_up.text,
-                    agent_start_timeout(&current.launch),
+                    agent_start_timeout(&current.launch)
+                        .min(crate::herdr::AGENT_START_TIMEOUT.as_millis() as u64),
                 ) {
                     Ok(()) => {
                         delivered = true;
@@ -3449,6 +3494,195 @@ mod tests {
     }
 
     #[test]
+    fn capped_brief_wait_stays_pending_without_resubmission() {
+        use crate::scenarios::World;
+        for (code, activity) in [
+            ("timeout", "working"),
+            ("agent_prompt_stalled", "blocked"),
+            ("timeout", "idle"),
+        ] {
+            let world = World::new();
+            let project = world.project("demo", "a.sock");
+            let lane = world.thread(&project, &world.home.path().join("lane"), |record| {
+                record.prompt_pending = true;
+                record.launch_attempts = 1;
+                record.launch.ready_timeout_ms = 300_000;
+            });
+            world.runner.on(
+                "agent prompt",
+                ok(&format!(
+                    r#"{{"error":{{"code":"{code}","message":"wait expired"}}}}"#
+                )),
+            );
+            let socket = project.coordinator().unwrap().socket;
+            let herdr = Herdr::new(world.env.herdr_bin(), &socket, &world.runner);
+            let mut agent = Agent {
+                pane_id: lane.pane_id.clone(),
+                tab_id: lane.tab_id.clone(),
+                workspace_id: lane.workspace_id.clone(),
+                cwd: lane.cwd.clone(),
+                name: lane.agent_name.clone(),
+                agent_status: "idle".into(),
+                ..Agent::default()
+            };
+            let pane = Pane {
+                pane_id: lane.pane_id.clone(),
+                tab_id: lane.tab_id.clone(),
+                workspace_id: lane.workspace_id.clone(),
+                cwd: lane.cwd.clone(),
+            };
+            let run_pass = |snapshot: &thread::Thread, agent: &Agent| {
+                thread_pass(
+                    &LaunchPass {
+                        ctx: &world.ctx(),
+                        project: &project,
+                        herdr: &herdr,
+                        threads: std::slice::from_ref(snapshot),
+                        agents: std::slice::from_ref(agent),
+                        panes: std::slice::from_ref(&pane),
+                    },
+                    "ha",
+                    None,
+                    false,
+                    None,
+                )
+                .unwrap()
+            };
+            assert!(run_pass(&lane, &agent).error.is_none());
+            let pending = thread::load(&project, &lane.id).unwrap();
+            assert_eq!(pending.status, thread::Status::Open);
+            assert!(pending.prompt_pending);
+            assert!(pending.brief_submitted);
+            let calls = world.runner.calls.borrow();
+            let prompt = calls
+                .iter()
+                .find(|cmd| cmd.display().contains("agent prompt"))
+                .unwrap();
+            let cap = crate::herdr::AGENT_START_TIMEOUT.as_millis() as u64;
+            assert!(
+                prompt
+                    .args
+                    .windows(2)
+                    .any(|pair| pair == ["--timeout", &cap.to_string()])
+            );
+            assert_eq!(
+                prompt.timeout,
+                crate::herdr::AGENT_START_TIMEOUT + Duration::from_secs(5)
+            );
+            drop(calls);
+
+            // Even the original idle snapshot is rechecked under the brief lock.
+            assert!(run_pass(&lane, &agent).error.is_none());
+            assert!(thread::load(&project, &lane.id).unwrap().prompt_pending);
+            assert_eq!(world.runner.count("agent prompt"), 1);
+
+            agent.agent_status = activity.into();
+            if activity == "idle" {
+                thread::update(&project, &lane.id, |record| {
+                    record.bootstrap = "acknowledged".into()
+                })
+                .unwrap();
+            }
+            assert!(run_pass(&pending, &agent).error.is_none());
+            assert!(!thread::load(&project, &lane.id).unwrap().prompt_pending);
+            assert!(run_pass(&lane, &agent).error.is_none());
+            assert_eq!(world.runner.count("agent prompt"), 1);
+
+            // A replacement attempt or pane earns its own submission.
+            thread::update(&project, &lane.id, |record| record.attempt += 1).unwrap();
+            assert!(!thread::load(&project, &lane.id).unwrap().brief_submitted);
+            thread::update(&project, &lane.id, |record| record.brief_submitted = true).unwrap();
+            thread::update(&project, &lane.id, |record| record.pane_id = "w3:p1".into()).unwrap();
+            assert!(!thread::load(&project, &lane.id).unwrap().brief_submitted);
+        }
+    }
+
+    #[test]
+    fn every_project_on_a_box_gets_one_outage_and_recovery_notice() {
+        use crate::scenarios::World;
+        for detail in [
+            "ssh: connect to host box: Operation timed out",
+            "helper failed",
+        ] {
+            let world = World::new();
+            let first = world.project("first", "first.sock");
+            let second = world.project("second", "second.sock");
+            for project in [&first, &second] {
+                for _ in 0..2 {
+                    thread::allocate(project, |lane| {
+                        lane.status = thread::Status::Open;
+                        lane.machine = "box".into();
+                        lane.machine_id = "box".into();
+                    })
+                    .unwrap();
+                }
+            }
+            let down = std::rc::Rc::new(std::cell::Cell::new(true));
+            let flag = down.clone();
+            world.runner.on_fn(
+                |cmd| cmd.program == "ssh",
+                move |_| Ok(if flag.get() {
+                    fail(255, detail)
+                } else {
+                    ok("boot\tboot-1\nfree\t1\nagents\t{\"result\":{\"agents\":[]}}\npanes\t{\"result\":{\"panes\":[]}}\n")
+                }),
+            );
+            world.runner.on(
+                "machine list --json",
+                ok(r#"[{"id":"box","label":"box","target":"box","session":"default","enabled":true}]"#),
+            );
+            let ctx = world.ctx();
+            let mut memory = Memory::new(&ctx);
+            memory.outage_secs = 0;
+            let log = Log {
+                path: world.home.path().join("ticker.log"),
+            };
+            let projects = [&first, &second, &first];
+            let notices = |project: &Project| {
+                inbox::unhandled(project)
+                    .into_iter()
+                    .filter(|item| item.kind == "outage")
+                    .collect::<Vec<_>>()
+            };
+            for tick in [1, 10] {
+                memory.tick = tick;
+                assert!(machine_passes(&ctx, &projects, &mut memory, &log).is_empty());
+                for project in [&first, &second] {
+                    let items = notices(project);
+                    assert_eq!(items.len(), 1);
+                    assert!(items[0].summary.contains("`box` has been unreachable"));
+                }
+            }
+            down.set(false);
+            for tick in [19, 20] {
+                memory.tick = tick;
+                assert!(machine_passes(&ctx, &projects, &mut memory, &log).is_empty());
+                for project in [&first, &second] {
+                    let items = notices(project);
+                    assert_eq!(items.len(), 2);
+                    assert_eq!(
+                        items
+                            .iter()
+                            .filter(|item| item.summary.contains("reachable again"))
+                            .count(),
+                        1
+                    );
+                }
+            }
+            assert_eq!(
+                world
+                    .runner
+                    .calls
+                    .borrow()
+                    .iter()
+                    .filter(|cmd| cmd.program == "ssh")
+                    .count(),
+                4
+            );
+        }
+    }
+
+    #[test]
     fn agent_not_ready_during_brief_prompt_is_pending_not_failed() {
         use crate::scenarios::{World, pane_json};
         let world = World::new();
@@ -3476,6 +3710,7 @@ mod tests {
         let saved = thread::load(&project, &lane.id).unwrap();
         assert_eq!(saved.status, thread::Status::Open);
         assert!(saved.prompt_pending);
+        assert!(!saved.brief_submitted);
     }
 
     fn held(version: &str) -> LockState {
@@ -5885,6 +6120,7 @@ mod tests {
         let lane = thread::allocate(&f.project, |lane| {
             lane.status = thread::Status::Open;
             lane.prompt_pending = true;
+            lane.launch.ready_timeout_ms = 300_000;
             lane.workspace_id = "w1".into();
             lane.tab_id = "w1:t2".into();
             lane.pane_id = "w1:p2".into();
@@ -5995,6 +6231,10 @@ mod tests {
             .map(|call| call.display())
             .collect();
         assert_eq!(prompts.len(), 3);
+        assert!(prompts.iter().all(|prompt| prompt.contains(&format!(
+            "--timeout {}",
+            crate::herdr::AGENT_START_TIMEOUT.as_millis()
+        ))));
         assert!(prompts[0].contains("skill lane"), "{}", prompts[0]);
         assert!(
             prompts[1].contains("check the first gate"),
