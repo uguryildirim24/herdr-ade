@@ -1295,13 +1295,17 @@ pub(crate) fn remote_attention(
     }
 
     let mut signals = Vec::new();
-    let sealed = events::list(project);
     for lane in threads {
         // A missing agent alone cannot prove a pane is gone. Observe the
         // pane even before launch; a sealed attempt needs no replacement.
         if lane.parked
             || crate::threads::parkable(project, lane)
-            || events::latest_event(&sealed, &lane.id, lane.attempt.max(1)).is_some_and(|event| {
+            || events::latest_event(
+                &events::for_thread(project, &lane.id),
+                &lane.id,
+                lane.attempt.max(1),
+            )
+            .is_some_and(|event| {
                 event.payload.done.is_some()
                     || event.payload.waiting.is_some()
                     || event.payload.failed.is_some()

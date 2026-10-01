@@ -1265,7 +1265,7 @@ pub(crate) fn restore_unchanged_seal(
     project: &Project,
     lane: &thread::Thread,
 ) -> Result<()> {
-    let events = crate::events::list(project);
+    let events = crate::events::for_thread(project, &lane.id);
     let Some(event) = crate::events::latest_done_event(&events, &lane.id, lane.attempt.max(1))
     else {
         return Ok(());
@@ -5913,9 +5913,15 @@ mod tests {
                     assert!(tick_for_test(&ctx, memory));
                     assert_eq!(thread::list_live(&f.project).len(), 4);
                     for number in 3001..=3004 {
+                        let lane = thread::Thread {
+                            id: format!("t-{number:04}"),
+                            ..Default::default()
+                        };
+                        assert!(crate::events::for_thread(&f.project, &lane.id).is_empty());
+                        restore_unchanged_seal(&ctx, &f.project, &lane).unwrap();
                         assert!(
-                            crate::events::for_thread(&f.project, &format!("t-{number:04}"))
-                                .is_empty()
+                            crate::threads::report_artifact_stored(&f.project, &lane)
+                                .is_ok_and(|stored| !stored)
                         );
                     }
                 });

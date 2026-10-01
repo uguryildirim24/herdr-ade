@@ -543,14 +543,30 @@ fn cached_events(project: &Project, thread: Option<&str>) -> Option<(Vec<Event>,
 /// Per-lane lookups never rescan or clone the entire project's event log in
 /// the ticker. Ordinary commands still read all historical evidence afresh.
 pub(crate) fn for_thread(project: &Project, thread: &str) -> Vec<Event> {
-    cached_events(project, Some(thread))
-        .map(|(events, _)| events)
-        .unwrap_or_else(|| {
-            list(project)
+    for_thread_snapshot(project, thread).0
+}
+
+fn for_thread_snapshot(project: &Project, thread: &str) -> (Vec<Event>, bool) {
+    cached_events(project, Some(thread)).unwrap_or_else(|| {
+        let (events, readable) = list_checked(project);
+        (
+            events
                 .into_iter()
                 .filter(|event| event.thread == thread)
-                .collect()
-        })
+                .collect(),
+            readable,
+        )
+    })
+}
+
+/// Keep the whole-log unreadable-evidence check without cloning its history
+/// for each lane or open reviewer.
+pub(crate) fn checked_for_thread(project: &Project, thread: &str) -> Result<Vec<Event>> {
+    let (events, readable) = for_thread_snapshot(project, thread);
+    if !readable {
+        bail!("event records are unreadable");
+    }
+    Ok(events)
 }
 
 /// Delivery/recovery has no obligations on resolved lanes. Keep orphaned
@@ -774,6 +790,10 @@ mod tests {
         assert!(for_unresolved_threads(&project).is_empty());
         assert!(crate::thread::list_live(&project).is_empty());
         assert_eq!(for_thread(&project, &lane.id), vec![event.clone()]);
+        assert_eq!(
+            checked_for_thread(&project, &lane.id).unwrap(),
+            vec![event.clone()]
+        );
         assert!(crate::thread::sealed_report_path(&project, &lane).is_some());
         assert_eq!(crate::thread::list_with_errors(&project).0.len(), 1);
 
@@ -815,9 +835,11 @@ mod tests {
         crate::project::write_atomic(&path, b"invalid = [").unwrap();
         let cache = crate::record_cache::Cache::new();
         assert!(!list_checked(&project).1);
+        assert!(checked_for_thread(&project, "t-9999").is_err());
         // In-place repair does not change the directory stamp.
         std::fs::write(&path, bytes(&event).unwrap()).unwrap();
         assert!(list_checked(&project).1);
+        assert!(checked_for_thread(&project, "t-9999").unwrap().is_empty());
         assert_eq!(for_unresolved_threads(&project), vec![event.clone()]);
         // A fresh CLI read must not inherit the ticker's snapshot.
         std::fs::write(&path, b"invalid = [").unwrap();

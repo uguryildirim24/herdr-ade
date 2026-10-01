@@ -2915,7 +2915,7 @@ fn resolve_with_views(
     if args.skip_copy && args.discard_uncopied {
         bail!("--skip-copy cannot be combined with --discard-uncopied");
     }
-    let events = crate::events::list(&project);
+    let events = crate::events::for_thread(&project, id);
     if follow_up_pending_for_seal(
         &record,
         crate::events::latest_done_event(&events, id, record.attempt.max(1)),
@@ -4352,6 +4352,7 @@ fn linked_files(ctx: &Ctx, record: &Thread, relative: &std::path::Path) -> Resul
 /// Repo links are kept only by integration, never copied into ADE artifacts.
 fn repo_link_kept(
     ctx: &Ctx,
+    project: &Project,
     record: &Thread,
     relative: &std::path::Path,
     path: &std::path::Path,
@@ -4460,8 +4461,15 @@ fn repo_link_kept(
         )?
     };
     // After placement `base` is the frozen start SHA, not a branch name.
-    // Use the same current integration checkout as finished_worktree_reason.
-    let integration = crate::git::symbolic_head(ctx.runner, &record.repo)?;
+    // Honor the configured integration branch even if another is checked out.
+    let rows = project.read_project_md()?.0.repos;
+    let integration = rows
+        .into_iter()
+        .chain(crate::harness::repos(&ctx.config_dir)?)
+        .find(|row| row.path == record.repo)
+        .and_then(|row| row.branch)
+        .map(Ok)
+        .unwrap_or_else(|| crate::git::symbolic_head(ctx.runner, &record.repo))?;
     let head = crate::git::rev_parse(
         ctx.runner,
         &record.repo,
@@ -4506,7 +4514,7 @@ fn draft_has_existing_links(
                 }
             }
             Some(ReportLink::Repo { relative, source }) => {
-                repo_link_kept(ctx, record, &relative, &source)?;
+                repo_link_kept(ctx, project, record, &relative, &source)?;
             }
             None => (),
         }
@@ -4611,7 +4619,7 @@ fn preserve_report_links(ctx: &Ctx, project: &Project, record: &Thread) -> Resul
             Some(ReportLink::Thread(relative)) => relative,
             Some(ReportLink::Repo { relative, source }) => {
                 // Git keeps this content on integration; leave the link as written.
-                repo_link_kept(ctx, record, &relative, &source)?;
+                repo_link_kept(ctx, project, record, &relative, &source)?;
                 continue;
             }
             None => continue,
@@ -4800,9 +4808,9 @@ pub(crate) fn finished_worktree_reason_with_merged(
 
 pub(crate) fn report_artifact_stored(project: &Project, record: &Thread) -> Result<bool> {
     let attempt = record.attempt.max(1);
-    for event in crate::events::checked(project)?
+    for event in crate::events::checked_for_thread(project, &record.id)?
         .into_iter()
-        .filter(|event| event.thread == record.id && event.attempt == attempt)
+        .filter(|event| event.attempt == attempt)
     {
         let Some(done) = event.payload.done else {
             continue;
@@ -5682,8 +5690,26 @@ mod tests {
 
     #[test]
     fn integration_keeps_repo_links_for_final_copy_and_kept_removal_on_mac_and_box() {
-        for remote in [false, true] {
+        use crate::testkit::{commit_file, git};
+
+        for (remote, configured) in [(false, false), (true, false), (false, true), (true, true)] {
             let (fx, lane) = repo_link_fixture(remote);
+            if configured {
+                git(&fx.repo, &["branch", "integration"]);
+                commit_file(
+                    &fx.repo,
+                    "figures/3d/gaba-dose/curves.svg",
+                    "different on checked-out main\n",
+                    "main differs from configured integration",
+                );
+                let (mut settings, body) = fx.project.read_project_md().unwrap();
+                settings.repos[0].branch = Some("integration".into());
+                std::fs::write(
+                    fx.project.project_md(),
+                    format!("+++\n{}+++\n\n{body}", toml::to_string(&settings).unwrap()),
+                )
+                .unwrap();
+            }
             let report = "[Figure](../../figures/3d/gaba-dose/curves.svg#plot)\n";
             std::fs::write(Path::new(&lane.thread_dir).join("report.md"), report).unwrap();
             seal_linked_report(&fx.project, &lane, report);

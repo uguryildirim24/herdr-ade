@@ -261,7 +261,7 @@ fn watch_no_verdict(ctx: &Ctx, project: &Project, review: &mut Review) -> Result
         return Ok(());
     };
     let lane = thread::load(project, id)?;
-    let events = crate::events::checked(project)?;
+    let events = crate::events::checked_for_thread(project, id)?;
     let fresh = crate::events::latest_done_event(&events, id, lane.attempt.max(1))
         .is_some_and(|e| e.id != review.reviewer_after && e.id != review.checked_event);
     if fresh
@@ -1055,11 +1055,11 @@ fn advance(ctx: &Ctx, project: &Project, review: &mut Review) -> Result<()> {
             review.refresh_tip = None;
             save(project, review)?;
         }
-        let events = crate::events::checked(project)?;
         let reviewer = thread::load(
             project,
             review.reviewer.as_deref().context("reviewer missing")?,
         )?;
+        let events = crate::events::checked_for_thread(project, &reviewer.id)?;
         if reviewer.status == Status::Resolved && !reviewer.cancellation_reason.is_empty() {
             bail!("reviewer was cancelled; use review retry or review cancel");
         }
