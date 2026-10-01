@@ -3934,15 +3934,15 @@ fn linked_relative_path(
     project: &Project,
     record: &Thread,
     dest: &str,
-) -> Option<std::path::PathBuf> {
-    let raw = dest.split(['#', '?']).next()?;
+) -> Result<Option<std::path::PathBuf>> {
+    let raw = dest.split(['#', '?']).next().unwrap_or(dest);
     if raw.is_empty()
         || raw.starts_with('/')
         || raw.contains("://")
         || raw.starts_with("data:")
         || raw.starts_with("mailto:")
     {
-        return None;
+        return Ok(None);
     }
     let prefix = format!(".herdr-project/{}-{}/", project.slug, record.id);
     let raw = raw.strip_prefix(&prefix).unwrap_or(raw);
@@ -3972,13 +3972,13 @@ fn linked_relative_path(
             std::path::Component::CurDir => (),
             std::path::Component::ParentDir => {
                 if !path.pop() {
-                    return None;
+                    bail!("linked path is not inside the thread folder: {dest}");
                 }
             }
-            _ => return None,
+            _ => bail!("linked path is not inside the thread folder: {dest}"),
         }
     }
-    (!path.as_os_str().is_empty()).then_some(path)
+    Ok((!path.as_os_str().is_empty()).then_some(path))
 }
 
 fn linked_file_missing(ctx: &Ctx, record: &Thread, relative: &std::path::Path) -> Result<bool> {
@@ -4024,25 +4024,212 @@ fn linked_file_missing(ctx: &Ctx, record: &Thread, relative: &std::path::Path) -
     }
 }
 
+struct LinkedFiles {
+    directory: bool,
+    files: std::collections::BTreeMap<std::path::PathBuf, Vec<u8>>,
+}
+
+fn markdown_label(name: &str) -> String {
+    name.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('\\', "\\\\")
+        .replace('[', "\\[")
+        .replace(']', "\\]")
+        .replace(['\n', '\r'], " ")
+}
+
 fn linked_bytes(ctx: &Ctx, record: &Thread, relative: &std::path::Path) -> Result<Vec<u8>> {
+    let mut linked = linked_files(ctx, record, relative)?;
+    if linked.directory {
+        bail!("report is not a regular file: {}", relative.display());
+    }
+    linked.files.remove(relative).context("linked file missing")
+}
+
+// The box walks and hashes the entire link in one probe. Payload requests
+// slice the concatenated files, so even thousands of small images need at
+// most 25 more round trips (200 MiB / 8 MiB), never one trip per file.
+const LINKED_BOX_SCRIPT: &str = r#"
+import os, sys, stat, json, hashlib
+root = os.path.realpath(sys.argv[1])
+path = os.path.join(root, sys.argv[2])
+def checked(path):
+    info = os.lstat(path)
+    canonical = os.path.realpath(path)
+    if os.path.commonpath([root, canonical]) != root:
+        sys.exit(3)
+    part = path
+    while part != root:
+        if os.path.islink(part):
+            sys.exit(4)
+        parent = os.path.dirname(part)
+        if parent == part:
+            sys.exit(3)
+        part = parent
+    if not (stat.S_ISREG(info.st_mode) or stat.S_ISDIR(info.st_mode)):
+        sys.exit(4)
+    return info
+try:
+    os.stat(root)
+    directory = stat.S_ISDIR(checked(path).st_mode)
+    entries = []
+    pending = [path]
+    total = 0
+    while pending:
+        item = pending.pop()
+        info = checked(item)
+        if stat.S_ISDIR(info.st_mode):
+            with os.scandir(item) as children:
+                pending.extend(child.path for child in children)
+        else:
+            total += info.st_size
+            if total > 209715200:
+                sys.exit(5)
+            entries.append((os.path.relpath(item, root), info.st_size))
+    entries.sort()
+    if len(sys.argv) == 3:
+        manifest = []
+        for name, size in entries:
+            with open(os.path.join(root, name), 'rb') as source:
+                digest = hashlib.sha256()
+                while data := source.read(1048576):
+                    digest.update(data)
+                digest = digest.hexdigest()
+            manifest.append({'path': name, 'size': size, 'hash': digest})
+        print(json.dumps({'directory': directory, 'files': manifest}))
+    else:
+        offset = int(sys.argv[3])
+        remaining = 8388608
+        for name, size in entries:
+            if offset >= size:
+                offset -= size
+                continue
+            with open(os.path.join(root, name), 'rb') as source:
+                source.seek(offset)
+                data = source.read(min(size - offset, remaining))
+            sys.stdout.write(data.hex())
+            remaining -= len(data)
+            offset = 0
+            if remaining == 0:
+                break
+except FileNotFoundError:
+    sys.exit(2)
+"#;
+
+fn linked_probe_result(out: &crate::runner::Output, path: &std::path::Path) -> Result<()> {
+    if out.success() {
+        return Ok(());
+    }
+    let reason = if out.timed_out {
+        "timed out".to_string()
+    } else {
+        match out.code {
+            Some(2) => "missing".into(),
+            Some(3) => "not inside the thread folder".into(),
+            Some(4) => "not a regular file or folder (symlinks are not kept)".into(),
+            Some(5) => "over cap (200 MiB)".into(),
+            _ => format!("probe failed: {}", out.error_text()),
+        }
+    };
+    bail!("linked path {reason}: {}; worktree kept", path.display());
+}
+
+fn linked_files(ctx: &Ctx, record: &Thread, relative: &std::path::Path) -> Result<LinkedFiles> {
     let root = std::path::Path::new(&record.thread_dir);
     let path = root.join(relative);
     if !record.is_remote() {
         let canonical_root = root.canonicalize()?;
-        let canonical = path
-            .canonicalize()
-            .with_context(|| format!("linked file missing: {}", path.display()))?;
-        if !canonical.starts_with(&canonical_root) || !std::fs::symlink_metadata(&path)?.is_file() {
-            bail!(
-                "linked file is not a regular file inside the thread folder: {}",
-                path.display()
-            );
+        let mut pending = vec![path.clone()];
+        let mut paths = Vec::new();
+        let mut total = 0_u64;
+        let mut directory = false;
+        while let Some(item) = pending.pop() {
+            let info = std::fs::symlink_metadata(&item).map_err(|error| {
+                if error.kind() == std::io::ErrorKind::NotFound {
+                    anyhow::anyhow!("linked path missing: {}", item.display())
+                } else {
+                    anyhow::anyhow!("could not inspect linked path {}: {error}", item.display())
+                }
+            })?;
+            let canonical = match std::fs::canonicalize(&item) {
+                Ok(canonical) => canonical,
+                Err(_) if info.file_type().is_symlink() => {
+                    bail!(
+                        "linked path is not a regular file or folder (symlink): {}",
+                        item.display()
+                    );
+                }
+                Err(error) => {
+                    return Err(error).with_context(|| {
+                        format!("could not resolve linked path {}", item.display())
+                    });
+                }
+            };
+            if !canonical.starts_with(&canonical_root) {
+                bail!(
+                    "linked path is not inside the thread folder: {}",
+                    item.display()
+                );
+            }
+            for ancestor in item.ancestors().take_while(|p| *p != root) {
+                if std::fs::symlink_metadata(ancestor)?
+                    .file_type()
+                    .is_symlink()
+                {
+                    bail!(
+                        "linked path is not a regular file or folder (symlink): {}",
+                        ancestor.display()
+                    );
+                }
+            }
+            if info.is_dir() {
+                directory |= item == path;
+                for child in std::fs::read_dir(&item)? {
+                    pending.push(child?.path());
+                }
+            } else if info.is_file() {
+                total = total
+                    .checked_add(info.len())
+                    .context("linked files size overflow")?;
+                if total > LINKED_FILES_CAP {
+                    bail!("linked files over cap (200 MiB); worktree kept");
+                }
+                paths.push(item);
+            } else {
+                bail!(
+                    "linked path is not a regular file or folder: {}",
+                    item.display()
+                );
+            }
         }
-        if std::fs::metadata(&path)?.len() > LINKED_FILES_CAP {
-            bail!("linked files exceed 200 MiB; worktree kept");
+        let mut files = std::collections::BTreeMap::new();
+        let mut read_total = 0_u64;
+        for item in paths {
+            // Bound reads too, in case a file grows after inspection.
+            use std::io::Read;
+            let mut bytes = Vec::new();
+            std::fs::File::open(&item)?
+                .take(LINKED_FILES_CAP - read_total + 1)
+                .read_to_end(&mut bytes)?;
+            read_total += bytes.len() as u64;
+            if read_total > LINKED_FILES_CAP {
+                bail!("linked files over cap (200 MiB); worktree kept");
+            }
+            files.insert(item.strip_prefix(root)?.to_path_buf(), bytes);
         }
-        return std::fs::read(&path)
-            .with_context(|| format!("could not read linked file {}", path.display()));
+        return Ok(LinkedFiles { directory, files });
+    }
+    #[derive(serde::Deserialize)]
+    struct Manifest {
+        directory: bool,
+        files: Vec<ManifestFile>,
+    }
+    #[derive(serde::Deserialize)]
+    struct ManifestFile {
+        path: std::path::PathBuf,
+        size: u64,
+        hash: String,
     }
     let profile = remote::machine_profile(
         ctx.runner,
@@ -4050,69 +4237,80 @@ fn linked_bytes(ctx: &Ctx, record: &Thread, relative: &std::path::Path) -> Resul
         &ctx.config_dir,
         record.machine_route(),
     )?;
-    let check = format!(
-        "root=$(realpath -e -- {root}) || exit 2; file=$(realpath -e -- {file}) || exit 2; case \"$file\" in \"$root\"/*) ;; *) exit 3;; esac; test -f \"$file\" || exit 4",
-        root = remote::quote(&root.to_string_lossy()),
-        file = remote::quote(&path.to_string_lossy()),
+    let script = format!(
+        "python3 -c {} {} {}",
+        remote::quote(LINKED_BOX_SCRIPT),
+        remote::quote(&record.thread_dir),
+        remote::quote(&relative.to_string_lossy())
     );
-    let out = remote::ssh(
-        ctx.runner,
-        &profile.target,
-        &format!(
-            "{check}; size=$(wc -c < \"$file\"); test \"$size\" -le 209715200 || {{ echo 'linked files exceed 200 MiB' >&2; exit 5; }}; printf '%s ' \"$size\"; sha256sum \"$file\""
-        ),
-        None,
-        std::time::Duration::from_secs(90),
-    )?;
-    if !out.success() {
-        bail!(
-            "linked file missing or inaccessible on {}: {} ({})",
-            profile.label,
-            path.display(),
-            out.error_text()
-        );
-    }
-    let mut parts = out.stdout.split_whitespace();
-    let size: u64 = parts
-        .next()
-        .context("remote linked file has no size")?
-        .parse()?;
-    if size > LINKED_FILES_CAP {
-        bail!("linked files exceed 200 MiB");
-    }
-    let expected_hash = parts.next().context("remote linked file has no hash")?;
-    // Runner's output is text. One full-size hex dump would multiply the
-    // 200 MiB cap several times in memory; fetch bounded pieces instead.
-    let mut bytes = Vec::new();
-    for offset in (0..size).step_by(8 * 1024 * 1024) {
+    let probe = |script: &str| -> Result<String> {
         let out = remote::ssh(
             ctx.runner,
             &profile.target,
-            &format!(
-                "{check}; dd if=\"$file\" bs=1048576 skip={} count=8 status=none | od -An -tx1 -v",
-                offset / 1024 / 1024
-            ),
+            script,
             None,
             std::time::Duration::from_secs(90),
         )?;
-        if !out.success() {
+        linked_probe_result(&out, &path)?;
+        Ok(out.stdout)
+    };
+    let manifest: Manifest = serde_json::from_str(&probe(&script)?)?;
+    let mut total = 0_u64;
+    for file in &manifest.files {
+        if file
+            .path
+            .components()
+            .any(|part| !matches!(part, std::path::Component::Normal(_)))
+            || !file.path.starts_with(relative)
+        {
             bail!(
-                "could not fetch linked file {}: {}",
-                path.display(),
-                out.error_text()
+                "linked path is not inside the thread folder: {}",
+                file.path.display()
             );
         }
-        for hex in out.stdout.split_whitespace() {
-            bytes.push(u8::from_str_radix(hex, 16)?);
-        }
-        if bytes.len() as u64 != (offset + 8 * 1024 * 1024).min(size) {
-            bail!("remote linked file changed during copy: {}", path.display());
+        total = total
+            .checked_add(file.size)
+            .context("linked files size overflow")?;
+        if total > LINKED_FILES_CAP {
+            bail!("linked files over cap (200 MiB); worktree kept");
         }
     }
-    if thread::sha256_hex(&bytes) != expected_hash {
-        bail!("remote linked file changed during copy: {}", path.display());
+    let mut bytes = Vec::new();
+    for offset in (0..total).step_by(8 * 1024 * 1024) {
+        let hex = probe(&format!("{script} {offset}"))?;
+        let hex = hex.trim();
+        if !hex.is_ascii() || hex.len() % 2 != 0 {
+            bail!("invalid linked file payload");
+        }
+        for i in (0..hex.len()).step_by(2) {
+            bytes.push(u8::from_str_radix(&hex[i..i + 2], 16)?);
+        }
+        if bytes.len() as u64 != (offset + 8 * 1024 * 1024).min(total) {
+            bail!(
+                "remote linked files changed during copy: {}",
+                path.display()
+            );
+        }
     }
-    Ok(bytes)
+    let mut files = std::collections::BTreeMap::new();
+    let mut offset = 0;
+    for file in manifest.files {
+        let end = offset + file.size as usize;
+        let content = bytes[offset..end].to_vec();
+        if thread::sha256_hex(&content) != file.hash
+            || files.insert(file.path.clone(), content).is_some()
+        {
+            bail!(
+                "remote linked file changed during copy: {}",
+                file.path.display()
+            );
+        }
+        offset = end;
+    }
+    Ok(LinkedFiles {
+        directory: manifest.directory,
+        files,
+    })
 }
 
 fn draft_has_existing_links(
@@ -4124,7 +4322,7 @@ fn draft_has_existing_links(
     let mut missing = Vec::new();
     let mut existing = false;
     for (_, dest) in report_destinations(text) {
-        if let Some(relative) = linked_relative_path(project, record, &dest) {
+        if let Some(relative) = linked_relative_path(project, record, &dest)? {
             if linked_file_missing(ctx, record, &relative)? {
                 missing.push(dest);
             } else {
@@ -4135,6 +4333,12 @@ fn draft_has_existing_links(
     thread::update(project, &record.id, |t| {
         t.missing_report_links = missing.clone()
     })?;
+    if !missing.is_empty() {
+        bail!(
+            "linked paths missing: {}; worktree kept",
+            missing.join(", ")
+        );
+    }
     Ok(existing)
 }
 
@@ -4221,27 +4425,46 @@ fn preserve_report_links(ctx: &Ctx, project: &Project, record: &Thread) -> Resul
     let mut total = 0_u64;
     let mut missing = Vec::new();
     for (range, dest) in destinations {
-        let Some(relative) = linked_relative_path(project, record, &dest) else {
+        let Some(relative) = linked_relative_path(project, record, &dest)? else {
             continue;
         };
-        if linked_file_missing(ctx, record, &relative)? {
-            missing.push(dest);
-            continue;
-        }
-        let bytes = if let Some(bytes) = files.get(&relative) {
-            bytes
-        } else {
-            let bytes = linked_bytes(ctx, record, &relative)?;
-            total = total
-                .checked_add(bytes.len() as u64)
-                .context("linked files size overflow")?;
-            if total > LINKED_FILES_CAP {
-                bail!("linked files exceed 200 MiB; worktree kept");
+        let linked = linked_files(ctx, record, &relative).inspect_err(|_| {
+            // Keep the missing-link record useful, without letting a missing
+            // deliverable permit removal of its worktree.
+            if linked_file_missing(ctx, record, &relative).unwrap_or(false) {
+                missing.push(dest.clone());
+                let _ = thread::update(project, &record.id, |t| {
+                    t.missing_report_links = missing.clone();
+                });
             }
-            files.insert(relative.clone(), bytes);
-            &files[&relative]
+        })?;
+        let hash = if linked.directory {
+            // A directory link becomes an addressed index: each child still
+            // uses the same content-addressed storage as a single-file link.
+            let mut index = String::from("# Linked folder\n\n");
+            for (path, bytes) in &linked.files {
+                let name = path.strip_prefix(&relative)?.to_string_lossy();
+                index.push_str(&format!(
+                    "- [{}]({})\n",
+                    markdown_label(&name),
+                    thread::sha256_hex(bytes)
+                ));
+            }
+            thread::store_artifact(project, index.as_bytes())?
+        } else {
+            thread::sha256_hex(&linked.files[&relative])
         };
-        let hash = thread::sha256_hex(bytes);
+        for (path, bytes) in linked.files {
+            if let std::collections::btree_map::Entry::Vacant(entry) = files.entry(path) {
+                total = total
+                    .checked_add(bytes.len() as u64)
+                    .context("linked files size overflow")?;
+                if total > LINKED_FILES_CAP {
+                    bail!("linked files over cap (200 MiB); worktree kept");
+                }
+                entry.insert(bytes);
+            }
+        }
         let suffix = &dest[dest.split(['#', '?']).next().unwrap_or(&dest).len()..];
         replacements.push((range, format!("{hash}{suffix}")));
     }
@@ -5151,6 +5374,221 @@ pub fn print_show(ctx: &Ctx, slug: &str, id: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn linked_test_box(world: &crate::scenarios::World) {
+        let config = world.home.path().join("cfg/config.toml");
+        let existing = std::fs::read_to_string(&config).unwrap();
+        std::fs::write(config, format!("{existing}{}", crate::remote::TEST_MACHINE)).unwrap();
+        world.runner.on("machine list --json", crate::runner::fake::ok(
+            r#"[{"id":"buildbox-id","label":"buildbox","target":"buildbox-pi","session":"default","enabled":true}]"#,
+        ));
+        // Execute only the linked-file script locally: SSH still goes through
+        // the fake runner, while the real probe protocol is exercised.
+        world.runner.on_fn(
+            |cmd| cmd.program == "ssh" && cmd.display().contains("manifest.append"),
+            |cmd| {
+                let output = std::process::Command::new("sh")
+                    .args(["-c", cmd.args.last().unwrap()])
+                    .output()?;
+                Ok(crate::runner::Output {
+                    code: output.status.code(),
+                    stdout: String::from_utf8(output.stdout)?,
+                    stderr: String::from_utf8(output.stderr)?,
+                    timed_out: false,
+                })
+            },
+        );
+    }
+
+    fn seal_linked_report(project: &Project, lane: &Thread, report: &str) {
+        let hash = thread::store_artifact(project, report.as_bytes()).unwrap();
+        crate::events::seal_create_if_absent(
+            project,
+            &crate::contracts::Event {
+                id: format!("{}-1-done", lane.id),
+                op: format!("{}-1-done", lane.id),
+                thread: lane.id.clone(),
+                attempt: 1,
+                created: project::now(),
+                recipient: crate::contracts::Recipient::default(),
+                payload: crate::contracts::EventPayload {
+                    done: Some(crate::contracts::DonePayload {
+                        has_changes: None,
+                        sha: "sealed".into(),
+                        report_path: lane.report_path(),
+                        artifact: hash,
+                        attestation: None,
+                        published_ref: None,
+                    }),
+                    ..Default::default()
+                },
+            },
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn linked_folders_complete_final_copy_on_mac_and_box() {
+        for remote in [false, true] {
+            let world = crate::scenarios::World::new();
+            if remote {
+                linked_test_box(&world);
+            }
+            let project = world.project("demo", "a.sock");
+            let lane = world.thread(&project, world.home.path(), |t| {
+                t.kind = Kind::Tab;
+                t.worktree_path.clear();
+                if remote {
+                    t.machine = "buildbox".into();
+                    t.machine_id = "buildbox-id".into();
+                }
+            });
+            let root = std::path::Path::new(&lane.thread_dir);
+            std::fs::create_dir_all(root.join("library/nested/empty")).unwrap();
+            let contents = [
+                ("library/before.png", b"before".as_slice()),
+                (
+                    "library/nested/after [dark]\n.png",
+                    b"after\0image".as_slice(),
+                ),
+                ("library/zero.png", b"".as_slice()),
+            ];
+            for (name, bytes) in contents {
+                std::fs::write(root.join(name), bytes).unwrap();
+            }
+            let report = "Screenshots: [library](library/#shots)\n";
+            std::fs::write(root.join("report.md"), report).unwrap();
+            seal_linked_report(&project, &lane, report);
+            world
+                .runner
+                .on("du -sk", crate::runner::fake::ok("4\t/library\n"));
+            world.runner.on("rsync", crate::runner::fake::ok(""));
+            world.runner.on(
+                "rm -rf -- /home/agent/build/lanes/",
+                crate::runner::fake::ok(""),
+            );
+            let outcome = resolve(&world.ctx(), "demo", &lane.id, &ResolveArgs::default()).unwrap();
+            assert_eq!(outcome.final_copy, "complete", "{outcome:?}");
+            assert!(outcome.copy_notes.is_empty(), "{outcome:?}");
+            let saved = thread::load(&project, &lane.id).unwrap();
+            let rewritten =
+                std::fs::read_to_string(thread::final_report_path(&project, &saved).unwrap())
+                    .unwrap();
+            let index_hash = report_destinations(&rewritten)[0]
+                .1
+                .split('#')
+                .next()
+                .unwrap()
+                .to_string();
+            let index =
+                std::fs::read_to_string(crate::events::artifact_path(&project, &index_hash))
+                    .unwrap();
+            assert_eq!(thread::sha256_hex(index.as_bytes()), index_hash);
+            for (_, bytes) in contents {
+                let hash = thread::sha256_hex(bytes);
+                assert!(index.contains(&hash), "{index}");
+                assert_eq!(
+                    std::fs::read(crate::events::artifact_path(&project, &hash)).unwrap(),
+                    bytes
+                );
+            }
+            assert!(rewritten.contains("#shots"));
+            if remote {
+                assert_eq!(world.runner.count("manifest.append"), 2);
+            }
+        }
+    }
+
+    #[test]
+    fn linked_path_refusals_name_the_reason_on_mac_and_box() {
+        use std::os::unix::fs::symlink;
+        for remote in [false, true] {
+            let world = crate::scenarios::World::new();
+            if remote {
+                linked_test_box(&world);
+            }
+            let root = world.home.path().join("thread");
+            std::fs::create_dir_all(root.join("library")).unwrap();
+            std::fs::write(root.join("regular"), "inside").unwrap();
+            std::fs::write(world.home.path().join("outside"), "outside").unwrap();
+            symlink(world.home.path().join("outside"), root.join("escape")).unwrap();
+            symlink(root.join("regular"), root.join("library/symlink")).unwrap();
+            let _socket = std::os::unix::net::UnixListener::bind(root.join("special")).unwrap();
+            let record = Thread {
+                thread_dir: root.to_string_lossy().into_owned(),
+                machine: if remote {
+                    "buildbox".into()
+                } else {
+                    String::new()
+                },
+                machine_id: if remote {
+                    "buildbox-id".into()
+                } else {
+                    String::new()
+                },
+                ..Default::default()
+            };
+            for (name, reason) in [
+                ("missing", "missing"),
+                ("escape", "not inside the thread folder"),
+                ("special", "not a regular file or folder"),
+                ("library", "not a regular file or folder"),
+            ] {
+                let error = linked_files(&world.ctx(), &record, std::path::Path::new(name))
+                    .err()
+                    .unwrap()
+                    .to_string();
+                assert!(error.contains(reason), "{remote}: {error}");
+                assert!(!error.contains("()"), "{error}");
+            }
+            std::fs::remove_file(root.join("library/symlink")).unwrap();
+            for name in ["a", "b"] {
+                std::fs::File::create(root.join("library").join(name))
+                    .unwrap()
+                    .set_len(101 * 1024 * 1024)
+                    .unwrap();
+            }
+            let error = linked_files(&world.ctx(), &record, std::path::Path::new("library"))
+                .err()
+                .unwrap()
+                .to_string();
+            assert!(error.contains("over cap (200 MiB)"), "{error}");
+        }
+    }
+
+    #[test]
+    fn box_probe_exit_codes_have_refusal_messages_without_stderr() {
+        for (code, reason) in [
+            (2, "missing"),
+            (3, "not inside the thread folder"),
+            (4, "not a regular file or folder"),
+            (5, "over cap"),
+        ] {
+            let error = linked_probe_result(
+                &crate::runner::fake::fail(code, ""),
+                std::path::Path::new("library"),
+            )
+            .unwrap_err()
+            .to_string();
+            assert!(error.contains(reason), "{error}");
+            assert!(!error.contains("()"));
+        }
+    }
+
+    #[test]
+    fn relative_report_link_cannot_escape_the_thread_folder() {
+        let world = crate::scenarios::World::new();
+        let project = world.project("demo", "a.sock");
+        let lane = world.thread(&project, world.home.path(), |_| {});
+        for dest in ["../outside", "%2e%2e/outside", "%2foutside"] {
+            assert!(
+                linked_relative_path(&project, &lane, dest)
+                    .unwrap_err()
+                    .to_string()
+                    .contains("not inside the thread folder")
+            );
+        }
+    }
 
     #[test]
     fn rebind_accepts_unnamed_agent_but_not_a_different_name() {

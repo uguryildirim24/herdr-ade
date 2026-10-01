@@ -1226,6 +1226,56 @@ mod tests {
     }
 
     #[test]
+    fn retained_box_worktree_with_a_linked_folder_can_be_removed() {
+        let (fx, _bare, record, _sha) = sealed_retained_box();
+        let folder =
+            Path::new(&record.worktree_path).join(format!(".herdr-project/demo-{}", record.id));
+        std::fs::create_dir_all(folder.join("library/nested")).unwrap();
+        std::fs::write(folder.join("library/before.png"), b"before").unwrap();
+        std::fs::write(folder.join("library/nested/after.png"), b"after").unwrap();
+        let report = "Screenshots: [library](library/)\n";
+        std::fs::write(folder.join("report.md"), report).unwrap();
+        let exclude = run(
+            Path::new(&record.worktree_path),
+            &["rev-parse", "--git-path", "info/exclude"],
+        );
+        std::fs::write(exclude.trim(), ".herdr-project/\n").unwrap();
+        thread::update(&fx.project, &record.id, |t| {
+            t.thread_dir = folder.to_string_lossy().into_owned();
+        })
+        .unwrap();
+        // Set up the immutable done with its linked report, retaining the
+        // published seal ref supplied by the fixture.
+        let mut event = crate::events::list(&fx.project)
+            .into_iter()
+            .find(|event| event.thread == record.id && event.payload.done.is_some())
+            .unwrap();
+        event.payload.done.as_mut().unwrap().artifact =
+            thread::store_artifact(&fx.project, report.as_bytes()).unwrap();
+        std::fs::write(
+            fx.project
+                .state_dir()
+                .join("events")
+                .join(format!("{}.toml", event.id)),
+            toml::to_string(&event).unwrap(),
+        )
+        .unwrap();
+
+        crate::threads::remove_kept_worktree(&fx.world.ctx(), "demo", &record.id).unwrap();
+        assert!(!Path::new(&record.worktree_path).exists());
+        let saved = thread::load(&fx.project, &record.id).unwrap();
+        assert!(saved.worktree_path.is_empty());
+        assert!(!saved.final_report_hash.is_empty());
+        for bytes in [b"before".as_slice(), b"after".as_slice()] {
+            let hash = thread::sha256_hex(bytes);
+            assert_eq!(
+                std::fs::read(crate::events::artifact_path(&fx.project, &hash)).unwrap(),
+                bytes
+            );
+        }
+    }
+
+    #[test]
     fn sealed_box_retained_checkout_refuses_commit_beyond_seal() {
         let (fx, _bare, record, _sha) = sealed_retained_box();
         crate::testkit::commit_file(

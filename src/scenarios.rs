@@ -1210,7 +1210,7 @@ fn a_failed_final_copy_blocks_resolve_unless_skipped() {
 }
 
 #[test]
-fn linked_files_over_cap_are_kept_but_missing_files_are_recorded_and_removed() {
+fn linked_files_over_cap_or_missing_keep_the_worktree() {
     for missing in [false, true] {
         let world = World::new();
         let project = world.project("demo", "a.sock");
@@ -1260,10 +1260,11 @@ fn linked_files_over_cap_are_kept_but_missing_files_are_recorded_and_removed() {
             threads::resolve(&world.ctx(), "demo", &lane.id, &ResolveArgs::default()).unwrap();
         let record = thread::load(&project, &lane.id).unwrap();
         if missing {
-            assert_eq!(outcome.worktree, "removed", "{outcome:?}");
+            assert_eq!(outcome.worktree, "kept", "{outcome:?}");
             assert_eq!(record.missing_report_links, vec!["figma/a.png"]);
-            assert!(!record.cleanup_pending);
-            assert_eq!(world.runner.count("worktree remove"), 1);
+            assert!(outcome.copy_notes.join(" ").contains("missing"));
+            assert!(record.cleanup_pending);
+            assert_eq!(world.runner.count("worktree remove"), 0);
         } else {
             assert_eq!(outcome.worktree, "kept");
             assert!(outcome.copy_notes.join(" ").contains("200 MiB"));
