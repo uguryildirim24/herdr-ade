@@ -572,7 +572,7 @@ pub(crate) fn run(ctx: &Ctx) -> Result<()> {
     };
     let mut last_reachable = Instant::now();
     let mut memory = Memory::new(ctx);
-    let _thread_records = thread::ListCache::new();
+    let _records = crate::record_cache::Cache::new();
 
     // Publish only after acquiring the lock, before the first pass: that
     // pass may block, but this process is already running the new image.
@@ -707,7 +707,7 @@ fn tick_with_steps(
     let mut deferred: BTreeSet<String> = projects
         .iter()
         .filter(|project| {
-            thread::list(project).iter().any(|lane| {
+            thread::list_live(project).iter().any(|lane| {
                 lane.is_remote()
                     && !lane.parked
                     && (matches!(lane.status, thread::Status::Open | thread::Status::Starting)
@@ -869,7 +869,7 @@ fn machine_passes_with_steps(
     let now = jiff::Timestamp::now();
     let mut by_machine: BTreeMap<String, Vec<(Project, Vec<thread::Thread>)>> = BTreeMap::new();
     for project in projects {
-        let remote: Vec<_> = thread::list(project)
+        let remote: Vec<_> = thread::list_live(project)
             .into_iter()
             .filter(|t| {
                 t.is_remote()
@@ -1074,7 +1074,7 @@ pub(crate) fn resume_provider_starts(
     mut report: impl FnMut(anyhow::Error),
 ) -> bool {
     let mut reachable = true;
-    for lane in thread::list(project) {
+    for lane in thread::list_live(project) {
         if lane.provider_wait_started.is_empty()
             || !matches!(lane.status, thread::Status::Starting | thread::Status::Open)
         {
@@ -1498,13 +1498,13 @@ fn thread_pass(
         });
     for t in threads {
         if t.status == thread::Status::Failed {
-            let records = thread::list(project);
+            let records = thread::list_live(project);
             if let Some(agent) = thread::recoverable_agent(t, &records, agents, panes) {
                 thread::update_checked(project, &t.id, |current| {
                     if current.status == thread::Status::Failed
                         && current.attempt == t.attempt
                         && current.pane_id == t.pane_id
-                        && !thread::list(project).iter().any(|other| {
+                        && !thread::list_live(project).iter().any(|other| {
                             other.id != current.id
                                 && other.status != thread::Status::Resolved
                                 && other.pane_id == current.pane_id
@@ -1635,7 +1635,7 @@ fn thread_pass(
             && !t.connection_waiting
             && t.report_hash.is_empty()
             && crate::events::latest_done_event(
-                &crate::events::list(project),
+                &crate::events::for_thread(project, &t.id),
                 &t.id,
                 t.attempt.max(1),
             )
@@ -1805,10 +1805,13 @@ fn thread_pass(
                     thread.follow_ups[index].state = thread::FollowUpState::Uncertain;
                     Ok(())
                 })?;
-                let after_seal =
-                    crate::events::latest_done_event(&crate::events::list(project), &t.id, attempt)
-                        .map(|event| event.id.clone())
-                        .unwrap_or_default();
+                let after_seal = crate::events::latest_done_event(
+                    &crate::events::for_thread(project, &t.id),
+                    &t.id,
+                    attempt,
+                )
+                .map(|event| event.id.clone())
+                .unwrap_or_default();
                 match herdr.agent_prompt_wait_started(
                     &current.pane_id,
                     &follow_up.text,
@@ -2459,7 +2462,7 @@ fn launch_pass(
 }
 
 fn open_threads(project: &Project, remote: bool) -> Vec<thread::Thread> {
-    thread::list(project)
+    thread::list_live(project)
         .into_iter()
         .filter(|t| {
             t.is_remote() == remote
@@ -5823,6 +5826,115 @@ mod tests {
         assert!(tick_for_test(&ctx, &mut memory));
         assert_eq!(world.runner.count("workspace close w2"), 2);
         assert_eq!(world.runner.count("agent start"), 0);
+    }
+
+    #[test]
+    fn thousands_of_settled_lanes_do_not_get_opened_each_pass() {
+        use crate::contracts::{DonePayload, Event, EventPayload, Recipient, WaitingPayload};
+        let f = fixture(false);
+        let thread_dir = thread::threads_dir_for_write(&f.project).unwrap();
+        let event_dir = f.project.record_dir_for_write("events").unwrap();
+        for number in 1..=3004 {
+            let id = format!("t-{number:04}");
+            let lane = thread::Thread {
+                id: id.clone(),
+                status: if number <= 3000 {
+                    thread::Status::Resolved
+                } else {
+                    thread::Status::Starting
+                },
+                created: project::now(),
+                ..Default::default()
+            };
+            std::fs::write(
+                thread_dir.join(format!("{id}.toml")),
+                toml::to_string(&lane).unwrap(),
+            )
+            .unwrap();
+            if number <= 3000 {
+                let event_id = format!("{id}-1-1");
+                let event = Event {
+                    id: event_id.clone(),
+                    op: event_id.clone(),
+                    thread: id,
+                    attempt: 1,
+                    recipient: Recipient {
+                        pane: "w1:p1".into(),
+                        coordinator_attempt: 1,
+                    },
+                    created: project::now(),
+                    payload: if number % 2 == 0 {
+                        EventPayload {
+                            done: Some(DonePayload::default()),
+                            ..Default::default()
+                        }
+                    } else {
+                        EventPayload {
+                            failed: Some(WaitingPayload::default()),
+                            ..Default::default()
+                        }
+                    },
+                };
+                std::fs::write(
+                    event_dir.join(format!("{event_id}.toml")),
+                    crate::events::bytes(&event).unwrap(),
+                )
+                .unwrap();
+            }
+        }
+        // Measure the old invalidated-thread-snapshot and per-lane full-log
+        // lookup pattern independently of other ticker work.
+        let before_threads = thread::count_thread_reads(|| {
+            assert_eq!(thread::list_with_errors(&f.project).0.len(), 3004);
+        });
+        let before_events = crate::events::count_event_reads(|| {
+            for _ in 0..4 {
+                assert_eq!(crate::events::list(&f.project).len(), 3000);
+            }
+        });
+        let runner = FakeRunner::new();
+        runner.on("agent list", ok(NO_AGENTS));
+        runner.on("pane list", ok(&with_cwd(PANE, &f)));
+        runner.on("workspace report-metadata", ok(r#"{"result":{}}"#));
+        let ctx = Ctx {
+            env: &f.env,
+            root: f.root.clone(),
+            config_dir: f.root.join("cfg"),
+            runner: &runner,
+            detached_ticker: false,
+        };
+        let mut memory = Memory::new(&ctx);
+        let _cache = crate::record_cache::Cache::new();
+        assert!(tick_for_test(&ctx, &mut memory));
+        let measure = |memory: &mut Memory| {
+            let mut event_reads = 0;
+            let thread_reads = thread::count_thread_reads(|| {
+                event_reads = crate::events::count_event_reads(|| {
+                    assert!(tick_for_test(&ctx, memory));
+                    assert_eq!(thread::list_live(&f.project).len(), 4);
+                    for number in 3001..=3004 {
+                        assert!(
+                            crate::events::for_thread(&f.project, &format!("t-{number:04}"))
+                                .is_empty()
+                        );
+                    }
+                });
+            });
+            (thread_reads, event_reads)
+        };
+        let idle = measure(&mut memory);
+        assert_eq!(idle, (0, 0));
+        for number in 3001..=3004 {
+            thread::update(&f.project, &format!("t-{number:04}"), |t| {
+                t.title = "changed".into()
+            })
+            .unwrap();
+        }
+        let changed = measure(&mut memory);
+        assert_eq!(changed, (4, 0));
+        println!(
+            "3000 settled + 4 live: old scan pattern {before_threads} thread / {before_events} event opens; warm full pass {idle:?}; four changed live records {changed:?}"
+        );
     }
 
     #[test]

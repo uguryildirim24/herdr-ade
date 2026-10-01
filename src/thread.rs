@@ -290,7 +290,7 @@ fn regular_file(path: &Path) -> bool {
 /// content-addressed artifact is present and valid.
 pub(crate) fn sealed_report_path(project: &Project, thread: &Thread) -> Option<PathBuf> {
     let attempt = thread.attempt.max(1);
-    let (path, hash) = crate::events::list(project)
+    let (path, hash) = crate::events::for_thread(project, &thread.id)
         .into_iter()
         .filter(|event| event.thread == thread.id && event.attempt == attempt)
         .filter_map(|event| {
@@ -341,6 +341,8 @@ pub(crate) fn report_reference(project: &Project, thread: &Thread) -> Option<Str
 pub(crate) fn load(project: &Project, id: &str) -> Result<Thread> {
     validate_id(id)?;
     let path = record_path(project, id);
+    #[cfg(test)]
+    THREAD_READS.with(|count| count.set(count.get() + 1));
     let text = std::fs::read_to_string(&path)
         .with_context(|| format!("no thread `{id}` in `{}`", project.slug))?;
     toml::from_str(&text).with_context(|| format!("{} does not parse", path.display()))
@@ -380,59 +382,87 @@ pub(crate) fn list_with_errors(project: &Project) -> (Vec<Thread>, Vec<anyhow::E
     (threads, errors)
 }
 
-type ListStamp = Option<(u64, std::time::SystemTime)>;
-type ThreadLists = std::collections::BTreeMap<std::path::PathBuf, (ListStamp, Vec<Thread>)>;
+fn needs_tick(t: &Thread) -> bool {
+    t.status != Status::Resolved
+        || t.cleanup_pending
+        || t.recovery_pending
+        || t.start_notices.iter().any(|notice| !notice.submitted)
+}
+
+#[derive(Default)]
+struct ThreadLists {
+    records: crate::record_cache::Records<Thread>,
+    live: std::collections::BTreeMap<PathBuf, (std::rc::Rc<Vec<Thread>>, Vec<Thread>)>,
+}
 
 thread_local! {
     static TICKER_LISTS: std::cell::RefCell<Option<ThreadLists>> =
         const { std::cell::RefCell::new(None) };
 }
 
-/// A ticker-only cache. All normal writers replace records atomically, which
-/// changes the threads directory; ordinary CLI reads stay uncached. This
-/// avoids parsing every historical lane repeatedly inside each idle beat.
-pub(crate) struct ListCache;
-
-impl ListCache {
-    pub(crate) fn new() -> Self {
-        TICKER_LISTS.with(|cache| *cache.borrow_mut() = Some(Default::default()));
-        Self
-    }
+pub(crate) fn set_cache(enabled: bool) {
+    TICKER_LISTS.with(|cache| {
+        *cache.borrow_mut() = enabled.then(ThreadLists::default);
+    });
 }
 
-impl Drop for ListCache {
-    fn drop(&mut self) {
-        TICKER_LISTS.with(|cache| *cache.borrow_mut() = None);
-    }
+fn cached_list(project: &Project, live: bool) -> Option<Vec<Thread>> {
+    TICKER_LISTS.with(|cache| {
+        let mut cache = cache.borrow_mut();
+        let cache = cache.as_mut()?;
+        let dir = threads_dir(project);
+        let (rows, _) = cache.records.read(dir.clone(), |id| load(project, id));
+        if !live {
+            return Some(rows.as_ref().clone());
+        }
+        let entry = cache.live.entry(dir).or_insert_with(|| {
+            let live = rows.iter().filter(|t| needs_tick(t)).cloned().collect();
+            (rows.clone(), live)
+        });
+        if !std::rc::Rc::ptr_eq(&entry.0, &rows) {
+            entry.1 = rows.iter().filter(|t| needs_tick(t)).cloned().collect();
+            entry.0 = rows;
+        }
+        Some(entry.1.clone())
+    })
+}
+
+pub(crate) fn snapshot(project: &Project) -> std::rc::Rc<Vec<Thread>> {
+    TICKER_LISTS
+        .with(|cache| {
+            cache.borrow_mut().as_mut().map(|cache| {
+                cache
+                    .records
+                    .read(threads_dir(project), |id| load(project, id))
+                    .0
+            })
+        })
+        .unwrap_or_else(|| std::rc::Rc::new(list_with_errors(project).0))
 }
 
 pub(crate) fn list(project: &Project) -> Vec<Thread> {
-    let dir = threads_dir(project);
-    let stamp = std::fs::metadata(&dir)
-        .and_then(|meta| Ok((meta.len(), meta.modified()?)))
-        .ok();
-    if let Some(found) = TICKER_LISTS.with(|cache| {
-        cache.borrow().as_ref().and_then(|rows| {
-            rows.get(&dir)
-                .filter(|(cached, _)| *cached == stamp)
-                .map(|(_, rows)| rows.clone())
-        })
-    }) {
-        return found;
-    }
-    let (rows, errors) = list_with_errors(project);
-    // An unreadable directory or record is not a stable empty/partial list.
-    // A repaired record may keep its parent's directory stamp unchanged.
-    TICKER_LISTS.with(|cache| {
-        if let Some(cache) = cache.borrow_mut().as_mut() {
-            if errors.is_empty() {
-                cache.insert(dir, (stamp, rows.clone()));
-            } else {
-                cache.remove(&dir);
-            }
-        }
-    });
-    rows
+    cached_list(project, false).unwrap_or_else(|| list_with_errors(project).0)
+}
+
+/// Working lanes and durable cleanup obligations. Full CLI/history reads and
+/// historical classification continue to use `list`, not this live index.
+pub(crate) fn list_live(project: &Project) -> Vec<Thread> {
+    cached_list(project, true)
+        .unwrap_or_else(|| list(project).into_iter().filter(needs_tick).collect())
+}
+
+#[cfg(test)]
+thread_local! {
+    static THREAD_READS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+pub(crate) fn count_thread_reads(f: impl FnOnce()) -> usize {
+    THREAD_READS.with(|count| {
+        let previous = count.replace(0);
+        f();
+        count.replace(previous)
+    })
 }
 
 fn write_record(project: &Project, thread: &Thread) -> Result<()> {
@@ -1498,7 +1528,7 @@ mod tests {
         let home = tempfile::tempdir().unwrap();
         let project = crate::project::create(home.path(), "demo", "", vec![]).unwrap();
         let original = allocate(&project, |t| t.title = "Original".into()).unwrap();
-        let _cache = ListCache::new();
+        let _cache = crate::record_cache::Cache::new();
         assert_eq!(list(&project)[0].title, "Original");
         // The unchanged directory is not parsed a second time.
         let path = threads_dir(&project).join(format!("{}.toml", original.id));
@@ -1511,6 +1541,25 @@ mod tests {
     }
 
     #[test]
+    fn settled_start_notices_stay_in_the_live_index_until_submitted() {
+        let home = tempfile::tempdir().unwrap();
+        let project = crate::project::create(home.path(), "demo", "", vec![]).unwrap();
+        let lane = allocate(&project, |t| {
+            t.status = Status::Resolved;
+            t.start_notices.push(crate::steps::Notice {
+                line: "start failed".into(),
+                submitted: false,
+            });
+        })
+        .unwrap();
+        let _cache = crate::record_cache::Cache::new();
+        assert_eq!(list_live(&project).len(), 1);
+        update(&project, &lane.id, |t| t.start_notices[0].submitted = true).unwrap();
+        assert!(list_live(&project).is_empty());
+        assert_eq!(list(&project).len(), 1);
+    }
+
+    #[test]
     fn ticker_retries_unreadable_records_without_directory_changes() {
         let home = tempfile::tempdir().unwrap();
         let project = crate::project::create(home.path(), "demo", "", vec![]).unwrap();
@@ -1518,7 +1567,7 @@ mod tests {
         let path = threads_dir(&project).join(format!("{}.toml", lane.id));
         let original = std::fs::read(&path).unwrap();
         std::fs::write(&path, "invalid = [").unwrap();
-        let _cache = ListCache::new();
+        let _cache = crate::record_cache::Cache::new();
         assert!(list(&project).is_empty());
         // Repair in place, not via the atomic writer: no directory rename.
         std::fs::write(&path, original).unwrap();

@@ -170,7 +170,7 @@ pub(crate) fn deliver_transition_notices(ctx: &Ctx, project: &Project) -> Result
         return Ok(());
     };
     let reviews = crate::review::list(project)?;
-    let lanes = thread::list(project);
+    let lanes = thread::list_live(project);
     if !reviews
         .iter()
         .any(|r| r.notices.iter().any(|n| !n.submitted))
@@ -272,7 +272,7 @@ pub(crate) fn save_state(project: &Project, state: &State) -> Result<()> {
 /// undelivered.
 pub(crate) fn deliver_events(ctx: &Ctx, project: &Project) -> Result<()> {
     let mut first: Option<anyhow::Error> = None;
-    let sealed = crate::events::list(project);
+    let sealed = crate::events::for_unresolved_threads(project);
     // Prompt order is serialized, but adoption is not: a held notice must
     // never delay reports from later seals in the same pass.
     let mut latest = std::collections::BTreeMap::new();
