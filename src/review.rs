@@ -129,7 +129,33 @@ pub(crate) fn mark_notice_submitted(project: &Project, id: &str, line: &str) -> 
     Ok(())
 }
 
+thread_local! {
+    static TICKER_LISTS: std::cell::RefCell<Option<crate::record_cache::Records<Review>>> = const { std::cell::RefCell::new(None) };
+}
+
+pub(crate) fn set_cache(enabled: bool) {
+    TICKER_LISTS.with(|cache| *cache.borrow_mut() = enabled.then(Default::default));
+}
+
 pub(crate) fn list(project: &Project) -> Result<Vec<Review>> {
+    if let Some(cached) = TICKER_LISTS.with(|cache| {
+        cache
+            .borrow_mut()
+            .as_mut()
+            .map(|cache| cache.read(dir(project), |id| load(project, id)))
+    }) {
+        let (rows, errors) = cached;
+        if let Some(error) = errors.into_iter().next() {
+            return Err(error);
+        }
+        let mut records = rows.as_ref().clone();
+        records.sort_by_key(|r| {
+            r.id.trim_start_matches("review-")
+                .parse::<u64>()
+                .unwrap_or(0)
+        });
+        return Ok(records);
+    }
     let entries = match std::fs::read_dir(dir(project)) {
         Ok(entries) => entries,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
@@ -551,7 +577,7 @@ fn pending(
     events: &[crate::contracts::Event],
     reviewers: &std::collections::BTreeSet<String>,
 ) -> Vec<Thread> {
-    pending_from(thread::list(project), repo, events, reviewers)
+    pending_from(thread::list_live(project), repo, events, reviewers)
 }
 fn pending_from(
     lanes: Vec<Thread>,
@@ -1561,16 +1587,26 @@ fn lane_repository(
 /// Classify old seals outside the open pile. The seal id is the cache key: a
 /// later attempt/follow-up can be classified afresh, but idle passes do no git.
 pub(crate) fn classify_old_seals(ctx: &Ctx, project: &Project, include_open: bool) -> Result<()> {
-    let events = crate::events::checked(project)?;
+    let mut events_by_thread: BTreeMap<String, Vec<crate::contracts::Event>> = BTreeMap::new();
+    for event in crate::events::checked(project)? {
+        events_by_thread
+            .entry(event.thread.clone())
+            .or_default()
+            .push(event);
+    }
     let harness = crate::harness::repos(&ctx.config_dir)?;
-    let tasks = crate::task::list_with_errors(project).0;
+    let mut tasks = None;
     let mut heads: BTreeMap<String, String> = BTreeMap::new();
     let reviewers = reviewer_ids(project)?;
     for lane in thread::list(project) {
         if reviewers.contains(&lane.id) || lane.repo.is_empty() || !lane.merged_sha.is_empty() {
             continue;
         }
-        let Some(event) = sealed(&events, &lane) else {
+        let events = events_by_thread
+            .get(&lane.id)
+            .map(Vec::as_slice)
+            .unwrap_or_default();
+        let Some(event) = sealed(events, &lane) else {
             continue;
         };
         if lane.historical_seal == event.id {
@@ -1619,6 +1655,7 @@ pub(crate) fn classify_old_seals(ctx: &Ctx, project: &Project, include_open: boo
         let harness_repo = harness.iter().any(|r| same_repo(&r.path, &row.path));
         let installed = if merged && harness_repo {
             let builds = tasks
+                .get_or_insert_with(|| crate::task::list_with_errors(project).0)
                 .iter()
                 .filter(|t| t.attempts.contains(&lane.id))
                 .flat_map(|t| t.installed.iter().filter_map(|e| e.build.as_deref()));
@@ -1687,8 +1724,9 @@ pub(crate) fn tick(ctx: &Ctx, project: &Project) -> Result<()> {
         }
     }
     if project.state_dir().join("reviews-enabled").exists() {
-        let events = crate::events::checked(project)?;
-        let threads = thread::list(project);
+        crate::events::checked(project)?;
+        let events = crate::events::for_unresolved_threads(project);
+        let threads = thread::list_live(project);
         let reviewers = reviewer_ids(project)?;
         let repos: std::collections::BTreeSet<_> = threads
             .iter()

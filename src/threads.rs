@@ -2212,7 +2212,7 @@ pub(crate) fn resolve_automatically_with_views(
 /// Retry a bounded slice of durable cleanup, including after a landed pile.
 pub(crate) fn retry_pending_cleanup(ctx: &Ctx, project: &Project) -> Result<()> {
     let mut views = CleanupViews::default();
-    let mut pending = thread::list(project)
+    let mut pending = thread::list_live(project)
         .into_iter()
         .filter(|record| record.cleanup_pending)
         .filter(|record| !record.cleanup_reason.starts_with("linked_files_not_kept:"))
@@ -2245,8 +2245,8 @@ pub(crate) fn retry_pending_cleanup(ctx: &Ctx, project: &Project) -> Result<()> 
 /// report is available, close it immediately; changed lanes remain visible so
 /// the coordinator can put them in a pile.
 pub(crate) fn resolve_report_only(ctx: &Ctx, project: &Project) {
-    let events = crate::events::list(project);
-    for record in thread::list(project) {
+    let events = crate::events::for_unresolved_threads(project);
+    for record in thread::list_live(project) {
         if record.status == Status::Resolved || record.role == "reviewer" {
             continue;
         }
@@ -2790,9 +2790,9 @@ pub(crate) fn done_attestation(
     project: &Project,
     record: &Thread,
 ) -> Option<crate::contracts::Attestation> {
-    crate::events::list(project)
+    crate::events::for_thread(project, &record.id)
         .into_iter()
-        .filter(|event| event.thread == record.id && event.attempt == record.attempt.max(1))
+        .filter(|event| event.attempt == record.attempt.max(1))
         .filter_map(|event| {
             let attestation = event.payload.done?.attestation?;
             Some((event.created, event.id, attestation))
@@ -3362,7 +3362,7 @@ pub(crate) fn parkable(project: &Project, record: &Thread) -> bool {
     if record.status != Status::Open || record.prompt_pending {
         return false;
     }
-    let events = crate::events::list(project);
+    let events = crate::events::for_thread(project, &record.id);
     let Some(done) = crate::events::latest_done_event(&events, &record.id, record.attempt.max(1))
     else {
         return false;
@@ -3590,7 +3590,7 @@ fn reopen_parked(
 
 pub(crate) fn park_completed(ctx: &Ctx, project: &Project) -> Result<()> {
     let mut first = None;
-    for record in thread::list(project) {
+    for record in thread::list_live(project) {
         if let Err(error) = park_one(ctx, project, &record) {
             first.get_or_insert(error.context(format!("{}: park", record.id)));
         }
@@ -3603,7 +3603,7 @@ fn park_one(ctx: &Ctx, project: &Project, record: &Thread) -> Result<()> {
         return Ok(());
     }
     let Some(done) = crate::events::latest_done_event(
-        &crate::events::list(project),
+        &crate::events::for_thread(project, &record.id),
         &record.id,
         record.attempt.max(1),
     )
@@ -4342,11 +4342,14 @@ fn draft_has_existing_links(
 
 fn preserve_report_links(ctx: &Ctx, project: &Project, record: &Thread) -> Result<()> {
     if thread::sealed_report_path(project, record).is_none() {
-        if crate::events::list(project).into_iter().any(|event| {
-            event.thread == record.id
-                && event.attempt == record.attempt.max(1)
-                && event.payload.done.is_some()
-        }) {
+        if crate::events::for_thread(project, &record.id)
+            .into_iter()
+            .any(|event| {
+                event.thread == record.id
+                    && event.attempt == record.attempt.max(1)
+                    && event.payload.done.is_some()
+            })
+        {
             bail!("the sealed report artifact is missing or damaged; worktree kept");
         }
         if record.is_remote() {
@@ -4405,7 +4408,7 @@ fn preserve_report_links(ctx: &Ctx, project: &Project, record: &Thread) -> Resul
         return Ok(());
     }
     // Read the seal, not an earlier rewritten report, for repeatable retries.
-    let events = crate::events::list(project);
+    let events = crate::events::for_thread(project, &record.id);
     let sealed = crate::events::latest_done_event(&events, &record.id, record.attempt.max(1))
         .and_then(|event| event.payload.done.as_ref())
         .map(|done| done.artifact.clone())
@@ -4493,7 +4496,7 @@ fn preserve_report_links(ctx: &Ctx, project: &Project, record: &Thread) -> Resul
 /// removal gate reads the sealed artifact.
 fn imported_report(project: &Project, record: &Thread) -> thread::Copied {
     let attempt = record.attempt.max(1);
-    let events = crate::events::list(project);
+    let events = crate::events::for_thread(project, &record.id);
     let hash = crate::events::latest_done_event(&events, &record.id, attempt)
         .and_then(|event| event.payload.done.as_ref())
         .map(|done| done.artifact.clone());
@@ -4538,7 +4541,7 @@ pub(crate) fn finished_worktree_reason_with_merged(
     merged: Option<&BTreeSet<String>>,
 ) -> Result<Option<String>> {
     if managed_git_folder(project, record) {
-        let done = crate::events::list(project)
+        let done = crate::events::for_thread(project, &record.id)
             .into_iter()
             .filter(|event| event.thread == record.id && event.attempt == record.attempt.max(1))
             .find_map(|event| event.payload.done);
@@ -5054,7 +5057,7 @@ fn removal_in_use_gate(
 pub(crate) fn relink_binding(ctx: &Ctx, project: &Project, pane: &str) -> Result<()> {
     let view = require_session(ctx, project)?;
     let mut observed = std::collections::BTreeMap::new();
-    for lane in thread::list(project) {
+    for lane in thread::list_live(project) {
         // The ordinary lineage pass below repairs local lanes using the same
         // observation; this binding pass handles box lanes only.
         if !lane.is_remote()
@@ -5102,7 +5105,7 @@ pub fn tick(project: &Project, herdr: &Herdr, agents: &[Agent]) -> Result<()> {
         Some(c) => c,
         None => return Ok(()),
     };
-    for record in thread::list(project) {
+    for record in thread::list_live(project) {
         if record.is_remote() || record.status == Status::Resolved {
             continue;
         }

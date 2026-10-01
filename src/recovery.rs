@@ -14,8 +14,12 @@ pub(crate) fn consume(ctx: &Ctx, project: &Project, event: &Event) -> Result<()>
         bail!("event_payload_invalid");
     }
     let record = thread::load(project, &event.thread)?;
-    if crate::events::latest_event(&events::list(project), &record.id, event.attempt)
-        .is_some_and(|latest| latest.id != event.id)
+    if crate::events::latest_event(
+        &events::for_thread(project, &record.id),
+        &record.id,
+        event.attempt,
+    )
+    .is_some_and(|latest| latest.id != event.id)
     {
         return Ok(());
     }
@@ -135,15 +139,17 @@ pub(crate) fn consume(ctx: &Ctx, project: &Project, event: &Event) -> Result<()>
 
 pub(crate) fn tick(ctx: &Ctx, project: &Project) -> Result<()> {
     let mut first = None;
-    for event in events::list(project)
+    // Old failures on settled lanes cannot cause a transition. Do not reopen
+    // their thread files on every beat merely to discover that again.
+    for event in events::for_unresolved_threads(project)
         .into_iter()
-        .filter(|e| e.payload.failed.is_some())
+        .filter(|event| event.payload.failed.is_some())
     {
         if let Err(e) = consume(ctx, project, &event) {
             first.get_or_insert(e);
         }
     }
-    for record in thread::list(project)
+    for record in thread::list_live(project)
         .into_iter()
         .filter(|t| t.recovery_pending && t.status != thread::Status::Resolved)
     {

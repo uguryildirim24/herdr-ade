@@ -440,6 +440,9 @@ pub(crate) fn count_event_reads(f: impl FnOnce()) -> usize {
 /// Load the event records once, retaining the unreadable-evidence signal used
 /// by task projections. Missing event directories represent an empty set.
 pub(crate) fn list_checked(project: &Project) -> (Vec<Event>, bool) {
+    if let Some(snapshot) = cached_events(project, None) {
+        return snapshot;
+    }
     let entries = match std::fs::read_dir(dir(project)) {
         Ok(entries) => entries,
         Err(error) => return (Vec::new(), error.kind() == std::io::ErrorKind::NotFound),
@@ -474,6 +477,129 @@ pub(crate) fn list_checked(project: &Project) -> (Vec<Event>, bool) {
 
 pub(crate) fn list(project: &Project) -> Vec<Event> {
     list_checked(project).0
+}
+
+#[derive(Default)]
+struct EventLists {
+    records: crate::record_cache::Records<Event>,
+    indexes: BTreeMap<PathBuf, EventIndex>,
+    unresolved: BTreeMap<PathBuf, UnresolvedEvents>,
+}
+
+struct UnresolvedEvents {
+    events: std::rc::Rc<Vec<Event>>,
+    threads: std::rc::Rc<Vec<crate::thread::Thread>>,
+    rows: Vec<Event>,
+}
+
+struct EventIndex {
+    rows: std::rc::Rc<Vec<Event>>,
+    threads: BTreeMap<String, Vec<usize>>,
+}
+
+thread_local! {
+    static TICKER_LISTS: std::cell::RefCell<Option<EventLists>> = const { std::cell::RefCell::new(None) };
+}
+
+pub(crate) fn set_cache(enabled: bool) {
+    TICKER_LISTS.with(|cache| *cache.borrow_mut() = enabled.then(EventLists::default));
+}
+
+fn cached_events(project: &Project, thread: Option<&str>) -> Option<(Vec<Event>, bool)> {
+    TICKER_LISTS.with(|cache| {
+        let mut cache = cache.borrow_mut();
+        let cache = cache.as_mut()?;
+        let dir = dir(project);
+        let (rows, errors) = cache.records.read(dir.clone(), |id| load(project, id));
+        let index = cache.indexes.entry(dir).or_insert_with(|| EventIndex {
+            rows: std::rc::Rc::new(Vec::new()),
+            threads: BTreeMap::new(),
+        });
+        if !std::rc::Rc::ptr_eq(&index.rows, &rows) {
+            index.threads.clear();
+            for (position, event) in rows.iter().enumerate() {
+                index
+                    .threads
+                    .entry(event.thread.clone())
+                    .or_default()
+                    .push(position);
+            }
+            index.rows = rows;
+        }
+        let events = match thread {
+            Some(thread) => index
+                .threads
+                .get(thread)
+                .into_iter()
+                .flatten()
+                .map(|position| index.rows[*position].clone())
+                .collect(),
+            None => index.rows.as_ref().clone(),
+        };
+        Some((events, errors.is_empty()))
+    })
+}
+
+/// Per-lane lookups never rescan or clone the entire project's event log in
+/// the ticker. Ordinary commands still read all historical evidence afresh.
+pub(crate) fn for_thread(project: &Project, thread: &str) -> Vec<Event> {
+    cached_events(project, Some(thread))
+        .map(|(events, _)| events)
+        .unwrap_or_else(|| {
+            list(project)
+                .into_iter()
+                .filter(|event| event.thread == thread)
+                .collect()
+        })
+}
+
+/// Delivery/recovery has no obligations on resolved lanes. Keep orphaned
+/// evidence in this projection so missing/corrupt lane errors are not hidden.
+/// Rebuild only when the event or thread snapshot changes.
+pub(crate) fn for_unresolved_threads(project: &Project) -> Vec<Event> {
+    let threads = crate::thread::snapshot(project);
+    let select = |events: &[Event]| {
+        let resolved: BTreeSet<_> = threads
+            .iter()
+            .filter(|t| t.status == crate::thread::Status::Resolved)
+            .map(|t| t.id.as_str())
+            .collect();
+        events
+            .iter()
+            .filter(|e| {
+                !resolved.contains(e.thread.as_str())
+                    // Recovery rejects a multi-tag failure before checking lane
+                    // status. Keep that existing corruption signal visible.
+                    || e.payload.failed.is_some()
+                        && (e.payload.done.is_some() || e.payload.waiting.is_some())
+            })
+            .cloned()
+            .collect::<Vec<_>>()
+    };
+    TICKER_LISTS
+        .with(|cache| {
+            let mut cache = cache.borrow_mut();
+            let cache = cache.as_mut()?;
+            let dir = dir(project);
+            let (events, _) = cache.records.read(dir.clone(), |id| load(project, id));
+            let entry = cache
+                .unresolved
+                .entry(dir)
+                .or_insert_with(|| UnresolvedEvents {
+                    rows: select(&events),
+                    events: events.clone(),
+                    threads: threads.clone(),
+                });
+            if !std::rc::Rc::ptr_eq(&entry.events, &events)
+                || !std::rc::Rc::ptr_eq(&entry.threads, &threads)
+            {
+                entry.rows = select(&events);
+                entry.events = events;
+                entry.threads = threads.clone();
+            }
+            Some(entry.rows.clone())
+        })
+        .unwrap_or_else(|| select(&list(project)))
 }
 
 /// Appends a fact once. Re-running acknowledgement or handling is idempotent;
@@ -631,6 +757,72 @@ mod tests {
             },
         };
         (root, project, event)
+    }
+
+    #[test]
+    fn ticker_indexes_keep_resolved_evidence_and_notice_reopen_cleanup_and_new_seals() {
+        let (_root, project, mut event) = fixture();
+        let lane = crate::thread::allocate(&project, |t| {
+            t.status = crate::thread::Status::Resolved;
+            t.attempt = 1;
+        })
+        .unwrap();
+        event.payload.done.as_mut().unwrap().artifact =
+            store_artifact(&project, b"final report").unwrap();
+        seal_create_if_absent(&project, &event).unwrap();
+        let _cache = crate::record_cache::Cache::new();
+        assert!(for_unresolved_threads(&project).is_empty());
+        assert!(crate::thread::list_live(&project).is_empty());
+        assert_eq!(for_thread(&project, &lane.id), vec![event.clone()]);
+        assert!(crate::thread::sealed_report_path(&project, &lane).is_some());
+        assert_eq!(crate::thread::list_with_errors(&project).0.len(), 1);
+
+        crate::thread::update(&project, &lane.id, |t| t.cleanup_pending = true).unwrap();
+        assert_eq!(crate::thread::list_live(&project).len(), 1);
+        // Cleanup can read the seal even though delivery never replays it.
+        assert!(for_unresolved_threads(&project).is_empty());
+        assert_eq!(for_thread(&project, &lane.id).len(), 1);
+        crate::thread::update(&project, &lane.id, |t| {
+            t.cleanup_pending = false;
+            t.status = crate::thread::Status::Open;
+        })
+        .unwrap();
+        assert_eq!(for_unresolved_threads(&project), vec![event.clone()]);
+        let mut newer = event.clone();
+        newer.id = "t-0001-1-2".into();
+        newer.created = "2026-10-01T00:00:00Z".into();
+        assert_eq!(
+            count_event_reads(|| seal_create_if_absent(&project, &newer).unwrap()),
+            0
+        );
+        assert_eq!(
+            count_event_reads(|| {
+                let events = for_thread(&project, &lane.id);
+                assert_eq!(latest_done_event(&events, &lane.id, 1), Some(&newer));
+            }),
+            1
+        );
+        assert_eq!(for_unresolved_threads(&project).len(), 2);
+        std::fs::remove_file(event_path(&project, &newer.id).unwrap()).unwrap();
+        assert_eq!(for_thread(&project, &lane.id), vec![event]);
+    }
+
+    #[test]
+    fn ticker_event_cache_retries_corrupt_evidence_and_does_not_hide_orphans() {
+        let (_root, project, event) = fixture();
+        seal_create_if_absent(&project, &event).unwrap();
+        let path = event_path(&project, &event.id).unwrap();
+        crate::project::write_atomic(&path, b"invalid = [").unwrap();
+        let cache = crate::record_cache::Cache::new();
+        assert!(!list_checked(&project).1);
+        // In-place repair does not change the directory stamp.
+        std::fs::write(&path, bytes(&event).unwrap()).unwrap();
+        assert!(list_checked(&project).1);
+        assert_eq!(for_unresolved_threads(&project), vec![event.clone()]);
+        // A fresh CLI read must not inherit the ticker's snapshot.
+        std::fs::write(&path, b"invalid = [").unwrap();
+        drop(cache);
+        assert!(!list_checked(&project).1);
     }
 
     #[test]

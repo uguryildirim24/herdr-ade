@@ -45,6 +45,7 @@ mod note;
 mod ops;
 mod overview;
 mod paths;
+mod record_cache;
 mod recovery;
 mod routing;
 // Shared with the `herdr-pi` binary: setup, install and login run only there.
