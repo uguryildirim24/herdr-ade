@@ -3928,14 +3928,22 @@ fn report_destinations(report: &str) -> Vec<(std::ops::Range<usize>, String)> {
     found
 }
 
+#[derive(Debug)]
+enum ReportLink {
+    Thread(std::path::PathBuf),
+    Repo {
+        relative: std::path::PathBuf,
+        source: std::path::PathBuf,
+    },
+}
+
 fn linked_relative_path(
     project: &Project,
     record: &Thread,
     dest: &str,
-) -> Result<Option<std::path::PathBuf>> {
+) -> Result<Option<ReportLink>> {
     let raw = dest.split(['#', '?']).next().unwrap_or(dest);
     if raw.is_empty()
-        || raw.starts_with('/')
         || raw.contains("://")
         || raw.starts_with("data:")
         || raw.starts_with("mailto:")
@@ -3963,20 +3971,37 @@ fn linked_relative_path(
         }
     }
     let decoded = String::from_utf8(decoded).unwrap_or_else(|_| raw.to_string());
-    let mut path = std::path::PathBuf::new();
+    let root = std::path::Path::new(&record.thread_dir);
+    let source = root.join(&decoded);
+    let mut path = root.to_path_buf();
     for component in std::path::Path::new(&decoded).components() {
         match component {
             std::path::Component::Normal(part) => path.push(part),
             std::path::Component::CurDir => (),
             std::path::Component::ParentDir => {
                 if !path.pop() {
-                    bail!("linked path is not inside the thread folder: {dest}");
+                    bail!("linked path is not inside the worktree: {dest}");
                 }
             }
-            _ => bail!("linked path is not inside the thread folder: {dest}"),
+            std::path::Component::RootDir => path = std::path::PathBuf::from("/"),
+            _ => bail!("linked path is not inside the worktree: {dest}"),
         }
     }
-    Ok((!path.as_os_str().is_empty()).then_some(path))
+    if let Ok(relative) = path.strip_prefix(root) {
+        return Ok(
+            (!relative.as_os_str().is_empty()).then(|| ReportLink::Thread(relative.to_path_buf()))
+        );
+    }
+    if !record.worktree_path.is_empty()
+        && let Ok(relative) = path.strip_prefix(&record.worktree_path)
+        && !relative.as_os_str().is_empty()
+    {
+        return Ok(Some(ReportLink::Repo {
+            relative: relative.to_path_buf(),
+            source,
+        }));
+    }
+    bail!("linked path is not inside the worktree: {dest}")
 }
 
 fn linked_file_missing(ctx: &Ctx, record: &Thread, relative: &std::path::Path) -> Result<bool> {
@@ -4049,7 +4074,7 @@ fn linked_bytes(ctx: &Ctx, record: &Thread, relative: &std::path::Path) -> Resul
 // slice the concatenated files, so even thousands of small images need at
 // most 25 more round trips (200 MiB / 8 MiB), never one trip per file.
 const LINKED_BOX_SCRIPT: &str = r#"
-import os, sys, stat, json, hashlib
+import os, sys, stat, json, hashlib, subprocess
 root = os.path.realpath(sys.argv[1])
 path = os.path.join(root, sys.argv[2])
 def checked(path):
@@ -4071,6 +4096,19 @@ def checked(path):
 try:
     os.stat(root)
     directory = stat.S_ISDIR(checked(path).st_mode)
+    if len(sys.argv) == 4 and sys.argv[3] == 'repo':
+        if directory:
+            sys.exit(4)
+        name = os.path.relpath(path, root)
+        def git(*args):
+            return subprocess.run(['git', '-C', root, *args], check=True, stdout=subprocess.PIPE).stdout
+        spec = ':(literal)' + name
+        if not git('ls-files', '-z', '--', spec):
+            sys.exit(6)
+        if git('status', '--porcelain', '-z', '--untracked-files=all', '--', spec):
+            sys.exit(7)
+        sys.stdout.write(git('hash-object', '--no-filters', '--', path).decode())
+        sys.exit(0)
     entries = []
     pending = [path]
     total = 0
@@ -4311,6 +4349,145 @@ fn linked_files(ctx: &Ctx, record: &Thread, relative: &std::path::Path) -> Resul
     })
 }
 
+/// Repo links are kept only by integration, never copied into ADE artifacts.
+fn repo_link_kept(
+    ctx: &Ctx,
+    record: &Thread,
+    relative: &std::path::Path,
+    path: &std::path::Path,
+) -> Result<()> {
+    let root = std::path::Path::new(&record.worktree_path);
+    let spec = format!(":(literal){}", relative.to_string_lossy());
+    let hash = if record.is_remote() {
+        let profile = remote::machine_profile(
+            ctx.runner,
+            &ctx.env.herdr_bin(),
+            &ctx.config_dir,
+            record.machine_route(),
+        )?;
+        let script = format!(
+            "python3 -c {} {} {} repo",
+            remote::quote(LINKED_BOX_SCRIPT),
+            remote::quote(&record.worktree_path),
+            remote::quote(&path.to_string_lossy())
+        );
+        let out = remote::ssh(
+            ctx.runner,
+            &profile.target,
+            &script,
+            None,
+            Duration::from_secs(90),
+        )?;
+        if !out.success() {
+            let reason = match out.code.filter(|_| !out.timed_out) {
+                Some(3) => "not inside the worktree",
+                Some(6) => "untracked repo file",
+                Some(7) => "uncommitted repo file",
+                _ => {
+                    linked_probe_result(&out, path)?;
+                    unreachable!()
+                }
+            };
+            bail!("linked path {reason}: {}; worktree kept", path.display());
+        }
+        out.stdout.trim().to_string()
+    } else {
+        let canonical_root = root.canonicalize()?;
+        let canonical = path
+            .canonicalize()
+            .with_context(|| format!("linked path missing: {}", path.display()))?;
+        if !canonical.starts_with(&canonical_root) {
+            bail!(
+                "linked path is not inside the worktree: {}; worktree kept",
+                path.display()
+            );
+        }
+        for ancestor in path.ancestors().take_while(|p| *p != root) {
+            if std::fs::symlink_metadata(ancestor)?
+                .file_type()
+                .is_symlink()
+            {
+                bail!(
+                    "linked path is not a regular file (symlink): {}; worktree kept",
+                    path.display()
+                );
+            }
+        }
+        if !std::fs::metadata(path)?.is_file() {
+            bail!(
+                "linked path is not a regular repo file: {}; worktree kept",
+                path.display()
+            );
+        }
+        if git(
+            ctx.runner,
+            &record.worktree_path,
+            &["ls-files", "-z", "--", &spec],
+            GIT_TIMEOUT,
+        )?
+        .is_empty()
+        {
+            bail!(
+                "linked path is an untracked repo file: {}; worktree kept",
+                path.display()
+            );
+        }
+        if !git(
+            ctx.runner,
+            &record.worktree_path,
+            &[
+                "status",
+                "--porcelain",
+                "-z",
+                "--untracked-files=all",
+                "--",
+                &spec,
+            ],
+            GIT_TIMEOUT,
+        )?
+        .is_empty()
+        {
+            bail!(
+                "linked path is an uncommitted repo file: {}; worktree kept",
+                path.display()
+            );
+        }
+        git(
+            ctx.runner,
+            &record.worktree_path,
+            &["hash-object", "--no-filters", "--", &path.to_string_lossy()],
+            GIT_TIMEOUT,
+        )?
+    };
+    // After placement `base` is the frozen start SHA, not a branch name.
+    // Use the same current integration checkout as finished_worktree_reason.
+    let integration = crate::git::symbolic_head(ctx.runner, &record.repo)?;
+    let head = crate::git::rev_parse(
+        ctx.runner,
+        &record.repo,
+        &format!("refs/heads/{integration}"),
+    )?;
+    let blob = git(
+        ctx.runner,
+        &record.repo,
+        &[
+            "ls-tree",
+            "--format=%(objecttype) %(objectname)",
+            &head,
+            "--",
+            &spec,
+        ],
+        GIT_TIMEOUT,
+    )?;
+    if blob != format!("blob {hash}") {
+        bail!(
+            "linked repo file content is not committed on integration branch `{integration}`: {}; worktree kept",
+            relative.display()
+        );
+    }
+    Ok(())
+}
+
 fn draft_has_existing_links(
     ctx: &Ctx,
     project: &Project,
@@ -4320,12 +4497,18 @@ fn draft_has_existing_links(
     let mut missing = Vec::new();
     let mut existing = false;
     for (_, dest) in report_destinations(text) {
-        if let Some(relative) = linked_relative_path(project, record, &dest)? {
-            if linked_file_missing(ctx, record, &relative)? {
-                missing.push(dest);
-            } else {
-                existing = true;
+        match linked_relative_path(project, record, &dest)? {
+            Some(ReportLink::Thread(relative)) => {
+                if linked_file_missing(ctx, record, &relative)? {
+                    missing.push(dest);
+                } else {
+                    existing = true;
+                }
             }
+            Some(ReportLink::Repo { relative, source }) => {
+                repo_link_kept(ctx, record, &relative, &source)?;
+            }
+            None => (),
         }
     }
     thread::update(project, &record.id, |t| {
@@ -4424,8 +4607,14 @@ fn preserve_report_links(ctx: &Ctx, project: &Project, record: &Thread) -> Resul
     let mut total = 0_u64;
     let mut missing = Vec::new();
     for (range, dest) in destinations {
-        let Some(relative) = linked_relative_path(project, record, &dest)? else {
-            continue;
+        let relative = match linked_relative_path(project, record, &dest)? {
+            Some(ReportLink::Thread(relative)) => relative,
+            Some(ReportLink::Repo { relative, source }) => {
+                // Git keeps this content on integration; leave the link as written.
+                repo_link_kept(ctx, record, &relative, &source)?;
+                continue;
+            }
+            None => continue,
         };
         let linked = linked_files(ctx, record, &relative).inspect_err(|_| {
             // Keep the missing-link record useful, without letting a missing
@@ -5425,6 +5614,205 @@ mod tests {
         .unwrap();
     }
 
+    fn repo_link_fixture(remote: bool) -> (crate::testkit::Fx, Thread) {
+        use crate::testkit::{commit_file, fixture, git};
+
+        let fx = fixture();
+        commit_file(
+            &fx.repo,
+            "figures/3d/gaba-dose/curves.svg",
+            "<svg/>\n",
+            "figure",
+        );
+        let (id, _) = fx.lane(1);
+        let old = thread::load(&fx.project, &id).unwrap();
+        let base = git(&fx.repo, &["rev-parse", "main"]);
+        git(
+            Path::new(&old.worktree_path),
+            &["branch", "-m", "hp/demo/t-0001"],
+        );
+        git(&fx.repo, &["merge", "--ff-only", "hp/demo/t-0001"]);
+        let merged = commit_file(&fx.repo, "other.txt", "unrelated", "integration advances");
+        std::fs::write(
+            fx.repo.join(".git/info/exclude"),
+            ".worktrees/\n.herdr-project/\n",
+        )
+        .unwrap();
+        if remote {
+            linked_test_box(&fx.world);
+            // Run the box protocol on the fixture's independent git checkout.
+            fx.world.runner.on_fn(
+                |cmd| cmd.program == "ssh",
+                |cmd| {
+                    let output = std::process::Command::new("sh")
+                        .args(["-c", cmd.args.last().unwrap()])
+                        .output()?;
+                    Ok(crate::runner::Output {
+                        code: output.status.code(),
+                        stdout: String::from_utf8(output.stdout)?,
+                        stderr: String::from_utf8(output.stderr)?,
+                        timed_out: false,
+                    })
+                },
+            );
+            let (mut settings, body) = fx.project.read_project_md().unwrap();
+            settings.repos[0].box_path = Some(fx.repo.to_string_lossy().into_owned());
+            settings.repos[0].publish_url = Some(fx.repo.to_string_lossy().into_owned());
+            std::fs::write(
+                fx.project.project_md(),
+                format!("+++\n{}+++\n\n{body}", toml::to_string(&settings).unwrap()),
+            )
+            .unwrap();
+        }
+        let lane = thread::update(&fx.project, &id, |t| {
+            t.branch = "hp/demo/t-0001".into();
+            t.base = base;
+            t.thread_dir = format!("{}/.herdr-project/demo-{}", t.worktree_path, t.id);
+            t.status = Status::Resolved;
+            t.merged_sha = merged;
+            if remote {
+                t.machine = "buildbox".into();
+                t.machine_id = "buildbox-id".into();
+            }
+        })
+        .unwrap();
+        std::fs::create_dir_all(&lane.thread_dir).unwrap();
+        (fx, lane)
+    }
+
+    #[test]
+    fn integration_keeps_repo_links_for_final_copy_and_kept_removal_on_mac_and_box() {
+        for remote in [false, true] {
+            let (fx, lane) = repo_link_fixture(remote);
+            let report = "[Figure](../../figures/3d/gaba-dose/curves.svg#plot)\n";
+            std::fs::write(Path::new(&lane.thread_dir).join("report.md"), report).unwrap();
+            seal_linked_report(&fx.project, &lane, report);
+            let ctx = fx.world.ctx();
+            preserve_report_links(&ctx, &fx.project, &lane).unwrap();
+            assert_eq!(
+                final_copy(&ctx, &fx.project, &lane).outcome,
+                CopyOutcome::Complete
+            );
+            let saved = thread::load(&fx.project, &lane.id).unwrap();
+            assert_eq!(
+                std::fs::read_to_string(thread::final_report_path(&fx.project, &saved).unwrap())
+                    .unwrap(),
+                report
+            );
+            let figure_hash = thread::sha256_hex(b"<svg/>\n");
+            assert!(!crate::events::artifact_path(&fx.project, &figure_hash).exists());
+            remove_kept_worktree(&ctx, "demo", &lane.id).unwrap();
+            assert!(!Path::new(&lane.worktree_path).exists());
+            assert!(
+                thread::load(&fx.project, &lane.id)
+                    .unwrap()
+                    .worktree_path
+                    .is_empty()
+            );
+        }
+    }
+
+    #[test]
+    fn dirty_kept_worktree_refusal_names_first_unstaged_path_on_mac_and_box() {
+        for remote in [false, true] {
+            let (fx, lane) = repo_link_fixture(remote);
+            seal_linked_report(&fx.project, &lane, "Done.\n");
+            std::fs::write(
+                Path::new(&lane.worktree_path).join("README.md"),
+                "modified\n",
+            )
+            .unwrap();
+            let error = remove_kept_worktree(&fx.world.ctx(), "demo", &lane.id).unwrap_err();
+            assert_eq!(error.to_string(), "worktree_dirty: README.md", "{remote}");
+            assert!(Path::new(&lane.worktree_path).exists());
+        }
+    }
+
+    #[test]
+    fn repo_link_refusals_keep_worktrees_on_mac_and_box() {
+        use crate::testkit::{commit_file, git};
+        use std::os::unix::fs::symlink;
+
+        for remote in [false, true] {
+            for case in [
+                "untracked",
+                "modified",
+                "staged",
+                "lane-only",
+                "different-blob",
+                "outside",
+                "symlink",
+                "symlink-parent",
+            ] {
+                let (fx, lane) = repo_link_fixture(remote);
+                let root = Path::new(&lane.worktree_path);
+                let figure = "figures/3d/gaba-dose/curves.svg";
+                let (dest, reason) = match case {
+                    "untracked" => {
+                        std::fs::write(root.join("untracked.svg"), "<svg/>").unwrap();
+                        ("../../untracked.svg", "untracked repo file")
+                    }
+                    "modified" | "staged" => {
+                        std::fs::write(root.join(figure), "changed").unwrap();
+                        if case == "staged" {
+                            git(root, &["add", figure]);
+                        }
+                        (
+                            "../../figures/3d/gaba-dose/curves.svg",
+                            "uncommitted repo file",
+                        )
+                    }
+                    "lane-only" => {
+                        commit_file(root, "lane-only.svg", "new", "lane-only figure");
+                        ("../../lane-only.svg", "not committed on integration branch")
+                    }
+                    "different-blob" => {
+                        commit_file(root, figure, "different", "change figure only in lane");
+                        (
+                            "../../figures/3d/gaba-dose/curves.svg",
+                            "not committed on integration branch",
+                        )
+                    }
+                    "outside" => ("../../../outside.svg", "not inside the worktree"),
+                    "symlink" => {
+                        std::fs::write(fx.world.home.path().join("outside.svg"), "outside")
+                            .unwrap();
+                        symlink(
+                            fx.world.home.path().join("outside.svg"),
+                            root.join("escape.svg"),
+                        )
+                        .unwrap();
+                        ("../../escape.svg", "not inside the worktree")
+                    }
+                    "symlink-parent" => {
+                        let outside = fx.world.home.path().join("outside-dir");
+                        std::fs::create_dir_all(outside.join("nested")).unwrap();
+                        std::fs::write(outside.join("outside.svg"), "outside").unwrap();
+                        symlink(outside.join("nested"), root.join("link")).unwrap();
+                        ("../../link/../outside.svg", "not inside the worktree")
+                    }
+                    _ => unreachable!(),
+                };
+                let report = format!("[Figure]({dest})\n");
+                seal_linked_report(&fx.project, &lane, &report);
+                let error = remove_kept_worktree(&fx.world.ctx(), "demo", &lane.id).unwrap_err();
+                let detail = format!("{error:#}");
+                assert!(
+                    detail.contains("linked_files_not_kept"),
+                    "{remote}/{case}: {detail}"
+                );
+                assert!(detail.contains(reason), "{remote}/{case}: {detail}");
+                assert!(root.exists());
+                assert!(
+                    !thread::load(&fx.project, &lane.id)
+                        .unwrap()
+                        .worktree_path
+                        .is_empty()
+                );
+            }
+        }
+    }
+
     #[test]
     fn linked_folders_complete_final_copy_on_mac_and_box() {
         for remote in [false, true] {
@@ -5574,16 +5962,20 @@ mod tests {
     }
 
     #[test]
-    fn relative_report_link_cannot_escape_the_thread_folder() {
+    fn relative_report_link_cannot_escape_the_worktree() {
         let world = crate::scenarios::World::new();
         let project = world.project("demo", "a.sock");
         let lane = world.thread(&project, world.home.path(), |_| {});
-        for dest in ["../outside", "%2e%2e/outside", "%2foutside"] {
+        for dest in [
+            "../../../outside",
+            "%2e%2e/%2e%2e/%2e%2e/outside",
+            "%2foutside",
+        ] {
             assert!(
                 linked_relative_path(&project, &lane, dest)
                     .unwrap_err()
                     .to_string()
-                    .contains("not inside the thread folder")
+                    .contains("not inside the worktree")
             );
         }
     }

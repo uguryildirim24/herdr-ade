@@ -397,6 +397,26 @@ mod tests {
     use super::*;
 
     #[test]
+    fn first_unstaged_status_path_reaches_local_and_box_inspection_verbatim() {
+        use crate::runner::fake::{FakeRunner, ok};
+
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().to_string_lossy();
+        let status = " M README.md\0 M scripts/circuit_tour.py\0";
+        let runner = FakeRunner::new();
+        runner.on("status --porcelain", ok(status));
+        let local = inspect_local(&runner, &path, &path, &[], false).unwrap();
+        assert_eq!(local.dirty, ["README.md", "scripts/circuit_tour.py"]);
+        let box_runner = FakeRunner::new();
+        box_runner.on(
+            "status --porcelain",
+            ok(&format!("{status}\0__HERDR_NESTED_WORKTREES__\0")),
+        );
+        let boxed = inspect_remote(&box_runner, "box", "/bin", &path, &[], false).unwrap();
+        assert_eq!(boxed.dirty, local.dirty);
+    }
+
+    #[test]
     fn nul_status_consumes_rename_and_copy_original_paths() {
         for status in ["R ", " R", "C ", " C", "RM", "MC"] {
             let text =

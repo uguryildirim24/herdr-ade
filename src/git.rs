@@ -23,6 +23,11 @@ pub(crate) struct RepoLock {
 }
 
 fn git(runner: &dyn Runner, repo: &str, args: &[&str], timeout: Duration) -> Result<String> {
+    Ok(git_raw(runner, repo, args, timeout)?.trim().to_string())
+}
+
+// Porcelain status has significant leading spaces and NUL-framed paths.
+fn git_raw(runner: &dyn Runner, repo: &str, args: &[&str], timeout: Duration) -> Result<String> {
     let out = runner.run(
         &Cmd::new("git", timeout)
             .args(["-C", repo])
@@ -38,7 +43,7 @@ fn git(runner: &dyn Runner, repo: &str, args: &[&str], timeout: Duration) -> Res
     if !out.success() {
         bail!("git {}: {}", args.join(" "), out.error_text());
     }
-    Ok(out.stdout.trim().to_string())
+    Ok(out.stdout)
 }
 
 /// Snapshot the repository without invoking git again: the timed-out git may
@@ -195,7 +200,7 @@ pub(crate) fn worktree_status_with_ignored(
     repo: &str,
     path: &str,
 ) -> Result<String> {
-    git(
+    git_raw(
         runner,
         repo,
         &[
