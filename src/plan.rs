@@ -6,7 +6,7 @@
 //! and the durable work records under the plan writer lock and writes only on
 //! change. It never rewrites the goal into the coordinator's wording.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs::File;
 use std::path::{Path, PathBuf};
 
@@ -555,14 +555,30 @@ fn find_step<'a>(plan: &'a mut Plan, id: &str) -> Result<&'a mut PlanStep> {
 pub(crate) fn show(ctx: &Ctx, slug: &str, json: bool) -> Result<String> {
     let project = Project::load(&ctx.root, slug)?;
     let mut plan = load(&project)?;
+    let evidence = crate::task::EvidenceSnapshot::load(&project);
     if let Some(card) = &mut plan {
-        project_states(&project, card);
+        project_states_with_evidence(&project, card, &evidence);
     }
+    let holds = plan
+        .as_ref()
+        .map(|card| failed_check_holds(&project, card, &evidence))
+        .unwrap_or_default();
     if json {
         let view = match &plan {
             Some(plan) => {
                 let mut value = serde_json::to_value(plan)?;
                 value["present"] = serde_json::json!(true);
+                for step in value["steps"].as_array_mut().into_iter().flatten() {
+                    add_hold_json(step, &holds);
+                    if let Some(subtasks) = step
+                        .get_mut("subtasks")
+                        .and_then(|value| value.as_array_mut())
+                    {
+                        for sub in subtasks {
+                            add_hold_json(sub, &holds);
+                        }
+                    }
+                }
                 value
             }
             None => serde_json::json!({
@@ -628,6 +644,9 @@ pub(crate) fn show(ctx: &Ctx, slug: &str, json: bool) -> Result<String> {
             step.text,
             refs
         ));
+        if let Some(hold) = holds.get(&step.id) {
+            out.push_str(&format!("{indent}  {}\n", hold.message()));
+        }
     }
     Ok(out)
 }
@@ -704,8 +723,13 @@ pub(crate) fn check_attempt_prerequisites(project: &Project, thread_id: &str) ->
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum SyncOutcome {
     Missing,
-    Unchanged { revision: u64 },
-    Changed { revision: u64 },
+    Unchanged {
+        revision: u64,
+        holds: BTreeMap<String, FailedCheckHold>,
+    },
+    Changed {
+        revision: u64,
+    },
 }
 
 /// `ha plan sync`: derive states from the bound work records and write only
@@ -716,10 +740,12 @@ pub(crate) fn sync(ctx: &Ctx, slug: &str) -> Result<SyncOutcome> {
     let Some(mut plan) = load(&project)? else {
         return Ok(SyncOutcome::Missing);
     };
-    if !project_states(&project, &mut plan) {
+    let evidence = crate::task::EvidenceSnapshot::load(&project);
+    if !project_states_with_evidence(&project, &mut plan, &evidence) {
         crate::project::refresh_page(&project)?;
         return Ok(SyncOutcome::Unchanged {
             revision: plan.revision,
+            holds: failed_check_holds(&project, &plan, &evidence),
         });
     }
     plan.revision += 1;
@@ -822,6 +848,123 @@ fn has_own_work(step: &PlanStep, tasks: &[crate::task::Task]) -> bool {
                 && (task.plan_step.as_deref() == Some(step.id.as_str())
                     || step.tasks.contains(&task.id))
         })
+}
+
+/// A display-only explanation: no new persisted state or completion rule.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub(crate) struct HoldingCheck {
+    pub(crate) lane_id: String,
+    pub(crate) task_id: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub(crate) struct FailedCheckHold {
+    pub(crate) checks: Vec<HoldingCheck>,
+    pub(crate) next: String,
+}
+
+impl FailedCheckHold {
+    pub(crate) fn message(&self) -> String {
+        let checks = self
+            .checks
+            .iter()
+            .map(|check| match &check.task_id {
+                Some(task) => format!("{} ({task})", check.lane_id),
+                None => check.lane_id.clone(),
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        format!("held by failed check {checks}; {}", self.next)
+    }
+}
+
+fn add_hold_json(value: &mut serde_json::Value, holds: &BTreeMap<String, FailedCheckHold>) {
+    if let Some(hold) = value["id"].as_str().and_then(|id| holds.get(id)) {
+        value["failed_check_hold"] = serde_json::json!({
+            "checks": hold.checks,
+            "next": hold.next,
+            "message": hold.message(),
+        });
+    }
+}
+
+/// Explain only steps whose work is otherwise satisfied. Reuse the same
+/// terminal evidence as derivation, including missing bindings and children.
+pub(crate) fn failed_check_holds(
+    project: &Project,
+    plan: &Plan,
+    evidence: &crate::task::EvidenceSnapshot,
+) -> BTreeMap<String, FailedCheckHold> {
+    let (tasks, errors) = crate::task::list_with_errors(project);
+    if !errors.is_empty() || !evidence.readable() {
+        return BTreeMap::new();
+    }
+    all_steps(plan).filter(|step| step.state == StepState::Running).filter_map(|step| {
+        let checks = terminal_checks(project, step, evidence, &tasks)?;
+        if checks.is_empty() {
+            return None;
+        }
+        let next = "get a fresh critic verdict (re-check, sealed PASS), or unlink the check task with a reason".into();
+        Some((step.id.clone(), FailedCheckHold { checks, next }))
+    }).collect()
+}
+
+fn terminal_checks(
+    project: &Project,
+    step: &PlanStep,
+    evidence: &crate::task::EvidenceSnapshot,
+    tasks: &[crate::task::Task],
+) -> Option<Vec<HoldingCheck>> {
+    if step
+        .tasks
+        .iter()
+        .any(|id| !tasks.iter().any(|task| &task.id == id))
+    {
+        return None;
+    }
+    if !has_own_work(step, tasks) && step.subtasks.is_empty() {
+        return None;
+    }
+    let mut checks = Vec::new();
+    for task in tasks.iter().filter(|task| {
+        task.dropped.is_empty()
+            && (step.tasks.contains(&task.id) || task.plan_step.as_deref() == Some(&step.id))
+    }) {
+        let view = crate::task::view_with_evidence(project, task.clone(), evidence);
+        if !view.terminal_with_evidence(project, evidence) {
+            return None;
+        }
+        if let Some(lane_id) = task_failed_check(project, task, evidence) {
+            checks.push(HoldingCheck {
+                lane_id,
+                task_id: Some(task.id.clone()),
+            });
+        }
+    }
+    for id in &step.threads {
+        let lane = thread::load(project, id).ok()?;
+        if !crate::review::lane_done(project, &lane, evidence.events()) {
+            return None;
+        }
+        if critic_failed(project, &lane, evidence)
+            && !checks.iter().any(|check| &check.lane_id == id)
+        {
+            let task_id = tasks
+                .iter()
+                .find(|task| task.attempts.last() == Some(id))
+                .map(|task| task.id.clone());
+            checks.push(HoldingCheck {
+                lane_id: id.clone(),
+                task_id,
+            });
+        }
+    }
+    for sub in &step.subtasks {
+        checks.extend(terminal_checks(project, sub, evidence, tasks)?);
+    }
+    let mut seen = BTreeSet::new();
+    checks.retain(|check| seen.insert((check.lane_id.clone(), check.task_id.clone())));
+    Some(checks)
 }
 
 fn critic_failed(
@@ -1463,6 +1606,132 @@ mod tests {
         .unwrap();
         check_prerequisites(&fx.project, "job-0002").unwrap();
         check_attempt_prerequisites(&fx.project, &deferred).unwrap();
+    }
+
+    #[test]
+    fn finished_spec_two_failed_checks_and_fold_explain_the_hold_until_both_pass() {
+        let fx = fixture();
+        let ctx = fx.world.ctx();
+        for id in ["job-0001", "job-0002", "job-0003", "job-0004"] {
+            write_task(&fx, id);
+        }
+        step_add(
+            &ctx,
+            "demo",
+            "Plan one-click apply",
+            vec![
+                "job-0001".into(),
+                "job-0002".into(),
+                "job-0003".into(),
+                "job-0004".into(),
+            ],
+            vec![],
+            None,
+        )
+        .unwrap();
+        let mut lanes = Vec::new();
+        for n in 1..=4 {
+            let (id, sha) = fx.lane(n);
+            crate::task::link_attempt(&fx.project, &format!("job-{n:04}"), &id).unwrap();
+            crate::thread::update(&fx.project, &id, |lane| {
+                lane.role = if n == 2 || n == 3 { "critic" } else { "lane" }.into();
+            })
+            .unwrap();
+            if n != 4 {
+                let report = if n == 1 {
+                    "# spec v1\n"
+                } else {
+                    "+++\nverdict = \"FAIL\"\n+++\nneeds work\n"
+                };
+                fx.seal_done(&id, 1, 1, &sha, report);
+                crate::thread::update(&fx.project, &id, |lane| lane.merged_sha = sha.clone())
+                    .unwrap();
+            }
+            lanes.push((id, sha));
+        }
+        // The fold is genuinely unfinished: retain the existing wording.
+        let unfinished = show(&ctx, "demo", false).unwrap();
+        assert!(unfinished.contains("running s-1"), "{unfinished}");
+        assert!(!unfinished.contains("held by failed check"), "{unfinished}");
+        fx.seal_done(&lanes[3].0, 1, 1, &lanes[3].1, "# fold into v2\n");
+        crate::thread::update(&fx.project, &lanes[3].0, |lane| {
+            lane.merged_sha = lanes[3].1.clone()
+        })
+        .unwrap();
+        let expected = format!(
+            "held by failed check {} (job-0002), {} (job-0003)",
+            lanes[1].0, lanes[2].0
+        );
+        let text = show(&ctx, "demo", false).unwrap();
+        assert!(text.contains(&expected), "{text}");
+        assert!(
+            text.contains("fresh critic verdict (re-check, sealed PASS)"),
+            "{text}"
+        );
+        assert!(
+            text.contains("unlink the check task with a reason"),
+            "{text}"
+        );
+        let json: serde_json::Value =
+            serde_json::from_str(&show(&ctx, "demo", true).unwrap()).unwrap();
+        assert_eq!(json["steps"][0]["state"], "running");
+        assert_eq!(
+            json["steps"][0]["failed_check_hold"]["checks"],
+            serde_json::json!([
+                {"lane_id": lanes[1].0, "task_id": "job-0002"},
+                {"lane_id": lanes[2].0, "task_id": "job-0003"},
+            ])
+        );
+        assert!(matches!(
+            sync(&ctx, "demo").unwrap(),
+            SyncOutcome::Changed { .. }
+        ));
+        let SyncOutcome::Unchanged { holds, .. } = sync(&ctx, "demo").unwrap() else {
+            panic!("the state was already running")
+        };
+        assert!(holds["s-1"].message().contains(&expected));
+        let digest = crate::coordinator::digest(&ctx, &fx.project, "ha")
+            .unwrap()
+            .0;
+        assert!(digest.contains(&expected), "{digest}");
+        assert!(
+            digest.contains("unlink the check task with a reason"),
+            "{digest}"
+        );
+        // A replacement PASS from one checker cannot hide the other's FAIL.
+        fx.seal_done(
+            &lanes[1].0,
+            1,
+            2,
+            &lanes[1].1,
+            "+++\nverdict = \"PASS\"\n+++\napproved\n",
+        );
+        let text = show(&ctx, "demo", false).unwrap();
+        assert!(
+            text.contains(&format!("held by failed check {} (job-0003)", lanes[2].0)),
+            "{text}"
+        );
+        fx.seal_done(
+            &lanes[2].0,
+            1,
+            2,
+            &lanes[2].1,
+            "+++\nverdict = \"PASS\"\n+++\napproved\n",
+        );
+        let json: serde_json::Value =
+            serde_json::from_str(&show(&ctx, "demo", true).unwrap()).unwrap();
+        assert_eq!(json["steps"][0]["state"], "done");
+        assert!(json["steps"][0].get("failed_check_hold").is_none());
+        assert!(matches!(
+            sync(&ctx, "demo").unwrap(),
+            SyncOutcome::Changed { .. }
+        ));
+        assert!(
+            !crate::coordinator::digest(&ctx, &fx.project, "ha")
+                .unwrap()
+                .0
+                .contains("held by failed check")
+        );
     }
 
     #[test]

@@ -2953,7 +2953,30 @@ fn plan_nudge(
     if !asks.is_empty() && next.is_none() {
         return Ok(());
     }
-    let line = if !asks.is_empty() {
+    let holds = crate::plan::failed_check_holds(
+        project,
+        plan,
+        &crate::task::EvidenceSnapshot::load(project),
+    );
+    let held = left
+        .iter()
+        .filter_map(|step| {
+            holds
+                .get(&step.id)
+                .map(|hold| format!("{}: {}", step.id, hold.message()))
+        })
+        .collect::<Vec<_>>();
+    let held_count = held.len();
+    let work_left = if held_count == 0 {
+        format!("{} steps are left", left.len())
+    } else {
+        format!(
+            "{} steps have unfinished work; {} held by failed checks",
+            left.len() - held_count,
+            held_count
+        )
+    };
+    let mut line = if !asks.is_empty() {
         let next = next.expect("open asks require an independent step");
         format!(
             "{} Rolf has an unanswered ask; independent step {} is ready. Start only work that does not require that answer.",
@@ -2962,15 +2985,16 @@ fn plan_nudge(
         )
     } else if let Some(next) = next {
         format!(
-            "{} Nothing is running and {} steps are left. Next: {} {}. Start its lanes, or ask Rolf if it needs his call.",
+            "{} Nothing is running and {}. Next: {} {}. Start its lanes, or ask Rolf if it needs his call.",
             steps::TICKER_PROMPT_PREFIX,
-            left.len(),
+            work_left,
             next.id,
             next.text
         )
     } else {
         let waiting = left
             .iter()
+            .filter(|step| !holds.contains_key(&step.id))
             .map(|step| {
                 if step.state == crate::contracts::StepState::Running {
                     format!("{} is still running", step.id)
@@ -2981,12 +3005,19 @@ fn plan_nudge(
             .collect::<Vec<_>>()
             .join("; ");
         format!(
-            "{} Nothing is running and {} steps are left. {}.",
+            "{} Nothing is running and {}. {}",
             steps::TICKER_PROMPT_PREFIX,
-            left.len(),
-            waiting
+            work_left,
+            if waiting.is_empty() {
+                waiting
+            } else {
+                format!("{waiting}.")
+            }
         )
     };
+    if !held.is_empty() {
+        line.push_str(&format!(" {}.", held.join("; ")));
+    }
     if steps::deliver_coordinator_prompt(project, herdr, &coordinator.pane_id, &line)? {
         state.plan_nudged = true;
     }
@@ -5351,6 +5382,111 @@ mod tests {
             ..Default::default()
         };
         (f, runner, agent)
+    }
+
+    #[test]
+    fn idle_nudge_distinguishes_failed_checks_from_unfinished_work() {
+        let fx = crate::testkit::fixture();
+        let ctx = fx.world.ctx();
+        fx.world.runner.on("pane read", ok("❯ \n"));
+        fx.world.runner.on("agent prompt", ok(r#"{"result":{}}"#));
+        let mut tasks = Vec::new();
+        let mut critics = Vec::new();
+        for n in 1..=3 {
+            let (id, sha) = fx.lane(n);
+            let job = format!("job-{n:04}");
+            let task = crate::task::Task {
+                id: job.clone(),
+                title: "Check or fold".into(),
+                authority: vec!["request:q-1".into()],
+                acceptance: vec!["The change lands.".into()],
+                attempts: vec![id.clone()],
+                ..Default::default()
+            };
+            std::fs::write(
+                fx.project
+                    .state_dir()
+                    .join("tasks")
+                    .join(format!("{job}.toml")),
+                toml::to_string(&task).unwrap(),
+            )
+            .unwrap();
+            let report = if n < 3 {
+                "+++\nverdict = \"FAIL\"\n+++\nneeds work\n"
+            } else {
+                "# fold\n"
+            };
+            fx.seal_done(&id, 1, 1, &sha, report);
+            thread::update(&fx.project, &id, |lane| {
+                lane.role = if n < 3 { "critic" } else { "lane" }.into();
+                lane.merged_sha = sha;
+                lane.status = thread::Status::Resolved;
+            })
+            .unwrap();
+            if n < 3 {
+                critics.push((id, job.clone()));
+            }
+            tasks.push(job);
+        }
+        crate::plan::step_add(&ctx, "demo", "Checked plan", tasks, vec![], None).unwrap();
+        let c = fx.project.coordinator().unwrap();
+        let agent = Agent {
+            pane_id: c.pane_id.clone(),
+            tab_id: c.tab_id,
+            workspace_id: c.workspace_id,
+            cwd: c.cwd,
+            name: c.agent_name,
+            agent_status: "idle".into(),
+            ..Default::default()
+        };
+        let herdr = Herdr::new("herdr", &c.socket, &fx.world.runner);
+        let mut state = steps::load_state(&fx.project);
+        plan_nudge(
+            &fx.project,
+            &herdr,
+            std::slice::from_ref(&agent),
+            &mut state,
+        )
+        .unwrap();
+        let prompts = || {
+            fx.world
+                .runner
+                .calls
+                .borrow()
+                .iter()
+                .filter(|call| call.display().contains("agent prompt"))
+                .map(|call| call.display())
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        let held = prompts();
+        assert!(
+            held.contains("0 steps have unfinished work; 1 held by failed checks"),
+            "{held}"
+        );
+        assert!(
+            held.contains(&format!(
+                "held by failed check {} ({}), {} ({})",
+                critics[0].0, critics[0].1, critics[1].0, critics[1].1
+            )),
+            "{held}"
+        );
+        assert!(held.contains("re-check, sealed PASS"), "{held}");
+        assert!(
+            held.contains("unlink the check task with a reason"),
+            "{held}"
+        );
+        assert!(!held.contains("s-1 is still running"), "{held}");
+        // The separate next-work nudge must still name any held step.
+        fx.world.runner.calls.borrow_mut().clear();
+        crate::plan::step_add(&ctx, "demo", "Next outcome", vec![], vec![], None).unwrap();
+        plan_nudge(&fx.project, &herdr, &[agent], &mut state).unwrap();
+        let mixed = prompts();
+        assert!(
+            mixed.contains("1 steps have unfinished work; 1 held by failed checks. Next: s-2"),
+            "{mixed}"
+        );
+        assert!(mixed.contains("held by failed check t-"), "{mixed}");
     }
 
     #[test]

@@ -706,10 +706,19 @@ fn run_project_commands(ctx: &Ctx, command: Command) -> Result<()> {
                         crate::output::set_outcome("plan_missing");
                         println!("no plan is written down yet")
                     }
-                    plan::SyncOutcome::Unchanged { revision } => {
+                    plan::SyncOutcome::Unchanged { revision, holds } => {
                         crate::output::set_outcome("unchanged");
                         crate::output::insert("revision", revision);
-                        println!("plan revision {revision}: no step state changed")
+                        if !holds.is_empty() {
+                            crate::output::insert(
+                                "failed_check_holds",
+                                serde_json::to_value(&holds)?,
+                            );
+                        }
+                        println!("plan revision {revision}: no step state changed");
+                        for (id, hold) in holds {
+                            println!("{id}: {}", hold.message());
+                        }
                     }
                     plan::SyncOutcome::Changed { revision } => {
                         crate::output::insert("revision", revision);
