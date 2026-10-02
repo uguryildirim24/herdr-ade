@@ -682,11 +682,13 @@ pub(crate) fn check_prerequisites(project: &Project, job: &str) -> Result<()> {
                 } else {
                     prerequisite.state
                 };
-                if let Some(thread) = failed_check(project, prerequisite, &evidence) {
+                if let Some(check) = failed_check(project, prerequisite, &evidence) {
+                    let reason = check.diagnostic.as_deref().unwrap_or("verdict FAIL");
                     bail!(
-                        "plan_prerequisite: {job} cannot start; step {} waits for {} (check failed: {thread} verdict FAIL). Send the work back with ha thread prompt and get a fresh verdict, or change the plan.",
+                        "plan_prerequisite: {job} cannot start; step {} waits for {} (check failed: {} {reason}). Send the work back with ha thread prompt and get a fresh verdict, or change the plan.",
                         dependent.id,
-                        id
+                        id,
+                        check.lane_id
                     );
                 }
                 bail!(
@@ -855,6 +857,8 @@ fn has_own_work(step: &PlanStep, tasks: &[crate::task::Task]) -> bool {
 pub(crate) struct HoldingCheck {
     pub(crate) lane_id: String,
     pub(crate) task_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) diagnostic: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
@@ -868,9 +872,15 @@ impl FailedCheckHold {
         let checks = self
             .checks
             .iter()
-            .map(|check| match &check.task_id {
-                Some(task) => format!("{} ({task})", check.lane_id),
-                None => check.lane_id.clone(),
+            .map(|check| {
+                let name = match &check.task_id {
+                    Some(task) => format!("{} ({task})", check.lane_id),
+                    None => check.lane_id.clone(),
+                };
+                match &check.diagnostic {
+                    Some(reason) => format!("{name}: {reason}"),
+                    None => name,
+                }
             })
             .collect::<Vec<_>>()
             .join(", ");
@@ -934,11 +944,8 @@ fn terminal_checks(
         if !view.terminal_with_evidence(project, evidence) {
             return None;
         }
-        if let Some(lane_id) = task_failed_check(project, task, evidence) {
-            checks.push(HoldingCheck {
-                lane_id,
-                task_id: Some(task.id.clone()),
-            });
+        if let Some(check) = task_failed_check(project, task, evidence) {
+            checks.push(check);
         }
     }
     for id in &step.threads {
@@ -946,17 +953,14 @@ fn terminal_checks(
         if !crate::review::lane_done(project, &lane, evidence.events()) {
             return None;
         }
-        if critic_failed(project, &lane, evidence)
+        if let Some(mut check) = critic_check(project, &lane, evidence)
             && !checks.iter().any(|check| &check.lane_id == id)
         {
-            let task_id = tasks
+            check.task_id = tasks
                 .iter()
                 .find(|task| task.attempts.last() == Some(id))
                 .map(|task| task.id.clone());
-            checks.push(HoldingCheck {
-                lane_id: id.clone(),
-                task_id,
-            });
+            checks.push(check);
         }
     }
     for sub in &step.subtasks {
@@ -967,40 +971,51 @@ fn terminal_checks(
     Some(checks)
 }
 
-fn critic_failed(
+fn critic_check(
     project: &Project,
     lane: &thread::Thread,
     evidence: &crate::task::EvidenceSnapshot,
-) -> bool {
+) -> Option<HoldingCheck> {
     if lane.role != "critic" {
-        return false;
+        return None;
     }
-    // Keep a failed verdict blocking even while a follow-up invalidates its
-    // completion; only a later sealed PASS can replace that FAIL.
-    crate::events::latest_done_event(evidence.events(), &lane.id, lane.attempt.max(1))
-        .and_then(|event| event.payload.done.as_ref())
-        .and_then(|done| thread::artifact(project, &done.artifact).ok())
-        .and_then(|bytes| String::from_utf8(bytes).ok())
-        .and_then(|text| crate::lane::critic_verdict(&text))
-        .as_deref()
-        == Some("FAIL")
+    // Keep the latest sealed check blocking through a follow-up. Unreadable
+    // evidence is not a passing check; readable historical prose still counts.
+    let done = crate::events::latest_done_event(evidence.events(), &lane.id, lane.attempt.max(1))?
+        .payload
+        .done
+        .as_ref()?;
+    let report = thread::artifact(project, &done.artifact)
+        .and_then(|bytes| String::from_utf8(bytes).context("critic report is invalid UTF-8"));
+    let diagnostic = match report {
+        Ok(text) if crate::lane::critic_verdict(&text).as_deref() == Some("FAIL") => None,
+        Ok(_) => return None,
+        Err(error) => Some(format!("unreadable critic evidence: {error:#}")),
+    };
+    Some(HoldingCheck {
+        lane_id: lane.id.clone(),
+        task_id: None,
+        diagnostic,
+    })
 }
 
 fn task_failed_check(
     project: &Project,
     task: &crate::task::Task,
     evidence: &crate::task::EvidenceSnapshot,
-) -> Option<String> {
+) -> Option<HoldingCheck> {
     let id = task.attempts.last()?;
     let lane = thread::load(project, id).ok()?;
-    critic_failed(project, &lane, evidence).then_some(lane.id)
+    let mut check = critic_check(project, &lane, evidence)?;
+    check.task_id = Some(task.id.clone());
+    Some(check)
 }
 
 fn failed_check(
     project: &Project,
     step: &PlanStep,
     evidence: &crate::task::EvidenceSnapshot,
-) -> Option<String> {
+) -> Option<HoldingCheck> {
     let tasks = crate::task::list_with_errors(project).0;
     for task in tasks.iter().filter(|task| {
         task.dropped.is_empty()
@@ -1014,8 +1029,8 @@ fn failed_check(
         let Ok(lane) = thread::load(project, id) else {
             continue;
         };
-        if critic_failed(project, &lane, evidence) {
-            return Some(id.clone());
+        if let Some(check) = critic_check(project, &lane, evidence) {
+            return Some(check);
         }
     }
     for sub in &step.subtasks {
@@ -1084,7 +1099,7 @@ fn derive_state_from_tasks(
             Ok(lane) => {
                 any_started = true;
                 all_satisfied &= crate::review::lane_done(project, &lane, evidence.events())
-                    && !critic_failed(project, &lane, evidence);
+                    && critic_check(project, &lane, evidence).is_none();
             }
             Err(_) => all_satisfied = false,
         }
@@ -1804,6 +1819,107 @@ mod tests {
         check_prerequisites(&fx.project, "job-0003").unwrap();
         fx.seal_done(&critic, 1, 4, &sha, "# historical report\n");
         check_prerequisites(&fx.project, "job-0003").unwrap();
+    }
+
+    #[test]
+    fn corrupt_failed_critic_evidence_never_completes_a_step() {
+        for binding in ["task", "thread"] {
+            for fault in ["missing", "mismatch", "utf8"] {
+                let fx = fixture();
+                let ctx = fx.world.ctx();
+                write_task(&fx, "job-0001");
+                write_task(&fx, "job-0002");
+                let (critic, sha) = fx.lane(1);
+                thread::update(&fx.project, &critic, |t| {
+                    t.role = "critic".into();
+                    t.merged_sha = sha.clone();
+                })
+                .unwrap();
+                crate::task::link_attempt(&fx.project, "job-0001", &critic).unwrap();
+                step_add(
+                    &ctx,
+                    "demo",
+                    "Check the work",
+                    if binding == "task" {
+                        vec!["job-0001".into()]
+                    } else {
+                        vec![]
+                    },
+                    vec![],
+                    None,
+                )
+                .unwrap();
+                if binding == "thread" {
+                    // Historical plans can bind a lane directly.
+                    let mut plan = load(&fx.project).unwrap().unwrap();
+                    plan.steps[0].threads = vec![critic.clone()];
+                    write(&fx.project, &plan).unwrap();
+                }
+                step_add(
+                    &ctx,
+                    "demo",
+                    "Use the work",
+                    vec!["job-0002".into()],
+                    vec!["s-1".into()],
+                    None,
+                )
+                .unwrap();
+                let report = "+++\nverdict = \"FAIL\"\n+++\nneeds work\n";
+                let event_id = fx.seal_done(&critic, 1, 1, &sha, report);
+                let shown: serde_json::Value =
+                    serde_json::from_str(&show(&ctx, "demo", true).unwrap()).unwrap();
+                assert_eq!(shown["steps"][0]["state"], "running");
+                let artifact_path = fx
+                    .project
+                    .state_dir()
+                    .join("artifacts")
+                    .join(thread::sha256_hex(report.as_bytes()));
+                match fault {
+                    "missing" => std::fs::remove_file(artifact_path).unwrap(),
+                    "mismatch" => std::fs::write(artifact_path, "changed bytes").unwrap(),
+                    "utf8" => {
+                        // A hash-valid artifact still has to decode before its verdict can be trusted.
+                        let artifact = thread::store_artifact(&fx.project, &[0xff]).unwrap();
+                        let path = fx
+                            .project
+                            .state_dir()
+                            .join("events")
+                            .join(format!("{event_id}.toml"));
+                        let mut event: crate::contracts::Event =
+                            toml::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+                        event.payload.done.as_mut().unwrap().artifact = artifact;
+                        std::fs::write(path, toml::to_string(&event).unwrap()).unwrap();
+                    }
+                    _ => unreachable!(),
+                }
+                let shown: serde_json::Value =
+                    serde_json::from_str(&show(&ctx, "demo", true).unwrap()).unwrap();
+                assert_eq!(shown["steps"][0]["state"], "running", "{binding}: {fault}");
+                let diagnostic = match fault {
+                    "missing" => "brief_artifact_missing",
+                    "mismatch" => "brief_artifact_mismatch",
+                    _ => "invalid UTF-8",
+                };
+                assert!(show(&ctx, "demo", false).unwrap().contains(diagnostic));
+                assert!(
+                    shown["steps"][0]["failed_check_hold"]["checks"][0]["diagnostic"]
+                        .as_str()
+                        .unwrap()
+                        .contains(diagnostic)
+                );
+                assert!(
+                    check_prerequisites(&fx.project, "job-0002")
+                        .unwrap_err()
+                        .to_string()
+                        .contains(diagnostic)
+                );
+                sync(&ctx, "demo").unwrap();
+                assert_eq!(
+                    load(&fx.project).unwrap().unwrap().steps[0].state,
+                    StepState::Running
+                );
+            }
+        }
     }
 
     #[test]

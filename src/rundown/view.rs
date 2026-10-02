@@ -2,9 +2,9 @@
 //! list. Pure: JSON in, styled lines out, so the look is tested without a
 //! terminal.
 //!
-//! Only the plan card feeds it (`ha --json plan show`). Text that still reads
-//! like a file name, an id or a hash is left out, because the tab is for Rolf
-//! and never shows developer wording.
+//! Only the plan card feeds it (`ha --json plan show`). Prefer plain words,
+//! but never hide work: a technical-only row keeps its text without ids, or
+//! gets a neutral numbered label.
 
 use serde_json::Value;
 
@@ -25,24 +25,34 @@ pub(crate) struct Step {
 }
 
 impl Step {
-    fn from_plan(step: &Value) -> Step {
+    fn from_plan(step: &Value, number: &mut usize) -> Step {
+        *number += 1;
+        let original = step["text"].as_str().unwrap_or_default();
+        let mut text = plain(original).trim_end_matches('.').to_string();
+        if text.is_empty() {
+            text = original
+                .split_whitespace()
+                .filter(|word| !id_word(word))
+                .collect::<Vec<_>>()
+                .join(" ");
+        }
+        if text.is_empty() {
+            text = format!("step {number}");
+        }
         Step {
             mark: match step["state"].as_str().unwrap_or_default() {
                 "done" => Mark::Done,
                 "running" => Mark::Now,
                 _ => Mark::Later,
             },
-            text: plain(step["text"].as_str().unwrap_or_default())
-                .trim_end_matches('.')
-                .to_string(),
+            text,
             subtasks: list(&step["subtasks"])
                 .iter()
-                .map(Step::from_plan)
+                .map(|sub| Step::from_plan(sub, number))
                 .map(|sub| Step {
                     subtasks: Vec::new(),
                     ..sub
                 })
-                .filter(|sub| !sub.text.is_empty())
                 .collect(),
         }
     }
@@ -82,10 +92,10 @@ impl Card {
                 }
             }
         }
+        let mut number = 0;
         let steps = list(&plan["steps"])
             .iter()
-            .map(Step::from_plan)
-            .filter(|step| !step.text.is_empty())
+            .map(|step| Step::from_plan(step, &mut number))
             .collect();
         Card {
             title: title.trim().to_string(),
@@ -148,6 +158,14 @@ fn technical_word(word: &str) -> bool {
     {
         return true;
     }
+    id_word(word)
+}
+
+/// Record ids and hashes are removed even from a technical-only fallback.
+fn id_word(word: &str) -> bool {
+    let lower = word
+        .trim_matches(|c: char| ",.;:!?()[]\"'`".contains(c))
+        .to_ascii_lowercase();
     // Record ids: s-15, t-0508, job-0098, r198, w1:p2.
     if let Some((head, tail)) = lower.split_once('-')
         && (1..=4).contains(&head.len())
@@ -160,6 +178,15 @@ fn technical_word(word: &str) -> bool {
     if lower.len() >= 3
         && lower.starts_with(['r', 'w'])
         && lower[1..].chars().all(|c| c.is_ascii_digit())
+    {
+        return true;
+    }
+    if let Some((workspace, pane)) = lower.split_once(":p")
+        && workspace.starts_with('w')
+        && workspace.len() > 1
+        && workspace[1..].chars().all(|c| c.is_ascii_digit())
+        && !pane.is_empty()
+        && pane.chars().all(|c| c.is_ascii_digit())
     {
         return true;
     }
@@ -180,8 +207,15 @@ fn plain(text: &str) -> String {
     if !technical(&text) {
         return text;
     }
-    text.split_whitespace()
-        .filter(|word| !technical_word(word))
+    let words: Vec<_> = text.split_whitespace().collect();
+    words.iter().enumerate()
+        .filter(|(i, word)| {
+            !technical_word(word)
+                // Remove a preposition with its stripped object, not a dangling "in".
+                && !(matches!(word.to_ascii_lowercase().as_str(), "in" | "on" | "at" | "from" | "to" | "under")
+                    && words.get(i + 1).is_some_and(|next| technical_word(next)))
+        })
+        .map(|(_, word)| *word)
         .collect::<Vec<_>>()
         .join(" ")
 }
@@ -612,6 +646,40 @@ mod tests {
     }
 
     #[test]
+    fn path_only_steps_and_subtasks_survive_with_plan_counts() {
+        // The plan-show result, including text that the plain-words filter empties.
+        let plan = json!({"steps": [
+            {"id": "s-1", "state": "done", "text": "src/rundown/view.rs"},
+            {"id": "s-2", "state": "left", "text": "t-0508", "subtasks": [
+                {"id": "s-3", "state": "left", "text": "notes.md"},
+                {"id": "s-4", "state": "left", "text": "job-0001"},
+            ]},
+        ]});
+        let card = Card::from_plan("Demo", &plan);
+        let steps = plan["steps"].as_array().unwrap();
+        assert_eq!(card.steps.len(), steps.len());
+        assert_eq!(
+            card.count(Mark::Done),
+            steps.iter().filter(|s| s["state"] == "done").count()
+        );
+        assert_eq!(card.steps[0].text, "src/rundown/view.rs");
+        assert_eq!(card.steps[1].text, "step 2");
+        assert_eq!(card.steps[1].subtasks.len(), 2);
+        assert_eq!(card.steps[1].subtasks[0].text, "notes.md");
+        assert_eq!(card.steps[1].subtasks[1].text, "step 4");
+        let text = screen(&card, 80);
+        for row in [
+            "src/rundown/view.rs",
+            "step 2",
+            "notes.md",
+            "step 4",
+            "1 of 2",
+        ] {
+            assert!(text.contains(row), "{row}: {text}");
+        }
+    }
+
+    #[test]
     fn ids_hashes_and_paths_never_show() {
         for word in [
             "s-15",
@@ -639,7 +707,7 @@ mod tests {
         }
         assert_eq!(
             plain("Fix t-0508 so the tab in src/rundown shows."),
-            "Fix so the tab in shows."
+            "Fix so the tab shows."
         );
     }
 

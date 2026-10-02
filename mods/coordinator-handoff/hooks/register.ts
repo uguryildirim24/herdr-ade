@@ -45,7 +45,7 @@ export const register: Register = (on) => {
         [`${home}/.local/bin/ha`, 'handoff', slug, '--note-file', '-'],
         { stdin: note.text },
       );
-      if (handoff.exitCode !== 0 || !handoff.stdout.trim()) return next(e);
+      if (handoff.exitCode !== 0 || handoff.isStdoutTruncated || !handoff.stdout.trim()) return next(e);
       await $.ui.toast('coordinator handoff written');
       return { messages: [{ role: 'user', text: handoff.stdout, toolUses: [] }] };
     } catch {
