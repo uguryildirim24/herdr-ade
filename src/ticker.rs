@@ -727,12 +727,6 @@ fn tick_with_steps(
     if !projects.is_empty() && deferred.len() == projects.len() {
         return Some(true);
     }
-    if let Err(error) = crate::review::reclassify_old_changes(ctx, |message| log.line(message)) {
-        log.line(&format!("one-time change reclassification: {error:#}"));
-    }
-    if let Err(error) = crate::branches::sweep_once(ctx, |message| log.line(message)) {
-        log.line(&format!("one-time branch sweep: {error:#}"));
-    }
     let mut reachable = Vec::new();
     let mut readiness = BTreeMap::new();
     for slug in project::list_slugs(&ctx.root) {
@@ -2736,57 +2730,13 @@ fn remote_pass(
         _ => return Ok(()),
     };
 
-    // Before the label/id fix, declaration lookup consumed an attempt without
-    // submitting an agent and left the startup clock running. Reclaim an idle
-    // pane once; a later real start that times out must not reset the bounded
-    // launch counter forever.
-    let mut threads = pass.threads.to_vec();
-    for t in &mut threads {
-        if !matches!(t.status, thread::Status::Open | thread::Status::Starting)
-            || !t.prompt_pending
-            || t.startup_wait_started.is_empty()
-            || t.launch_attempts == 0
-            || t.startup_recovery_used
-            || (t.status == thread::Status::Starting
-                && thread::seconds_since(&t.startup_wait_started, jiff::Timestamp::now()).max(0)
-                    as u64
-                    * 1000
-                    < agent_start_timeout(&t.launch))
-            || agents.iter().any(|agent| agent.pane_id == t.pane_id)
-            || !panes.iter().any(|pane| thread::pane_matches(t, pane))
-        {
-            continue;
-        }
-        if !remote
-            .pane_process_info(&t.pane_id)
-            .is_ok_and(|info| info.pane_id == t.pane_id && info.foreground_processes.is_empty())
-        {
-            continue;
-        }
-        if crate::remote::declaration_for_route(
-            ctx.runner,
-            &ctx.env.herdr_bin(),
-            &ctx.config_dir,
-            t.machine_route(),
-        )
-        .is_ok()
-        {
-            let updated = thread::update(project, &t.id, |record| {
-                record.launch_attempts = 0;
-                record.startup_recovery_used = true;
-                record.startup_wait_started.clear();
-                record.status = thread::Status::Open;
-            })
-            .map_err(|e| format!("{e:#}"))?;
-            *t = updated;
-        }
-    }
+    let threads = pass.threads;
     let prefix = coordinator::current_prefix(&ctx.root).map_err(|e| format!("{e:#}"))?;
     let state_input = LaunchPass {
         ctx,
         project,
         herdr: &remote,
-        threads: &threads,
+        threads,
         agents: &agents,
         panes: &panes,
     };
@@ -2801,7 +2751,7 @@ fn remote_pass(
         project,
         steps::RemoteView {
             machine_id: &view.machine_id,
-            threads: &threads,
+            threads,
             agents: &agents,
             panes: &panes,
             boot_id: &view.boot_id,
@@ -2813,7 +2763,7 @@ fn remote_pass(
             ctx,
             project,
             herdr,
-            threads: &threads,
+            threads,
             agents: &agents,
             panes: &panes,
         },
@@ -4181,126 +4131,6 @@ mod tests {
         assert_eq!(rebound.identity.pane_id, rebound.pane_id);
         assert_eq!(rebound.identity.cwd, rebound.cwd);
         assert!(!rebound.identity.pane_id.is_empty());
-    }
-
-    #[test]
-    fn exhausted_box_start_with_saved_id_and_label_key_recovers_on_next_pass() {
-        let fixture = fixture(false);
-        std::fs::create_dir_all(fixture.root.join("cfg")).unwrap();
-        std::fs::write(
-            fixture.root.join("cfg/config.toml"),
-            crate::remote::TEST_MACHINE,
-        )
-        .unwrap();
-        let runner = FakeRunner::new();
-        runner.on(
-            "machine list --json",
-            ok(r#"[{"id":"machine-1","label":"buildbox","target":"box","session":"default","enabled":true}]"#),
-        );
-        let probes = std::rc::Rc::new(std::cell::Cell::new(0));
-        let counts = probes.clone();
-        runner.on_fn(
-            |cmd| cmd.display().contains("pane process-info"),
-            move |_| {
-                let n = counts.get();
-                counts.set(n + 1);
-                if n == 1 {
-                    Ok(ok(r#"{"result":{"process_info":{"pane_id":"w2:p1","foreground_processes":[{"pid":42,"name":"claude","argv0":"claude"}]}}}"#))
-                } else {
-                    Ok(ok(r#"{"result":{"process_info":{"pane_id":"w2:p1","foreground_processes":[]}}}"#))
-                }
-            },
-        );
-        runner.on(
-            "agent start",
-            ok(r#"{"result":{"agent":{"workspace_id":"w2","tab_id":"w2:t1","pane_id":"w2:p1"}}}"#),
-        );
-        let record = thread::allocate(&fixture.project, |t| {
-            t.status = thread::Status::Starting;
-            t.prompt_pending = true;
-            t.machine = "buildbox".into();
-            t.machine_id = "machine-1".into();
-            t.workspace_id = "w2".into();
-            t.tab_id = "w2:t1".into();
-            t.pane_id = "w2:p1".into();
-            t.cwd = "/box/lane".into();
-            t.agent_name = "hp-demo-t-0001".into();
-            t.launch.kind = "claude".into();
-            t.launch_attempts = thread::MAX_LAUNCH_ATTEMPTS;
-            t.startup_wait_started = "2020-01-01T00:00:00Z".into();
-        })
-        .unwrap();
-        let ctx = Ctx {
-            env: &fixture.env,
-            root: fixture.root.clone(),
-            config_dir: fixture.root.join("cfg"),
-            runner: &runner,
-            detached_ticker: false,
-        };
-        let herdr = Herdr::new("herdr", "", &runner);
-        let view = steps::CourierOutcome {
-            machine_id: "machine-1".into(),
-            boot_id: "boot".into(),
-            progress: Default::default(),
-            agents: Some(vec![]),
-            panes: Some(vec![Pane {
-                workspace_id: record.workspace_id.clone(),
-                tab_id: record.tab_id.clone(),
-                pane_id: record.pane_id.clone(),
-                cwd: record.cwd.clone(),
-            }]),
-        };
-        let mut errors = Vec::new();
-        remote_pass(
-            &LaunchPass {
-                ctx: &ctx,
-                project: &fixture.project,
-                herdr: &herdr,
-                threads: &[record],
-                agents: &[],
-                panes: &[],
-            },
-            "machine-1",
-            &view,
-            &mut true,
-            &mut errors,
-        )
-        .unwrap();
-        assert_eq!(runner.count("agent start"), 1, "{errors:#?}");
-        let saved = thread::load(&fixture.project, "t-0001").unwrap();
-        assert_eq!(saved.launch_attempts, 1);
-        assert!(saved.startup_recovery_used);
-        assert!(!saved.identity.pane_id.is_empty());
-        assert!(!saved.startup_wait_started.is_empty());
-
-        // A later submitted start can itself time out. It must not be
-        // reclaimed again and thereby evade the launch limit indefinitely.
-        let exhausted = thread::update(&fixture.project, &saved.id, |t| {
-            t.status = thread::Status::Starting;
-            t.launch_attempts = thread::MAX_LAUNCH_ATTEMPTS;
-            t.startup_wait_started = "2020-01-01T00:00:00Z".into();
-        })
-        .unwrap();
-        remote_pass(
-            &LaunchPass {
-                ctx: &ctx,
-                project: &fixture.project,
-                herdr: &herdr,
-                threads: &[exhausted],
-                agents: &[],
-                panes: &[],
-            },
-            "machine-1",
-            &view,
-            &mut true,
-            &mut errors,
-        )
-        .unwrap();
-        assert_eq!(runner.count("agent start"), 1, "{errors:#?}");
-        assert_eq!(
-            thread::load(&fixture.project, &saved.id).unwrap().status,
-            thread::Status::Failed
-        );
     }
 
     #[test]
