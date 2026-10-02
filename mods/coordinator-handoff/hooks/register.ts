@@ -41,26 +41,13 @@ export const register: Register = (on) => {
         timer?.cancel();
       }
       if (!note.isAnswered) return next(e);
-      // The replacement conversation needs the full snapshot, not the delta
-      // since this coordinator's last read. Peek keeps receipts untouched.
-      const context = await $.process.run([`${home}/.local/bin/ha`, 'context', slug, '--peek', '--full']);
-      if (context.exitCode !== 0) return next(e);
-      const requestsDir = `${cwd}/.state/requests`;
-      const records = (await $.fs.list(requestsDir))
-        .filter(entry => entry.kind === 'file' && entry.name.endsWith('.json'))
-        .sort((a, b) => a.name < b.name ? -1 : a.name > b.name ? 1 : 0)
-        .slice(-12);
-      const requests: string[] = [];
-      for (const record of records) {
-        const request = JSON.parse(await $.fs.read(`${requestsDir}/${record.name}`));
-        requests.push(`### ${request.id} · ${request.at}\n\n${request.text}`);
-      }
-      const utc = new Date(await $.clock.now()).toISOString();
-      const path = `${cwd}/.state/handoffs/${utc}.md`;
-      const handoff = `# Coordinator handoff\n\nThis replaced a compaction at ${utc}. Saved at ${path}.\n\n## Session note\n\n${note.text}\n\n## Harness context\n\n${context.stdout}\n\n## Rolf's latest messages (verbatim, oldest first)\n\n${requests.join('\n\n')}\n`;
-      await $.fs.write(path, handoff);
-      await $.ui.toast(`coordinator handoff written: ${path}`);
-      return { messages: [{ role: 'user', text: handoff, toolUses: [] }] };
+      const handoff = await $.process.run(
+        [`${home}/.local/bin/ha`, 'handoff', slug, '--note-file', '-'],
+        { stdin: note.text },
+      );
+      if (handoff.exitCode !== 0 || !handoff.stdout.trim()) return next(e);
+      await $.ui.toast('coordinator handoff written');
+      return { messages: [{ role: 'user', text: handoff.stdout, toolUses: [] }] };
     } catch {
       return next(e);
     }

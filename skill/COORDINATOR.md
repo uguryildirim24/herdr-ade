@@ -6,7 +6,7 @@ Use `ha` for the default root; for a non-default root, `ha context <slug>` print
 
 ## Every turn
 
-1. Run `ha context <slug>`. It shows changes since your last read; use `--full` for the entire page. Work from the changes and their action rows, not from memory.
+1. Run `ha context <slug>`. It shows changes since your last read; use `--full` for the entire page. Work from the changes and their action rows, not from memory. A fresh session can use `ha handoff <slug>` for a non-consuming, budgeted snapshot, including Rolf's latest 12 messages verbatim. `ha handoff <slug> --note-file <path|->` adds a session note, saves the handoff and keeps the newest 20. Compaction's mod calls this command; don't trim or assemble the handoff yourself. Cut notices point to the full context and task history.
 2. Handle unowned inbox messages with `ha inbox done <slug> <item>...`. Thread and review changes need no inbox acknowledgement.
 3. Act, then answer Rolf. Before ending a turn with plan steps left and nothing running, start work that can proceed. If the next step needs Rolf's call, ask the one question that blocks it in this chat; while waiting for his reply, keep unrelated work moving.
 

@@ -1154,7 +1154,7 @@ pub(crate) fn context(ctx: &Ctx, slug: &str, peek: bool, full: bool) -> Result<(
     let same_session = previous.as_ref().is_some_and(|before| {
         before.generation == current.generation && before.pane == current.pane
     });
-    let (mut text, shown, events) = digest_snapshot(ctx, &project, &prefix)?;
+    let (mut text, shown, events) = digest_snapshot(ctx, &project, &prefix, false)?;
     if !full {
         text = compact_page(
             &project,
@@ -1201,7 +1201,7 @@ pub(crate) fn context(ctx: &Ctx, slug: &str, peek: bool, full: bool) -> Result<(
 /// Test view of the digest and the inbox ids it showed.
 #[cfg(test)]
 pub(crate) fn digest(ctx: &Ctx, project: &Project, prefix: &str) -> Result<(String, Vec<String>)> {
-    let (text, items, _) = digest_snapshot(ctx, project, prefix)?;
+    let (text, items, _) = digest_snapshot(ctx, project, prefix, false)?;
     Ok((text, items))
 }
 
@@ -1286,14 +1286,25 @@ fn repo_snapshot(runner: &dyn crate::runner::Runner, path: &str) -> String {
     )
 }
 
+pub(crate) fn handoff_snapshot(ctx: &Ctx, project: &Project) -> Result<String> {
+    let prefix = current_prefix(&ctx.root)?;
+    Ok(digest_snapshot(ctx, project, &prefix, true)?.0)
+}
+
 fn digest_snapshot(
     ctx: &Ctx,
     project: &Project,
     prefix: &str,
+    handoff: bool,
 ) -> Result<(String, Vec<String>, Vec<crate::contracts::Event>)> {
     let mut out = String::new();
     match project.read_project_md() {
-        Ok((_, body)) => {
+        Ok((settings, body)) => {
+            let body = if handoff {
+                crate::project::page_body_with_history(project, &settings, Some(10))
+            } else {
+                body
+            };
             out.push_str(body.trim_end());
             out.push('\n');
         }
@@ -1322,7 +1333,7 @@ fn digest_snapshot(
 
     // Rolf's own words, each under its request id.
     let requests = crate::prompt::recent_requests(project, REQUEST_ROWS);
-    if !requests.is_empty() {
+    if !handoff && !requests.is_empty() {
         let _ = writeln!(
             out,
             "\n## Latest messages from Rolf — cite one with --basis request:<id>"
@@ -1681,7 +1692,7 @@ mod tests {
         project
             .update_coordinator(|c| c.closed_by_rolf_at = project::now())
             .unwrap();
-        let (text, _, _) = digest_snapshot(&world.ctx(), &project, "ha").unwrap();
+        let (text, _, _) = digest_snapshot(&world.ctx(), &project, "ha", false).unwrap();
         let compact = filter_page(&project, &text, true);
         assert!(compact.contains("Closed by Rolf. Run `ha open`"));
     }

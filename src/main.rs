@@ -34,6 +34,7 @@ mod coordinator;
 mod doctor;
 mod events;
 mod git;
+mod handoff;
 mod harness;
 mod herdr;
 mod hook;
