@@ -736,12 +736,15 @@ fn deliver_or_defer(project: &Project, herdr: &Herdr, agent: &Agent, prompt: &st
 
 /// The last view belongs to a coordinator incarnation, not to a terminal or
 /// a global clock. Peeks never advance it.
-#[derive(Default, Serialize, Deserialize)]
+#[derive(Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
 struct ContextCursor {
     generation: u32,
     pane: String,
     standing: String,
+    #[serde(skip)]
+    standing_text: String,
+    events: BTreeMap<String, String>,
     messages: BTreeMap<String, String>,
     asks: BTreeMap<String, String>,
     tasks: BTreeMap<String, String>,
@@ -750,10 +753,6 @@ struct ContextCursor {
     reviews: BTreeMap<String, String>,
     inbox: BTreeMap<String, String>,
     relevant_config: BTreeMap<String, String>,
-    /// Completion evidence already seen by this coordinator incarnation.
-    completed: BTreeMap<String, String>,
-    /// Old cursors have no completion receipt; do not replay their whole history.
-    completion_receipt: bool,
 }
 
 impl ContextCursor {
@@ -761,17 +760,121 @@ impl ContextCursor {
         let coordinator = project.coordinator().unwrap_or_default();
         let evidence = crate::task::EvidenceSnapshot::load(project);
         let events = evidence.events();
-        let lanes = crate::thread::list(project)
+        let threads = crate::thread::list(project);
+        let event_items = threads
+            .iter()
+            .filter(|thread| thread.status != crate::thread::Status::Resolved)
+            .filter_map(|thread| {
+                let event = crate::events::latest_event(events, &thread.id, thread.attempt.max(1))?;
+                let detail = if let Some(done) = &event.payload.done {
+                    let report = crate::thread::sealed_report_reference(project, thread)
+                        .unwrap_or_else(|| format!(".state/artifacts/{} (missing)", done.artifact));
+                    format!("done: {} report={report}", done.sha)
+                } else if let Some(waiting) = event
+                    .payload
+                    .waiting
+                    .as_ref()
+                    .filter(|_| event.id != thread.answered_waiting_event)
+                {
+                    let kind = waiting
+                        .provider_kind
+                        .as_deref()
+                        .map(|kind| format!(" ({kind})"))
+                        .unwrap_or_default();
+                    format!(
+                        "waiting — {}{kind}: {} event={}",
+                        waiting.class.plain(),
+                        waiting.text,
+                        event.id
+                    )
+                } else if let Some(failed) = &event.payload.failed {
+                    let kind = failed
+                        .provider_kind
+                        .as_deref()
+                        .map(|kind| format!(" ({kind})"))
+                        .unwrap_or_default();
+                    format!(
+                        "failed — {}{kind}: {} event={}",
+                        failed.class.plain(),
+                        failed.text,
+                        event.id
+                    )
+                } else {
+                    return None;
+                };
+                Some((event.id.clone(), format!("{} {detail}", thread.id)))
+            })
+            .collect();
+        let lanes = threads
             .into_iter()
             .map(|thread| {
                 let stage = project::running_stage(&thread, events);
-                (thread.id, format!("{} — {stage}", thread.title.trim()))
+                let mut detail = format!("{} — {stage}", thread.title.trim());
+                if !thread.pane_id.is_empty() || !thread.machine.is_empty() {
+                    let _ = write!(
+                        detail,
+                        "\n  pane={} machine={}",
+                        thread.pane_id, thread.machine
+                    );
+                }
+                if thread.lineage_mismatch {
+                    detail.push_str(
+                        "\n  lineage-mismatch: live process identity differs; parent not repaired",
+                    );
+                }
+                for note in &thread.copy_notes {
+                    let _ = write!(detail, "\n  copy incomplete: {note}");
+                }
+                if !thread.launch.recipe_basis.is_empty() {
+                    let _ = write!(
+                        detail,
+                        "\n  recipe={} via {}: {:?}",
+                        thread.launch.recipe_id,
+                        thread.launch.recipe_request,
+                        thread.launch.recipe_basis
+                    );
+                }
+                if !thread.error.is_empty() {
+                    let _ = write!(
+                        detail,
+                        "\n  {}: {}",
+                        thread.failure_class.plain(),
+                        thread.error
+                    );
+                }
+                let completion =
+                    crate::events::latest_event(events, &thread.id, thread.attempt.max(1));
+                let sealed_report = completion
+                    .and_then(|event| event.payload.done.as_ref())
+                    .is_some_and(|done| done.artifact == thread.report_hash)
+                    && crate::thread::sealed_report_path(project, &thread).is_some();
+                if !thread.report_hash.is_empty()
+                    && !sealed_report
+                    && let Some(report) = crate::thread::report_reference(project, &thread)
+                {
+                    let _ = write!(detail, "\n  report draft: {report} (not completion)");
+                }
+                (thread.id, detail)
             })
             .collect();
         let reviews = crate::review::list(project)
             .unwrap_or_default()
             .into_iter()
-            .map(|review| (review.id, format!("{:?}", review.phase)))
+            .map(|review| {
+                let detail = format!(
+                    "{:?} {} lanes — reviewer {}{}{}",
+                    review.phase,
+                    review.members.len(),
+                    review.reviewer.as_deref().unwrap_or("pending"),
+                    review.gates_summary(),
+                    if review.attention.is_empty() {
+                        String::new()
+                    } else {
+                        format!(" — {}", review.attention)
+                    }
+                );
+                (review.id, detail)
+            })
             .collect();
         let messages = crate::prompt::recent_requests(project, usize::MAX)
             .into_iter()
@@ -779,7 +882,12 @@ impl ContextCursor {
             .collect();
         let asks = crate::ask::open_asks(project)
             .into_iter()
-            .map(|ask| (ask.id, ask.question))
+            .map(|ask| {
+                (
+                    ask.id,
+                    format!("{} Choices: {}", ask.question, ask.choices.join(" / ")),
+                )
+            })
             .collect();
         let tasks = crate::task::views_with_evidence(project, &evidence)
             .0
@@ -848,39 +956,12 @@ impl ContextCursor {
             })
             .unwrap_or_default();
         let relevant_config = relevant_config(ctx, project);
-        let evidence = crate::task::EvidenceSnapshot::load(project);
-        let completed = crate::task::views_with_evidence(project, &evidence)
-            .0
-            .into_iter()
-            .filter(|view| {
-                !view.record.dropped.is_empty()
-                    || matches!(
-                        view.state,
-                        crate::task::State::Finished
-                            | crate::task::State::Merged
-                            | crate::task::State::Installed
-                    )
-            })
-            .map(|view| {
-                let task = &view.record;
-                let done = evidence
-                    .events()
-                    .iter()
-                    .filter(|event| {
-                        task.attempts.contains(&event.thread) && event.payload.done.is_some()
-                    })
-                    .map(|event| event.id.as_str())
-                    .max()
-                    .unwrap_or("");
-                // Review, merge and install are not new completion notices.
-                let signature = format!("{done}:{:?}", task.dropped.last().map(|e| &e.at));
-                (task.id.clone(), signature)
-            })
-            .collect();
         Self {
             generation: coordinator.generation,
             pane: coordinator.pane_id,
             standing: crate::thread::sha256_hex(standing.as_bytes()),
+            standing_text: standing,
+            events: event_items,
             messages,
             asks,
             tasks,
@@ -889,8 +970,6 @@ impl ContextCursor {
             reviews,
             inbox,
             relevant_config,
-            completed,
-            completion_receipt: true,
         }
     }
 }
@@ -957,194 +1036,139 @@ fn split_sections(body: &str) -> BTreeMap<String, String> {
     sections
 }
 
-fn changes_since(previous: Option<&ContextCursor>, current: &ContextCursor) -> String {
-    let Some(previous) = previous else {
-        return "## Since your last context\n\nFirst read in this coordinator session; full view follows.\n\n".into();
-    };
-    let mut changes = Vec::new();
-    for (label, old, new) in [
-        ("Rolf", &previous.messages, &current.messages),
-        ("Ask", &previous.asks, &current.asks),
-        ("Task", &previous.tasks, &current.tasks),
-        ("Plan", &previous.plan, &current.plan),
-        ("Lane", &previous.lanes, &current.lanes),
-        ("Review", &previous.reviews, &current.reviews),
-        ("Inbox", &previous.inbox, &current.inbox),
+struct ContextDelta {
+    text: String,
+    cursor: ContextCursor,
+    inbox: Vec<String>,
+    events: Vec<String>,
+    remaining: usize,
+}
+
+fn changes_since(
+    previous: Option<&ContextCursor>,
+    current: &ContextCursor,
+    limit: usize,
+) -> ContextDelta {
+    let first = previous.is_none();
+    let empty = ContextCursor::default();
+    let previous = previous.unwrap_or(&empty);
+    let mut cursor = previous.clone();
+    cursor.generation = current.generation;
+    cursor.pane.clone_from(&current.pane);
+    let mut out = String::from("## Since your last context\n\n");
+    if first {
+        out.push_str("First read in this coordinator session; unread items follow.\n\n");
+    }
+    let mut count = 0;
+    let mut inbox = Vec::new();
+    let mut events = Vec::new();
+    // The selected rows both render the delta and advance its cursor. Nothing
+    // outside this item set can acquire a receipt.
+    for (label, old, new, seen) in [
+        (
+            "Rolf",
+            &previous.messages,
+            &current.messages,
+            &mut cursor.messages,
+        ),
+        ("Ask", &previous.asks, &current.asks, &mut cursor.asks),
+        ("Task", &previous.tasks, &current.tasks, &mut cursor.tasks),
+        ("Plan", &previous.plan, &current.plan, &mut cursor.plan),
+        ("Lane", &previous.lanes, &current.lanes, &mut cursor.lanes),
+        (
+            "Review",
+            &previous.reviews,
+            &current.reviews,
+            &mut cursor.reviews,
+        ),
+        ("Inbox", &previous.inbox, &current.inbox, &mut cursor.inbox),
+        (
+            "Event",
+            &previous.events,
+            &current.events,
+            &mut cursor.events,
+        ),
     ] {
         for (id, value) in new {
-            if old.get(id) != Some(value) {
-                changes.push(format!("- {label} {id}: {value}"));
+            if old.get(id) == Some(value) {
+                continue;
+            }
+            count += 1;
+            if count > limit {
+                continue;
+            }
+            let _ = writeln!(out, "- {label} {id}: {value}");
+            seen.insert(id.clone(), value.clone());
+            match label {
+                "Inbox" => inbox.push(id.clone()),
+                "Event" => events.push(id.clone()),
+                _ => {}
             }
         }
-    }
-    for id in previous.asks.keys() {
-        if !current.asks.contains_key(id) {
-            changes.push(format!("- Ask {id} closed."));
-        }
-    }
-    for id in previous.plan.keys() {
-        if !current.plan.contains_key(id) {
-            changes.push(format!("- Plan {id} removed."));
+        for id in old.keys().filter(|id| !new.contains_key(*id)) {
+            if matches!(label, "Ask" | "Plan") {
+                count += 1;
+                if count > limit {
+                    continue;
+                }
+                let action = if label == "Ask" { "closed" } else { "removed" };
+                let _ = writeln!(out, "- {label} {id} {action}.");
+            }
+            seen.remove(id);
         }
     }
     if previous.standing != current.standing {
-        changes.push("- Standing notes changed.".into());
+        count += 1;
+        if count <= limit {
+            out.push_str("- Standing notes changed:\n\n");
+            if current.standing_text.is_empty() {
+                out.push_str("No standing notes in force.\n");
+            } else {
+                out.push_str(&current.standing_text);
+                out.push('\n');
+            }
+            cursor.standing.clone_from(&current.standing);
+        }
     }
-    if current.relevant_config.iter().any(|(key, value)| {
+    let config_changed = current.relevant_config.iter().any(|(key, value)| {
         previous
             .relevant_config
             .get(key)
             .is_some_and(|old| old != value)
             || (key.starts_with("project-repo:") && !previous.relevant_config.contains_key(key))
-    }) {
-        changes.push("- This project's recipe or repository configuration changed.".into());
-    }
-    let mut out = String::from("## Since your last context\n\n");
-    if changes.is_empty() {
-        out.push_str("Nothing new.\n");
-    } else {
-        for line in changes.iter().take(DIGEST_ROWS) {
-            let _ = writeln!(out, "{line}");
+    });
+    if config_changed {
+        count += 1;
+        if count <= limit {
+            out.push_str("- This project's recipe or repository configuration changed.\n");
+            cursor.relevant_config.clone_from(&current.relevant_config);
         }
-        overflow_count(&mut out, changes.len());
+    } else {
+        cursor.relevant_config.clone_from(&current.relevant_config);
+    }
+    if count == 0 {
+        out.push_str("Nothing new.\n");
+    } else if count > limit {
+        let _ = writeln!(
+            out,
+            "… {} more changes waiting for the next context read.",
+            count - limit
+        );
     }
     out.push('\n');
-    out
-}
-
-fn filter_page(project: &Project, text: &str, collapse: bool) -> String {
-    let mut out = String::new();
-    let mut section = "";
-    let mut skip_item = false;
-    let mut standing_notice = false;
-    for line in text.split_inclusive('\n') {
-        if line.starts_with("## ") {
-            section = line.trim();
-            skip_item = false;
-        }
-        let standing = matches!(
-            section,
-            "## Task notes in force" | "## Standing instructions in force" | "## Facts in force"
-        );
-        if standing && collapse {
-            if !standing_notice {
-                let _ = writeln!(
-                    out,
-                    "## Standing notes\n\nUnchanged; run `ha context {} --full` to see them.\n",
-                    project.slug
-                );
-                standing_notice = true;
-            }
-            continue;
-        }
-        if line.starts_with("- ") {
-            skip_item = standing && line.contains("(historical");
-        }
-        if !skip_item {
-            out.push_str(line);
-        }
+    ContextDelta {
+        text: out,
+        cursor,
+        inbox,
+        events,
+        remaining: count.saturating_sub(limit),
     }
-    out
-}
-
-/// Keep task history on the project page and in --full, not in every context read.
-fn compact_tasks(
-    project: &Project,
-    text: &str,
-    before: Option<&ContextCursor>,
-    now: &ContextCursor,
-) -> String {
-    let mut out = String::new();
-    let mut section = String::new();
-    let mut body = String::new();
-    let evidence = crate::task::EvidenceSnapshot::load(project);
-    let views: BTreeMap<_, _> = crate::task::views_with_evidence(project, &evidence)
-        .0
-        .into_iter()
-        .map(|view| (view.record.id.clone(), view))
-        .collect();
-    let flush = |out: &mut String, heading: &str, body: &str| match heading {
-        "## Recently finished or dropped tasks" => {
-            // The project page lists only terminal tasks. A newly finished lane
-            // still awaiting review belongs here too, without the report path.
-            let mut rows: Vec<_> = views
-                .values()
-                .filter(|view| {
-                    now.completed.get(&view.record.id).is_some_and(|signature| {
-                        before.is_some_and(|previous| {
-                            previous.completion_receipt
-                                && previous.completed.get(&view.record.id) != Some(signature)
-                        })
-                    })
-                })
-                .collect();
-            rows.sort_by(|a, b| b.record.created.cmp(&a.record.created));
-            if !rows.is_empty() {
-                out.push_str(heading);
-                out.push_str("\n\n");
-                for view in rows {
-                    let _ = writeln!(
-                        out,
-                        "- `{}` [{}] {}",
-                        view.record.id,
-                        view.state.word(),
-                        view.record
-                            .title
-                            .split_whitespace()
-                            .collect::<Vec<_>>()
-                            .join(" ")
-                    );
-                }
-                out.push('\n');
-            }
-        }
-        _ => {
-            out.push_str(heading);
-            if !heading.is_empty() {
-                out.push('\n');
-            }
-            out.push_str(body);
-        }
-    };
-    for line in text.split_inclusive('\n') {
-        if line.starts_with("## ") {
-            flush(&mut out, &section, &body);
-            section = line.trim_end().into();
-            body.clear();
-        } else {
-            body.push_str(line);
-        }
-    }
-    flush(&mut out, &section, &body);
-    out
-}
-
-fn compact_page(
-    project: &Project,
-    text: &str,
-    before: Option<&ContextCursor>,
-    now: &ContextCursor,
-) -> String {
-    compact_tasks(
-        project,
-        &filter_page(
-            project,
-            text,
-            before.is_some_and(|previous| previous.standing == now.standing),
-        ),
-        before,
-        now,
-    )
 }
 
 pub(crate) fn context(ctx: &Ctx, slug: &str, peek: bool, full: bool) -> Result<()> {
     let project = Project::load(&ctx.root, slug)?;
     if !peek {
         crate::project::refresh_page(&project)?;
-    }
-    // A peek reads; it is not the coordinator's receipt (D14).
-    if !peek {
-        acknowledge_bootstrap(&project)?;
     }
     let prefix = current_prefix(&ctx.root)?;
     let wake_revision = crate::steps::wake_revision(&project);
@@ -1154,35 +1178,51 @@ pub(crate) fn context(ctx: &Ctx, slug: &str, peek: bool, full: bool) -> Result<(
     let same_session = previous.as_ref().is_some_and(|before| {
         before.generation == current.generation && before.pane == current.pane
     });
-    let (mut text, shown, events) = digest_snapshot(ctx, &project, &prefix, false)?;
-    if !full {
-        text = compact_page(
-            &project,
-            &text,
-            previous.as_ref().filter(|_| same_session),
-            &current,
-        );
-    }
-    let changes = changes_since(previous.as_ref().filter(|_| same_session), &current);
-    if !full && same_session {
-        print!("{changes}");
+    let delta = changes_since(
+        previous.as_ref().filter(|_| same_session && !full),
+        &current,
+        if full { usize::MAX } else { DIGEST_ROWS },
+    );
+    let rendered = if same_session && !full {
+        delta.text.clone()
     } else {
-        print!("{changes}{text}");
-    }
+        // The first read includes orientation, not a second independently
+        // truncated item list. Every actionable row comes from the delta.
+        let (text, _, _) = digest_snapshot(ctx, &project, &prefix, false)?;
+        let orientation = split_sections(&text)
+            .into_iter()
+            .filter(|(heading, _)| {
+                matches!(
+                    heading.as_str(),
+                    "" | "## Goal and what Rolf gets"
+                        | "## Repositories"
+                        | "## Recipes"
+                        | "## Coordinator status"
+                )
+            })
+            .map(|(_, section)| section)
+            .collect::<String>();
+        format!("{}{orientation}", delta.text)
+    };
+    // Finish the actual human/JSON write, including flush, before consuming
+    // anything. Buffering JSON prose alone is not a successful delivery.
+    crate::output::emit(&rendered)?;
     let coordinator = project.coordinator();
     let owns_read = coordinator.as_ref().is_none_or(|record| {
         std::env::var("HERDR_PANE_ID").ok().as_deref() == Some(record.pane_id.as_str())
     });
     if !peek && owns_read {
         // An external read is a peek: it cannot consume the coordinator's delta.
-        crate::project::write_json(&path, &current)?;
-        if coordinator.is_some() {
+        acknowledge_bootstrap(&project)?;
+        crate::project::write_json(&path, &delta.cursor)?;
+        if coordinator.is_some() && delta.remaining == 0 {
             crate::steps::receipt(&project, wake_revision)?;
         }
-        inbox::mark_seen(&project, &shown)?;
+        inbox::mark_seen(&project, &delta.inbox)?;
         if let Some(record) = coordinator {
-            inbox::acknowledge_events(&project, &shown, &record.pane_id, record.attempt())?;
-            for event in events {
+            inbox::acknowledge_events(&project, &delta.inbox, &record.pane_id, record.attempt())?;
+            for id in &delta.events {
+                let event = crate::events::load(&project, id)?;
                 if event.recipient.pane == record.pane_id
                     && event.recipient.coordinator_attempt == record.attempt()
                 {
@@ -1686,28 +1726,26 @@ mod tests {
     }
 
     #[test]
-    fn closed_status_survives_collapsed_standing_notes() {
+    fn closed_status_is_in_context_orientation() {
         let world = crate::scenarios::World::new();
         let project = world.project("demo", "a.sock");
         project
             .update_coordinator(|c| c.closed_by_rolf_at = project::now())
             .unwrap();
         let (text, _, _) = digest_snapshot(&world.ctx(), &project, "ha", false).unwrap();
-        let compact = filter_page(&project, &text, true);
-        assert!(compact.contains("Closed by Rolf. Run `ha open`"));
+        let sections = split_sections(&text);
+        assert!(sections["## Coordinator status"].contains("Closed by Rolf. Run `ha open`"));
     }
 
     #[test]
-    fn repeated_context_leads_with_changes_and_collapses_unchanged_standing() {
+    fn repeated_context_leads_with_changes_and_omits_unchanged_standing() {
         let world = crate::scenarios::World::new();
         let project = world.project("demo", "a.sock");
         let ctx = world.ctx();
         let before = ContextCursor::capture(&ctx, &project);
-        let body = "# Project\n\n## Standing instructions in force\n\n- `n-1` (request:q-1): Keep this.\n\n## Running now\n\nNone.\n";
-        let compact = compact_page(&project, body, Some(&before), &before);
-        assert!(compact.contains("Unchanged; run `ha context demo --full`"));
-        assert!(!compact.contains("Keep this."));
-        assert!(body.contains("Keep this.")); // --full retains the unfiltered page
+        let compact = changes_since(Some(&before), &before, DIGEST_ROWS).text;
+        assert!(compact.contains("Nothing new."));
+        assert!(!compact.contains("Standing notes"));
         let mut after = ContextCursor::capture(&ctx, &project);
         after.messages.insert("q-2".into(), "New request".into());
         after.lanes.insert("t-0001".into(), "Fix — working".into());
@@ -1717,11 +1755,15 @@ mod tests {
         after
             .inbox
             .insert("i1".into(), "[alert] investigate".into());
-        let summary = changes_since(Some(&before), &after);
+        let summary = changes_since(Some(&before), &after, DIGEST_ROWS).text;
         for expected in ["Rolf q-2", "Lane t-0001", "Review review-1", "Inbox i1"] {
             assert!(summary.contains(expected), "{summary}");
         }
-        assert!(changes_since(None, &after).contains("First read"));
+        assert!(
+            changes_since(None, &after, DIGEST_ROWS)
+                .text
+                .contains("First read")
+        );
     }
 
     #[test]
@@ -1747,7 +1789,8 @@ mod tests {
         let mut lane_started = ContextCursor::capture(&ctx, &project);
         lane_started.relevant_config = newly_used;
         assert!(
-            !changes_since(Some(&unrelated), &lane_started)
+            !changes_since(Some(&unrelated), &lane_started, DIGEST_ROWS)
+                .text
                 .contains("recipe or repository configuration changed")
         );
         let changed = std::fs::read_to_string(&path)
@@ -1756,80 +1799,10 @@ mod tests {
         std::fs::write(path, changed).unwrap();
         let after = ContextCursor::capture(&ctx, &project);
         assert!(
-            changes_since(Some(&unrelated), &after)
+            changes_since(Some(&unrelated), &after, DIGEST_ROWS)
+                .text
                 .contains("recipe or repository configuration changed")
         );
-    }
-
-    #[test]
-    fn default_view_hides_historical_notes_and_old_finished_tasks() {
-        let world = crate::scenarios::World::new();
-        let project = world.project("demo", "a.sock");
-        let task = crate::task::Task {
-            id: "job-9999".into(),
-            title: "Old task".into(),
-            authority: vec!["request:q-1".into()],
-            acceptance: vec!["Done.".into()],
-            created: "2020-01-01T00:00:00Z".into(),
-            ..Default::default()
-        };
-        let dir = project.record_dir_for_write("tasks").unwrap();
-        std::fs::write(dir.join("job-9999.toml"), toml::to_string(&task).unwrap()).unwrap();
-        let body = "## Facts in force\n\n- `n-1` (historical; t-0001): old fact\n  long continuation\n- `n-2` (request:q-1): current fact\n\n## Recently finished or dropped tasks\n\n- `job-9999` [installed] old task\n";
-        let cursor = ContextCursor::default();
-        let filtered = compact_page(&project, body, None, &cursor);
-        assert!(!filtered.contains("old fact"), "{filtered}");
-        assert!(!filtered.contains("long continuation"), "{filtered}");
-        assert!(filtered.contains("current fact"));
-        assert!(!filtered.contains("old task"));
-    }
-
-    #[test]
-    fn completion_rows_only_show_changes_since_read_without_reports() {
-        let world = crate::scenarios::World::new();
-        let project = world.project("demo", "a.sock");
-        let body = "# Project\n\n## Recently finished or dropped tasks\n\n- `job-0001` [dropped] Old\n  Final report (`t-0001`): `secret`\n- `job-0002` [open] New\n  Final report (`t-0002`): `secret`\n\n---\n";
-        let dir = project.record_dir_for_write("tasks").unwrap();
-        for (id, title) in [("job-0001", "Old"), ("job-0002", "New")] {
-            let task = crate::task::Task {
-                id: id.into(),
-                title: title.into(),
-                authority: vec!["request:q-1".into()],
-                acceptance: vec!["Done".into()],
-                created: "2020-01-01T00:00:00Z".into(),
-                dropped: vec![crate::task::DropEvidence {
-                    at: "2020-01-02T00:00:00Z".into(),
-                    reason: "superseded".into(),
-                }],
-                ..Default::default()
-            };
-            std::fs::write(
-                dir.join(format!("{id}.toml")),
-                toml::to_string(&task).unwrap(),
-            )
-            .unwrap();
-        }
-        let now = ContextCursor::capture(&world.ctx(), &project);
-        let mut before = ContextCursor {
-            completion_receipt: true,
-            ..Default::default()
-        };
-        before
-            .completed
-            .insert("job-0001".into(), now.completed["job-0001"].clone());
-        assert!(
-            !compact_page(&project, body, Some(&ContextCursor::default()), &now)
-                .contains("## Recently finished or dropped tasks")
-        );
-        let text = compact_page(&project, body, Some(&before), &now);
-        assert!(text.contains("- `job-0002` [dropped] New"), "{text}");
-        assert!(!text.contains("job-0001"), "{text}");
-        assert!(!text.contains("secret"), "{text}");
-        assert!(
-            !compact_page(&project, body, Some(&now), &now)
-                .contains("## Recently finished or dropped tasks")
-        );
-        assert!(body.contains("Final report")); // --full keeps the whole list
     }
 
     #[test]
