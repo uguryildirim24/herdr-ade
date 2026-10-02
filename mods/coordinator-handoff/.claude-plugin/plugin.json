@@ -1,0 +1,5 @@
+{
+  "name": "coordinator-handoff",
+  "version": "1.0.0",
+  "description": "Replace coordinator compaction with a fresh session note and harness handoff."
+}

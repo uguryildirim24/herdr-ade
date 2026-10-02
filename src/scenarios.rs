@@ -2967,6 +2967,26 @@ fn harness_repo(home: &Path, name: &str, package: &str) -> String {
         format!("[package]\nname = \"{package}\"\nversion = \"0.1.0\"\n"),
     )
     .unwrap();
+    if package == "herdr-ade" {
+        for (path, text) in [
+            (
+                ".claude-plugin/plugin.json",
+                include_str!("../mods/coordinator-handoff/.claude-plugin/plugin.json"),
+            ),
+            (
+                "hooks/hooks.json",
+                include_str!("../mods/coordinator-handoff/hooks/hooks.json"),
+            ),
+            (
+                "hooks/register.ts",
+                include_str!("../mods/coordinator-handoff/hooks/register.ts"),
+            ),
+        ] {
+            let file = repo.join("mods/coordinator-handoff").join(path);
+            std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+            std::fs::write(file, text).unwrap();
+        }
+    }
     std::fs::canonicalize(&repo)
         .unwrap()
         .to_string_lossy()
@@ -3018,6 +3038,17 @@ fn harness_install_builds_and_installs_each_repo_kind() {
     world.runner.on("machine list --json", ok("[]"));
 
     crate::harness::install(&world.ctx()).unwrap();
+    #[cfg(target_os = "macos")]
+    assert_eq!(
+        std::fs::read_to_string(
+            world
+                .home
+                .path()
+                .join(".local/share/herdr-ade/mods/coordinator-handoff/hooks/register.ts")
+        )
+        .unwrap(),
+        include_str!("../mods/coordinator-handoff/hooks/register.ts")
+    );
 
     let calls = world.runner.calls.borrow();
     let builds: Vec<_> = calls.iter().filter(|c| c.program == "cargo").collect();
