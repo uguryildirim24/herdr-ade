@@ -473,6 +473,66 @@ fn local_install(ctx: &Ctx, repo: &str, bin: &str, commit: &str, source_clean: b
     Ok(())
 }
 
+/// Stage the whole mod, then publish it in one filesystem operation. Mac's
+/// RENAME_SWAP can replace a nonempty directory without a missing-path window.
+#[cfg(target_os = "macos")]
+fn install_coordinator_handoff(home: &Path, repo: &Path) -> Result<()> {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+
+    unsafe extern "C" {
+        fn renamex_np(
+            from: *const std::ffi::c_char,
+            to: *const std::ffi::c_char,
+            flags: u32,
+        ) -> i32;
+    }
+
+    fn copy_folder(from: &Path, to: &Path) -> Result<()> {
+        std::fs::create_dir(to)?;
+        for entry in std::fs::read_dir(from)? {
+            let entry = entry?;
+            let target = to.join(entry.file_name());
+            if entry.file_type()?.is_dir() {
+                copy_folder(&entry.path(), &target)?;
+            } else {
+                std::fs::copy(entry.path(), target)?;
+            }
+        }
+        Ok(())
+    }
+
+    let mods = home.join(".local/share/herdr-ade/mods");
+    std::fs::create_dir_all(&mods)?;
+    let target = mods.join("coordinator-handoff");
+    let staged = mods.join(format!(
+        ".coordinator-handoff-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)?
+            .as_nanos()
+    ));
+    let result = (|| -> Result<()> {
+        copy_folder(&repo.join("mods/coordinator-handoff"), &staged)?;
+        if target.exists() {
+            let from = CString::new(staged.as_os_str().as_bytes())?;
+            let to = CString::new(target.as_os_str().as_bytes())?;
+            // Both strings remain alive and NUL-terminated for this call.
+            if unsafe { renamex_np(from.as_ptr(), to.as_ptr(), 0x00000002) } != 0 {
+                return Err(std::io::Error::last_os_error().into());
+            }
+        } else {
+            std::fs::rename(&staged, &target)?;
+        }
+        Ok(())
+    })();
+    // After a swap, staged holds the previous installation, not the new one.
+    if staged.exists() {
+        std::fs::remove_dir_all(&staged)?;
+    }
+    result.context("harness_install_failed: coordinator handoff mod")
+}
+
 fn installed_version(ctx: &Ctx, bin: &str) -> Result<InstalledBinary> {
     let path = ctx.env.home.join(".local/bin").join(bin);
     let out = ctx
@@ -1221,6 +1281,10 @@ fn install_for(ctx: &Ctx, current: Option<(&str, &str)>) -> Result<InstallOutcom
         for bin in kind.binaries() {
             local_install(ctx, &repo.path, bin, &commit, source_clean)?;
         }
+        #[cfg(target_os = "macos")]
+        if kind == Kind::Plugin {
+            install_coordinator_handoff(&ctx.env.home, Path::new(&repo.path))?;
+        }
         builds.push(InstalledBuild {
             repo: repo.path.clone(),
             machine: "local".into(),
@@ -1423,6 +1487,40 @@ mod tests {
     use crate::runner::fake::{FakeRunner, fail, ok};
     use crate::runner::{RealRunner, Runner};
     use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn coordinator_mod_install_replaces_the_whole_folder_atomically() {
+        let home = tempfile::tempdir().unwrap();
+        let repo = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let target = home
+            .path()
+            .join(".local/share/herdr-ade/mods/coordinator-handoff");
+        install_coordinator_handoff(home.path(), repo).unwrap();
+        let manifest = target.join(".claude-plugin/plugin.json");
+        let original = std::fs::read(&manifest).unwrap();
+        assert_eq!(
+            original,
+            std::fs::read(repo.join("mods/coordinator-handoff/.claude-plugin/plugin.json"))
+                .unwrap()
+        );
+        std::fs::write(&manifest, "old manifest").unwrap();
+        std::fs::write(target.join("removed-hook.ts"), "obsolete").unwrap();
+        install_coordinator_handoff(home.path(), repo).unwrap();
+        assert_eq!(std::fs::read(&manifest).unwrap(), original);
+        assert!(!target.join("removed-hook.ts").exists());
+        assert!(target.join("hooks/register.ts").exists());
+        assert_eq!(
+            std::fs::read_dir(target.parent().unwrap()).unwrap().count(),
+            1
+        );
+        assert!(install_coordinator_handoff(home.path(), &repo.join("missing-repo")).is_err());
+        assert_eq!(std::fs::read(&manifest).unwrap(), original);
+        assert_eq!(
+            std::fs::read_dir(target.parent().unwrap()).unwrap().count(),
+            1
+        );
+    }
 
     #[test]
     fn review_install_order_uses_project_then_numeric_suffix() {
