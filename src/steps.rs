@@ -26,8 +26,9 @@ struct WakeCursor {
     binding: String,
     revision: u64,
     lines: Vec<String>,
-    submitted_at: u64,
     primed_binding: String,
+    /// Binding that heard each line; absent entries use historical cursor.binding.
+    heard_bindings: Vec<String>,
     pending_announced: bool,
 }
 
@@ -62,6 +63,7 @@ pub(crate) fn receipt(project: &Project, observed: u64) -> Result<()> {
         return Ok(());
     }
     cursor.lines.clear();
+    cursor.heard_bindings.clear();
     cursor.revision += 1;
     cursor.binding = wake_binding(project);
     cursor.primed_binding.clear();
@@ -75,9 +77,17 @@ fn record_wake(project: &Project, line: &str) -> Result<()> {
     if cursor.lines.is_empty() {
         cursor.binding = wake_binding(project);
     }
+    let historical_heard = if cursor.primed_binding.is_empty() {
+        &cursor.binding
+    } else {
+        &cursor.primed_binding
+    };
+    cursor
+        .heard_bindings
+        .resize(cursor.lines.len(), historical_heard.clone());
     cursor.lines.push(line.into());
+    cursor.heard_bindings.push(wake_binding(project));
     cursor.revision += 1;
-    cursor.submitted_at = wake_now();
     cursor.primed_binding.clear();
     cursor.pending_announced = false;
     project::write_json(&wake_path(project), &cursor)
@@ -106,13 +116,22 @@ fn announce_pending(project: &Project, cursor: &WakeCursor) -> Result<()> {
     Ok(())
 }
 
-/// Re-prime once on rebind, or after an idle turn that never read context.
-/// Never re-type an event's original notice on a replacement binding.
+/// Prime only transitions this binding never heard. Missing a context receipt
+/// is not new news and must not wake the same binding again.
 fn prime_unread(ctx: &Ctx, project: &Project) -> Result<()> {
     let bound = project.coordinator();
     let binding = wake_binding(project);
     let cursor: WakeCursor = project::read_json(&wake_path(project)).unwrap_or_default();
-    if cursor.lines.is_empty() || cursor.primed_binding == binding {
+    let unheard: Vec<_> = cursor
+        .lines
+        .iter()
+        .enumerate()
+        .filter_map(|(i, line)| {
+            let heard = cursor.heard_bindings.get(i).unwrap_or(&cursor.binding);
+            (heard != &binding && cursor.primed_binding != binding).then_some(line.as_str())
+        })
+        .collect();
+    if unheard.is_empty() {
         return Ok(());
     }
     let Some(bound) = bound else {
@@ -129,26 +148,29 @@ fn prime_unread(ctx: &Ctx, project: &Project) -> Result<()> {
         announce_pending(project, &cursor)?;
         return Ok(());
     };
-    if !agent.ready()
-        || (cursor.binding == binding
-            && (agent.agent_status != "idle"
-                || wake_now().saturating_sub(cursor.submitted_at) < 90))
-    {
+    if !agent.promptable() {
         return Ok(());
     }
     let line = format!(
         "Unread transitions since the last ha context ({}): {}. Run ha context {} to consume them.",
-        cursor.lines.len(),
-        cursor.lines.join(" | "),
+        unheard.len(),
+        unheard.join(" | "),
         project.slug
     );
-    // Do not register this digest as another unread transition.
-    let _writer = crate::prompt::writer_lock(project)?;
-    if !crate::prompt::coordinator_prompt_clear(project, &herdr, &bound.pane_id)? {
+    // The digest shares batching, but must not become another unread line.
+    if !coordinator_enqueue_at(
+        project,
+        &herdr,
+        &bound.pane_id,
+        Some(NoticeInput {
+            line: &line,
+            event: None,
+            digest: Some(cursor.revision),
+        }),
+        wake_now(),
+    )? {
         return Ok(());
     }
-    crate::prompt::mark_automated_prompt(project, &bound.pane_id, &line)?;
-    herdr.agent_prompt(&bound.pane_id, &line)?;
     let _lock = project.lock()?;
     let mut latest: WakeCursor = project::read_json(&wake_path(project)).unwrap_or_default();
     if latest.revision == cursor.revision && wake_binding(project) == binding {
@@ -159,6 +181,7 @@ fn prime_unread(ctx: &Ctx, project: &Project) -> Result<()> {
 }
 
 /// A transition-owned wake-up, independent of the lane's eventual status.
+/// `submitted` means accepted by the durable outbox (which owns transport).
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
 pub(crate) struct Notice {
     pub(crate) line: String,
@@ -184,7 +207,7 @@ pub(crate) fn deliver_transition_notices(ctx: &Ctx, project: &Project) -> Result
     let ready = herdr.agent_list()?.into_iter().any(|agent| {
         agent.pane_id == coordinator.pane_id
             && agent.name == coordinator.agent_name
-            && agent.ready()
+            && agent.promptable()
     });
     if !ready {
         return Ok(());
@@ -263,9 +286,9 @@ pub(crate) fn save_state(project: &Project, state: &State) -> Result<()> {
     project::write_json(&project.state_dir().join("ticker.json"), state)
 }
 
-/// Delivers every sealed event whose transport submission is not yet in its
-/// journal. The event, not the typed line or report hash, is authoritative.
-/// A held notice holds later notices, preserving their seal order. An event whose journal already holds `submitted` is not typed
+/// Delivers every sealed event not already submitted or durably queued. The event, not the typed line or report hash, is authoritative.
+/// A draft-held notice holds later notices, preserving their seal order.
+/// An event whose journal already holds `queued` or `submitted` is not typed
 /// again; one read before its line went out (`acknowledged` or `handled` with
 /// no `submitted`) is still typed once, so the wake-up always happens. An
 /// event for a superseded lane attempt is left as it is, sealed and
@@ -324,7 +347,9 @@ pub(crate) fn deliver_events(ctx: &Ctx, project: &Project) -> Result<()> {
         };
         // Context reads sealed work directly, including seals submitted to a
         // previous coordinator. Never replay a line already typed once.
-        if states.contains(&crate::contracts::DeliveryState::Submitted) {
+        if states.contains(&crate::contracts::DeliveryState::Submitted)
+            || states.contains(&crate::contracts::DeliveryState::Queued)
+        {
             continue;
         }
         // No `submitted` yet: fresh, or read before its wake-up line was
@@ -339,11 +364,15 @@ pub(crate) fn deliver_events(ctx: &Ctx, project: &Project) -> Result<()> {
             break;
         }
         // A held notice must not be overtaken by a later one.
-        if !crate::events::states(project, &event.id)?
-            .contains(&crate::contracts::DeliveryState::Submitted)
+        let states = crate::events::states(project, &event.id)?;
+        if !states.contains(&crate::contracts::DeliveryState::Submitted)
+            && !states.contains(&crate::contracts::DeliveryState::Queued)
         {
             break;
         }
+    }
+    if let Err(error) = flush_coordinator_notices(ctx, project) {
+        first.get_or_insert(error);
     }
     if let Err(error) = prime_unread(ctx, project) {
         first.get_or_insert(error);
@@ -382,6 +411,12 @@ fn pile_member(project: &Project, event: &crate::contracts::Event) -> bool {
 }
 
 fn deliver_notice(ctx: &Ctx, project: &Project, event: &crate::contracts::Event) -> Result<()> {
+    let states = crate::events::states(project, &event.id)?;
+    if states.contains(&crate::contracts::DeliveryState::Submitted)
+        || states.contains(&crate::contracts::DeliveryState::Queued)
+    {
+        return Ok(());
+    }
     let coordinator = project
         .coordinator()
         .ok_or_else(|| anyhow::anyhow!("recipient_unavailable: project has no coordinator"))?;
@@ -479,7 +514,7 @@ fn deliver_notice(ctx: &Ctx, project: &Project, event: &crate::contracts::Event)
     let agent = herdr.agent_list()?.into_iter().find(|agent| {
         agent.pane_id == event.recipient.pane
             && agent.name == coordinator.agent_name
-            && agent.ready()
+            && agent.promptable()
     });
     let Some(_agent) = agent else {
         return Ok(());
@@ -491,34 +526,177 @@ fn deliver_notice(ctx: &Ctx, project: &Project, event: &crate::contracts::Event)
             queued.join("; ")
         ));
     }
-    if deliver_coordinator_prompt(project, &herdr, &event.recipient.pane, &line)? {
+    if coordinator_enqueue_at(
+        project,
+        &herdr,
+        &event.recipient.pane,
+        Some(NoticeInput {
+            line: &line,
+            event: Some(&event.id),
+            digest: None,
+        }),
+        wake_now(),
+    )? && !crate::events::states(project, &event.id)?
+        .contains(&crate::contracts::DeliveryState::Submitted)
+    {
         crate::events::append_delivery(
             project,
             &event.id,
-            crate::contracts::DeliveryState::Submitted,
+            crate::contracts::DeliveryState::Queued,
         )?;
     }
     Ok(())
 }
 
-/// The same serialized delivery used for event notices and plan nudges.
-/// Returns false when a draft or another prompt still owns the pane.
+/// Durable outbox shared by automated notices. Source journals advance after
+/// acceptance here; a held batch survives seals, cleanup and rebinds.
+#[derive(Default, Serialize, Deserialize)]
+#[serde(default)]
+struct NoticeBatch {
+    first_at: u64,
+    lines: Vec<String>,
+    events: Vec<String>,
+    wake_lines: Vec<String>,
+    digests: Vec<u64>,
+}
+
+struct NoticeInput<'a> {
+    line: &'a str,
+    event: Option<&'a str>,
+    digest: Option<u64>,
+}
+
+fn batch_path(project: &Project) -> std::path::PathBuf {
+    project.state_dir().join("notice-batch.json")
+}
+
+fn save_batch(project: &Project, batch: &NoticeBatch) -> Result<()> {
+    let _lock = project.lock()?;
+    project::write_json(&batch_path(project), batch)
+}
+
 pub(crate) fn deliver_coordinator_prompt(
     project: &Project,
     herdr: &Herdr<'_>,
     pane: &str,
     line: &str,
 ) -> Result<bool> {
+    coordinator_notice_at(project, herdr, pane, Some(line), wake_now())
+}
+
+fn coordinator_notice_at(
+    project: &Project,
+    herdr: &Herdr<'_>,
+    pane: &str,
+    line: Option<&str>,
+    now: u64,
+) -> Result<bool> {
+    coordinator_enqueue_at(
+        project,
+        herdr,
+        pane,
+        line.map(|line| NoticeInput {
+            line,
+            event: None,
+            digest: None,
+        }),
+        now,
+    )
+}
+
+fn coordinator_enqueue_at(
+    project: &Project,
+    herdr: &Herdr<'_>,
+    pane: &str,
+    notice: Option<NoticeInput<'_>>,
+    now: u64,
+) -> Result<bool> {
     let _writer = crate::prompt::writer_lock(project)?;
+    let Some(agent) = herdr.agent_list()?.into_iter().find(|a| {
+        project
+            .coordinator()
+            .is_some_and(|c| c.pane_id == pane && crate::coordinator::agent_matches(&c, a))
+            && a.promptable()
+    }) else {
+        return Ok(false);
+    };
+    // Never alter or submit Rolf's draft, whether idle or mid-turn.
     if !crate::prompt::coordinator_prompt_clear(project, herdr, pane)? {
         return Ok(false);
     }
-    crate::prompt::mark_automated_prompt(project, pane, line)?;
-    // Store intent before transport: a context read racing the prompt cannot
-    // miss the wake even if the process dies before Herdr answers.
-    record_wake(project, line)?;
-    herdr.agent_prompt(pane, line)?;
+    let path = batch_path(project);
+    let mut batch: NoticeBatch = project::read_json(&path).unwrap_or_default();
+    if let Some(notice) = notice
+        && notice
+            .event
+            .is_none_or(|id| !batch.events.iter().any(|old| old == id))
+    {
+        if batch.lines.is_empty() {
+            batch.first_at = now;
+        }
+        batch.lines.push(notice.line.into());
+        if let Some(event) = notice.event {
+            batch.events.push(event.into());
+        }
+        if let Some(revision) = notice.digest {
+            batch.digests.push(revision);
+        } else {
+            batch.wake_lines.push(notice.line.into());
+        }
+        save_batch(project, &batch)?;
+    }
+    if !batch.lines.is_empty() && (!agent.ready() || now.saturating_sub(batch.first_at) >= 120) {
+        let text = batch.lines.join("\n");
+        crate::prompt::mark_automated_prompt(project, pane, &text)?;
+        if let Err(error) = herdr.agent_prompt(pane, &text) {
+            // Acceptance into the outbox is durable even if transport fails.
+            // Keep the batch; sources must not enqueue it again on retry.
+            eprintln!("{}: notice batch will retry: {error}", project.slug);
+            return Ok(true);
+        }
+        for event in &batch.events {
+            crate::events::append_delivery(
+                project,
+                event,
+                crate::contracts::DeliveryState::Submitted,
+            )?;
+        }
+        if !batch.digests.is_empty() {
+            let _lock = project.lock()?;
+            let mut cursor: WakeCursor =
+                project::read_json(&wake_path(project)).unwrap_or_default();
+            if batch.digests.contains(&cursor.revision) {
+                let binding = wake_binding(project);
+                cursor.heard_bindings = vec![binding.clone(); cursor.lines.len()];
+                cursor.primed_binding = binding;
+                project::write_json(&wake_path(project), &cursor)?;
+            }
+        }
+        for line in &batch.wake_lines {
+            record_wake(project, line)?;
+        }
+        save_batch(project, &NoticeBatch::default())?;
+    }
     Ok(true)
+}
+
+/// The cheap ticker flushes even when no new transitions arrive.
+pub(crate) fn flush_coordinator_notices(ctx: &Ctx, project: &Project) -> Result<()> {
+    let Some(c) = project.coordinator() else {
+        return Ok(());
+    };
+    if project::read_json::<NoticeBatch>(&batch_path(project)).is_none_or(|b| b.lines.is_empty()) {
+        return Ok(());
+    }
+    let herdr = Herdr::new(ctx.env.herdr_bin(), &c.socket, ctx.runner);
+    coordinator_notice_at(project, &herdr, &c.pane_id, None, wake_now())?;
+    Ok(())
+}
+
+#[cfg(test)]
+pub(crate) fn flush_notices_for_test(project: &Project, herdr: &Herdr<'_>) {
+    let pane = project.coordinator().unwrap().pane_id;
+    coordinator_notice_at(project, herdr, &pane, None, wake_now() + 120).unwrap();
 }
 
 fn adopt_report(project: &Project, event: &crate::contracts::Event) -> Result<()> {
@@ -1296,21 +1474,50 @@ pub(crate) fn remote_attention(
 
     let mut signals = Vec::new();
     for lane in threads {
-        // A missing agent alone cannot prove a pane is gone. Observe the
-        // pane even before launch; a sealed attempt needs no replacement.
-        if lane.parked
-            || crate::threads::parkable(project, lane)
-            || events::latest_event(
-                &events::for_thread(project, &lane.id),
-                &lane.id,
-                lane.attempt.max(1),
-            )
-            .is_some_and(|event| {
-                event.payload.done.is_some()
-                    || event.payload.waiting.is_some()
-                    || event.payload.failed.is_some()
-            })
+        // Courier views can predate recovery or a concurrent seal. Never emit
+        // attention for the superseded placement or a terminal record.
+        let Ok(current) = thread::load(project, &lane.id) else {
+            continue;
+        };
+        if current.attempt != lane.attempt
+            || current.pane_id != lane.pane_id
+            || !matches!(current.status, Status::Open | Status::Starting)
         {
+            continue;
+        }
+        let identity = format!(
+            "{}:{}:{}:{}",
+            lane.attempt, lane.workspace_id, lane.tab_id, lane.pane_id
+        );
+        if state
+            .attention_identity
+            .get(&lane.id)
+            .is_some_and(|old| old != &identity)
+        {
+            state.blocked.remove(&lane.id);
+            state.gone.remove(&lane.id);
+            state.pending_gone.remove(&lane.id);
+            state.missing.remove(&lane.id);
+            state.missing_identity.remove(&lane.id);
+        }
+        state.attention_identity.insert(lane.id.clone(), identity);
+        let remote = Herdr::new(
+            ctx.env.herdr_bin(),
+            project.coordinator().map(|c| c.socket).unwrap_or_default(),
+            ctx.runner,
+        )
+        .on_machine(lane.machine_route());
+        if agents
+            .iter()
+            .any(|agent| thread::agent_matches(lane, agent) && agent.parent().is_some())
+            && panes.iter().any(|pane| thread::pane_matches(lane, pane))
+            && let Err(error) = remote.pane_clear_tokens(&lane.pane_id, &["parent"])
+        {
+            errors.push(error.into());
+            continue;
+        }
+        // A missing agent alone is unknown; sealed attempts need no replacement.
+        if current.parked || crate::threads::attempt_sealed(project, &current) {
             state.blocked.remove(&lane.id);
             state.missing.remove(&lane.id);
             state.missing_identity.remove(&lane.id);
@@ -1334,7 +1541,14 @@ pub(crate) fn remote_attention(
         } else {
             state.blocked.remove(&lane.id);
         }
-        if live.pane_exists {
+        let agent_dead = live.pane_exists
+            && live.agent_state.is_none()
+            && !agents.iter().any(|a| a.pane_id == lane.pane_id)
+            && lane.identity.process.is_some()
+            && remote
+                .pane_process_info(&lane.pane_id)
+                .is_ok_and(|info| info.agent_gone(&lane.pane_id));
+        if live.pane_exists && !agent_dead {
             state.missing.remove(&lane.id);
             state.missing_identity.remove(&lane.id);
             if state.pending_gone.contains(&lane.id) && !state.gone.contains(&lane.id) {
@@ -1388,9 +1602,18 @@ pub(crate) fn remote_attention(
                     .iter()
                     .any(|pane| thread::pane_matches(&current, pane)) =>
             {
-                state.missing.remove(&lane.id);
-                state.missing_identity.remove(&lane.id);
-                continue;
+                if !agent_dead
+                    || !herdr
+                        .agent_list()
+                        .is_ok_and(|agents| !agents.iter().any(|a| a.pane_id == current.pane_id))
+                    || !herdr
+                        .pane_process_info(&current.pane_id)
+                        .is_ok_and(|info| info.agent_gone(&current.pane_id))
+                {
+                    state.missing.remove(&lane.id);
+                    state.missing_identity.remove(&lane.id);
+                    continue;
+                }
             }
             Ok(_) => {}
             Err(error) => {
@@ -1416,11 +1639,9 @@ pub(crate) fn remote_attention(
                 state.missing.remove(&lane.id);
                 state.missing_identity.remove(&lane.id);
                 state.pending_gone.remove(&lane.id);
-                // Recovery and its terminal FAILED notice are durable even if
-                // the coordinator is temporarily unavailable.
-                if let Err(error) = type_remote_line(ctx, project, &format!("GONE {}", lane.id)) {
-                    errors.push(error);
-                }
+                // fail_start_checked stores attempt-owned GONE before retrying;
+                // it survives an unavailable coordinator and record resolution.
+                state.gone.insert(lane.id.clone());
             }
             Ok(None) => {
                 state.missing.remove(&lane.id);
@@ -1430,29 +1651,40 @@ pub(crate) fn remote_attention(
         }
     }
     for signal in signals {
+        if let Signal::Gone(ref lane) = signal {
+            if let Some(record) = threads.iter().find(|record| &record.id == lane) {
+                let recover = !record.launch.recipe_id.is_empty();
+                match crate::threads::fail_start_checked(
+                    ctx,
+                    project,
+                    lane,
+                    "the machine rebooted before this attempt sealed",
+                    crate::contracts::FailureClass::ProcessGone,
+                    recover,
+                    Some(record),
+                ) {
+                    Ok(Some(_)) => {
+                        state.pending_gone.remove(lane);
+                        state.gone.insert(lane.clone());
+                        // A reboot can leave a restored terminal behind. Unlike
+                        // a confirmed absent pane, it still needs deliberate cleanup.
+                        errors.extend(crate::threads::close_pane(ctx, project, record).err());
+                    }
+                    Ok(None) => {
+                        state.pending_gone.remove(lane);
+                    }
+                    Err(error) => errors.push(error.context(format!("{lane}: process recovery"))),
+                }
+            }
+            continue;
+        }
         let line = signal.line();
         match type_remote_line(ctx, project, &line) {
             Ok(true) => match signal {
                 Signal::Blocked(lane) => {
                     state.blocked.insert(lane);
                 }
-                Signal::Gone(lane) => {
-                    state.pending_gone.remove(&lane);
-                    state.gone.insert(lane.clone());
-                    if let Some(record) = threads.iter().find(|record| record.id == lane) {
-                        let recover = !record.launch.recipe_id.is_empty();
-                        if let Err(error) = crate::threads::fail_start(
-                            ctx,
-                            project,
-                            &lane,
-                            "the pane or agent is gone without a report",
-                            crate::contracts::FailureClass::ProcessGone,
-                            recover,
-                        ) {
-                            errors.push(error.context(format!("{lane}: process recovery")));
-                        }
-                    }
-                }
+                Signal::Gone(_) => unreachable!("GONE is stored by recovery above"),
             },
             // A suspended or busy writer has not consumed the transition. Do
             // not mark it: the next successful pass must try again.
@@ -1479,19 +1711,7 @@ pub(crate) fn type_remote_line(ctx: &Ctx, project: &Project, text: &str) -> Resu
         return Ok(false);
     }
     let herdr = Herdr::new(ctx.env.herdr_bin(), &record.socket, ctx.runner);
-    let _writer = crate::prompt::writer_lock(project)?;
-    let ready = herdr.agent_list()?.into_iter().any(|agent| {
-        agent.pane_id == record.pane_id && agent.name == record.agent_name && agent.ready()
-    });
-    if !ready {
-        return Ok(false);
-    }
-    if !crate::prompt::coordinator_prompt_clear(project, &herdr, &record.pane_id)? {
-        return Ok(false);
-    }
-    crate::prompt::mark_automated_prompt(project, &record.pane_id, text)?;
-    herdr.agent_prompt(&record.pane_id, text)?;
-    Ok(true)
+    deliver_coordinator_prompt(project, &herdr, &record.pane_id, text)
 }
 
 /// A server restart is a machine event, not an individual thread change.
@@ -1602,8 +1822,8 @@ mod tests {
         }
     }
 
-    /// A project with a ready coordinator in its bound pane, and the fake
-    /// runner answering `agent prompt`.
+    /// A project with a mid-turn coordinator (notices queue without a wake),
+    /// and the fake runner answering `agent prompt`.
     fn delivery_world() -> (World, Project) {
         let world = World::new();
         let project = world.project("demo", "a.sock");
@@ -1613,7 +1833,14 @@ mod tests {
         let cwd = project.canonical_dir().to_string_lossy().into_owned();
         *world.agents.borrow_mut() = format!(
             "[{}]",
-            agent_json("w1", "w1:t1", "w1:p1", &cwd, "hp-demo-coordinator", "idle")
+            agent_json(
+                "w1",
+                "w1:t1",
+                "w1:p1",
+                &cwd,
+                "hp-demo-coordinator",
+                "working"
+            )
         );
         (world, project)
     }
@@ -1659,6 +1886,417 @@ mod tests {
             .collect()
     }
 
+    fn coordinator_state(world: &World, project: &Project, state: &str) {
+        let c = project.coordinator().unwrap();
+        *world.agents.borrow_mut() = format!(
+            "[{}]",
+            agent_json(
+                &c.workspace_id,
+                &c.tab_id,
+                &c.pane_id,
+                &c.cwd,
+                &c.agent_name,
+                state,
+            )
+        );
+    }
+
+    #[test]
+    fn idle_notices_coalesce_at_120_seconds_and_busy_notices_flush_now() {
+        let (world, project) = delivery_world();
+        coordinator_state(&world, &project, "idle");
+        let c = project.coordinator().unwrap();
+        let herdr = Herdr::new(world.env.herdr_bin(), &c.socket, &world.runner);
+        let lines = [
+            "DONE t-0001 report sha",
+            "GONE t-0002 attempt 1",
+            "REVIEW review-1 merged pushed",
+        ];
+        // Measured baseline: the previous writer submitted every line separately.
+        for line in lines {
+            herdr.agent_prompt(&c.pane_id, line).unwrap();
+        }
+        let before = typed_lines(&world).len();
+        world.runner.calls.borrow_mut().clear();
+        for (line, now) in lines.into_iter().zip([100, 130, 219]) {
+            assert!(coordinator_notice_at(&project, &herdr, &c.pane_id, Some(line), now).unwrap());
+        }
+        coordinator_notice_at(&project, &herdr, &c.pane_id, None, 219).unwrap();
+        assert!(typed_lines(&world).is_empty());
+        coordinator_notice_at(&project, &herdr, &c.pane_id, None, 220).unwrap();
+        let after = typed_lines(&world).len();
+        assert_eq!(after, 1);
+        let prompt = world
+            .runner
+            .calls
+            .borrow()
+            .iter()
+            .find(|cmd| cmd.display().contains("agent prompt"))
+            .unwrap()
+            .args
+            .clone();
+        assert!(
+            prompt.iter().any(|arg| arg == &lines.join("\n")),
+            "{prompt:?}"
+        );
+        prime_unread(&world.ctx(), &project).unwrap();
+        assert_eq!(
+            typed_lines(&world).len(),
+            1,
+            "already-delivered lines need no digest"
+        );
+        println!("synthetic idle burst: notice prompts {before} -> {after} (3 lines retained)");
+
+        coordinator_notice_at(
+            &project,
+            &herdr,
+            &c.pane_id,
+            Some("WAITING t-0003 input"),
+            300,
+        )
+        .unwrap();
+        coordinator_state(&world, &project, "working");
+        coordinator_notice_at(&project, &herdr, &c.pane_id, Some("BLOCKED t-0004"), 301).unwrap();
+        assert_eq!(
+            typed_lines(&world).len(),
+            2,
+            "busy flushes even the older held line immediately"
+        );
+        assert!(typed_lines(&world)[1].contains("WAITING t-0003"));
+        assert!(typed_lines(&world)[1].contains("BLOCKED t-0004"));
+        assert!(
+            project::read_json::<NoticeBatch>(&batch_path(&project))
+                .unwrap()
+                .lines
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn held_notices_survive_receipt_rebind_and_transport_failure() {
+        let (world, project) = delivery_world();
+        coordinator_state(&world, &project, "idle");
+        let c = project.coordinator().unwrap();
+        let failing = crate::runner::fake::FakeRunner::new();
+        failing.on(
+            "agent list",
+            crate::runner::fake::ok(&format!(
+                r#"{{"result":{{"agents":{}}}}}"#,
+                world.agents.borrow()
+            )),
+        );
+        failing.on("pane read", crate::runner::fake::ok("❯ \n"));
+        failing.on(
+            "agent prompt",
+            crate::runner::fake::fail(
+                1,
+                r#"{"error":{"code":"unreachable","message":"transport failed"}}"#,
+            ),
+        );
+        let herdr = Herdr::new("herdr", &c.socket, &failing);
+        assert!(
+            coordinator_notice_at(&project, &herdr, &c.pane_id, Some("DONE t-0001"), 100).unwrap()
+        );
+        receipt(&project, wake_revision(&project)).unwrap();
+        assert!(coordinator_notice_at(&project, &herdr, &c.pane_id, None, 220).unwrap());
+        assert_eq!(
+            project::read_json::<NoticeBatch>(&batch_path(&project))
+                .unwrap()
+                .lines,
+            ["DONE t-0001"]
+        );
+        project
+            .update_coordinator(|c| {
+                c.pane_id = "w1:p9".into();
+                c.generation += 1;
+            })
+            .unwrap();
+        coordinator_state(&world, &project, "working");
+        flush_coordinator_notices(&world.ctx(), &project).unwrap();
+        assert_eq!(typed_lines(&world).len(), 1);
+        assert!(typed_lines(&world)[0].contains("w1:p9"));
+        prime_unread(&world.ctx(), &project).unwrap();
+        assert_eq!(typed_lines(&world).len(), 1);
+    }
+
+    #[test]
+    fn idle_event_journal_distinguishes_durable_queue_from_transport() {
+        let (world, project) = delivery_world();
+        coordinator_state(&world, &project, "idle");
+        let lane = thread::allocate(&project, |t| {
+            t.status = Status::Open;
+        })
+        .unwrap();
+        let event = sealed_done(&project, &lane.id);
+        deliver_events(&world.ctx(), &project).unwrap();
+        deliver_event(&world.ctx(), &project, &event).unwrap();
+        deliver_events(&world.ctx(), &project).unwrap();
+        assert!(typed_lines(&world).is_empty());
+        assert_eq!(
+            events::states(&project, &event.id).unwrap(),
+            [crate::contracts::DeliveryState::Queued]
+        );
+        assert_eq!(
+            project::read_json::<NoticeBatch>(&batch_path(&project))
+                .unwrap()
+                .lines
+                .len(),
+            1
+        );
+        receipt(&project, wake_revision(&project)).unwrap();
+        let c = project.coordinator().unwrap();
+        let herdr = Herdr::new("herdr", &c.socket, &world.runner);
+        flush_notices_for_test(&project, &herdr);
+        assert_eq!(
+            events::states(&project, &event.id).unwrap(),
+            [
+                crate::contracts::DeliveryState::Queued,
+                crate::contracts::DeliveryState::Submitted
+            ]
+        );
+        deliver_event(&world.ctx(), &project, &event).unwrap();
+        assert_eq!(typed_lines(&world).len(), 1);
+    }
+
+    #[test]
+    fn historical_delivered_cursor_does_not_repeat_a_digest_on_idle() {
+        for primed in [false, true] {
+            let (world, project) = delivery_world();
+            coordinator_state(&world, &project, "idle");
+            let binding = wake_binding(&project);
+            project::write_json(
+                &wake_path(&project),
+                &serde_json::json!({
+                    "binding": if primed { "previous" } else { &binding }, "revision": 1,
+                    "primed_binding": if primed { &binding } else { "" },
+                    "lines": ["REVIEW review-1 merged pushed"], "submitted_at": 1
+                }),
+            )
+            .unwrap();
+            prime_unread(&world.ctx(), &project).unwrap();
+            assert!(typed_lines(&world).is_empty());
+            coordinator_state(&world, &project, "working");
+            type_remote_line(&world.ctx(), &project, "BLOCKED t-0002").unwrap();
+            prime_unread(&world.ctx(), &project).unwrap();
+            assert_eq!(
+                typed_lines(&world).len(),
+                1,
+                "new notices cannot re-arm an already-delivered historical digest"
+            );
+        }
+    }
+
+    #[test]
+    fn sealed_park_clears_the_fork_link_before_close() {
+        let (world, project) = delivery_world();
+        let lane = thread::allocate(&project, |t| {
+            t.status = Status::Open;
+            t.pane_id = "w2:p1".into();
+            t.tab_id = "w2:t1".into();
+            t.workspace_id = "w2".into();
+            t.cwd = "/lane".into();
+            t.repo = "/repo".into();
+            t.base = "base".into();
+            t.prompt_pending = false;
+        })
+        .unwrap();
+        *world.panes.borrow_mut() = format!(
+            "[{}]",
+            crate::scenarios::pane_json("w2", "w2:t1", "w2:p1", "/lane")
+        );
+        sealed_done(&project, &lane.id);
+        deliver_events(&world.ctx(), &project).unwrap();
+        assert!(
+            typed_lines(&world).is_empty(),
+            "a changed pile member has no individual DONE notice"
+        );
+        crate::threads::park_completed(&world.ctx(), &project).unwrap();
+        assert!(thread::load(&project, &lane.id).unwrap().parked);
+        // Replay the fork's documented parent-token/closure fixture. Before,
+        // closing an attached pane produced one GONE; now the link is removed.
+        let mut parent = true;
+        let mut gone = 0;
+        for cmd in world.runner.calls.borrow().iter() {
+            let line = cmd.display();
+            if line.contains("--clear-token parent") {
+                parent = false;
+            }
+            if line.contains("workspace close") || line.contains("tab close") {
+                gone += usize::from(parent);
+            }
+        }
+        assert_eq!(gone, 0);
+        println!("synthetic sealed park: GONE 1 -> {gone}");
+    }
+
+    #[test]
+    fn sealed_box_attempts_ignore_missing_snapshots_and_reboots() {
+        for waiting in [false, true] {
+            let (world, project) = delivery_world();
+            let lane = thread::allocate(&project, |t| {
+                t.status = Status::Open;
+                t.pane_id = "w2:p1".into();
+                t.tab_id = "w2:t1".into();
+                t.workspace_id = "w2".into();
+                t.cwd = "/lane".into();
+                t.machine_id = "box".into();
+                t.machine = "box".into();
+                t.launch_attempts = 1;
+            })
+            .unwrap();
+            let mut event = sealed_done(&project, &lane.id);
+            if waiting {
+                event.id = format!("{}-1-2", lane.id);
+                event.op = event.id.clone();
+                event.payload.done = None;
+                event.payload.waiting = Some(crate::contracts::WaitingPayload {
+                    text: "missing input".into(),
+                    class: crate::contracts::FailureClass::Unknown,
+                    provider_kind: None,
+                });
+                events::seal_create_if_absent(&project, &event).unwrap();
+            }
+            let mut state = events::remote_state(&project, "box");
+            state.boot_id = "boot-1".into();
+            events::save_remote_state(&project, "box", &state).unwrap();
+            for _ in 0..5 {
+                let errors = remote_attention(
+                    &world.ctx(),
+                    &project,
+                    RemoteView {
+                        machine_id: "box",
+                        threads: std::slice::from_ref(&lane),
+                        agents: &[],
+                        panes: &[],
+                        boot_id: "boot-2",
+                        now: at("2026-09-19T00:00:00Z"),
+                    },
+                );
+                assert!(errors.is_empty(), "{errors:?}");
+            }
+            assert!(typed_lines(&world).is_empty());
+            assert!(
+                thread::load(&project, &lane.id)
+                    .unwrap()
+                    .start_notices
+                    .is_empty()
+            );
+            assert!(
+                events::remote_state(&project, "box")
+                    .pending_gone
+                    .is_empty()
+            );
+        }
+    }
+
+    #[test]
+    fn live_box_reboot_recovers_once_and_stale_terminal_views_cannot_repeat_gone() {
+        let (world, project) = delivery_world();
+        let lane = thread::allocate(&project, |t| {
+            t.status = Status::Open;
+            t.pane_id = "w2:p1".into();
+            t.tab_id = "w2:t1".into();
+            t.workspace_id = "w2".into();
+            t.cwd = "/lane".into();
+            t.machine_id = "box".into();
+            t.machine = "box".into();
+            t.launch_attempts = 1;
+        })
+        .unwrap();
+        *world.panes.borrow_mut() = format!(
+            "[{}]",
+            crate::scenarios::pane_json("w2", "w2:t1", "w2:p1", "/lane")
+        );
+        let mut state = events::remote_state(&project, "box");
+        state.boot_id = "boot-1".into();
+        events::save_remote_state(&project, "box", &state).unwrap();
+        let c = project.coordinator().unwrap();
+        let remote = Herdr::new("herdr", &c.socket, &world.runner).on_machine("box");
+        let panes = remote.pane_list().unwrap();
+        for _ in 0..3 {
+            let errors = remote_attention(
+                &world.ctx(),
+                &project,
+                RemoteView {
+                    machine_id: "box",
+                    threads: std::slice::from_ref(&lane),
+                    agents: &[],
+                    panes: &panes,
+                    boot_id: "boot-2",
+                    now: at("2026-09-19T00:00:00Z"),
+                },
+            );
+            assert!(errors.is_empty(), "{errors:?}");
+        }
+        deliver_transition_notices(&world.ctx(), &project).unwrap();
+        assert_eq!(world.runner.count("workspace close w2"), 1);
+        assert_eq!(
+            typed_lines(&world)
+                .iter()
+                .filter(|line| line.contains("GONE"))
+                .count(),
+            1
+        );
+        let calls = world.runner.calls.borrow();
+        let clear = calls
+            .iter()
+            .position(|cmd| cmd.display().contains("--clear-token parent"))
+            .unwrap();
+        let close = calls
+            .iter()
+            .position(|cmd| cmd.display().contains("workspace close w2"))
+            .unwrap();
+        assert!(clear < close);
+    }
+
+    #[test]
+    fn unsealed_box_crash_is_durable_and_stale_reobservation_cannot_repeat_it() {
+        let (world, project) = delivery_world();
+        let lane = thread::allocate(&project, |t| {
+            t.status = Status::Open;
+            t.pane_id = "w2:p1".into();
+            t.tab_id = "w2:t1".into();
+            t.workspace_id = "w2".into();
+            t.cwd = "/lane".into();
+            t.machine_id = "box".into();
+            t.machine = "box".into();
+        })
+        .unwrap();
+        for _ in 0..5 {
+            let errors = remote_attention(
+                &world.ctx(),
+                &project,
+                RemoteView {
+                    machine_id: "box",
+                    threads: std::slice::from_ref(&lane),
+                    agents: &[],
+                    panes: &[],
+                    boot_id: "boot-1",
+                    now: at("2026-09-19T00:00:00Z"),
+                },
+            );
+            assert!(errors.is_empty(), "{errors:?}");
+        }
+        deliver_transition_notices(&world.ctx(), &project).unwrap();
+        deliver_transition_notices(&world.ctx(), &project).unwrap();
+        assert_eq!(
+            typed_lines(&world)
+                .iter()
+                .filter(|line| line.contains("GONE"))
+                .count(),
+            1
+        );
+        assert_eq!(
+            thread::load(&project, &lane.id)
+                .unwrap()
+                .start_notices
+                .iter()
+                .filter(|n| n.line.starts_with("GONE"))
+                .count(),
+            1
+        );
+    }
+
     #[test]
     fn unread_wake_is_digested_once_after_rebind_not_retyped() {
         let (world, project) = delivery_world();
@@ -1681,7 +2319,17 @@ mod tests {
             agent_json("w1", "w1:t1", "w1:p2", &cwd, "hp-demo-coordinator", "idle")
         );
         deliver_events(&world.ctx(), &project).unwrap();
+        assert_eq!(
+            typed_lines(&world).len(),
+            1,
+            "the unheard digest also waits for idle batching"
+        );
+        type_remote_line(&world.ctx(), &project, "REVIEW review-1 merged pushed").unwrap();
+        let c = project.coordinator().unwrap();
+        let herdr = Herdr::new("herdr", &c.socket, &world.runner);
+        flush_notices_for_test(&project, &herdr);
         assert_eq!(typed_lines(&world).len(), 2);
+        assert!(typed_lines(&world)[1].contains("REVIEW review-1"));
         assert!(typed_lines(&world)[1].contains("Unread transitions"));
         assert!(typed_lines(&world)[1].contains("DONE"));
         deliver_events(&world.ctx(), &project).unwrap();
@@ -1691,6 +2339,11 @@ mod tests {
                 .unwrap()
                 .contains(&crate::contracts::DeliveryState::Submitted)
         );
+        // A new delivered line must not re-arm the old digest on this binding.
+        coordinator_state(&world, &project, "working");
+        type_remote_line(&world.ctx(), &project, "BLOCKED t-0002").unwrap();
+        deliver_events(&world.ctx(), &project).unwrap();
+        assert_eq!(typed_lines(&world).len(), 3);
     }
 
     #[test]

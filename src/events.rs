@@ -261,6 +261,8 @@ pub(crate) struct RemoteState {
     pub(crate) missing: BTreeMap<String, u32>,
     /// Attempt/pane that owns each consecutive absence streak.
     pub(crate) missing_identity: BTreeMap<String, String>,
+    /// Attempt and placement owning blocked/gone observations.
+    pub(crate) attention_identity: BTreeMap<String, String>,
     pub(crate) gone: BTreeSet<String>,
     /// Boot-change GONE notices that still owe a coordinator wake-up.
     pub(crate) pending_gone: BTreeSet<String>,

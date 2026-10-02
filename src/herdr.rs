@@ -205,6 +205,11 @@ impl Agent {
         ready_state(&self.agent_status)
     }
 
+    /// Herdr queues prompts during a turn without starting another wake.
+    pub(crate) fn promptable(&self) -> bool {
+        self.ready() || self.agent_status == "working"
+    }
+
     pub(crate) fn parent(&self) -> Option<&str> {
         self.tokens.get("parent").map(String::as_str)
     }
@@ -244,6 +249,18 @@ pub(crate) struct ForegroundProcess {
 }
 
 impl ProcessInfo {
+    /// A foreground shell (or no process) proves the agent has exited. Tools
+    /// and unavailable observations remain unknown, not a crash signal.
+    pub(crate) fn agent_gone(&self, pane: &str) -> bool {
+        self.pane_id == pane
+            && self.foreground_processes.iter().all(|p| {
+                matches!(
+                    p.name.rsplit('/').next().unwrap_or_default(),
+                    "sh" | "bash" | "zsh" | "fish"
+                )
+            })
+    }
+
     /// First foreground process, used as identity evidence (SPEC-ADE D3).
     /// Every foreground process: while the agent runs a tool, the tool is
     /// in the foreground beside it.
@@ -723,24 +740,6 @@ impl<'a> Herdr<'a> {
             args.push(name);
         }
         self.call(&args, CALL_TIMEOUT).map(|_| ())
-    }
-
-    /// Adopt / reconcile parent token: pane path, no TTL (SPEC-ADE D3).
-    pub(crate) fn pane_set_parent(&self, pane: &str, parent: &str) -> Result<(), HerdrError> {
-        let token = format!("parent={parent}");
-        self.call(
-            &[
-                "pane",
-                "report-metadata",
-                pane,
-                "--source",
-                SOURCE,
-                "--token",
-                &token,
-            ],
-            CALL_TIMEOUT,
-        )
-        .map(|_| ())
     }
 }
 

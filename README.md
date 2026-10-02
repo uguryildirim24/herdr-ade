@@ -97,7 +97,7 @@ A lane never merges into the integration branch on its own. On a box, `ha done` 
 
 ### What is `--plain`?
 
-An internal birth sentence. `thread start --job` uses the stable task's title as that sentence; pass `--plain` only when this lane is genuinely different. `thread adopt` still requires it. It keeps exact technical detail without vocabulary or length checks. Technical views wrap or collapse long rows. Recipe choice normally comes from the editable `[routing]` table in `config.toml`; `context` lists every recipe and its exact route. `thread start` rejects model and role flags. Only a model Rolf explicitly names may use `--recipe`, together with `--basis` quoting his request on the task. Adoption's `--role` only labels the existing workflow; `--passive` sets the parent token and sends no primer. See [task-based routing](docs/operations.md#task-based-routing).
+An internal birth sentence. `thread start --job` uses the stable task's title as that sentence; pass `--plain` only when this lane is genuinely different. `thread adopt` still requires it. It keeps exact technical detail without vocabulary or length checks. Technical views wrap or collapse long rows. Recipe choice normally comes from the editable `[routing]` table in `config.toml`; `context` lists every recipe and its exact route. `thread start` rejects model and role flags. Only a model Rolf explicitly names may use `--recipe`, together with `--basis` quoting his request on the task. Adoption's `--role` only labels the existing workflow; `--passive` sends no primer. ADE owns lane notices; it does not attach fork parent links. See [task-based routing](docs/operations.md#task-based-routing).
 
 ### Where does my project live?
 
