@@ -850,7 +850,10 @@ cat > "$cursor"
 printf 'boot\t%s\n' "$(cat /proc/sys/kernel/random/boot_id 2>/dev/null || true)"
 avail=$(df -B1 --output=avail / 2>/dev/null | tail -n1 | tr -d ' ')
 printf 'free\t%s\n' "${avail:-0}"
-"$ade_bin" --root "$root" recover >/dev/null 2>&1 || true
+if ! "$ade_bin" --root "$root" recover >/dev/null; then
+  printf 'box recovery failed: %s\n' "$ade_bin" >&2
+  exit 1
+fi
 if [ -x "$herdr_bin" ]; then
   a=$("$herdr_bin" --session __SESSION__ agent list 2>/dev/null | tr -d '\n')
   p=$("$herdr_bin" --session __SESSION__ pane list 2>/dev/null | tr -d '\n')
@@ -1597,7 +1600,7 @@ mod tests {
         crate::remote::MachineDeclaration {
             root: root.into(),
             path: "/bin:/usr/bin".into(),
-            ade_bin: "/missing/herdr-ade".into(),
+            ade_bin: "/bin/true".into(),
             ..Default::default()
         }
     }
@@ -2124,11 +2127,28 @@ mod tests {
     }
 
     #[test]
+    fn courier_helper_surfaces_box_recovery_failure() {
+        let home = tempfile::tempdir().unwrap();
+        let mut machine = test_machine(&home.path().display().to_string());
+        machine.ade_bin = "/bin/false".into();
+        let script = courier_helper(&machine, "default");
+        let out = crate::runner::RealRunner
+            .run(
+                &crate::runner::Cmd::new("sh", Duration::from_secs(120))
+                    .args(["-c", &script])
+                    .stdin(String::new()),
+            )
+            .unwrap();
+        assert!(!out.success());
+        assert!(out.error_text().contains("box recovery failed: /bin/false"));
+        assert!(!out.stdout.contains("event\t"));
+    }
+
+    #[test]
     fn courier_helper_survives_a_hostile_box_root() {
         let script = courier_helper(&test_machine("/home/it's a $(box)"), "default");
         let command = format!("sh -c {}", crate::remote::quote(&script));
-        // A throwaway HOME so the script's box recovery never touches the real
-        // ADE root; the box binaries are absent there.
+        // An isolated HOME; recovery is a successful no-op in this fixture.
         let home = tempfile::tempdir().unwrap();
         let out = crate::runner::RealRunner
             .run(

@@ -1486,7 +1486,7 @@ mod tests {
     }
 
     #[test]
-    fn box_recovery_seals_a_staged_op_from_its_card_and_abandons_a_dead_reserved_one() {
+    fn box_recovery_repairs_an_interrupted_receipt_twice_and_abandons_a_dead_reserved_op() {
         let root = tempfile::tempdir().unwrap();
         let project = project::create(root.path(), "demo", "", vec![]).unwrap();
         let recipient = Recipient {
@@ -1539,7 +1539,13 @@ mod tests {
             },
         )
         .unwrap();
-        stage_waiting(&project, &staged.op).unwrap();
+        let staged_op = stage_waiting(&project, &staged.op).unwrap();
+        let event = event_from_op(&staged_op).unwrap();
+        events::seal_create_if_absent(&project, &event).unwrap();
+        // Old writer crashed after create_new of the final receipt, before
+        // writing any bytes. The event exists but its op is still staged.
+        project.record_dir_for_write("receipts").unwrap();
+        std::fs::write(events::receipt_path(&project, &event.id).unwrap(), b"").unwrap();
         let reserved = reserve(
             &project,
             Reservation {
@@ -1568,6 +1574,15 @@ mod tests {
             detached_ticker: false,
         };
         recover_box(&ctx).unwrap();
+        recover_box(&ctx).unwrap();
+        let receipt_path = events::receipt_path(&project, &event.id).unwrap();
+        let receipt: events::Receipt =
+            toml::from_str(&std::fs::read_to_string(&receipt_path).unwrap()).unwrap();
+        assert_eq!(receipt.event, event.id);
+        assert_eq!(
+            receipt.event_hash,
+            crate::thread::sha256_hex(&events::bytes(&event).unwrap())
+        );
         assert_eq!(load(&project, &staged.op).unwrap().state, OpState::Sealed);
         assert_eq!(events::list(&project).len(), 1);
         assert!(events::receipt_path(&project, &staged.op).unwrap().exists());

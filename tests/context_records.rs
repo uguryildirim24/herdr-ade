@@ -89,8 +89,8 @@ fn context_acknowledges_only_shown_current_attempt_evidence_for_its_binding() {
     assert!(text.contains("current wait"));
     assert!(text.contains("report draft: .state/threads/t-0001.md (not completion)"));
     assert!(!text.contains("superseded"));
-    let receipt = project.join(".state/deliveries/t-0001-2-2.jsonl");
-    let failed_receipt = project.join(".state/deliveries/t-0003-2-1.jsonl");
+    let receipt = project.join(".state/deliveries/t-0001-2-2");
+    let failed_receipt = project.join(".state/deliveries/t-0003-2-1");
     assert!(!receipt.exists(), "peek never acknowledges");
     assert!(!failed_receipt.exists());
     context(home.path(), "w9:p9", false);
@@ -105,17 +105,17 @@ fn context_acknowledges_only_shown_current_attempt_evidence_for_its_binding() {
     assert_eq!(std::fs::read(&cursor).unwrap(), before);
     let deliveries = project.join(".state/deliveries");
     assert!(
-        std::fs::read_to_string(deliveries.join("t-0003-2-1.jsonl"))
+        std::fs::read_to_string(deliveries.join("t-0003-2-1/00000001.json"))
             .unwrap()
             .contains("acknowledged")
     );
     assert!(
-        std::fs::read_to_string(deliveries.join("t-0001-2-2.jsonl"))
+        std::fs::read_to_string(deliveries.join("t-0001-2-2/00000001.json"))
             .unwrap()
             .contains("acknowledged")
     );
     for id in ["t-0001-1-1", "t-0001-2-1", "t-0002-2-1"] {
-        assert!(!deliveries.join(format!("{id}.jsonl")).exists());
+        assert!(!deliveries.join(id).exists());
     }
     assert!(!project.join(".state/inbox-counter.json").exists());
 }
