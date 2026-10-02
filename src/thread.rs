@@ -81,6 +81,9 @@ pub(crate) struct Thread {
     /// First brief submission staged for this attempt and pane. Pending can
     /// remain true until activity is observed, without submitting it twice.
     pub(crate) brief_submitted: bool,
+    /// Start of the bounded delivery observation window, not a receipt.
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub(crate) brief_submitted_at: String,
     /// A sealed completion whose pane was closed; its branch and attempt remain live.
     pub(crate) parked: bool,
     /// The current attempt's sealed waiting event answered by the last
@@ -510,6 +513,7 @@ pub(crate) fn update_checked(
     change(&mut thread)?;
     if thread.attempt != before.attempt || thread.pane_id != before.pane_id {
         thread.brief_submitted = false;
+        thread.brief_submitted_at.clear();
     }
     if thread.attempt != before.attempt {
         // A receipt or answered wait proves one exact attempt; a replacement

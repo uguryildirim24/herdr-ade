@@ -3172,6 +3172,7 @@ fn refuse_busy_retry(herdr: &Herdr<'_>, record: &Thread) -> Result<()> {
         || agent_state.as_deref() == Some("working")
         || (record.launch_attempts > 0
             && record.prompt_pending
+            && !record.error.starts_with("brief_delivery_failed:")
             && agent_state
                 .as_deref()
                 .is_some_and(crate::herdr::ready_state))
@@ -8222,6 +8223,36 @@ mod tests {
             );
             assert!(error.contains("Trust this folder?"), "{error}");
             assert_eq!(runner.count("pane read"), 1);
+        }
+    }
+
+    #[test]
+    fn retry_accepts_delivery_failure_but_not_a_now_working_agent() {
+        use crate::runner::fake::{FakeRunner, ok};
+        for state in ["idle", "working"] {
+            let runner = FakeRunner::new();
+            runner.on("agent list", ok(&format!(r#"{{"result":{{"agents":[{{"pane_id":"w1:p2","tab_id":"w1:t2","workspace_id":"w1","cwd":"/repo","name":"hp-demo-t-0001","agent_status":"{state}"}}]}}}}"#)));
+            runner.on("pane read", ok("empty prompt\n"));
+            let herdr = Herdr::new("herdr", "", &runner);
+            let record = Thread {
+                id: "t-0001".into(),
+                pane_id: "w1:p2".into(),
+                tab_id: "w1:t2".into(),
+                workspace_id: "w1".into(),
+                cwd: "/repo".into(),
+                agent_name: "hp-demo-t-0001".into(),
+                status: Status::Failed,
+                launch_attempts: 1,
+                prompt_pending: true,
+                brief_submitted: true,
+                error: "brief_delivery_failed: no activity".into(),
+                ..Thread::default()
+            };
+            assert_eq!(refuse_busy_retry(&herdr, &record).is_ok(), state == "idle");
+            let mut pending = record.clone();
+            pending.status = Status::Open;
+            pending.error = "brief_delivery_pending: timeout".into();
+            assert!(refuse_busy_retry(&herdr, &pending).is_err());
         }
     }
 
