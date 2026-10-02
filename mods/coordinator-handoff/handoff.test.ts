@@ -60,6 +60,16 @@ test('nonzero ha exit falls back', async ($, on) => {
   expect(await $.session.compact(input)).toEqual(fallback);
 });
 
+test('successful ha exit with truncated stdout falls back', async ($, on) => {
+  setup(on);
+  on('model.fork', () => ({ value: { isAnswered: true, text: 'note', usage } }));
+  on('process.run', () => ({ value: { exitCode: 0, stdout: 'partial handoff', stderr: '', isStdoutTruncated: true, isStderrTruncated: false } }));
+  let announced = false;
+  on('ui.toast', () => { announced = true; return { value: undefined }; });
+  expect(await $.session.compact(input)).toEqual(fallback);
+  expect(announced).toBe(false);
+});
+
 test('slow fork cannot wedge compaction', async ($, on) => {
   const { clock } = setup(on);
   on('model.fork', async () => {
