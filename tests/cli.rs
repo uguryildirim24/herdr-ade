@@ -137,7 +137,7 @@ fn notes_and_tasks_accept_a_request_from_another_project() {
         "The direction remains visible in context.",
     ]);
 
-    let notes = std::fs::read_to_string(root.join("demo/.state/notes.jsonl")).unwrap();
+    let notes = std::fs::read_to_string(root.join("demo/.state/notes/n-0001.json")).unwrap();
     let task = std::fs::read_to_string(root.join("demo/.state/tasks/job-0001.toml")).unwrap();
     assert!(notes.contains("\"request\":\"source/q-cross\""), "{notes}");
     assert!(task.contains("request:source/q-cross"), "{task}");

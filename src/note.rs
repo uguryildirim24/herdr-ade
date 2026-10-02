@@ -1,14 +1,13 @@
 //! Provenanced project memory and standing instructions.
 //!
-//! New notes are append-only records. Historical task notes still load from
-//! task records; current facts and instructions live only in this log.
+//! New notes are immutable atomic records. Historical task notes and JSONL
+//! logs still load; current facts and instructions use one file per record.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::File;
-use std::io::Write;
 use std::path::PathBuf;
 
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
 use clap::ValueEnum;
 use serde::{Deserialize, Serialize};
 
@@ -86,12 +85,61 @@ pub(crate) fn replacement_lock(project: &Project) -> Result<ReplacementLock> {
     Ok(ReplacementLock { _file: file })
 }
 
+fn records<T: serde::de::DeserializeOwned>(project: &Project, kind: &str) -> Result<Vec<T>> {
+    let (mut rows, _) = project::read_jsonl(&project.record_file(&format!("{kind}.jsonl")))?;
+    let dir = project.record_dir(kind);
+    let entries = match std::fs::read_dir(&dir) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(rows),
+        Err(error) => {
+            return Err(error).with_context(|| format!("could not read {}", dir.display()));
+        }
+    };
+    let mut paths = entries
+        .map(|entry| entry.map(|entry| entry.path()))
+        .collect::<std::io::Result<Vec<_>>>()?;
+    paths.sort();
+    for path in paths {
+        if path.extension().is_some_and(|ext| ext == "json") {
+            rows.push(
+                serde_json::from_slice(&std::fs::read(&path)?)
+                    .with_context(|| format!("corrupt record: {}", path.display()))?,
+            );
+        }
+    }
+    Ok(rows)
+}
+
 pub(crate) fn read(project: &Project) -> Vec<Note> {
-    std::fs::read_to_string(path(project))
-        .unwrap_or_default()
-        .lines()
-        .filter_map(|line| serde_json::from_str(line).ok())
-        .collect()
+    records(project, "notes").unwrap_or_else(|error| {
+        eprintln!("{error:#}");
+        Vec::new()
+    })
+}
+
+/// Reserve even the id of a historical interrupted append. If the write died
+/// before its id, reserve one slot above the last complete historical record.
+fn interrupted_id(project: &Project) -> Result<u64> {
+    let (rows, tail) = project::read_jsonl::<Note>(&path(project))?;
+    let Some(tail) = tail else { return Ok(0) };
+    let last = rows
+        .iter()
+        .filter_map(|row| note_number(&row.id))
+        .max()
+        .unwrap_or(0);
+    let text = String::from_utf8_lossy(&tail);
+    let recorded = text
+        .split_once("\"id\"")
+        .and_then(|(_, rest)| rest.split_once(':'))
+        .and_then(|(_, rest)| rest.trim_start().strip_prefix("\"n-"))
+        .and_then(|rest| rest.split('"').next())
+        .and_then(|number| number.parse::<u64>().ok())
+        .unwrap_or(0);
+    Ok(recorded.max(last + 1))
+}
+
+fn note_number(id: &str) -> Option<u64> {
+    id.strip_prefix("n-")?.parse().ok()
 }
 
 pub(crate) fn rows(project: &Project) -> Vec<Row> {
@@ -161,11 +209,10 @@ pub(crate) fn rows(project: &Project) -> Vec<Row> {
 }
 
 fn retirements(project: &Project) -> Vec<Retirement> {
-    std::fs::read_to_string(project.record_file("retirements.jsonl"))
-        .unwrap_or_default()
-        .lines()
-        .filter_map(|line| serde_json::from_str(line).ok())
-        .collect()
+    records(project, "retirements").unwrap_or_else(|error| {
+        eprintln!("{error:#}");
+        Vec::new()
+    })
 }
 
 pub(crate) fn validate_basis(project: &Project, text: &str) -> Result<String> {
@@ -214,7 +261,9 @@ pub(crate) fn retire(
     let request = validate_basis(project, &reference)?;
     let _replacement_lock = replacement_lock(project)?;
     let _lock = project.lock()?;
-    if !read(project).iter().any(|note| note.id == id) {
+    let notes = records::<Note>(project, "notes")?;
+    records::<Retirement>(project, "retirements")?;
+    if !notes.iter().any(|note| note.id == id) {
         return Err(crate::refusal::error(
             format!("note_retirement: no note `{id}` exists"),
             format!(
@@ -235,11 +284,10 @@ pub(crate) fn retire(
         request: request.trim_start_matches("request:").to_string(),
         reason: reason.trim().to_string(),
     };
-    let path = project.record_file_for_write("retirements.jsonl")?;
-    let mut file = File::options().create(true).append(true).open(path)?;
-    writeln!(file, "{}", serde_json::to_string(&record)?)?;
-    file.sync_all()?;
-    drop(file);
+    let path = project
+        .record_dir_for_write("retirements")?
+        .join(format!("{id}.json"));
+    project::write_create_only(&path, &serde_json::to_vec(&record)?)?;
     drop(_lock);
     crate::project::refresh_page(project)?;
     Ok(record)
@@ -294,6 +342,9 @@ pub(crate) fn add(
         crate::task::load(project, task)?;
     }
     let _replacement_lock = replaces.map(|_| replacement_lock(project)).transpose()?;
+    let _lock = project.lock()?;
+    let notes = records::<Note>(project, "notes")?;
+    records::<Retirement>(project, "retirements")?;
     if let Some(old) = replaces {
         if !target_exists(project, old) {
             return Err(crate::refusal::error(
@@ -309,11 +360,10 @@ pub(crate) fn add(
             ));
         }
     }
-    let _lock = project.lock()?;
-    let records = read(project);
-    let next = records
+    let next = notes
         .iter()
-        .filter_map(|record| record.id.strip_prefix("n-")?.parse::<u64>().ok())
+        .filter_map(|record| note_number(&record.id))
+        .chain([interrupted_id(project)?])
         .max()
         .unwrap_or(0)
         + 1;
@@ -327,11 +377,10 @@ pub(crate) fn add(
         replaces: replaces.map(str::to_string),
         tasks,
     };
-    let path = project.record_file_for_write("notes.jsonl")?;
-    let mut file = File::options().create(true).append(true).open(path)?;
-    writeln!(file, "{}", serde_json::to_string(&note)?)?;
-    file.sync_all()?;
-    drop(file);
+    let path = project
+        .record_dir_for_write("notes")?
+        .join(format!("{}.json", note.id));
+    project::write_create_only(&path, &serde_json::to_vec(&note)?)?;
     drop(_lock);
     crate::project::refresh_page(project)?;
     Ok(note)
@@ -380,6 +429,125 @@ pub(crate) fn active_for(project: &Project, task: Option<&str>) -> Vec<Row> {
 mod tests {
     use super::*;
     use crate::testkit::fixture;
+
+    #[test]
+    fn interrupted_append_then_add_replace_and_retire_preserves_records_and_ids() {
+        for (tail, expected) in [
+            (r#"{"schema":1,"id":"n-0010","text":"torn"#, "n-0011"),
+            (r#"{"schema":1"#, "n-0003"),
+        ] {
+            let fx = fixture();
+            crate::prompt::record_test_request(&fx.project, "q-1", "Keep the corrected notes.")
+                .unwrap();
+            let historical = Note {
+                schema: 1,
+                id: "n-0001".into(),
+                kind: Kind::Instruction,
+                at: project::now(),
+                request: "q-1".into(),
+                text: "Historical instruction.".into(),
+                replaces: None,
+                tasks: vec![],
+            };
+            std::fs::write(
+                path(&fx.project),
+                format!("{}\n{tail}", serde_json::to_string(&historical).unwrap()),
+            )
+            .unwrap();
+            let historical_retirement = Retirement {
+                id: "n-0000".into(),
+                at: project::now(),
+                request: "q-1".into(),
+                reason: "Historical retirement.".into(),
+            };
+            std::fs::write(
+                fx.project.record_file("retirements.jsonl"),
+                format!(
+                    "{}\n{{\"id\":",
+                    serde_json::to_string(&historical_retirement).unwrap()
+                ),
+            )
+            .unwrap();
+            let added = add(
+                &fx.project,
+                Kind::Instruction,
+                "Added after crash.",
+                "q-1",
+                None,
+                vec![],
+            )
+            .unwrap();
+            assert_eq!(added.id, expected);
+            let replaced = add(
+                &fx.project,
+                Kind::Instruction,
+                "Replacement after crash.",
+                "q-1",
+                Some(&historical.id),
+                vec![],
+            )
+            .unwrap();
+            let retired = retire(&fx.project, &added.id, "q-1", "Retired after crash.").unwrap();
+            let again = add(
+                &fx.project,
+                Kind::Memory,
+                "Another note.",
+                "q-1",
+                None,
+                vec![],
+            )
+            .unwrap();
+            let notes = read(&fx.project);
+            assert_eq!(notes.len(), 4);
+            assert_eq!(
+                notes
+                    .iter()
+                    .map(|note| &note.id)
+                    .collect::<BTreeSet<_>>()
+                    .len(),
+                4
+            );
+            for note in [&historical, &added, &replaced, &again] {
+                assert!(notes.contains(note));
+            }
+            let retirements = retirements(&fx.project);
+            assert_eq!(retirements.len(), 2);
+            assert!(retirements.iter().any(|row| row.id == retired.id));
+            assert!(
+                retirements
+                    .iter()
+                    .any(|row| row.reason == historical_retirement.reason)
+            );
+            let rows = rows(&fx.project);
+            assert!(rows.iter().any(|row| row.text == "Retired after crash."));
+            assert!(
+                active_for(&fx.project, None)
+                    .iter()
+                    .any(|row| row.id == replaced.id)
+            );
+            assert!(
+                !active_for(&fx.project, None)
+                    .iter()
+                    .any(|row| row.id == added.id)
+            );
+            // Current evidence is not silently skipped or overwritten.
+            let bad = fx
+                .project
+                .record_dir("notes")
+                .join(format!("{}.json", again.id));
+            std::fs::write(&bad, b"{").unwrap();
+            let error = add(
+                &fx.project,
+                Kind::Memory,
+                "Must not hide corruption.",
+                "q-1",
+                None,
+                vec![],
+            )
+            .unwrap_err();
+            assert!(format!("{error:#}").contains(&bad.display().to_string()));
+        }
+    }
 
     #[test]
     fn retirement_keeps_history_but_removes_current_fact_and_instruction() {

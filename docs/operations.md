@@ -19,7 +19,9 @@ How Herdr ADE works, what it writes where, and how to run threads on other machi
   scratch/                the coordinator's temporary files
   library/<id>/           files a thread produced for Rolf
   .state/
-    notes.jsonl           dated facts and instructions with request ids and replacements
+    notes/<id>.json       immutable facts and instructions with request ids and replacements
+    retirements/<id>.json immutable note retirements
+    deliveries/<id>/      atomic delivery entries (historical JSONL journals still load)
     tasks/job-NNNN.toml   stable tasks: request, acceptance, links and evidence
     threads/<id>.toml     thread record          artifacts/<hash>  sealed final report
     threads/<id>.task.md  the task as given      threads/<id>/     project-owned lane folder
@@ -29,6 +31,8 @@ How Herdr ADE works, what it writes where, and how to run threads on other machi
 ~/.herdr-ade/.ticker.lock  .ticker.log  .trash/
 ~/.config/herdr-ade/config.toml             executable recipes, editable routing, dispatch placement, machines and harness repositories; any coordinator may edit it
 ```
+
+New notes, retirements, delivery entries, receipts and import markers publish complete files atomically without overwrite. Historical `notes.jsonl`, `retirements.jsonl` and delivery JSONL journals still load; interrupted final lines are named, never joined to a new write, and interrupted note ids are reserved. Recovery rebuilds incomplete historical receipts and import markers from their immutable events, while conflicting complete evidence remains an error. Box recovery errors surface through the courier.
 
 Content folders in this tree are created on their first write; a new project has only `PROJECT.md` and `.state/`. All binary-owned records live under `.state/`. A project-owned lane folder stays where its thread record says it is.
 

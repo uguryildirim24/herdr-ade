@@ -2,7 +2,7 @@
 //! Mac-side import of box envelopes (SPEC-remote §4.3).
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::fs::{File, OpenOptions};
+use std::fs::File;
 use std::io::Write as _;
 use std::path::PathBuf;
 
@@ -96,10 +96,33 @@ fn import_path(project: &Project, machine: &str, event: &str) -> Result<PathBuf>
         .join(format!("{event}.toml")))
 }
 
-fn load_import(project: &Project, machine: &str, event: &str) -> Option<ImportSource> {
-    let path = import_path(project, machine, event).ok()?;
-    let text = std::fs::read_to_string(path).ok()?;
-    toml::from_str(&text).ok()
+fn load_import(project: &Project, machine: &str, event: &str) -> Result<Option<ImportSource>> {
+    let path = import_path(project, machine, event)?;
+    let bytes = match std::fs::read(&path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(error).with_context(|| format!("could not read {}", path.display()));
+        }
+    };
+    match std::str::from_utf8(&bytes)
+        .ok()
+        .and_then(|text| toml::from_str::<ImportSource>(text).ok())
+    {
+        Some(source)
+            if !source.event.is_empty()
+                && !source.event_hash.is_empty()
+                && !source.machine.is_empty()
+                && !source.project.is_empty()
+                && !source.imported.is_empty() =>
+        {
+            Ok(Some(source))
+        }
+        _ => {
+            eprintln!("interrupted import marker: {}", path.display());
+            Ok(None)
+        }
+    }
 }
 
 /// What an [`import_box_event`] call did.
@@ -131,7 +154,7 @@ pub(crate) fn import_box_event(
     // race an imported completion into existence after its final check.
     let _lock = project.lock()?;
     let event_hash = hash_bytes(box_bytes);
-    if let Some(existing) = load_import(project, machine, &event.id) {
+    if let Some(existing) = load_import(project, machine, &event.id)? {
         if existing.event_hash == event_hash {
             return Ok(ImportOutcome::Replay);
         }
@@ -187,26 +210,14 @@ fn write_import_create_only(project: &Project, source: &ImportSource) -> Result<
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    let mut file = match OpenOptions::new().create_new(true).write(true).open(&path) {
-        Ok(file) => file,
-        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-            let actual = std::fs::read_to_string(&path).unwrap_or_default();
-            let expected = String::from_utf8_lossy(text.as_bytes()).into_owned();
-            if actual == expected {
-                return Ok(());
-            }
-            bail!(
-                "import_conflict: {} already exists with different bytes",
-                source.event
-            )
-        }
-        Err(error) => {
-            return Err(error).with_context(|| format!("could not write {}", path.display()));
-        }
-    };
-    file.write_all(text.as_bytes())?;
-    file.sync_all()?;
-    Ok(())
+    if path.exists() && load_import(project, &source.machine, &source.event)?.is_none() {
+        // Historical in-place writes could leave a partial marker. Its source
+        // is reconstructible from the hash-checked immutable box event.
+        project::write_atomic(&path, text.as_bytes())?;
+        return sync_parent(&path);
+    }
+    project::write_create_only(&path, text.as_bytes())
+        .with_context(|| format!("import_conflict: {}", path.display()))
 }
 
 /// Content-addressed artifact write; a retry with the same bytes is a no-op.
@@ -315,35 +326,8 @@ pub(crate) fn seal_create_if_absent(project: &Project, event: &Event) -> Result<
     project.record_dir_for_write("events")?;
     let path = event_path(project, &event.id)?;
     let expected = bytes(event)?;
-    // Written whole beside the target, then linked into place: a reader never
-    // sees a half-written event (the dot name is skipped by every lister).
-    let tmp = dir(project).join(format!(".{}.{}.tmp", event.id, std::process::id()));
-    {
-        let mut file = std::fs::File::create(&tmp)?;
-        file.write_all(&expected)?;
-        file.sync_all()?;
-    }
-    let linked = std::fs::hard_link(&tmp, &path);
-    let _ = std::fs::remove_file(&tmp);
-    match linked {
-        Ok(()) => {
-            sync_parent(&path)?;
-            Ok(())
-        }
-        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-            let actual = std::fs::read(&path)
-                .with_context(|| format!("could not read sealed event {}", path.display()))?;
-            if actual == expected {
-                Ok(())
-            } else {
-                bail!(
-                    "event_conflict: sealed event {} has different bytes",
-                    event.id
-                )
-            }
-        }
-        Err(error) => Err(error).with_context(|| format!("could not seal {}", path.display())),
-    }
+    project::write_create_only(&path, &expected)
+        .with_context(|| format!("event_conflict: sealed event {}", event.id))
 }
 
 /// The receipt written when a `done` or `waiting` event is sealed (D5): the
@@ -393,25 +377,33 @@ pub(crate) fn write_receipt(project: &Project, event: &Event) -> Result<()> {
     if !text.ends_with('\n') {
         text.push('\n');
     }
-    let mut file = match OpenOptions::new().create_new(true).write(true).open(&path) {
-        Ok(file) => file,
-        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-            let actual = std::fs::read_to_string(&path).unwrap_or_default();
-            if actual == text {
-                return Ok(());
-            }
-            bail!(
-                "receipt_conflict: {} already has different bytes",
-                path.display()
+    if path.exists() {
+        let actual =
+            std::fs::read(&path).with_context(|| format!("could not read {}", path.display()))?;
+        let complete = std::str::from_utf8(&actual)
+            .ok()
+            .and_then(|text| toml::from_str::<Receipt>(text).ok())
+            .is_some_and(|receipt| {
+                !receipt.event.is_empty()
+                    && !receipt.event_hash.is_empty()
+                    && !receipt.created.is_empty()
+                    && (event.payload.done.is_none()
+                        || (!receipt.artifact.is_empty() && !receipt.artifact_hash.is_empty()))
+            });
+        if !complete {
+            // Rebuild only incomplete historical receipts, from the event
+            // whose immutable bytes have already passed the seal equality check.
+            eprintln!(
+                "interrupted receipt: {}; rebuilding from sealed event {}",
+                path.display(),
+                event.id
             );
+            project::write_atomic(&path, text.as_bytes())?;
+            return sync_parent(&path);
         }
-        Err(error) => {
-            return Err(error).with_context(|| format!("could not write {}", path.display()));
-        }
-    };
-    file.write_all(text.as_bytes())?;
-    file.sync_all()?;
-    sync_parent(&path)
+    }
+    project::write_create_only(&path, text.as_bytes())
+        .with_context(|| format!("receipt_conflict: {}", path.display()))
 }
 
 pub(crate) fn load(project: &Project, id: &str) -> Result<Event> {
@@ -635,27 +627,43 @@ pub(crate) fn append_delivery_locked(
     if state != DeliveryState::Submitted && states(project, event)?.contains(&state) {
         return Ok(());
     }
-    let path = journal_path(project, event)?;
+    let rows = delivery_lines(project, event)?;
+    let dir = deliveries_dir(project).join(event);
+    std::fs::create_dir_all(&dir)?;
+    let path = dir.join(format!("{:08}.json", rows.len() + 1));
     let line = DeliveryLine {
         event: event.to_string(),
         state,
     };
-    let mut file = OpenOptions::new().create(true).append(true).open(&path)?;
-    serde_json::to_writer(&mut file, &line)?;
-    file.write_all(b"\n")?;
-    file.sync_all()?;
-    sync_parent(&path)
+    project::write_create_only(&path, &serde_json::to_vec(&line)?)
 }
 
 fn delivery_lines(project: &Project, event: &str) -> Result<Vec<DeliveryLine>> {
     let path = journal_path(project, event)?;
-    let Ok(text) = std::fs::read_to_string(path) else {
-        return Ok(Vec::new());
+    let (mut rows, _) = project::read_jsonl::<DeliveryLine>(&path)?;
+    let dir = deliveries_dir(project).join(event);
+    let entries = match std::fs::read_dir(&dir) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(rows),
+        Err(error) => {
+            return Err(error).with_context(|| format!("could not read {}", dir.display()));
+        }
     };
-    text.lines()
-        .filter(|line| !line.trim().is_empty())
-        .map(|line| serde_json::from_str(line).context("delivery journal line does not parse"))
-        .collect()
+    let mut paths = entries
+        .map(|entry| entry.map(|entry| entry.path()))
+        .collect::<std::io::Result<Vec<_>>>()?;
+    paths.sort();
+    for path in paths {
+        if path.extension().is_some_and(|ext| ext == "json") {
+            let line: DeliveryLine = serde_json::from_slice(&std::fs::read(&path)?)
+                .with_context(|| format!("corrupt delivery record: {}", path.display()))?;
+            if line.event != event {
+                bail!("delivery event mismatch: {}", path.display());
+            }
+            rows.push(line);
+        }
+    }
+    Ok(rows)
 }
 
 pub(crate) fn states(project: &Project, event: &str) -> Result<Vec<DeliveryState>> {
@@ -973,6 +981,61 @@ mod tests {
                 .unwrap_err()
                 .to_string()
                 .contains("receipt_conflict")
+        );
+    }
+
+    #[test]
+    fn torn_delivery_tail_does_not_block_acknowledgement() {
+        let (_root, project, event) = fixture();
+        project.record_dir_for_write("deliveries").unwrap();
+        let path = journal_path(&project, &event.id).unwrap();
+        let submitted = DeliveryLine {
+            event: event.id.clone(),
+            state: DeliveryState::Submitted,
+        };
+        let old = format!(
+            "{}\n{{\"event\":\"{}\",\"state\":",
+            serde_json::to_string(&submitted).unwrap(),
+            event.id
+        );
+        std::fs::write(&path, &old).unwrap();
+        append_delivery(&project, &event.id, DeliveryState::Acknowledged).unwrap();
+        append_delivery(&project, &event.id, DeliveryState::Acknowledged).unwrap();
+        assert_eq!(
+            states(&project, &event.id).unwrap(),
+            vec![DeliveryState::Submitted, DeliveryState::Acknowledged]
+        );
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), old);
+        let bad = deliveries_dir(&project)
+            .join(&event.id)
+            .join("00000002.json");
+        std::fs::write(&bad, b"{").unwrap();
+        let error = append_delivery(&project, &event.id, DeliveryState::Handled).unwrap_err();
+        assert!(format!("{error:#}").contains(&bad.display().to_string()));
+    }
+
+    #[test]
+    fn interrupted_import_marker_is_rebuilt_then_replays() {
+        let (_root, project, _event) = fixture();
+        let report = b"report body";
+        let event = box_event(&hash_bytes(report));
+        let path = import_path(&project, "buildbox", &event.id).unwrap();
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, b"event = \"").unwrap();
+        let box_bytes = bytes(&event).unwrap();
+        assert_eq!(
+            import_box_event(&project, "buildbox", &box_bytes, Some(report)).unwrap(),
+            ImportOutcome::New
+        );
+        assert_eq!(
+            import_box_event(&project, "buildbox", &box_bytes, Some(report)).unwrap(),
+            ImportOutcome::Replay
+        );
+        assert_eq!(
+            toml::from_str::<ImportSource>(&std::fs::read_to_string(&path).unwrap())
+                .unwrap()
+                .event_hash,
+            hash_bytes(&box_bytes)
         );
     }
 

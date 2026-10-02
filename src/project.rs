@@ -118,6 +118,86 @@ pub(crate) fn write_atomic(path: &Path, contents: &[u8]) -> Result<()> {
     result.with_context(|| format!("could not write {}", path.display()))
 }
 
+/// Publish complete immutable bytes without ever exposing an empty final file.
+/// Exact replays are accepted; a different existing record is never overwritten.
+pub(crate) fn write_create_only(path: &Path, contents: &[u8]) -> Result<()> {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static SERIAL: AtomicU64 = AtomicU64::new(0);
+    let dir = path.parent().context("path has no parent")?;
+    let name = path.file_name().context("path has no file name")?;
+    let (tmp, mut file) = loop {
+        let tmp = dir.join(format!(
+            ".{}.{}.{}.tmp",
+            name.to_string_lossy(),
+            std::process::id(),
+            SERIAL.fetch_add(1, Ordering::Relaxed)
+        ));
+        match File::options().create_new(true).write(true).open(&tmp) {
+            Ok(file) => break (tmp, file),
+            // A crash can leave a temp file and the OS can reuse its pid.
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => {
+                return Err(error).with_context(|| format!("could not create {}", tmp.display()));
+            }
+        }
+    };
+    let result = (|| -> Result<()> {
+        file.write_all(contents)?;
+        file.sync_all()?;
+        match std::fs::hard_link(&tmp, path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                if std::fs::read(path)? != contents {
+                    bail!("{} already exists with different bytes", path.display());
+                }
+            }
+            Err(error) => return Err(error.into()),
+        }
+        File::open(dir)?.sync_all()?;
+        Ok(())
+    })();
+    let _ = std::fs::remove_file(&tmp);
+    result.with_context(|| format!("could not publish {}", path.display()))
+}
+
+/// Historical append journals may have an unterminated torn tail. Keep their
+/// complete rows and name that lost evidence; corruption anywhere else is an error.
+pub(crate) fn read_jsonl<T: serde::de::DeserializeOwned>(
+    path: &Path,
+) -> Result<(Vec<T>, Option<Vec<u8>>)> {
+    let bytes = match std::fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok((vec![], None)),
+        Err(error) => {
+            return Err(error).with_context(|| format!("could not read {}", path.display()));
+        }
+    };
+    let mut rows = Vec::new();
+    let mut tail = None;
+    let lines: Vec<_> = bytes.split(|byte| *byte == b'\n').collect();
+    for (index, line) in lines.iter().enumerate() {
+        if line.iter().all(u8::is_ascii_whitespace) {
+            continue;
+        }
+        match serde_json::from_slice(line) {
+            Ok(row) => rows.push(row),
+            Err(error) if index + 1 == lines.len() && !bytes.ends_with(b"\n") => {
+                eprintln!(
+                    "interrupted journal: {}:{}: {error}",
+                    path.display(),
+                    index + 1
+                );
+                tail = Some(line.to_vec());
+            }
+            Err(error) => {
+                return Err(error)
+                    .with_context(|| format!("corrupt journal: {}:{}", path.display(), index + 1));
+            }
+        }
+    }
+    Ok((rows, tail))
+}
+
 pub(crate) fn now() -> String {
     jiff::Timestamp::now()
         .round(jiff::Unit::Second)
