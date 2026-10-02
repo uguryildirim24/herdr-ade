@@ -75,7 +75,7 @@ Every command accepts the global `--json` flag. It returns one record with an
 | `thread resolve <project> <id> [--skip-copy] [--discard-uncopied] [--keep-pane] [--reopen]` | Resolve after the final copy and close the pane and tab. A landed worktree is removed only when it has no changes or non-disposable ignored data. Changes refuse resolution; ignored data resolves the thread but keeps the worktree with folder sizes. Cleanup prunes the branch if the worktree is removed; a kept worktree keeps its branch. |
 | `overview <project> [--history] [--wait]` | Active threads grouped by what needs you. `--history` also shows resolved threads. |
 | `plan show <project>`, `plan set <project>`, `plan step add\|edit\|link\|unlink\|remove\|move <project>`, `plan sync <project>` | The plan card: goal, end result and any number of steps. `plan step add <project> "<text>" --under <step>` adds a subtask one level deep. New links use repeatable `--task`; a task may link to several steps or subtasks. Historical thread and task-side step bindings still load. |
-| `ask <project> "<question>?" --choice "<sentence>" --choice "<sentence>" [--task JOB]` | Record a question; a task-linked open ask closes when its task closes. A normalized duplicate is refused. |
+| `ask <project> "<question>?" --choice "<sentence>" --choice "<sentence>" [--task JOB]` | Record a Rundown ask. Coordinators ask in chat instead. A task-linked open ask closes when its task closes; a normalized duplicate is refused. |
 | `ask close <project> <id> --choice <number-or-sentence> \| --withdraw "<reason>"` | Answer or withdraw an open ask in one command. An answer is task authority. |
 | `review <project> [--repo PATH]` | Start or show the repository pile review; this first explicit call opts the project into automatic review. |
 | `review retry <project> [--repo PATH]` | Replace a stuck or dead reviewer in its checkout. |
@@ -92,9 +92,13 @@ The project keeps a plan card. Reading it never changes a plan, resolves a lane 
 
 - **The plan card** is `<project>/.state/plan.toml`, written under `<project>/.state/plan.lock` with a revision guard and an atomic rename. It holds the goal copied exactly from `PROJECT.md`, one of seven end-result kinds and any number of ordered steps. New bindings name stable tasks in each step, so one task may support several steps. A step's state is projected from those tasks. Historical thread bindings and task-side `plan_step` links still project from current lane/task records. Old round links are ignored. `plan sync` is the manual refresh.
 
-Every message Rolf sends the coordinator gets a request id from the prompt-submit hook and a record under `.state/requests/`. Historical request ids in the old talk journal remain readable; nothing writes that journal now. Automated harness prompts do not count as Rolf's requests; `context` shows new request ids. `ha ask` notifies Rolf of a question.
+Coordinators ask Rolf in their chat, as a short choice between outcomes he can picture, only about spend, irreversible steps or steps that leave the machine. They do not create Rundown asks. While waiting for his chat reply, they keep unrelated work moving; if nothing can proceed, they wait without recording a question to silence the ticker.
 
-There is no cap on plan steps or open questions. Ask creation and closure serialize through `.state/asks/.open.lock`; duplicate open questions remain refused.
+Every message Rolf sends the coordinator gets a request id from the prompt-submit hook and a record under `.state/requests/`. Historical request ids in the old talk journal remain readable; nothing writes that journal now. Automated harness prompts do not count as Rolf's requests; `context` shows new request ids. His chat answer supplies request-backed authority for work.
+
+The idle-plan ticker sends one nudge, then stays quiet until the plan revision, lane set, Rolf's latest request or the open ask set changes, or a lane runs. Its text suggests only work that can proceed without his reply and explicitly allows waiting for his reply in chat. It does not infer chat-wait state or require a new flag or record.
+
+The `ask` and `ask close` commands remain available; historical ask records still load. Open asks still appear in the project page's **Waiting on Rolf** section, overview and context, and publication retries still notify Rolf. The current Rundown tab reads only the plan card, not asks. There is no cap on plan steps or open questions. Ask creation and closure serialize through `.state/asks/.open.lock`; duplicate open questions remain refused.
 
 **Recovery.** A plan write is atomic, so a reader sees an old or a new complete record. A stale `--expect` fails and changes nothing. A failed plan refresh is reported on its own line and never rolls back a merge; the project page reads the authoritative records and shows that the plan needs to catch up until persistence catches up.
 
