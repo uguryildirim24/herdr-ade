@@ -762,7 +762,7 @@ fn start_locked(ctx: &Ctx, project: &Project, row: project::Repo) -> Result<Opti
         retry_generation: 0,
         moved: 0,
         refresh_tip: None,
-        push_remote: row.push_remote,
+        push_remote: row.push_remote.or(row.publish_url),
         install_required: crate::harness::repos(&ctx.config_dir)?
             .iter()
             .any(|r| same_repo(&r.path, &row.path)),
@@ -1219,6 +1219,43 @@ fn fetch_reviewer(
     Ok(())
 }
 
+/// `ls-remote <name>` uses its fetch URL, whereas `push <name>` uses its
+/// push URLs. Verify each actual destination, never the reviewer clone that
+/// might already have fast-forwarded its own integration branch.
+fn push_destinations(git: &Git<'_>, remote: &str) -> Result<Vec<String>> {
+    let names = git.run(&["remote"])?;
+    let urls = if names.lines().any(|name| name == remote) {
+        git.run(&["remote", "get-url", "--push", "--all", remote])?
+    } else {
+        // Let Git resolve pushInsteadOf for a literal URL too. This remote
+        // exists only in this command's config, not in the repository.
+        let mut name = "ade-publication".to_owned();
+        while names.lines().any(|existing| existing == name) {
+            name.push('-');
+        }
+        let rows = git.run(&[
+            "-c",
+            &format!("remote.{name}.url={remote}"),
+            "remote",
+            "--verbose",
+        ])?;
+        let prefix = format!("{name}\t");
+        rows.lines()
+            .filter_map(|row| row.strip_prefix(&prefix)?.strip_suffix(" (push)"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    let urls = urls
+        .lines()
+        .filter(|url| !url.is_empty())
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+    if urls.is_empty() {
+        bail!("integration not published: {remote} has no push destination");
+    }
+    Ok(urls)
+}
+
 fn remote_contains(git: &Git<'_>, remote: &str, reference: &str, candidate: &str) -> Result<bool> {
     let published = git.run(&["ls-remote", remote, reference])?;
     match published.split_whitespace().next() {
@@ -1324,20 +1361,37 @@ fn land_with_install(
         }
     }
     defer_members(project, review)?;
-    if !review.push {
-        if let Some(remote) = review
-            .push_remote
-            .as_deref()
-            .filter(|remote| !remote.is_empty())
-        {
-            let target = format!("refs/heads/{}", review.integration);
-            if !remote_contains(&git, remote, &target, &candidate)? {
-                git.run(&["push", remote, &format!("{candidate}:{target}")])?;
-                if !remote_contains(&git, remote, &target, &candidate)? {
-                    bail!("integration publication not verified");
+    if review.push_remote.is_none() {
+        let row = repository(ctx, project, Some(&review.repo))?;
+        review.push_remote = row.push_remote.or(row.publish_url);
+    }
+    if let Some(remote) = review
+        .push_remote
+        .clone()
+        .filter(|remote| !remote.is_empty())
+    {
+        let target = format!("refs/heads/{}", review.integration);
+        let destinations = push_destinations(&git, &remote)?;
+        let mut published = true;
+        for url in &destinations {
+            published &= remote_contains(&git, url, &target, &candidate)?;
+        }
+        // A pending install must not trust a historical push cursor. Repair a
+        // falsely recorded publication before any local or box install runs.
+        if !published {
+            review.push = false;
+            save(project, review)?;
+            git.run(&["push", &remote, &format!("{candidate}:{target}")])?;
+            for url in &destinations {
+                if !remote_contains(&git, url, &target, &candidate)? {
+                    bail!(
+                        "integration not published: {url} {target} does not contain {candidate} after push"
+                    );
                 }
             }
         }
+    }
+    if !review.push {
         review.push = true;
         save(project, review)?;
     }
