@@ -2985,7 +2985,7 @@ fn plan_nudge(
         )
     } else if let Some(next) = next {
         format!(
-            "{} Nothing is running and {}. Next: {} {}. Start its lanes, or ask Rolf if it needs his call.",
+            "{} Nothing is running and {}. Next: {} {}. Start work that can proceed without Rolf's reply. If you are waiting for his reply in chat, keep waiting.",
             steps::TICKER_PROMPT_PREFIX,
             work_left,
             next.id,
@@ -5507,7 +5507,7 @@ mod tests {
         let calls = runner.calls.borrow();
         assert!(calls.iter().any(|call| {
             call.display()
-                .contains("2 steps are left. Next: s-1 First outcome")
+                .contains("2 steps are left. Next: s-1 First outcome. Start work that can proceed without Rolf's reply. If you are waiting for his reply in chat, keep waiting.")
         }));
     }
 
