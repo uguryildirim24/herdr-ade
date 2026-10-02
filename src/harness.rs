@@ -1684,6 +1684,18 @@ mod tests {
                 &format!("{bin} 0.1.0+abc1234-dirty.1"),
                 "cached dirty build",
             );
+            // macOS /bin/sh compares -nt at whole-second precision. Give the
+            // cached image an older timestamp than a later refresh, while
+            // keeping it newer than the untouched epoch build stamp.
+            std::fs::File::options()
+                .write(true)
+                .open(repo.join("target/release").join(bin))
+                .unwrap()
+                .set_times(
+                    std::fs::FileTimes::new()
+                        .set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_secs(1)),
+                )
+                .unwrap();
         }
         let tools = root.path().join("tools");
         std::fs::create_dir(&tools).unwrap();

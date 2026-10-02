@@ -92,6 +92,14 @@ enum Command {
         #[arg(long)]
         full: bool,
     },
+    /// Print a bounded, non-consuming snapshot for a fresh coordinator
+    Handoff {
+        #[arg(value_name = "PROJECT")]
+        slug: String,
+        /// Save a complete handoff with this session note; - reads stdin
+        #[arg(long, value_name = "PATH|-")]
+        note_file: Option<String>,
+    },
     /// Print threads grouped by what needs you
     Overview {
         #[arg(value_name = "PROJECT")]
@@ -1341,6 +1349,9 @@ fn dispatch_with_start(
             },
         ),
         Command::Context { slug, peek, full } => coordinator::context(&ctx, &slug, peek, full),
+        Command::Handoff { slug, note_file } => {
+            crate::handoff::print(&ctx, &slug, note_file.as_deref())
+        }
         Command::Overview {
             slug,
             history,

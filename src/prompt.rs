@@ -683,10 +683,10 @@ pub(crate) fn writer_lock(project: &Project) -> Result<WriterLock> {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
-struct RequestRecord {
-    id: String,
-    text: String,
-    at: String,
+pub(crate) struct RequestRecord {
+    pub(crate) id: String,
+    pub(crate) text: String,
+    pub(crate) at: String,
 }
 
 fn requests_dir(project: &Project) -> PathBuf {
@@ -704,6 +704,14 @@ fn requests(project: &Project) -> Vec<RequestRecord> {
             serde_json::from_str(&text).ok()
         })
         .collect()
+}
+
+/// Handoffs carry the durable request files verbatim, oldest first.
+pub(crate) fn handoff_requests(project: &Project) -> Vec<RequestRecord> {
+    let mut rows = requests(project);
+    rows.sort_by(|a, b| a.at.cmp(&b.at).then_with(|| a.id.cmp(&b.id)));
+    rows.drain(..rows.len().saturating_sub(12));
+    rows
 }
 
 /// Rolf's exact words for one durable request id, including historical ids.

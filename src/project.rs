@@ -817,6 +817,15 @@ pub(crate) fn running_stage(
 }
 
 fn page_body(project: &Project, settings: &Settings) -> String {
+    page_body_with_history(project, settings, None)
+}
+
+/// The handoff uses the same live page renderer, without writing PROJECT.md.
+pub(crate) fn page_body_with_history(
+    project: &Project,
+    settings: &Settings,
+    history_limit: Option<usize>,
+) -> String {
     let evidence = crate::task::EvidenceSnapshot::load(project);
     let mut out = String::from("# Project\n\n");
     out.push_str("## Goal and what Rolf gets\n\n");
@@ -1020,7 +1029,19 @@ fn page_body(project: &Project, settings: &Settings) -> String {
     if finished.is_empty() {
         out.push_str("None.\n");
     }
-    for view in finished {
+    for view in finished
+        .into_iter()
+        .take(history_limit.unwrap_or(usize::MAX))
+    {
+        if history_limit.is_some() {
+            out.push_str(&format!(
+                "- `{}` [{}] {}\n",
+                view.record.id,
+                view.state.word(),
+                one_line(&view.record.title)
+            ));
+            continue;
+        }
         out.push_str(&format!(
             "- `{}` [{}] {}",
             view.record.id,
@@ -1047,6 +1068,10 @@ fn page_body(project: &Project, settings: &Settings) -> String {
         }
     }
 
+    if history_limit.is_some() {
+        out.push_str(&format!("\nAll work: `ha task list {}`.\n", project.slug));
+        return out;
+    }
     let history = latest_history(project).unwrap_or_else(|| "the hidden .state folder".into());
     out.push_str(&format!(
         "\n---\nView rebuilt at {}; history is kept in {}.\n",
