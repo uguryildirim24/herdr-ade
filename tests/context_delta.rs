@@ -122,7 +122,9 @@ fn an_event_behind_plan_changes_is_acknowledged_only_when_rendered() {
     fixture.read();
     fixture.plan(21);
     fixture.wait();
-    let receipt = fixture.project.join(".state/deliveries/t-0001-1-1.jsonl");
+    let receipt = fixture
+        .project
+        .join(".state/deliveries/t-0001-1-1/00000001.json");
     let first = fixture.read();
     assert!(!first.contains("fixture waiting reason"), "{first}");
     assert!(!receipt.exists());
@@ -164,7 +166,7 @@ fn a_failing_writer_consumes_nothing_in_text_or_json() {
         assert!(
             !fixture
                 .project
-                .join(".state/deliveries/t-0001-1-1.jsonl")
+                .join(".state/deliveries/t-0001-1-1")
                 .exists()
         );
         assert!(fixture.read().contains("- Plan s-001:"));
