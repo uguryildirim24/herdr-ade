@@ -2877,7 +2877,7 @@ fn ade_new_verb_scenarios_have_canned_herdr_replies() {
     use crate::runner::fake::{ADE_NEW_VERB_SCENARIOS, FakeRunner};
     assert_eq!(
         ADE_NEW_VERB_SCENARIOS,
-        ["thread_start_parent", "ha_done", "ha_waiting", "ask", "say",]
+        ["thread_start_parent", "ha_done", "ha_waiting", "say",]
     );
     let runner = FakeRunner::new();
     runner.on_ade_new_verbs();
@@ -2943,18 +2943,6 @@ fn ade_new_verb_scenarios_have_canned_herdr_replies() {
         ]))
         .unwrap();
     assert!(waiting_line.success());
-
-    // ask / say (SPEC-ADE D17)
-    let ask = runner
-        .run(&Cmd::new("herdr", std::time::Duration::from_secs(1)).args([
-            "notification",
-            "show",
-            "keep the experiment running another hour? (2 choices)",
-            "--body",
-            "1 keep it running another hour\n2 stop it now",
-        ]))
-        .unwrap();
-    assert!(ask.success());
 }
 
 // ---------------------------------------------------------- harness (t-0054)

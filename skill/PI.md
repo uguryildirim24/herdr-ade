@@ -15,89 +15,61 @@ herdr agent start <name> --kind pi --pane <pane> --parent <coordinator pane> \
 
 Always `--no-skills`. Never `--approve` or `-a`. Never `--session`, `-c`,
 `-r`, `--config-dir` or an extension flag on a recipe: those are refused
-(`pi_args_forbidden`).
+(`pi_args_forbidden`). Recipes and routing live in `config.toml`.
 
-## Rows this round
-
-| Recipe | Provider | Model | Thinking |
-|---|---|---|---|
-| DeepSeek through OpenCode Go | `opencode-go` | `deepseek-v4.1-flash` | `high` |
-| OpenCode Muse | `opencode-go` | `muse-spark-1.3-contributor` | `high` |
-| Kimi k3 | `kimi-coding` | `k3` | `high` |
-| ChatGPT Sol | `openai-codex` | `gpt-5.6-sol` | `high` |
-| ChatGPT Astra (disabled) | `openai-codex` | `gpt-6-astra` | `xhigh` |
-
-Your context is compacted near 372k tokens on DeepSeek; nothing is lost, the
-full record stays in the session file.
-
-Cursor stays outside pi. There is no
-`pi_cursor_*` row.
-
-## The one-time login is Rolf's
+## Login and readiness
 
 The plugin never runs a login and never sees a key. Rolf runs
-`herdr-pi login` and types `/login` inside pi, in the shared folder:
+`herdr-pi login <provider>` and types `/login` inside pi:
 
-| Provider | What he does once |
+| Provider | What he does once per machine |
 |---|---|
-| `openai-codex` | `/login`, "ChatGPT Plus/Pro (Codex)", finish in the browser or with the device code |
-| `opencode-go` | `/login`, "Use an API key", OpenCode Go (the Go plan's key) |
-| `kimi-coding` | `/login`; use the device flow when the screen shows it, else paste the key |
+| `openai-codex` | Choose "ChatGPT Plus/Pro (Codex)", finish in the browser or with the device code |
+| `opencode-go` | Choose "Use an API key", OpenCode Go (the Go plan's key) |
+| `kimi-coding` | Use the device flow when the screen shows it, else paste the key |
 
-One login serves every pi lane. A lane that starts without a login is
-refused before the tab opens (`pi auth check`, no network refresh).
-
-## Check before a start
+One login serves every pi lane on that machine. A box uses its own configured
+wrapper and `~/.herdr-ade/pi` login store; the Mac login does not count.
+Never copy `auth.json` or any Mac credential to the box.
 
 ```
-herdr-pi check <provider>    # read-only JSON; exit 1 when not ready
+herdr-pi check <provider>    # readiness JSON; exit 1 when not ready
 ```
 
-ADE checks this itself before `herdr agent start`. It refuses when the pin is
-not exactly 0.99.1, when `pi` in a login shell is not the wrapper, when
-`settings.json` does not say `defaultProjectTrust: "never"`, when the herdr
-extension or the guard is missing, or when the login is not ready.
+ADE checks readiness before `herdr agent start`. The credential check may
+refresh OAuth; a tiny live, tool-free model call proves the provider works.
+Results are cached for 15 seconds. `herdr-pi doctor` shows per-machine rows.
+Starts are refused when the pin is not exactly 0.99.1, when `pi` in a login
+shell is not the wrapper, when `settings.json` does not say
+`defaultProjectTrust: "never"`, when the herdr extension or guard is missing,
+or when the provider is not ready.
 
-## When a lane is stuck
+## Failure and recovery
 
-A provider limit, a dead login or an unreachable endpoint is not idle and not
-done. The guard reports the pane `blocked` and seals one typed provider-failure
-event. Its provider kind is `limit`, `login`, `unreachable` or `error`.
-
-The event starts bounded recovery automatically. Every provider failure starts
-the same task as a new process on the same recipe; it never switches recipes.
-An explicit `ha thread retry <slug> <id> --reason "<evidence>"` does the same and
-consumes the next bounded retry. It refuses after the limit is exhausted and
-waits for the coordinator. Never re-prompt or type recovery into the pane.
+A provider limit, a dead login or an unreachable endpoint is not idle or done.
+The guard reports the pane `blocked` and seals one typed provider-failure
+event: `limit`, `login`, `unreachable` or `error`. The harness starts a new
+process for the same task on the same recipe; it never switches recipes.
+Only automatic retries are bounded. An explicit
+`ha thread retry <slug> <id> --reason "<evidence>"` remains available after
+that allowance is exhausted. Never re-prompt or type recovery into the pane.
 
 - `limit`: wait.
-- `login`: tell Rolf to run `herdr-pi login` again.
-- `unreachable` or `error`: let the bounded recovery run.
+- `login`: tell Rolf to run `herdr-pi login <provider>` again.
+- `unreachable` or `error`: let bounded recovery run.
 - The guard never sends `DONE`. Only `ha done` does.
 
-If you see the trust question or the missing-folder question on screen, type
-nothing. Report the broken start through thread recovery. A trusted folder
-runs repository code, so the settings file never trusts one.
+If the trust or missing-folder question appears, type nothing and report the
+broken start through thread recovery. The settings file never trusts a folder.
 
-## After a herdr restart
+## Restart
 
-A saved `pi --session <path>` comes back through `~/.local/bin/pi`, which
-points at the wrapper. The shared folder, the model and the thinking level
-come back by themselves. Do not replay `--provider`, `--model` or
-`--approve`.
+After a herdr restart, a saved `pi --session <path>` comes back through
+`~/.local/bin/pi`, which points at the wrapper. The shared folder, model and
+thinking level return by themselves. Do not replay launch flags.
 
-## On the cloud box
-
-A pi lane on the box runs the guarded wrapper at its configured pi path
-against the box's own `~/.herdr-ade/pi` login store.
-The Mac login does not count. Rolf signs each provider in once on the box
-(the coordinator opens a terminal for it): `herdr-pi login openai-codex`,
-`login opencode-go`, `login kimi-coding`. `herdr-pi check <provider>` on the
-box gates the start, and `herdr-pi doctor` shows the per-machine rows. Never
-copy `auth.json` or any Mac credential to the box.
-
-On the box, `ha done` publishes a pi lane's branch and seals its event. The lane is
-restarted from the brief after a reboot or resize like any other box lane.
+On the box, `ha done` publishes the lane branch and seals its event. After a
+reboot or resize, a box lane restarts from its brief, not a cold shell.
 
 ## What a pi lane must not do
 

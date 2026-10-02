@@ -746,7 +746,6 @@ struct ContextCursor {
     standing_text: String,
     events: BTreeMap<String, String>,
     messages: BTreeMap<String, String>,
-    asks: BTreeMap<String, String>,
     tasks: BTreeMap<String, String>,
     plan: BTreeMap<String, String>,
     lanes: BTreeMap<String, String>,
@@ -880,15 +879,6 @@ impl ContextCursor {
             .into_iter()
             .map(|(request, text)| (request, request_preview(&text)))
             .collect();
-        let asks = crate::ask::open_asks(project)
-            .into_iter()
-            .map(|ask| {
-                (
-                    ask.id,
-                    format!("{} Choices: {}", ask.question, ask.choices.join(" / ")),
-                )
-            })
-            .collect();
         let tasks = crate::task::views_with_evidence(project, &evidence)
             .0
             .into_iter()
@@ -963,7 +953,6 @@ impl ContextCursor {
             standing_text: standing,
             events: event_items,
             messages,
-            asks,
             tasks,
             plan,
             lanes,
@@ -1071,7 +1060,6 @@ fn changes_since(
             &current.messages,
             &mut cursor.messages,
         ),
-        ("Ask", &previous.asks, &current.asks, &mut cursor.asks),
         ("Task", &previous.tasks, &current.tasks, &mut cursor.tasks),
         ("Plan", &previous.plan, &current.plan, &mut cursor.plan),
         ("Lane", &previous.lanes, &current.lanes, &mut cursor.lanes),
@@ -1106,13 +1094,12 @@ fn changes_since(
             }
         }
         for id in old.keys().filter(|id| !new.contains_key(*id)) {
-            if matches!(label, "Ask" | "Plan") {
+            if label == "Plan" {
                 count += 1;
                 if count > limit {
                     continue;
                 }
-                let action = if label == "Ask" { "closed" } else { "removed" };
-                let _ = writeln!(out, "- {label} {id} {action}.");
+                let _ = writeln!(out, "- {label} {id} removed.");
             }
             seen.remove(id);
         }

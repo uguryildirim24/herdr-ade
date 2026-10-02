@@ -44,7 +44,7 @@ Say what you want once. The coordinator starts the threads the work needs and te
 
 ### 💬 Know when a thread needs an answer
 
-A thread that waits on a permission prompt for more than 30 seconds moves to Waiting on you, and a finished one stays under Ready for review until you've looked. The coordinator reads thread, review, and courier event facts directly; its inbox holds messages, not copies of those facts.
+The coordinator asks for decisions in chat; there is no `ha ask` workflow or question widget. Historical answer references remain readable. A thread that waits on a permission prompt for more than 30 seconds moves to Waiting on you, and a finished one stays under Ready for review until you've looked. The coordinator reads thread, review, and courier event facts directly; its inbox holds messages, not copies of those facts.
 
 ## Open your first project in three steps
 

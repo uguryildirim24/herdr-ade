@@ -537,7 +537,7 @@ mod tests {
         let request = handle_prompt(project, "w1:p1", "Build the dashboard")
             .unwrap()
             .unwrap();
-        let parent = crate::task::add(
+        crate::task::add(
             project,
             "Build dashboard",
             vec![format!("request:{request}")],
@@ -550,19 +550,39 @@ mod tests {
             crate::prompt::request_text(project, &request).as_deref(),
             Some("Build the dashboard")
         );
-        let ask = crate::ask::ask(
-            &fx.world.ctx(),
-            "demo",
-            crate::ask::NewAsk {
-                question: "Use the new dashboard?".into(),
-                choices: vec!["Use it".into(), "Wait".into()],
-                what: None,
-                means: None,
-                task: Some(parent.id),
-            },
+        // Historical records are read, never created through a live ask command.
+        let dir = project.record_dir_for_write("asks").unwrap().join("a-1");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("r1.toml"),
+            r#"id = "a-1"
+revision = 1
+project = "demo"
+question = "Use the new dashboard?"
+choices = ["Use it", "Wait"]
+asked = "2026-09-18T00:00:00Z"
+coordinator_binding = "w1:p1"
+"#,
         )
         .unwrap();
-        crate::ask::answer(&fx.world.ctx(), "demo", &ask.id, ask.revision, 1, "Rolf").unwrap();
+        std::fs::write(
+            dir.join("r1.answer.toml"),
+            r#"id = "a-1"
+revision = 1
+choice = 1
+text = "Use it"
+not_understood = false
+answered = "2026-09-18T00:01:00Z"
+by = "Rolf"
+"#,
+        )
+        .unwrap();
+        let ask = crate::ask::load_revision(project, "a-1", 1)
+            .unwrap()
+            .unwrap();
+        assert_eq!(ask.choices, ["Use it", "Wait"]);
+        assert_eq!(ask.task, None);
+        assert_eq!(crate::ask::latest_revision(project, "a-1"), 1);
         crate::task::add(
             project,
             "Use dashboard",
@@ -573,39 +593,34 @@ mod tests {
         )
         .unwrap();
 
-        let task = crate::task::add(
-            project,
-            "Another task",
-            vec![format!("request:{request}")],
-            vec!["Answer only while open".into()],
-            None,
-            None,
+        assert_eq!(
+            crate::note::validate_basis(project, "ask:a-1@1").unwrap(),
+            "ask:a-1@1"
+        );
+        assert!(crate::note::validate_basis(project, "ask:a-1@2").is_err());
+        std::fs::write(
+            dir.join("r2.toml"),
+            std::fs::read_to_string(dir.join("r1.toml"))
+                .unwrap()
+                .replace("revision = 1", "revision = 2"),
         )
         .unwrap();
-        let linked = crate::ask::ask(
-            &fx.world.ctx(),
-            "demo",
-            crate::ask::NewAsk {
-                question: "Use the alternate dashboard?".into(),
-                choices: vec!["Yes".into(), "No".into()],
-                what: None,
-                means: None,
-                task: Some(task.id.clone()),
-            },
+        assert!(crate::note::validate_basis(project, "ask:a-1@1").is_err());
+        assert!(crate::note::validate_basis(project, "ask:a-1@2").is_err());
+        std::fs::write(
+            dir.join("r2.withdrawn.toml"),
+            r#"id = "a-1"
+revision = 2
+reason = "No longer needed"
+by = "Rolf"
+at = "2026-09-18T00:02:00Z"
+"#,
         )
         .unwrap();
-        assert!(
-            crate::ask::open_asks(project)
-                .iter()
-                .any(|row| row.id == linked.id)
-        );
-        crate::task::drop_task(project, &task.id, "No longer needed").unwrap();
-        assert!(
-            !crate::ask::open_asks(project)
-                .iter()
-                .any(|row| row.id == linked.id)
-        );
-        assert!(crate::ask::answer(&fx.world.ctx(), "demo", &linked.id, 1, 1, "Rolf").is_err());
+        let withdrawal = crate::ask::withdrawal_of(project, "a-1", 2).unwrap();
+        assert_eq!(withdrawal.reason, "No longer needed");
+        assert_eq!(crate::ask::latest_revision(project, "a-1"), 2);
+        assert!(crate::ask::answer_of(project, "a-1", 2).is_none());
     }
 
     #[test]

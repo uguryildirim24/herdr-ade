@@ -101,18 +101,6 @@ pub(crate) fn render(project: &Project, rows: &[Row]) -> String {
         let _ = write!(out, " — {goal}");
     }
     let _ = writeln!(out);
-    // pile reviews: the review stage and the questions waiting on Rolf.
-    let asks = crate::ask::open_asks(project);
-    if let Some(newest) = crate::ask::newest_open(project) {
-        let _ = writeln!(
-            out,
-            "  questions for you: {} (newest {}@{}: {})",
-            asks.len(),
-            newest.id,
-            newest.revision,
-            crate::ask::compact_line(&newest)
-        );
-    }
     if rows.is_empty() {
         let _ = writeln!(out, "\n  no threads yet");
     }
