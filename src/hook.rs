@@ -84,30 +84,10 @@ pub(crate) fn install(ctx: &Ctx, project: &Project, kind: &str, pane: &str) -> R
     );
     let _lock = project.lock()?;
     if shape == ConfigShape::Pi {
-        // pi does not load hooks.json. Remove our old inert entries while
-        // leaving unrelated project settings alone.
+        // The global extension resolves coordinator-hook.json from ADE state.
+        // Never write commands into the checkout. Existing extension-command
+        // files are ignored, even if malformed; leave them harmless on disk.
         remove_old_pi_hooks(project, &adapter)?;
-        let argv = vec![
-            binary.to_string_lossy().to_string(),
-            "--root".into(),
-            ctx.root.to_string_lossy().to_string(),
-            "hook".into(),
-            "--kind".into(),
-            kind.into(),
-            "--project".into(),
-            project.slug.clone(),
-            "--binding".into(),
-            pane.into(),
-        ];
-        let mut prompt = argv.clone();
-        prompt.extend(["--phase".into(), "prompt".into()]);
-        write_json_atomic(
-            &path,
-            &serde_json::json!({
-                "pane": pane,
-                "prompt": prompt,
-            }),
-        )?;
     } else {
         let mut value = read_json_object(&path)?;
         remove_entries(&mut value, shape, &adapter);
@@ -124,7 +104,9 @@ pub(crate) fn install(ctx: &Ctx, project: &Project, kind: &str, pane: &str) -> R
     if read_binding(project)?.as_ref() != Some(&binding) {
         bail!("hook_install_failed: hook binding did not verify");
     }
-    verify_owned_entry(&path, pane, shape, &adapter)?;
+    if shape != ConfigShape::Pi {
+        verify_owned_entry(&path, pane, &adapter)?;
+    }
     Ok(true)
 }
 
@@ -296,7 +278,7 @@ fn install_entry(
                 }));
             }
         }
-        ConfigShape::Pi => bail!("pi hooks are written as extension commands"),
+        ConfigShape::Pi => bail!("pi hooks use the ADE state binding"),
     }
     Ok(())
 }
@@ -317,25 +299,8 @@ fn remove_entries(
     }
 }
 
-fn verify_owned_entry(
-    path: &Path,
-    pane: &str,
-    shape: ConfigShape,
-    adapter: &crate::adapters::Adapter,
-) -> Result<()> {
+fn verify_owned_entry(path: &Path, pane: &str, adapter: &crate::adapters::Adapter) -> Result<()> {
     let value = read_json_object(path)?;
-    if shape == ConfigShape::Pi {
-        if value["pane"] != pane
-            || !["prompt"].iter().all(|key| {
-                value[key].as_array().is_some_and(|args| {
-                    args.iter().any(|arg| arg == pane) && args.iter().any(|arg| arg == "hook")
-                })
-            })
-        {
-            bail!("hook_install_failed: pi extension commands did not verify");
-        }
-        return Ok(());
-    }
     let names = std::slice::from_ref(&adapter.hook.prompt_event);
     let found: usize = names
         .iter()
@@ -644,7 +609,7 @@ mod tests {
     }
 
     #[test]
-    fn pi_installs_executable_extension_commands_and_removes_inert_hooks() {
+    fn pi_binds_in_ade_state_without_writing_checkout_commands() {
         let temp = tempfile::tempdir().unwrap();
         let env = Env::for_test(temp.path(), &[]);
         let runner = FakeRunner::new();
@@ -664,16 +629,27 @@ mod tests {
         install(&ctx, &project, "pi", "w1:p1").unwrap();
         assert!(!old.exists(), "pi never reads hooks.json");
         let path = project.dir().join(".pi/herdr-ade-hooks.json");
-        let value = read_json_object(&path).unwrap();
-        assert_eq!(value["pane"], "w1:p1");
-        assert_eq!(
-            value["prompt"].as_array().unwrap().last().unwrap(),
-            "prompt"
-        );
-        assert!(value.get("stop").is_none());
-        assert!(value.get("activate").is_none());
+        assert!(!path.exists(), "no pi commands are written to the checkout");
+        let binding = read_binding(&project).unwrap().unwrap();
+        assert_eq!(binding.kind, "pi");
+        assert_eq!(binding.project, "demo");
+        assert_eq!(binding.pane, "w1:p1");
         assert!(captures(&project, "w1:p1").unwrap());
+        // Historical command files are ignored, not parsed or refreshed.
+        let historical = r#"{"pane":"w1:p1","prompt":["hostile","command"]}"#;
+        std::fs::write(&path, historical).unwrap();
         install(&ctx, &project, "pi", "w1:p1").unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), historical);
+        std::fs::write(&path, b"not json").unwrap();
+        install(&ctx, &project, "pi", "w1:p1").unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "not json");
+        // A historical binding without session_id remains readable.
+        std::fs::write(
+            binding_path(&project),
+            r#"{"kind":"pi","project":"demo","pane":"w1:p1"}"#,
+        )
+        .unwrap();
+        assert!(scope_binding(&project, "pi", "w1:p1", "pi-session", "prompt").unwrap());
         remove(&ctx, &project).unwrap();
         assert!(!path.exists());
         assert!(!captures(&project, "w1:p1").unwrap());

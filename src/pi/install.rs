@@ -86,11 +86,30 @@ pub(crate) fn install(runner: &dyn sh::Runner, layout: &Layout) -> Result<Instal
     })
 }
 
+/// Pin the extension to the installed ADE sibling and this shared state root.
+/// Both herdr-pi setup and herdr-ade install run from the installed bin folder.
+fn guard_source(layout: &Layout) -> Result<String> {
+    let binary = std::env::current_exe()
+        .context("could not locate the installed ADE binary")?
+        .with_file_name("herdr-ade");
+    let root = layout.root.parent().context("pi folder has no ADE root")?;
+    let root = std::path::absolute(root)?;
+    Ok(GUARD_TS
+        .replace(
+            "\"__HERDR_ADE_BINARY__\"",
+            &serde_json::to_string(&binary.to_string_lossy())?,
+        )
+        .replace(
+            "\"__HERDR_ADE_ROOT__\"",
+            &serde_json::to_string(&root.to_string_lossy())?,
+        ))
+}
+
 /// Write the plugin-owned guard extension and return its path.
 pub(crate) fn write_guard(layout: &Layout) -> Result<std::path::PathBuf> {
     std::fs::create_dir_all(layout.extensions())
         .with_context(|| format!("could not create {}", layout.extensions().display()))?;
-    std::fs::write(layout.guard(), GUARD_TS)
+    std::fs::write(layout.guard(), guard_source(layout)?)
         .with_context(|| format!("could not write {}", layout.guard().display()))?;
     Ok(layout.guard())
 }
@@ -98,7 +117,9 @@ pub(crate) fn write_guard(layout: &Layout) -> Result<std::path::PathBuf> {
 /// True when the installed guard is the exact extension compiled into this
 /// binary (SPEC-pi v2 §3.9). A marker alone cannot detect changed behavior.
 pub(crate) fn guard_ok(layout: &Layout) -> bool {
-    std::fs::read_to_string(layout.guard()).is_ok_and(|text| text == GUARD_TS)
+    guard_source(layout).is_ok_and(|expected| {
+        std::fs::read_to_string(layout.guard()).is_ok_and(|text| text == expected)
+    })
 }
 
 /// The one line Rolf types after setup (SPEC-pi v2 §3.2). The wrapper itself
@@ -250,9 +271,12 @@ mod tests {
         assert!(guard_ok(&layout));
         let installed = std::fs::read_to_string(layout.guard()).unwrap();
         assert!(installed.contains("fetch failed"));
+        assert!(!installed.contains("__HERDR_ADE_"));
+        assert!(!installed.contains("herdr-ade-hooks.json"));
+        assert!(installed.contains(&serde_json::to_string(dir.path()).unwrap()));
         assert!(
             installed.contains(
-                "[\"failed\", \"--class\", \"provider\", \"--provider-kind\", cls, text]"
+                "[\"--root\", ADE_ROOT, \"failed\", \"--class\", \"provider\", \"--provider-kind\", cls, text]"
             )
         );
     }
