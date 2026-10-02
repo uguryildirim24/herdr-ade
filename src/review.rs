@@ -1398,7 +1398,11 @@ fn land_with_install(
         let row = repository(ctx, project, Some(&review.repo))?;
         review.push_remote = row.push_remote.or(row.publish_url);
     }
-    if let Some(remote) = review.push_remote.clone().filter(|remote| !remote.is_empty()) {
+    if let Some(remote) = review
+        .push_remote
+        .clone()
+        .filter(|remote| !remote.is_empty())
+    {
         let target = format!("refs/heads/{}", review.integration);
         let destinations = push_destinations(&git, &remote)?;
         let mut published = true;
