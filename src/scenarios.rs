@@ -1768,6 +1768,7 @@ fn forty_minute_sleep_defers_dark_wakes_and_imports_seals_before_resuming_starts
         candidate_branch: String::new(),
         members: vec![],
         gates: vec![],
+        gates_note: String::new(),
         selected_gates: vec![],
         reviewer: Some("t-0001".into()),
         phase: crate::review::Phase::Reviewing,

@@ -1495,11 +1495,12 @@ fn digest_snapshot(
     {
         let _ = writeln!(
             out,
-            "- {} [{:?}] {} lanes — reviewer {}{}",
+            "- {} [{:?}] {} lanes — reviewer {}{}{}",
             review.id,
             review.phase,
             review.members.len(),
             review.reviewer.as_deref().unwrap_or("pending"),
+            review.gates_summary(),
             if review.attention.is_empty() {
                 String::new()
             } else {

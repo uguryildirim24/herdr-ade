@@ -2000,7 +2000,15 @@ fn dispatch_with_start(
             };
             let message = record
                 .as_ref()
-                .map(|r| format!("{}: {:?} ({} lanes)\n", r.id, r.phase, r.members.len()))
+                .map(|r| {
+                    format!(
+                        "{}: {:?} ({} lanes){}\n",
+                        r.id,
+                        r.phase,
+                        r.members.len(),
+                        r.gates_summary()
+                    )
+                })
                 .unwrap_or_else(|| "no pile review running\n".into());
             crate::output::success(
                 Some("review"),

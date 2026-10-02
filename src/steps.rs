@@ -1987,6 +1987,7 @@ mod tests {
             candidate_branch: "candidate".into(),
             members: vec![],
             gates: vec![],
+            gates_note: String::new(),
             selected_gates: vec![],
             reviewer: Some(reviewer.id.clone()),
             phase: crate::review::Phase::Complete,

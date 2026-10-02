@@ -96,6 +96,7 @@ fn seal_verdict(
         candidate: candidate.into(),
         without,
         gates,
+        gates_note: String::new(),
     };
     let report = format!(
         "+++\n{}+++\n\nChecked the complete pile.\n",
@@ -509,6 +510,34 @@ fn missing_repo_gates_means_gate_free_review() {
     let review = prepared(&fx);
     assert!(review.gates.is_empty());
     assert!(review.selected_gates.is_empty());
+    assert_eq!(review.gates_note, "no gates declared");
+    assert_eq!(
+        load(&fx.project, &review.id).unwrap().gates_note,
+        "no gates declared"
+    );
+    assert!(task(&fx.project, &review).contains("no gates declared"));
+    let (context, _) = crate::coordinator::digest(&fx.world.ctx(), &fx.project, "ha").unwrap();
+    assert!(context.contains("no gates declared"));
+    let candidate = git(&fx.repo, &["rev-parse", &review.candidate_branch]);
+    seal_verdict(
+        &fx,
+        &review,
+        &candidate,
+        "MERGE",
+        BTreeMap::new(),
+        vec![],
+        1,
+    );
+    tick(&fx.world.ctx(), &fx.project).unwrap();
+    let landed = load(&fx.project, &review.id).unwrap();
+    assert_eq!(landed.phase, Phase::Complete);
+    assert_eq!(landed.verdict.unwrap().gates_note, "no gates declared");
+    assert!(
+        landed
+            .notices
+            .iter()
+            .any(|n| n.line.contains("merged") && n.line.contains("no gates declared"))
+    );
 }
 
 #[test]
@@ -1272,6 +1301,7 @@ fn persisted_landing_without_remote_completes_on_ticker_pass() {
         candidate: candidate.clone(),
         without: BTreeMap::new(),
         gates: vec![],
+        gates_note: String::new(),
     });
     review.phase = Phase::Landing;
     save(&fx.project, &review).unwrap();
@@ -1308,6 +1338,7 @@ fn large_landing_shares_every_ticker_pass_with_other_projects_due_work() {
         candidate: candidate.clone(),
         without: BTreeMap::new(),
         gates: vec![],
+        gates_note: String::new(),
     });
     review.phase = Phase::Landing;
     save(&fx.project, &review).unwrap();
@@ -1415,6 +1446,7 @@ fn configured_remote_failure_is_not_treated_as_local_only() {
         candidate,
         without: BTreeMap::new(),
         gates: vec![],
+        gates_note: String::new(),
     });
     review.phase = Phase::Landing;
     fx.world.runner.calls.borrow_mut().clear();
@@ -1455,6 +1487,7 @@ fn landing_recovers_ref_before_marker_and_install_failure_without_early_task_don
         candidate: candidate.clone(),
         without: BTreeMap::new(),
         gates: vec![],
+        gates_note: String::new(),
     });
     review.phase = Phase::Landing;
     review.install_required = true;
@@ -1514,6 +1547,7 @@ fn landing_completes_while_a_merged_member_owes_cleanup() {
         candidate,
         without: BTreeMap::new(),
         gates: vec![],
+        gates_note: String::new(),
     });
     review.phase = Phase::Landing;
     save(&fx.project, &review).unwrap();
