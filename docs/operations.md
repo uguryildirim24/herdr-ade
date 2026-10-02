@@ -65,7 +65,7 @@ Every command accepts the global `--json` flag. It returns one record with an
 | `new <name> [--goal] [--repo PATH[@MACHINE]]...` | Create a project folder with its one current page. |
 | `list [--all]` | Projects with status and thread counts by group. |
 | `open <project> [--recipe ID --basis request:<id>] [--reprime] [--session N \| --socket P] [--rebind]` | Workspace, coordinator tab and coordinator agent; focuses it when it already runs. A basis may name another project's request as `request:<project>/<id>`. The binding keeps the chosen recipe and basis when its process relaunches. |
-| `context <project> [--peek] [--full]` | First read shows the project page; subsequent reads show changes since the last read. `--full` shows the complete page; `--peek` records nothing. |
+| `context <project> [--peek] [--full]` | Shows up to 20 unread changes and counts any overflow for the next read. The first read adds project orientation. `--full` shows all current items without the row limit; `--peek` records nothing. Failed output consumes nothing. |
 | `handoff <project> [--note-file <path\|->]` | Fresh, non-consuming snapshot with a 16,000-character budget. With a session note (or stdin via `-`), writes `.state/handoffs/<UTC>.md`, keeps the newest 20, and prints the saved handoff. |
 | `inbox done <project> <item>... \| --all` | Mark inbox items handled. |
 | `task add`, `task show`, `task list`, `task drop` | Stable intent and acceptance conditions. State comes from the lane seal and pile review: open, working, finished, merged, installed. A no-change seal finishes immediately. `task drop --acceptance N --reason` withdraws a replaced condition. |

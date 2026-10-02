@@ -138,6 +138,19 @@ pub fn write_stderr(args: std::fmt::Arguments<'_>) {
     });
 }
 
+/// Deliver a receipt-bearing command before it commits any read state.
+/// JSON must reach the writer too, rather than merely enter the prose buffer.
+pub fn emit(message: &str) -> std::io::Result<()> {
+    let mut stdout = std::io::stdout().lock();
+    if structured() {
+        STATE.with(|state| state.borrow_mut().stdout.push_str(message));
+        render_to(take(), None, &mut stdout)?;
+    } else {
+        stdout.write_all(message.as_bytes())?;
+    }
+    stdout.flush()
+}
+
 fn take() -> State {
     STATE.with(|state| std::mem::take(&mut *state.borrow_mut()))
 }
@@ -150,7 +163,13 @@ pub fn finish_error(reason: &str) -> std::io::Result<()> {
     render(take(), Some(reason))
 }
 
-fn render(mut state: State, reason: Option<&str>) -> std::io::Result<()> {
+fn render(state: State, reason: Option<&str>) -> std::io::Result<()> {
+    let mut stdout = std::io::stdout().lock();
+    render_to(state, reason, &mut stdout)?;
+    stdout.flush()
+}
+
+fn render_to(state: State, reason: Option<&str>, stdout: &mut impl Write) -> std::io::Result<()> {
     if !state.active {
         if let Some(reason) = reason {
             writeln!(std::io::stderr().lock(), "herdr-ade: {reason}")?;
@@ -168,8 +187,7 @@ fn render(mut state: State, reason: Option<&str>) -> std::io::Result<()> {
             data: state.data,
             warnings: state.stderr,
         };
-        let mut stdout = std::io::stdout().lock();
-        serde_json::to_writer_pretty(&mut stdout, &record)?;
+        serde_json::to_writer_pretty(&mut *stdout, &record)?;
         writeln!(stdout)
     } else {
         if let Some(reason) = reason {
@@ -182,7 +200,6 @@ fn render(mut state: State, reason: Option<&str>) -> std::io::Result<()> {
                 crate::refusal::next_line(next)
             )?;
         }
-        state.active = false;
         Ok(())
     }
 }

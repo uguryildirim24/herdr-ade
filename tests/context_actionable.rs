@@ -1,4 +1,4 @@
-//! Context starts from the project page and adds only bounded action rows.
+//! Context renders one bounded set, with project orientation on the first read.
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -53,43 +53,27 @@ impl Project {
     }
 }
 
-fn page_body(page: &str) -> &str {
-    page.split_once("\n+++\n")
-        .unwrap()
-        .1
-        .trim_start_matches('\n')
-}
-
 #[test]
-fn context_starts_with_the_complete_project_page_without_duplicate_tours() {
+fn context_starts_with_orientation_and_one_action_item_set() {
     let p = Project::new();
     p.write(
         ".state/threads/t-0001.toml",
         "id = \"t-0001\"\ntitle = \"Needs help\"\nstatus = \"failed\"\nattempt = 1\nerror = \"compiler failure\"\n",
     );
     let text = p.context(false);
-    let page = std::fs::read_to_string(p.dir.join("PROJECT.md")).unwrap();
     assert!(text.starts_with("## Since your last context"), "{text}");
-    assert!(
-        text.contains(
-            page_body(&page)
-                .split("## Recently finished or dropped tasks")
-                .next()
-                .unwrap()
-                .trim_end()
-        ),
-        "{text}"
-    );
+    assert!(text.contains("## Goal and what Rolf gets"), "{text}");
+    assert_eq!(text.matches("- Lane t-0001:").count(), 1, "{text}");
     assert!(
         !text.contains("## Recently finished or dropped tasks"),
         "{text}"
     );
-    assert!(text.contains("## Threads needing action"), "{text}");
+    assert!(!text.contains("## Threads needing action"), "{text}");
     assert!(text.contains("compiler failure"), "{text}");
     assert!(!text.contains("## Memory notes and standing instructions"));
     assert!(!text.contains("## Completion preparation"));
     assert!(!text.contains("## Routines"));
-    assert_eq!(text.matches("## Open tasks").count(), 1, "{text}");
+    assert!(!text.contains("## Open tasks"), "{text}");
 }
 
 #[test]
@@ -106,7 +90,7 @@ fn context_shows_the_words_inside_a_pasted_message() {
 
     let text = p.context(true);
     assert!(
-        text.contains("- q-paste: pasted text: Keep these exact words."),
+        text.contains("- Rolf q-paste: pasted text: Keep these exact words."),
         "{text}"
     );
     assert!(!text.contains("<pasted_content id="), "{text}");
@@ -129,10 +113,10 @@ fn action_rows_are_bounded_without_raw_storage_pointers() {
         );
     }
     let text = p.context(true);
-    assert_eq!(text.matches("… 1 more.").count(), 2, "{text}");
+    assert!(text.contains("23 more changes waiting"), "{text}");
     assert!(text.contains("failure 20"));
     assert!(!text.contains("failure 21"));
-    assert!(text.contains("message-0020"));
+    assert!(!text.contains("message-0020"));
     assert!(!text.contains("message-0021"));
     assert!(!text.contains("read threads/"));
     assert!(!text.contains("read inbox/"));
