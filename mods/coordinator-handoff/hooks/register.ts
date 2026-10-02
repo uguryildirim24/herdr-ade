@@ -41,7 +41,9 @@ export const register: Register = (on) => {
         timer?.cancel();
       }
       if (!note.isAnswered) return next(e);
-      const context = await $.process.run([`${home}/.local/bin/ha`, 'context', slug, '--peek']);
+      // The replacement conversation needs the full snapshot, not the delta
+      // since this coordinator's last read. Peek keeps receipts untouched.
+      const context = await $.process.run([`${home}/.local/bin/ha`, 'context', slug, '--peek', '--full']);
       if (context.exitCode !== 0) return next(e);
       const requestsDir = `${cwd}/.state/requests`;
       const records = (await $.fs.list(requestsDir))

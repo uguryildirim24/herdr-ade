@@ -54,7 +54,7 @@ test('nonzero ha exit falls back', async ($, on) => {
   setup(on);
   on('model.fork', () => ({ value: { isAnswered: true, text: 'note', usage } }));
   on('process.run', (_, e) => {
-    expect(e.argv).toEqual([`${home}/.local/bin/ha`, 'context', 'demo', '--peek']);
+    expect(e.argv).toEqual([`${home}/.local/bin/ha`, 'context', 'demo', '--peek', '--full']);
     return { value: { exitCode: 1, stdout: '', stderr: 'error', isStdoutTruncated: false, isStderrTruncated: false } };
   });
   expect(await $.session.compact(input)).toEqual(fallback);
@@ -82,7 +82,7 @@ for (const trigger of ['manual', 'auto', 'plugin'] as const) {
       return { value: { isAnswered: true, text: 'fresh session note', usage } };
     });
     on('process.run', (_, e) => {
-      expect(e.argv).toEqual([`${home}/.local/bin/ha`, 'context', 'demo', '--peek']);
+      expect(e.argv).toEqual([`${home}/.local/bin/ha`, 'context', 'demo', '--peek', '--full']);
       return { value: { exitCode: 0, stdout: 'harness records', stderr: '', isStdoutTruncated: false, isStderrTruncated: false } };
     });
     on('fs.list', (_, e) => {
