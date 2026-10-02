@@ -711,6 +711,8 @@ fn tick_with_steps(
                 lane.is_remote()
                     && !lane.parked
                     && (matches!(lane.status, thread::Status::Open | thread::Status::Starting)
+                        || (lane.status == thread::Status::Failed
+                            && lane.error.starts_with("brief_delivery_failed:"))
                         || lane.recovery_pending)
                     && memory
                         .machines
@@ -875,6 +877,8 @@ fn machine_passes_with_steps(
                 t.is_remote()
                     && !t.parked
                     && (matches!(t.status, thread::Status::Open | thread::Status::Starting)
+                        || (t.status == thread::Status::Failed
+                            && t.error.starts_with("brief_delivery_failed:"))
                         || t.recovery_pending)
             })
             .collect();
@@ -2550,7 +2554,8 @@ fn open_threads(project: &Project, remote: bool) -> Vec<thread::Thread> {
             t.is_remote() == remote
                 && !t.parked
                 && (matches!(t.status, thread::Status::Open | thread::Status::Starting)
-                    || !remote && t.status == thread::Status::Failed)
+                    || (t.status == thread::Status::Failed
+                        && (!remote || t.error.starts_with("brief_delivery_failed:"))))
         })
         .collect()
 }
@@ -3850,6 +3855,110 @@ mod tests {
             assert!(!settled.prompt_pending);
             assert!(settled.error.is_empty());
             assert_eq!(world.runner.count("agent prompt"), 1);
+        }
+    }
+
+    #[test]
+    fn remote_delivery_failure_keeps_polling_until_late_evidence() {
+        use crate::scenarios::{World, agent_json, pane_json};
+        for evidence in ["none", "working", "bootstrap"] {
+            let world = World::new();
+            let project = world.project("demo", "a.sock");
+            let lane = world.thread(&project, &world.home.path().join("lane"), |record| {
+                record.machine = "box".into();
+                record.machine_id = "box".into();
+                record.status = thread::Status::Failed;
+                record.prompt_pending = true;
+                record.brief_submitted = true;
+                record.launch_attempts = 1;
+                record.attempt = 1;
+                record.launch.brief_hash = "frozen".into();
+                record.error = "brief_delivery_failed: no activity".into();
+            });
+            let agent = agent_json(
+                &lane.workspace_id,
+                &lane.tab_id,
+                &lane.pane_id,
+                &lane.cwd,
+                &lane.agent_name,
+                if evidence == "working" {
+                    "working"
+                } else {
+                    "idle"
+                },
+            );
+            let pane = pane_json(&lane.workspace_id, &lane.tab_id, &lane.pane_id, &lane.cwd);
+            let receipt = if evidence == "bootstrap" {
+                format!("bootstrap\tdemo\t{}\tfrozen\t{}\n", lane.id, lane.pane_id)
+            } else {
+                String::new()
+            };
+            let manifest = format!(
+                "boot\tboot-1\nfree\t1\nagents\t{{\"result\":{{\"agents\":[{agent}]}}}}\npanes\t{{\"result\":{{\"panes\":[{pane}]}}}}\n{receipt}"
+            );
+            world
+                .runner
+                .on_fn(|cmd| cmd.program == "ssh", move |_| Ok(ok(&manifest)));
+            world.runner.on(
+                "machine list --json",
+                ok(r#"[{"id":"box","label":"box","target":"box","session":"default","enabled":true}]"#),
+            );
+            let ctx = world.ctx();
+            let mut memory = Memory::new(&ctx);
+            memory.tick = 1;
+            let log = Log {
+                path: world.home.path().join("ticker.log"),
+            };
+            assert!(machine_passes(&ctx, &[&project], &mut memory, &log).is_empty());
+            let view = memory
+                .machine_views
+                .get("box")
+                .expect("failed delivery must still be polled")
+                .as_ref()
+                .unwrap();
+            let threads = open_threads(&project, true);
+            assert_eq!(
+                threads.len(),
+                1,
+                "failed delivery must reach the remote state pass"
+            );
+            let herdr = Herdr::new(
+                ctx.env.herdr_bin(),
+                &project.coordinator().unwrap().socket,
+                &world.runner,
+            );
+            let mut errors = Vec::new();
+            remote_pass(
+                &LaunchPass {
+                    ctx: &ctx,
+                    project: &project,
+                    herdr: &herdr,
+                    threads: &threads,
+                    agents: &[],
+                    panes: &[],
+                },
+                "box",
+                view,
+                &mut true,
+                &mut errors,
+            )
+            .unwrap();
+            assert!(errors.is_empty(), "{errors:#?}");
+            let current = thread::load(&project, &lane.id).unwrap();
+            assert_eq!(current.attempt, lane.attempt);
+            assert_eq!(current.pane_id, lane.pane_id);
+            if evidence == "none" {
+                assert_eq!(current.status, thread::Status::Failed);
+                assert!(current.prompt_pending);
+            } else {
+                assert_eq!(current.status, thread::Status::Open);
+                assert!(!current.prompt_pending);
+                assert!(current.error.is_empty());
+            }
+            assert_eq!(world.runner.count("agent prompt"), 0);
+            assert_eq!(world.runner.count("agent start"), 0);
+            assert_eq!(world.runner.count("tab close"), 0);
+            assert_eq!(world.runner.count("workspace close"), 0);
         }
     }
 
