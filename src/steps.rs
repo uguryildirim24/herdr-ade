@@ -193,10 +193,12 @@ pub(crate) fn deliver_transition_notices(ctx: &Ctx, project: &Project) -> Result
         return Ok(());
     };
     let reviews = crate::review::list(project)?;
+    let holds = crate::review::hold_notices(project)?;
     let lanes = thread::list_live(project);
-    if !reviews
-        .iter()
-        .any(|r| r.notices.iter().any(|n| !n.submitted))
+    if !holds.iter().any(|n| !n.submitted)
+        && !reviews
+            .iter()
+            .any(|r| r.notices.iter().any(|n| !n.submitted))
         && !lanes
             .iter()
             .any(|t| t.start_notices.iter().any(|n| !n.submitted))
@@ -211,6 +213,12 @@ pub(crate) fn deliver_transition_notices(ctx: &Ctx, project: &Project) -> Result
     });
     if !ready {
         return Ok(());
+    }
+    for (index, notice) in holds.iter().enumerate().filter(|(_, n)| !n.submitted) {
+        if !deliver_coordinator_prompt(project, &herdr, &coordinator.pane_id, &notice.line)? {
+            return Ok(());
+        }
+        crate::review::mark_hold_submitted(project, index)?;
     }
     for old in reviews {
         let Some(_lock) = crate::review::try_operation_lock(ctx, &old.repo)? else {

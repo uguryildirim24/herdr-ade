@@ -1791,11 +1791,85 @@ pub(crate) fn classify_old_seals(ctx: &Ctx, project: &Project, include_open: boo
     Ok(())
 }
 
-pub(crate) fn tick(ctx: &Ctx, project: &Project) -> Result<()> {
-    if project.state_dir().join("reviews-enabled").exists() {
-        classify_old_seals(ctx, project, false)?;
+/// Holds have their own journal because there may be no review record yet.
+/// A reason is announced once until it changes or the hold clears. Pending
+/// notices survive that clearing and are handed to the shared durable outbox.
+#[derive(Default, Serialize, Deserialize)]
+struct PileHolds {
+    current: BTreeMap<String, String>,
+    notices: Vec<crate::steps::Notice>,
+}
+fn holds_path(project: &Project) -> PathBuf {
+    project.state_dir().join("pile-holds.json")
+}
+pub(crate) fn hold_notices(project: &Project) -> Result<Vec<crate::steps::Notice>> {
+    Ok(load_holds(project)?.notices)
+}
+fn load_holds(project: &Project) -> Result<PileHolds> {
+    match std::fs::read(holds_path(project)) {
+        Ok(bytes) => Ok(serde_json::from_slice(&bytes)?),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(PileHolds::default()),
+        Err(error) => Err(error.into()),
     }
+}
+pub(crate) fn mark_hold_submitted(project: &Project, index: usize) -> Result<()> {
+    let _lock = project.lock()?;
+    let mut holds = load_holds(project)?;
+    if let Some(notice) = holds.notices.get_mut(index) {
+        notice.submitted = true;
+        project::write_json(&holds_path(project), &holds)?;
+    }
+    Ok(())
+}
+fn record_holds(project: &Project, current: BTreeMap<String, (String, String)>) -> Result<()> {
+    let _lock = project.lock()?;
+    let mut holds = load_holds(project)?;
+    for (repo, (reason, line)) in &current {
+        if holds.current.get(repo) != Some(reason) {
+            holds.notices.push(crate::steps::Notice {
+                line: line.clone(),
+                submitted: false,
+            });
+        }
+    }
+    let next = current
+        .into_iter()
+        .map(|(repo, (reason, _))| (repo, reason))
+        .collect();
+    if holds.current != next {
+        holds.current = next;
+        project::write_json(&holds_path(project), &holds)?;
+    }
+    Ok(())
+}
+fn working_hold(lane: &Thread, events: &[crate::contracts::Event]) -> Option<&'static str> {
+    if !matches!(lane.status, Status::Starting | Status::Open) {
+        return None;
+    }
+    let latest = crate::events::latest_event(events, &lane.id, lane.attempt.max(1));
+    if crate::threads::follow_up_pending_for_seal(lane, latest)
+        || lane.follow_ups.iter().any(|f| {
+            f.attempt == lane.attempt.max(1)
+                && f.state == thread::FollowUpState::Delivered
+                && latest.is_some_and(|event| f.waiting_event == event.id)
+        })
+    {
+        return Some("follow-up pending");
+    }
+    if latest.is_some_and(|event| event.payload.done.is_some() || event.payload.waiting.is_some()) {
+        None
+    } else {
+        Some("working")
+    }
+}
+
+pub(crate) fn tick(ctx: &Ctx, project: &Project) -> Result<()> {
+    let enabled = project.state_dir().join("reviews-enabled").exists();
     let mut first = None;
+    if enabled && let Err(error) = classify_old_seals(ctx, project, false) {
+        // An unrelated historical seal must not prevent a fresh pile starting.
+        first = Some(error);
+    }
     for old in list(project)?.into_iter().filter(|r| !r.phase.closed()) {
         let Some(_lock) = try_operation_lock(ctx, &old.repo)? else {
             continue;
@@ -1811,71 +1885,140 @@ pub(crate) fn tick(ctx: &Ctx, project: &Project) -> Result<()> {
             first.get_or_insert(error);
         }
     }
-    if project.state_dir().join("reviews-enabled").exists() {
-        crate::events::checked(project)?;
-        let events = crate::events::for_unresolved_threads(project);
-        let threads = thread::list_live(project);
-        let reviewers = reviewer_ids(project)?;
-        let repos: std::collections::BTreeSet<_> = threads
-            .iter()
-            .filter(|t| !reviewers.contains(&t.id) && t.status != Status::Resolved)
-            .map(|t| t.repo.clone())
-            .collect();
-        for repo in repos {
-            if repo.is_empty() || pending(project, &repo, &events, &reviewers).is_empty() {
-                continue;
+    crate::events::checked(project)?;
+    let events = crate::events::for_unresolved_threads(project);
+    let threads = thread::list_live(project);
+    let reviewers = reviewer_ids(project)?;
+    let repos: BTreeMap<_, _> = threads
+        .iter()
+        .filter(|t| !reviewers.contains(&t.id) && t.status != Status::Resolved)
+        .map(|t| (repo_identity(&t.repo), t.repo.clone()))
+        .collect();
+    let mut holds = BTreeMap::new();
+    for repo in repos.into_values() {
+        let mut pile = pending(project, &repo, &events, &reviewers);
+        if repo.is_empty() || pile.is_empty() {
+            continue;
+        }
+        let outcome = (|| -> Result<Option<String>> {
+            let active = active_for_repo(ctx, &repo)?;
+            // Members already under review are not a new ready pile.
+            if let Some((home, review)) = &active {
+                if home.slug == project.slug {
+                    pile.retain(|lane| !review.members.iter().any(|m| m.thread == lane.id));
+                }
+                if pile.is_empty() {
+                    return Ok(None);
+                }
+                return Ok(Some(format!(
+                    "{} / {} (active review {})",
+                    home.slug,
+                    review.reviewer.as_deref().unwrap_or("reviewer allocation"),
+                    review.id
+                )));
             }
-            let failed_local = threads.iter().any(|t| {
-                same_repo(&t.repo, &repo)
-                    && !reviewers.contains(&t.id)
-                    && t.status == Status::Failed
-                    && !t.is_remote()
-            });
-            let live_failed = if failed_local {
+            if !enabled {
+                return Ok(Some(format!(
+                    "automatic review not enabled (next: ha review {})",
+                    project.slug
+                )));
+            }
+            let mut blockers: Vec<String> = threads
+                .iter()
+                .filter(|t| same_repo(&t.repo, &repo) && !reviewers.contains(&t.id))
+                .filter_map(|t| working_hold(t, &events).map(|why| format!("{} ({why})", t.id)))
+                .collect();
+            let failed: Vec<_> = threads
+                .iter()
+                .filter(|t| {
+                    same_repo(&t.repo, &repo)
+                        && !reviewers.contains(&t.id)
+                        && t.status == Status::Failed
+                        && !t.is_remote()
+                })
+                .collect();
+            if !failed.is_empty() {
                 let socket = project.coordinator().map(|c| c.socket).unwrap_or_default();
                 let herdr = crate::herdr::Herdr::new(ctx.env.herdr_bin(), &socket, ctx.runner);
                 let agents = herdr.agent_list()?;
                 let panes = herdr.pane_list()?;
-                threads.iter().any(|t| {
-                    same_repo(&t.repo, &repo)
-                        && thread::recoverable_agent(t, &threads, &agents, &panes).is_some()
-                })
-            } else {
-                false
-            };
-            if live_failed
-                || threads.iter().any(|t| {
-                    same_repo(&t.repo, &repo)
-                        && !reviewers.contains(&t.id)
-                        && matches!(t.status, Status::Starting | Status::Open)
-                        && (crate::events::latest_event(&events, &t.id, t.attempt.max(1))
-                            .is_none_or(|e| e.payload.done.is_none())
-                            || crate::threads::follow_up_pending_for_seal(
-                                t,
-                                crate::events::latest_done_event(&events, &t.id, t.attempt.max(1)),
-                            ))
-                })
-            {
-                continue;
+                blockers.extend(
+                    failed
+                        .into_iter()
+                        .filter(|t| {
+                            thread::recoverable_agent(t, &threads, &agents, &panes).is_some()
+                        })
+                        .map(|t| format!("{} (failed lane has a live agent)", t.id)),
+                );
+            }
+            if !blockers.is_empty() {
+                blockers.sort();
+                return Ok(Some(blockers.join(", ")));
             }
             let Some(_lock) = try_operation_lock(ctx, &repo)? else {
-                continue;
+                return Ok(Some("repository operation lock (busy)".into()));
             };
-            if active_for_repo(ctx, &repo)?.is_none() {
-                let mut configured = None;
-                for lane in pending_from(threads.clone(), &repo, &events, &reviewers) {
-                    let seal = sealed(&events, &lane).expect("pending seal");
-                    if let Some(row) = lane_repository(ctx, project, &lane, &seal.id)? {
-                        configured = Some(row);
-                    }
-                }
-                if let Some(row) = configured
-                    && let Err(error) = start_locked(ctx, project, row)
-                {
-                    first.get_or_insert(error);
+            // Recheck under the operation lock: another project may have started a review.
+            if let Some((home, review)) = active_for_repo(ctx, &repo)? {
+                return Ok(Some(format!(
+                    "{} / {} (active review {})",
+                    home.slug,
+                    review.reviewer.as_deref().unwrap_or("reviewer allocation"),
+                    review.id
+                )));
+            }
+            let mut configured = None;
+            let mut unconfigured = Vec::new();
+            for lane in &pile {
+                let seal = sealed(&events, lane).expect("pending seal");
+                if let Some(row) = lane_repository(ctx, project, lane, &seal.id)? {
+                    configured = Some(row);
+                } else {
+                    unconfigured.push(format!("{} (repository not configured)", lane.id));
                 }
             }
+            if let Some(row) = configured {
+                start_locked(ctx, project, row)?;
+                Ok(None)
+            } else {
+                Ok(Some(unconfigured.join(", ")))
+            }
+        })();
+        let reason = match outcome {
+            Ok(reason) => reason,
+            Err(error) => {
+                let reason = format!(
+                    "{} (review start: {})",
+                    pile.iter()
+                        .map(|t| t.id.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", "),
+                    crate::steps::short_error(&format!("{error:#}"))
+                );
+                first.get_or_insert(error);
+                Some(reason)
+            }
+        };
+        if let Some(reason) = reason {
+            let ready = pile
+                .iter()
+                .map(|t| t.id.as_str())
+                .collect::<Vec<_>>()
+                .join(", ");
+            let name = std::path::Path::new(&repo)
+                .file_name()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .into_owned();
+            holds.insert(
+                repo_identity(&repo).to_string_lossy().into_owned(),
+                (
+                    reason.clone(),
+                    format!("PILE {name}: {ready} ready; held by {reason}"),
+                ),
+            );
         }
     }
+    record_holds(project, holds)?;
     first.map_or(Ok(()), Err)
 }
