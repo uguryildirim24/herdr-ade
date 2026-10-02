@@ -911,6 +911,7 @@ fn page_body(project: &Project, settings: &Settings) -> String {
     out.push_str("\n## Plan\n\n");
     match &plan {
         Some(plan) if !plan.steps.is_empty() => {
+            let holds = crate::plan::failed_check_holds(project, plan, &evidence);
             for step in &plan.steps {
                 out.push_str(&format!(
                     "- `{}` [{}] {}\n",
@@ -918,6 +919,9 @@ fn page_body(project: &Project, settings: &Settings) -> String {
                     step.state.word(),
                     step.text.trim()
                 ));
+                if let Some(hold) = holds.get(&step.id) {
+                    out.push_str(&format!("  {}\n", hold.message()));
+                }
                 for sub in &step.subtasks {
                     out.push_str(&format!(
                         "  - `{}` [{}] {}\n",
@@ -925,6 +929,9 @@ fn page_body(project: &Project, settings: &Settings) -> String {
                         sub.state.word(),
                         sub.text.trim()
                     ));
+                    if let Some(hold) = holds.get(&sub.id) {
+                        out.push_str(&format!("    {}\n", hold.message()));
+                    }
                 }
             }
         }

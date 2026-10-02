@@ -759,11 +759,12 @@ struct ContextCursor {
 impl ContextCursor {
     fn capture(ctx: &Ctx, project: &Project) -> Self {
         let coordinator = project.coordinator().unwrap_or_default();
-        let events = crate::events::list(project);
+        let evidence = crate::task::EvidenceSnapshot::load(project);
+        let events = evidence.events();
         let lanes = crate::thread::list(project)
             .into_iter()
             .map(|thread| {
-                let stage = project::running_stage(&thread, &events);
+                let stage = project::running_stage(&thread, events);
                 (thread.id, format!("{} — {stage}", thread.title.trim()))
             })
             .collect();
@@ -780,40 +781,40 @@ impl ContextCursor {
             .into_iter()
             .map(|ask| (ask.id, ask.question))
             .collect();
-        let tasks = crate::task::views_with_evidence(
-            project,
-            &crate::task::EvidenceSnapshot::load(project),
-        )
-        .0
-        .into_iter()
-        .map(|view| {
-            (
-                view.record.id,
-                format!(
-                    "{}: {} — {}",
-                    view.state.word(),
-                    view.record.title,
-                    view.next
-                ),
-            )
-        })
-        .collect();
+        let tasks = crate::task::views_with_evidence(project, &evidence)
+            .0
+            .into_iter()
+            .map(|view| {
+                (
+                    view.record.id,
+                    format!(
+                        "{}: {} — {}",
+                        view.state.word(),
+                        view.record.title,
+                        view.next
+                    ),
+                )
+            })
+            .collect();
         let plan = crate::plan::load(project)
             .ok()
             .flatten()
-            .map(|plan| {
+            .map(|mut plan| {
+                crate::plan::project_states_with_evidence(project, &mut plan, &evidence);
+                let holds = crate::plan::failed_check_holds(project, &plan, &evidence);
+                let describe = |step: &crate::contracts::PlanStep| {
+                    let mut line = format!("{}: {}", step.state.word(), step.text);
+                    if let Some(hold) = holds.get(&step.id) {
+                        line.push_str(&format!(" — {}", hold.message()));
+                    }
+                    line
+                };
                 let mut rows = BTreeMap::new();
                 rows.insert("outcome".into(), format!("{}: {}", plan.kind, plan.does));
                 for step in &plan.steps {
-                    rows.insert(
-                        step.id.clone(),
-                        format!("{}: {}", step.state.word(), step.text),
-                    );
+                    rows.insert(step.id.clone(), describe(step));
                     for subtask in &step.subtasks {
-                        rows.insert(
-                            subtask.id.clone(),
-                            format!("{}: {}", subtask.state.word(), subtask.text),
-                        );
+                        rows.insert(subtask.id.clone(), describe(subtask));
                     }
                 }
                 rows
