@@ -191,6 +191,10 @@ For other agents the principle is the same: allow reading and steering, keep any
 
 The ticker shows one Herdr notification for each set of new inbox items. The coordinator reads those items in its next context; the ticker never types an inbox or next-step prompt into its pane. If the coordinator pane is missing but its session responds, the ticker attempts to relaunch it with its saved recipe at most once per hour.
 
+## Brief delivery
+
+`brief_submitted` records a staged send, not proof that the agent received it. The ticker waits for activity or the attempt's bootstrap receipt without repeating an ambiguous paste. If the agent is still ready at the end of its configured ready window after staging (five minutes when unset), delivery becomes `brief_delivery_failed` and the coordinator gets a diagnostic with the transport result and pane screen. The pane and worktree stay intact. `thread retry --reason` accepts this failure, keeps the recipe, and still refuses a fresh working agent. Late activity or a receipt settles the original delivery without restarting it.
+
 ## Lane completion deliveries
 
 A lane's typed event line is the wake-up: the ticker types it once into the coordinator's ready pane. `context` reads the current attempt's sealed completion evidence directly, alongside thread and review records. Local and courier completions write no duplicate inbox item; a replacement coordinator reads the same sealed work in context. Only a command the bound coordinator runs (`context`, or `inbox done` for messages) acknowledges a delivery; `--peek` and automation never do. Old thread/round inbox projections are ignored on read, not migrated.

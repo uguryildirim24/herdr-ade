@@ -1498,6 +1498,28 @@ fn thread_pass(
         });
     for t in threads {
         if t.status == thread::Status::Failed {
+            // Late activity or a receipt can settle an uncertain delivery. No
+            // replacement or second paste is needed, even after its deadline.
+            if t.error.starts_with("brief_delivery_failed:")
+                && (t.bootstrap == "acknowledged"
+                    || thread::live_state(t, agents, panes, now)
+                        .agent_state
+                        .as_deref()
+                        .is_some_and(|state| matches!(state, "working" | "blocked")))
+            {
+                thread::update(project, &t.id, |current| {
+                    if current.status == thread::Status::Failed
+                        && current.attempt == t.attempt
+                        && current.pane_id == t.pane_id
+                    {
+                        current.status = thread::Status::Open;
+                        current.prompt_pending = false;
+                        current.error.clear();
+                        current.last_group = "working".into();
+                    }
+                })?;
+                continue;
+            }
             let records = thread::list_live(project);
             if let Some(agent) = thread::recoverable_agent(t, &records, agents, panes) {
                 thread::update_checked(project, &t.id, |current| {
@@ -1694,7 +1716,8 @@ fn thread_pass(
             {
                 if current.brief_submitted || current.bootstrap == "acknowledged" {
                     // A capped wait can finish before activity is observed.
-                    // Keep waiting on this submission, never type it again.
+                    // Never replay an ambiguous paste, but bound the wait so
+                    // a command lost before submission cannot hang forever.
                     if current.bootstrap == "acknowledged"
                         || matches!(state.as_str(), "working" | "blocked")
                     {
@@ -1703,13 +1726,59 @@ fn thread_pass(
                                 && record.pane_id == current.pane_id
                             {
                                 record.prompt_pending = false;
+                                record.error.clear();
                             }
                         })?;
+                    } else if current.brief_submitted_at.is_empty() {
+                        // Historical staged submissions have no timestamp. Give
+                        // them a full observation window after installation.
+                        thread::update(project, &t.id, |record| {
+                            record.brief_submitted_at = project::now();
+                        })?;
+                    } else if ready
+                        && thread::seconds_since(&current.brief_submitted_at, now).max(0) as u64
+                            * 1000
+                            >= brief_delivery_timeout(&current.launch)
+                    {
+                        let screen = threads::startup_screen(herdr, &t.pane_id);
+                        let detail = format!(
+                            "brief_delivery_failed: no activity or bootstrap receipt since {}; last submission: {}; screen: {screen}. Check the pane, then thread retry --reason",
+                            current.brief_submitted_at,
+                            if current.error.is_empty() {
+                                "outcome unknown"
+                            } else {
+                                &current.error
+                            },
+                        );
+                        let mut failed = false;
+                        thread::update(project, &t.id, |record| {
+                            if record.attempt == current.attempt
+                                && record.pane_id == current.pane_id
+                                && record.status == thread::Status::Open
+                                && record.prompt_pending
+                                && record.bootstrap != "acknowledged"
+                            {
+                                // Keep the process and worktree for diagnosis.
+                                // Explicit retry stays on the selected recipe.
+                                record.status = thread::Status::Failed;
+                                record.error = detail.clone();
+                                record.failure_class = crate::contracts::FailureClass::Unknown;
+                                record.last_group = thread::Group::WaitingOnYou.token().into();
+                                failed = true;
+                            }
+                        })?;
+                        if failed {
+                            inbox::write(project, "brief-delivery", &t.id, &detail, "")?;
+                        }
+                        continue;
                     }
                 } else {
-                    // Persist before calling herdr: interruption or an ambiguous
-                    // transport result must not cause a second submission.
-                    thread::update(project, &t.id, |record| record.brief_submitted = true)?;
+                    // Staging is not proof of delivery. Persist its deadline
+                    // before calling herdr, including interruption before send.
+                    thread::update(project, &t.id, |record| {
+                        record.brief_submitted = true;
+                        record.brief_submitted_at = project::now();
+                    })?;
                     match herdr.agent_prompt_wait_started(
                         &t.pane_id,
                         &thread::launch_prompt(prefix, slug, &current),
@@ -1735,22 +1804,27 @@ fn thread_pass(
                                     && record.pane_id == current.pane_id
                                 {
                                     record.brief_submitted = false;
+                                    record.brief_submitted_at.clear();
                                 }
                             })?;
                         }
-                        Err(error)
-                            if matches!(
-                                error.code.as_str(),
-                                "timeout" | "agent_prompt_stalled"
-                            ) =>
-                        {
-                            // The wait expired, not the attempt. Leave the brief
-                            // pending until activity or its bootstrap receipt arrives.
-                        }
                         Err(error) => {
-                            pass.error = pass
-                                .error
-                                .or(Some(anyhow::anyhow!("{}: brief prompt: {error}", t.id)))
+                            // A timeout may happen before the remote API ever
+                            // receives the request. Retain the transport evidence
+                            // while waiting for activity, not an infinite latch.
+                            thread::update(project, &t.id, |record| {
+                                if record.attempt == current.attempt
+                                    && record.pane_id == current.pane_id
+                                    && record.prompt_pending
+                                {
+                                    record.error = format!("brief_delivery_pending: {error}");
+                                }
+                            })?;
+                            if !matches!(error.code.as_str(), "timeout" | "agent_prompt_stalled") {
+                                pass.error = pass
+                                    .error
+                                    .or(Some(anyhow::anyhow!("{}: brief prompt: {error}", t.id)));
+                            }
                         }
                     }
                 }
@@ -2105,6 +2179,14 @@ fn thread_pass(
         }
     }
     Ok(pass)
+}
+
+fn brief_delivery_timeout(launch: &crate::contracts::Launch) -> u64 {
+    if launch.ready_timeout_ms == 0 {
+        thread::STARTING_TIMEOUT_SECS as u64 * 1000
+    } else {
+        launch.ready_timeout_ms
+    }
 }
 
 fn agent_start_timeout(launch: &crate::contracts::Launch) -> u64 {
@@ -3625,9 +3707,149 @@ mod tests {
             // A replacement attempt or pane earns its own submission.
             thread::update(&project, &lane.id, |record| record.attempt += 1).unwrap();
             assert!(!thread::load(&project, &lane.id).unwrap().brief_submitted);
-            thread::update(&project, &lane.id, |record| record.brief_submitted = true).unwrap();
+            assert!(
+                thread::load(&project, &lane.id)
+                    .unwrap()
+                    .brief_submitted_at
+                    .is_empty()
+            );
+            thread::update(&project, &lane.id, |record| {
+                record.brief_submitted = true;
+                record.brief_submitted_at = project::now();
+            })
+            .unwrap();
             thread::update(&project, &lane.id, |record| record.pane_id = "w3:p1".into()).unwrap();
             assert!(!thread::load(&project, &lane.id).unwrap().brief_submitted);
+            assert!(
+                thread::load(&project, &lane.id)
+                    .unwrap()
+                    .brief_submitted_at
+                    .is_empty()
+            );
+        }
+    }
+
+    #[test]
+    fn undelivered_brief_fails_after_its_window_without_replaying_or_killing() {
+        use crate::scenarios::World;
+        for remote in [false, true] {
+            let world = World::new();
+            let project = world.project("demo", "a.sock");
+            let lane = world.thread(&project, &world.home.path().join("lane"), |record| {
+                record.prompt_pending = true;
+                record.launch_attempts = 1;
+                record.launch.ready_timeout_ms = 300_000;
+                if remote {
+                    record.machine = "box".into();
+                }
+            });
+            // The command timed out without a server submission, as t-0607's
+            // box log shows. Staging must not become an infinite delivery latch.
+            world.runner.on(
+                "agent prompt",
+                crate::runner::Output {
+                    timed_out: true,
+                    ..Default::default()
+                },
+            );
+            world.runner.on("pane read", ok("pi\nempty prompt\n"));
+            let socket = project.coordinator().unwrap().socket;
+            let local = Herdr::new(world.env.herdr_bin(), &socket, &world.runner);
+            let herdr = local.on_machine(lane.machine_route());
+            let mut agent = Agent {
+                pane_id: lane.pane_id.clone(),
+                tab_id: lane.tab_id.clone(),
+                workspace_id: lane.workspace_id.clone(),
+                cwd: lane.cwd.clone(),
+                name: lane.agent_name.clone(),
+                agent_status: "idle".into(),
+                ..Agent::default()
+            };
+            let pane = Pane {
+                pane_id: lane.pane_id.clone(),
+                tab_id: lane.tab_id.clone(),
+                workspace_id: lane.workspace_id.clone(),
+                cwd: lane.cwd.clone(),
+            };
+            let run_pass = |agent: &Agent| {
+                let current = thread::load(&project, &lane.id).unwrap();
+                thread_pass(
+                    &LaunchPass {
+                        ctx: &world.ctx(),
+                        project: &project,
+                        herdr: &herdr,
+                        threads: &[current],
+                        agents: std::slice::from_ref(agent),
+                        panes: std::slice::from_ref(&pane),
+                    },
+                    "ha",
+                    None,
+                    false,
+                    None,
+                )
+                .unwrap()
+            };
+            assert!(run_pass(&agent).error.is_none());
+            let pending = thread::load(&project, &lane.id).unwrap();
+            assert!(pending.error.contains("timed out"));
+            assert!(!pending.brief_submitted_at.is_empty());
+            // An old persisted stage (including an interrupted send) gets a
+            // full window when no timestamp was recorded, without a new paste.
+            thread::update(&project, &lane.id, |record| {
+                record.brief_submitted_at.clear()
+            })
+            .unwrap();
+            assert!(run_pass(&agent).error.is_none());
+            let historical = thread::load(&project, &lane.id).unwrap();
+            assert_eq!(historical.status, thread::Status::Open);
+            assert!(!historical.brief_submitted_at.is_empty());
+            // A lane can take about a minute to start. Neither its first poll
+            // nor a minute-old ambiguous submission is a delivery failure.
+            thread::update(&project, &lane.id, |record| {
+                record.brief_submitted_at =
+                    (jiff::Timestamp::now() - jiff::SignedDuration::from_secs(60)).to_string();
+            })
+            .unwrap();
+            assert!(run_pass(&agent).error.is_none());
+            assert_eq!(
+                thread::load(&project, &lane.id).unwrap().status,
+                thread::Status::Open
+            );
+            thread::update(&project, &lane.id, |record| {
+                record.brief_submitted_at =
+                    (jiff::Timestamp::now() - jiff::SignedDuration::from_secs(301)).to_string();
+            })
+            .unwrap();
+            assert!(run_pass(&agent).error.is_none());
+            let failed = thread::load(&project, &lane.id).unwrap();
+            assert_eq!(failed.status, thread::Status::Failed);
+            assert!(failed.prompt_pending);
+            assert_eq!(failed.pane_id, lane.pane_id);
+            assert!(failed.error.starts_with("brief_delivery_failed:"));
+            assert!(failed.error.contains("timed out"));
+            assert!(failed.error.contains("empty prompt"));
+            assert_eq!(failed.last_group, "waiting-on-you");
+            assert!(run_pass(&agent).error.is_none());
+            assert_eq!(world.runner.count("agent prompt"), 1);
+            assert_eq!(world.runner.count("tab close"), 0);
+            assert_eq!(world.runner.count("workspace close"), 0);
+            assert_eq!(crate::inbox::unhandled(&project).len(), 1);
+            // A late start settles the submission instead of creating another
+            // attempt. The retry path separately checks fresh working state.
+            if remote {
+                thread::update(&project, &lane.id, |record| {
+                    record.bootstrap = "acknowledged".into()
+                })
+                .unwrap();
+            } else {
+                agent.agent_status = "working".into();
+            }
+            assert!(run_pass(&agent).error.is_none());
+            let settled = thread::load(&project, &lane.id).unwrap();
+            assert_eq!(settled.status, thread::Status::Open);
+            assert!(!settled.prompt_pending);
+            assert!(settled.error.is_empty());
+            assert_eq!(world.runner.count("agent prompt"), 1);
         }
     }
 
