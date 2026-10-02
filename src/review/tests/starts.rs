@@ -1,5 +1,152 @@
 use super::*;
 
+fn harness_gates(fx: &Fx, gates: Option<Vec<project::Gate>>, listed: bool) {
+    let (mut settings, body) = fx.project.read_project_md().unwrap();
+    let mut row = settings.repos[0].clone();
+    row.gates = gates;
+    let config = fx.world.ctx().config_dir.join("config.toml");
+    let mut text = std::fs::read_to_string(&config).unwrap();
+    text.push('\n');
+    text.push_str(
+        &toml::to_string(&BTreeMap::from([(
+            "harness",
+            BTreeMap::from([("repos", vec![row])]),
+        )]))
+        .unwrap(),
+    );
+    std::fs::write(config, text).unwrap();
+    if !listed {
+        settings.repos.clear();
+        std::fs::write(
+            fx.project.project_md(),
+            format!("+++\n{}+++\n{body}", toml::to_string(&settings).unwrap()),
+        )
+        .unwrap();
+    }
+}
+
+fn four_gates() -> Vec<project::Gate> {
+    [
+        "cargo fmt --check",
+        "cargo test",
+        "cargo clippy --all-targets -- -D warnings",
+        "git diff --check",
+    ]
+    .into_iter()
+    .map(|command| project::Gate {
+        command: command.into(),
+        paths: None,
+        env: BTreeMap::new(),
+    })
+    .collect()
+}
+
+#[test]
+fn unlisted_harness_repo_selects_all_four_harness_gates() {
+    let fx = configured();
+    harness_gates(&fx, Some(four_gates()), false);
+    lane(&fx, 1);
+    let review = prepared(&fx);
+    assert!(review.install_required);
+    assert_eq!(review.gates, four_gates());
+    assert_eq!(review.selected_gates, four_gates());
+    assert!(review.gates_note.is_empty());
+    let brief = task(&fx.project, &review);
+    for gate in four_gates() {
+        assert!(brief.contains(&gate.command));
+    }
+    let candidate = git(&fx.repo, &["rev-parse", &review.candidate_branch]);
+    seal_verdict(
+        &fx,
+        &review,
+        &candidate,
+        "MERGE",
+        BTreeMap::new(),
+        vec![],
+        1,
+    );
+    let events = crate::events::checked(&fx.project).unwrap();
+    let reviewer = thread::load(&fx.project, review.reviewer.as_deref().unwrap()).unwrap();
+    let event = sealed(&events, &reviewer).unwrap();
+    let git = Git::new(&fx.world.runner, fx.repo.to_str().unwrap());
+    assert!(verdict(&fx.project, &review, event, &git).is_err());
+    let runs = four_gates()
+        .into_iter()
+        .map(|gate| GateRun {
+            command: gate.command,
+            exit: 0,
+        })
+        .collect();
+    seal_verdict(&fx, &review, &candidate, "MERGE", BTreeMap::new(), runs, 2);
+    let events = crate::events::checked(&fx.project).unwrap();
+    assert!(
+        verdict(
+            &fx.project,
+            &review,
+            sealed(&events, &reviewer).unwrap(),
+            &git
+        )
+        .is_ok()
+    );
+}
+
+#[test]
+fn harness_gates_override_listing_project_gates() {
+    let fx = configured();
+    // The listing project explicitly has no gates; the harness policy wins.
+    harness_gates(&fx, Some(four_gates()), true);
+    lane(&fx, 1);
+    let review = prepared(&fx);
+    assert_eq!(review.gates, four_gates());
+    assert_eq!(review.selected_gates, four_gates());
+}
+
+#[test]
+fn harness_repo_without_any_gate_declaration_refuses_before_allocating() {
+    for listed in [false, true] {
+        let fx = configured();
+        let (mut settings, body) = fx.project.read_project_md().unwrap();
+        settings.repos[0].gates = None;
+        std::fs::write(
+            fx.project.project_md(),
+            format!("+++\n{}+++\n{body}", toml::to_string(&settings).unwrap()),
+        )
+        .unwrap();
+        harness_gates(&fx, None, listed);
+        lane(&fx, 1);
+        let error = start(&fx.world.ctx(), "demo", Some(fx.repo.to_str().unwrap()))
+            .unwrap_err()
+            .to_string();
+        assert_eq!(
+            error,
+            format!(
+                "harness_gates_missing: {} has no gates; add gates to its [harness] row in config.toml",
+                fx.repo.display()
+            )
+        );
+        assert!(list(&fx.project).unwrap().is_empty());
+        assert!(reviewer_ids(&fx.project).unwrap().is_empty());
+        assert!(git(&fx.repo, &["branch", "--list", "review/*"]).is_empty());
+    }
+}
+
+#[test]
+fn harness_repo_uses_listing_project_gates_when_harness_gates_are_omitted() {
+    let fx = configured();
+    let (mut settings, body) = fx.project.read_project_md().unwrap();
+    settings.repos[0].gates = Some(four_gates());
+    std::fs::write(
+        fx.project.project_md(),
+        format!("+++\n{}+++\n{body}", toml::to_string(&settings).unwrap()),
+    )
+    .unwrap();
+    harness_gates(&fx, None, true);
+    lane(&fx, 1);
+    let review = prepared(&fx);
+    assert_eq!(review.gates, four_gates());
+    assert_eq!(review.selected_gates, four_gates());
+}
+
 #[test]
 fn repository_worktrees_share_one_review_lock() {
     let fx = configured();

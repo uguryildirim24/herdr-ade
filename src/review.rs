@@ -53,6 +53,8 @@ pub(crate) struct Verdict {
     #[serde(default)]
     pub without: BTreeMap<String, String>,
     pub gates: Vec<GateRun>,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub gates_note: String,
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct Review {
@@ -63,6 +65,8 @@ pub(crate) struct Review {
     pub candidate_branch: String,
     pub members: Vec<Member>,
     pub gates: Vec<project::Gate>,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub gates_note: String,
     pub selected_gates: Vec<project::Gate>,
     pub reviewer: Option<String>,
     pub phase: Phase,
@@ -88,6 +92,16 @@ pub(crate) struct Review {
     /// Review-owned wake-ups survive resolution of the reviewer and members.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub(crate) notices: Vec<crate::steps::Notice>,
+}
+
+impl Review {
+    pub(crate) fn gates_summary(&self) -> String {
+        if self.gates_note.is_empty() {
+            String::new()
+        } else {
+            format!(" — {}", self.gates_note)
+        }
+    }
 }
 
 pub(crate) fn dir(project: &Project) -> PathBuf {
@@ -643,7 +657,23 @@ fn start_locked(ctx: &Ctx, project: &Project, row: project::Repo) -> Result<Opti
     if pile.is_empty() {
         return Ok(None);
     }
-    let gates = row.gates.clone().unwrap_or_default();
+    let harness = crate::harness::repos(&ctx.config_dir)?;
+    let harness_row = harness.iter().find(|r| same_repo(&r.path, &row.path));
+    let declared_gates = harness_row
+        .and_then(|r| r.gates.as_ref())
+        .or(row.gates.as_ref());
+    if harness_row.is_some() && declared_gates.is_none() {
+        bail!(
+            "harness_gates_missing: {} has no gates; add gates to its [harness] row in config.toml",
+            row.path
+        );
+    }
+    let gates_note = if declared_gates.is_none() {
+        "no gates declared".to_owned()
+    } else {
+        String::new()
+    };
+    let gates = declared_gates.cloned().unwrap_or_default();
     for gate in &gates {
         if let Some(paths) = &gate.paths {
             for path in paths {
@@ -752,6 +782,7 @@ fn start_locked(ctx: &Ctx, project: &Project, row: project::Repo) -> Result<Opti
         members,
         selected_gates: selected(&gates, &changed),
         gates,
+        gates_note,
         reviewer: None,
         phase: Phase::Preparing,
         verdict: None,
@@ -763,9 +794,7 @@ fn start_locked(ctx: &Ctx, project: &Project, row: project::Repo) -> Result<Opti
         moved: 0,
         refresh_tip: None,
         push_remote: row.push_remote,
-        install_required: crate::harness::repos(&ctx.config_dir)?
-            .iter()
-            .any(|r| same_repo(&r.path, &row.path)),
+        install_required: harness_row.is_some(),
         fast_forward: false,
         push: false,
         install: false,
@@ -801,6 +830,9 @@ fn task(project: &Project, review: &Review) -> String {
         })
         .expect("gate serialization"),
     );
+    if !review.gates_note.is_empty() {
+        out.push_str(&format!("\n{}\n", review.gates_note));
+    }
     out.push_str("\nSelected gates for this pile:\n");
     for gate in &review.selected_gates {
         out.push_str(&format!(
@@ -901,7 +933,8 @@ fn verdict(
         .strip_prefix("+++\n")
         .and_then(|s| s.split_once("\n+++").map(|(front, _)| front))
         .context("review report needs TOML front matter")?;
-    let verdict: Verdict = toml::from_str(front)?;
+    let mut verdict: Verdict = toml::from_str(front)?;
+    verdict.gates_note = review.gates_note.clone();
     if verdict.review != review.id || verdict.candidate != done.sha {
         bail!("verdict identity or candidate differs from sealed reviewer HEAD");
     }
@@ -1418,9 +1451,10 @@ fn land_with_install(
     queue_notice(
         review,
         format!(
-            "REVIEW {} merged {members} ({}{published})",
+            "REVIEW {} merged {members} ({}{published}){}",
             review.id,
-            &candidate[..candidate.len().min(7)]
+            &candidate[..candidate.len().min(7)],
+            review.gates_summary()
         ),
     );
     review.attention.clear();

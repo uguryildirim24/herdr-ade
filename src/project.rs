@@ -145,7 +145,8 @@ pub(crate) struct Repo {
     /// The only remote to which a completed integration branch may be pushed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) push_remote: Option<String>,
-    /// Missing and empty gate lists both make the repository gate-free.
+    /// Empty declares a gate-free policy. Missing is unconfigured; harness
+    /// reviews require a declaration here or on the reviewing project's row.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) gates: Option<Vec<Gate>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -901,10 +902,11 @@ fn page_body(project: &Project, settings: &Settings) -> String {
     }
     for review in reviews {
         out.push_str(&format!(
-            "- Review `{}`: {:?} ({} lanes)\n",
+            "- Review `{}`: {:?} ({} lanes){}\n",
             review.id,
             review.phase,
-            review.members.len()
+            review.members.len(),
+            review.gates_summary()
         ));
     }
 

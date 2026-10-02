@@ -6045,6 +6045,7 @@ mod tests {
             candidate_branch: String::new(),
             members: vec![],
             gates: vec![],
+            gates_note: String::new(),
             selected_gates: vec![],
             reviewer: None,
             phase: crate::review::Phase::Reviewing,

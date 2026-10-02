@@ -1498,6 +1498,7 @@ mod tests {
                         }]
                     },
                     gates: vec![],
+                    gates_note: String::new(),
                     selected_gates: vec![],
                     reviewer: reviewer.then(|| record.id.clone()),
                     phase: crate::review::Phase::Complete,
@@ -1507,6 +1508,7 @@ mod tests {
                         candidate: seal.clone(),
                         without: Default::default(),
                         gates: vec![],
+                        gates_note: String::new(),
                     }),
                     verdict_event: String::new(),
                     reviewer_after: String::new(),
