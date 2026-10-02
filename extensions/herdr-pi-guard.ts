@@ -1,4 +1,4 @@
-// herdr-pi-guard:version=4
+// herdr-pi-guard:version=5
 // Plugin-owned pi extension (SPEC-pi v2 §3.7, §3.10). Written by
 // setup and every harness install; doctor compares the complete file.
 //
@@ -14,27 +14,32 @@ import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import { spawn } from "node:child_process";
 
-// pi has no hooks.json. ADE installs these commands in the coordinator's
-// project; the global extension runs them only in its bound pane.
-function commands(ctx) {
+// Setup renders these absolute paths into the global extension. Neither the
+// executable nor its arguments come from cwd; old checkout hook files are ignored.
+const ADE_BINARY = "__HERDR_ADE_BINARY__";
+const ADE_ROOT = "__HERDR_ADE_ROOT__";
+
+function coordinatorBinding() {
   const pane = process.env.HERDR_PANE_ID;
-  // ADE owns this file, not pi's project-local extension loader; pi's normal
-  // defaultProjectTrust is `never` for ADE projects.
-  if (!pane) return null;
+  // ADE already supplies project/thread/attempt/hash when it creates a pane.
+  // Use that identity to find its state, not a cwd search or a pane-only scan
+  // (pane ids can repeat on different herdr sessions and machines).
+  const [project, thread] = (process.env.HERDR_ADE_LAUNCH || "").split("/");
+  if (!pane || thread !== "coordinator" || !/^[a-z0-9][a-z0-9-]*$/.test(project)) return null;
   try {
-    const value = JSON.parse(readFileSync(join(ctx.cwd, ".pi/herdr-ade-hooks.json"), "utf8"));
-    if (value.pane !== pane) return null;
-    if (![value.prompt].every((argv) =>
-      Array.isArray(argv) && argv.length > 1 && argv.every((arg) => typeof arg === "string"))) return null;
-    return value;
+    const binding = JSON.parse(readFileSync(join(ADE_ROOT, project, ".state/coordinator-hook.json"), "utf8"));
+    return binding.kind === "pi" && binding.pane === pane && binding.project === project ? binding : null;
   } catch {
     return null;
   }
 }
 
-function hook(argv, payload) {
+function hook(binding, payload) {
   return new Promise((resolve, reject) => {
-    const child = spawn(argv[0], argv.slice(1), { stdio: ["pipe", "pipe", "pipe"] });
+    const child = spawn(ADE_BINARY, [
+      "--root", ADE_ROOT, "hook", "--kind", "pi", "--project", binding.project,
+      "--binding", binding.pane, "--phase", "prompt",
+    ], { stdio: ["pipe", "pipe", "pipe"] });
     let stdout = "";
     let stderr = "";
     const timer = setTimeout(() => child.kill(), 10000);
@@ -63,8 +68,8 @@ export default function (pi) {
   pi.on("input", async (event, ctx) => {
     // sendUserMessage corrections are extension delivery, not Rolf's words.
     if (event.source === "extension") return;
-    const config = commands(ctx);
-    if (!config) return;
+    const binding = coordinatorBinding();
+    if (!binding) return;
     const payload = {
       prompt: event.text,
       session_id: ctx.sessionManager.getSessionId(),
@@ -72,7 +77,7 @@ export default function (pi) {
       queued: !!event.streamingBehavior,
     };
     try {
-      const output = await hook(config.prompt, payload);
+      await hook(binding, payload);
     } catch (error) {
       if (ctx.hasUI) ctx.ui.notify(`ADE prompt check failed: ${error}`, "error");
       return { action: "handled" }; // never let an unrecorded request through
@@ -172,8 +177,8 @@ export default function (pi) {
     const text = `${provider} ${cls}: ${first120(label)}`;
     try {
       await pi.exec(
-        "ha",
-        ["failed", "--class", "provider", "--provider-kind", cls, text],
+        ADE_BINARY,
+        ["--root", ADE_ROOT, "failed", "--class", "provider", "--provider-kind", cls, text],
         { timeout: 5000 },
       );
     } catch {
