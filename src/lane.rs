@@ -89,6 +89,7 @@ pub(crate) fn done(ctx: &Ctx, report: &str, sha: &str) -> Result<()> {
     let event = ops::seal(&binding.project, &op.op, |candidate| {
         validate_current(&binding, candidate.attempt, candidate)
     })?;
+    detach_sealed_lane(ctx, &binding)?;
     let _ = crate::project::refresh_page(&binding.project);
     if binding.card.is_none() {
         steps::deliver_event(ctx, &binding.project, &event)?;
@@ -172,6 +173,7 @@ fn seal_message(
     let event = ops::seal(&binding.project, &op.op, |candidate| {
         validate_current(&binding, candidate.attempt, candidate)
     })?;
+    detach_sealed_lane(ctx, &binding)?;
     let _ = crate::project::refresh_page(&binding.project);
     if binding.card.is_none() {
         // Failure is consumed by the next ticker pass, never synchronously:
@@ -187,6 +189,20 @@ fn seal_message(
         crate::output::insert("provider_kind", serde_json::json!(kind));
     }
     println!("sealed {}", event.id);
+    Ok(())
+}
+
+fn detach_sealed_lane(ctx: &Ctx, binding: &Binding) -> Result<()> {
+    let socket = std::env::var("HERDR_SOCKET_PATH").unwrap_or_else(|_| {
+        binding
+            .project
+            .coordinator()
+            .map(|c| c.socket)
+            .unwrap_or_default()
+    });
+    // On the box this is the box's local server, not the card's Mac recipient.
+    Herdr::new(ctx.env.herdr_bin(), socket, ctx.runner)
+        .pane_clear_tokens(&binding.thread.pane_id, &["parent"])?;
     Ok(())
 }
 

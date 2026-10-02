@@ -36,10 +36,6 @@ impl Default for Recipe {
 /// The `local` machine sentinel: the Mac itself (SPEC-remote §4.1).
 pub(crate) const MACHINE_LOCAL: &str = "local";
 
-/// The local machine's display label, the one herdr's sidebar shows. It is the
-/// machine part of a cross-machine `parent` token (the fork lane t-0053 form).
-pub(crate) const MACHINE_LOCAL_LABEL: &str = "Local";
-
 /// A saved machine's stable profile (SPEC-remote §4.1). `id` is the plugin's
 /// identity; `label` is renameable and is only shown.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -346,6 +342,8 @@ pub(crate) struct Event {
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum DeliveryState {
+    /// Accepted by ADE's durable idle-time outbox, not yet sent to Herdr.
+    Queued,
     Submitted,
     Acknowledged,
     Handled,

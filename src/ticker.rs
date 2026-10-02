@@ -1192,40 +1192,14 @@ fn startup_failure(input: &LaunchPass<'_>, thread: &thread::Thread, detail: &str
         t.error = reason.clone();
         t.failure_class = crate::contracts::FailureClass::Unknown;
         t.last_group = thread::Group::WaitingOnYou.token().into();
-    })?;
-    if !thread.is_remote() {
-        let notice = format!(
-            "{} did not become ready during startup: {reason}. Read `thread show {} {}` before retrying.",
-            thread.id, input.project.slug, thread.id
-        );
-        let sent = input.project.coordinator().is_some_and(|coordinator| {
-            input
-                .agents
-                .iter()
-                .any(|agent| agent.pane_id == coordinator.pane_id && agent.ready())
-                && crate::prompt::writer_lock(input.project).is_ok_and(|_writer| {
-                    crate::prompt::coordinator_prompt_clear(
-                        input.project,
-                        input.herdr,
-                        &coordinator.pane_id,
-                    )
-                    .unwrap_or(false)
-                        && crate::prompt::mark_automated_prompt(
-                            input.project,
-                            &coordinator.pane_id,
-                            &notice,
-                        )
-                        .is_ok()
-                        && input
-                            .herdr
-                            .agent_prompt(&coordinator.pane_id, &notice)
-                            .is_ok()
-                })
+        t.start_notices.push(steps::Notice {
+            line: format!(
+                "{} did not become ready during startup: {reason}. Read `thread show {} {}` before retrying.",
+                thread.id, input.project.slug, thread.id
+            ),
+            submitted: false,
         });
-        if !sent {
-            crate::inbox::write(input.project, "lane-notice", &thread.id, &notice, "")?;
-        }
-    }
+    })?;
     Ok(())
 }
 
@@ -1980,20 +1954,24 @@ fn thread_pass(
                 t.id, t.pane_id
             );
             let sent = if let Some(coordinator) = project.coordinator() {
-                agents
-                    .iter()
-                    .any(|agent| coordinator::agent_matches(&coordinator, agent) && agent.ready())
-                    && steps::deliver_coordinator_prompt(
-                        project,
-                        herdr,
-                        &coordinator.pane_id,
-                        &notice,
-                    )?
+                agents.iter().any(|agent| {
+                    coordinator::agent_matches(&coordinator, agent) && agent.promptable()
+                }) && steps::deliver_coordinator_prompt(
+                    project,
+                    herdr,
+                    &coordinator.pane_id,
+                    &notice,
+                )?
             } else {
                 false
             };
             if !sent {
-                inbox::write(project, "lane-notice", &t.id, &notice, "")?;
+                thread::update(project, &t.id, |record| {
+                    record.start_notices.push(steps::Notice {
+                        line: notice,
+                        submitted: false,
+                    });
+                })?;
             }
         }
         // Observation failures do not advance a clock or manufacture a stall.
@@ -2064,7 +2042,8 @@ fn thread_pass(
                     for notice in progress_notice_lines(&notices, &t.id, &t.pane_id) {
                         let sent = if let Some(coordinator) = project.coordinator() {
                             agents.iter().any(|agent| {
-                                coordinator::agent_matches(&coordinator, agent) && agent.ready()
+                                coordinator::agent_matches(&coordinator, agent)
+                                    && agent.promptable()
                             }) && steps::deliver_coordinator_prompt(
                                 project,
                                 herdr,
@@ -2077,7 +2056,12 @@ fn thread_pass(
                         };
                         // A transport error must not consume the one-shot notice.
                         if !sent {
-                            inbox::write(project, "lane-notice", &t.id, &notice, "")?;
+                            thread::update(project, &t.id, |record| {
+                                record.start_notices.push(steps::Notice {
+                                    line: notice,
+                                    submitted: false,
+                                });
+                            })?;
                         }
                     }
                 }
@@ -2088,17 +2072,20 @@ fn thread_pass(
         {
             thread::update(project, &t.id, reset_progress)?;
         }
-        // Only absence of the pane proves a local process is gone. Herdr may
-        // temporarily omit agent state while the terminal and process still
-        // exist (including after an interactive startup timeout); that state
-        // is Unknown and must never authorize closing the pane.
+        // A missing pane or a previously identified agent back at a shell is
+        // news. An omitted name while a process still runs remains unknown.
         let process_gone = !t.is_remote()
             && (after.startup_wait_started.is_empty()
                 || thread::seconds_since(&after.startup_wait_started, now).max(0) as u64 * 1000
                     >= agent_start_timeout(&after.launch))
-            && after.report_hash.is_empty()
-            && !threads::parkable(project, &after)
-            && !live.pane_exists;
+            && !threads::attempt_sealed(project, &after)
+            && (!live.pane_exists
+                || (live.agent_state.is_none()
+                    && !agents.iter().any(|a| a.pane_id == after.pane_id)
+                    && after.identity.process.is_some()
+                    && herdr
+                        .pane_process_info(&after.pane_id)
+                        .is_ok_and(|info| info.agent_gone(&after.pane_id))));
         if process_gone && !whole_session_missing {
             // The pane list may predate this record: a concurrent start or
             // retry can place a tab after the pass took its snapshot. Absence
@@ -2120,7 +2107,19 @@ fn thread_pass(
                             && pane.workspace_id == current.workspace_id
                     }) =>
                 {
-                    continue;
+                    // A surviving terminal can still contain a dead agent.
+                    // An omitted name alone is unknown, never proof of death.
+                    if !live.pane_exists
+                        || herdr
+                            .agent_list()?
+                            .iter()
+                            .any(|a| a.pane_id == current.pane_id)
+                        || !herdr
+                            .pane_process_info(&current.pane_id)
+                            .is_ok_and(|info| info.agent_gone(&current.pane_id))
+                    {
+                        continue;
+                    }
                 }
                 Ok(_) => {}
                 Err(error) => {
@@ -2453,11 +2452,6 @@ fn launch_pass(
     let Some(first) = pending.first() else {
         return false;
     };
-    let parent = pass
-        .project
-        .coordinator()
-        .filter(|_| !first.is_remote())
-        .map(|coordinator| coordinator.pane_id);
     let starts: Vec<_> = pending
         .iter()
         .map(|t| crate::herdr::AgentStart {
@@ -2466,7 +2460,8 @@ fn launch_pass(
             pane: &t.pane_id,
             agent_args: &t.launch.args,
             launch_bin: None,
-            parent: parent.as_deref(),
+            // ADE owns notices so fork exits cannot bypass idle batching.
+            parent: None,
             // `agent start` need not hold the ticker for the whole observation
             // window: subsequent passes watch the pane for the remaining time.
             ready_timeout_ms: agent_start_timeout(&t.launch)
@@ -2588,7 +2583,7 @@ fn tick_cheap(ctx: &Ctx, project: &Project, refresh_tokens: bool) -> Result<Opti
     // checks agent identity on each machine before touching parent metadata.
     let state = steps::load_state(project);
     if !state.lanes_parented_to.is_empty() && state.lanes_parented_to != record.pane_id {
-        match crate::threads::relink_binding(ctx, project, &record.pane_id) {
+        match crate::threads::clear_push_links(ctx, project) {
             Ok(()) => {
                 let mut state = steps::load_state(project);
                 state.lanes_parented_to = record.pane_id.clone();
@@ -2653,6 +2648,9 @@ fn tick_cheap(ctx: &Ctx, project: &Project, refresh_tokens: bool) -> Result<Opti
     }
     crate::threads::resolve_report_only(ctx, project);
 
+    if let Err(error) = steps::flush_coordinator_notices(ctx, project) {
+        first_error = first_error.or(Some(error));
+    }
     let local = open_threads(project, false);
     let pass = thread_pass(
         &LaunchPass {
@@ -2867,9 +2865,13 @@ fn clean_managed_project_tabs(
             })
         })
         .filter_map(|record| {
-            herdr.tab_close(&record.tab_id).err().map(|error| {
-                anyhow::anyhow!("{machine}: close managed tab {}: {error}", record.tab_id)
-            })
+            herdr
+                .pane_clear_tokens(&record.pane_id, &["parent"])
+                .and_then(|()| herdr.tab_close(&record.tab_id))
+                .err()
+                .map(|error| {
+                    anyhow::anyhow!("{machine}: close managed tab {}: {error}", record.tab_id)
+                })
         })
         .collect()
 }
@@ -4437,15 +4439,10 @@ mod tests {
         assert_eq!(saved.failure_class, crate::contracts::FailureClass::Unknown);
         assert!(errors.is_empty());
         assert_eq!(runner.count("agent start"), 1);
-        assert_eq!(runner.count("agent prompt"), 1);
-        assert!(
-            runner
-                .calls
-                .borrow()
-                .iter()
-                .any(|call| call.display().contains("Trust this folder?")
-                    && call.display().contains("agent prompt"))
-        );
+        assert_eq!(runner.count("agent prompt"), 0);
+        assert_eq!(saved.start_notices.len(), 1);
+        assert!(saved.start_notices[0].line.contains("Trust this folder?"));
+        assert!(!saved.start_notices[0].submitted);
     }
 
     #[test]
@@ -4553,6 +4550,7 @@ mod tests {
         })
         .unwrap();
         let coordinator = f.project.coordinator().unwrap();
+        runner.on("agent list", ok(&with_cwd(AGENT_READY, &f)));
         let coordinator_agent = Agent {
             pane_id: coordinator.pane_id,
             tab_id: coordinator.tab_id,
@@ -4599,6 +4597,8 @@ mod tests {
         };
         poll(&agent);
         poll(&agent);
+        assert_eq!(runner.count("agent prompt"), 0);
+        steps::flush_notices_for_test(&f.project, &herdr);
         assert_eq!(runner.count("agent prompt"), 1);
         assert!(
             runner
@@ -4828,6 +4828,83 @@ mod tests {
     }
 
     #[test]
+    fn an_identified_agent_dying_before_seal_sends_gone_even_with_a_draft_report() {
+        let world = crate::scenarios::World::new();
+        let project = world.project("demo", "a.sock");
+        let c = project.coordinator().unwrap();
+        *world.agents.borrow_mut() = format!(
+            "[{}]",
+            crate::scenarios::agent_json(
+                &c.workspace_id,
+                &c.tab_id,
+                &c.pane_id,
+                &c.cwd,
+                &c.agent_name,
+                "working",
+            )
+        );
+        let lane = thread::allocate(&project, |t| {
+            t.status = thread::Status::Open;
+            t.pane_id = "w2:p1".into();
+            t.tab_id = "w2:t1".into();
+            t.workspace_id = "w2".into();
+            t.cwd = "/lane".into();
+            t.agent_name = "hp-demo-t-0001".into();
+            t.report_hash = "unsealed-draft".into();
+            t.identity.process = Some(crate::contracts::ProcessIdentity {
+                pid: 42,
+                argv0: "pi".into(),
+            });
+        })
+        .unwrap();
+        *world.panes.borrow_mut() = format!(
+            "[{},{}]",
+            world.coordinator_pane(&project),
+            crate::scenarios::pane_json("w2", "w2:t1", "w2:p1", "/lane")
+        );
+        world.runner.on("pane process-info", ok(r#"{"result":{"process_info":{"pane_id":"w2:p1","foreground_processes":[{"pid":5,"name":"bash"}]}}}"#));
+        world.runner.on("agent prompt", ok(r#"{"result":{}}"#));
+        let ctx = world.ctx();
+        let herdr = Herdr::new("herdr", &c.socket, &world.runner);
+        let pass = thread_pass(
+            &LaunchPass {
+                ctx: &ctx,
+                project: &project,
+                herdr: &herdr,
+                threads: std::slice::from_ref(&lane),
+                agents: &herdr.agent_list().unwrap(),
+                panes: &herdr.pane_list().unwrap(),
+            },
+            "ha",
+            None,
+            false,
+            None,
+        )
+        .unwrap();
+        assert!(pass.error.is_none(), "{:?}", pass.error);
+        let failed = thread::load(&project, &lane.id).unwrap();
+        assert_eq!(failed.status, thread::Status::Failed);
+        assert_eq!(
+            failed.failure_class,
+            crate::contracts::FailureClass::ProcessGone
+        );
+        steps::deliver_transition_notices(&ctx, &project).unwrap();
+        steps::deliver_transition_notices(&ctx, &project).unwrap();
+        assert_eq!(
+            world
+                .runner
+                .calls
+                .borrow()
+                .iter()
+                .filter(
+                    |cmd| cmd.display().contains("agent prompt") && cmd.display().contains("GONE")
+                )
+                .count(),
+            1
+        );
+    }
+
+    #[test]
     fn a_lane_placed_after_the_pane_snapshot_is_not_failed_or_closed() {
         let fixture = fixture(false);
         let record = thread::allocate(&fixture.project, |t| {
@@ -5008,6 +5085,7 @@ mod tests {
             ok(r#"{"result":{"process_info":{"pane_id":"w2:p1","foreground_processes":[]}}}"#),
         );
         runner.on("tab close w2:t1", ok(r#"{"result":{}}"#));
+        runner.on("pane report-metadata", ok(r#"{"result":{}}"#));
         let herdr = Herdr::new("herdr", "", &runner).on_machine("machine-1");
         let panes = [Pane {
             pane_id: "w2:p1".into(),
@@ -5694,12 +5772,14 @@ mod tests {
         );
         let mut state = steps::load_state(&f.project);
         plan_nudge(&f.project, &herdr, agents, &mut state).unwrap();
+        steps::flush_notices_for_test(&f.project, &herdr);
         steps::save_state(&f.project, &state).unwrap();
     }
 
     fn nudge_setup() -> (Fixture, FakeRunner, Agent) {
         let f = fixture(false);
         let runner = FakeRunner::new();
+        runner.on("agent list", ok(&with_cwd(AGENT_READY, &f)));
         runner.on("pane read", ok("❯ \n"));
         runner.on("agent prompt", ok(r#"{"result":{}}"#));
         let c = f.project.coordinator().unwrap();
@@ -5770,6 +5850,17 @@ mod tests {
             agent_status: "idle".into(),
             ..Default::default()
         };
+        *fx.world.agents.borrow_mut() = format!(
+            "[{}]",
+            crate::scenarios::agent_json(
+                &agent.workspace_id,
+                &agent.tab_id,
+                &agent.pane_id,
+                &agent.cwd,
+                &agent.name,
+                "idle",
+            )
+        );
         let herdr = Herdr::new("herdr", &c.socket, &fx.world.runner);
         let mut state = steps::load_state(&fx.project);
         plan_nudge(
@@ -5790,6 +5881,7 @@ mod tests {
                 .collect::<Vec<_>>()
                 .join("\n")
         };
+        steps::flush_notices_for_test(&fx.project, &herdr);
         let held = prompts();
         assert!(
             held.contains("0 steps have unfinished work; 1 held by failed checks"),
@@ -5812,6 +5904,7 @@ mod tests {
         fx.world.runner.calls.borrow_mut().clear();
         crate::plan::step_add(&ctx, "demo", "Next outcome", vec![], vec![], None).unwrap();
         plan_nudge(&fx.project, &herdr, &[agent], &mut state).unwrap();
+        steps::flush_notices_for_test(&fx.project, &herdr);
         let mixed = prompts();
         assert!(
             mixed.contains("1 steps have unfinished work; 1 held by failed checks. Next: s-2"),
@@ -5875,6 +5968,7 @@ mod tests {
             &runner,
         );
         plan_nudge(&f.project, &herdr, std::slice::from_ref(&agent), &mut state).unwrap();
+        steps::flush_notices_for_test(&f.project, &herdr);
         assert!(
             runner
                 .calls
@@ -5885,6 +5979,7 @@ mod tests {
         plan.steps[2].state = crate::contracts::StepState::Done;
         std::fs::write(&path, toml::to_string(&plan).unwrap()).unwrap();
         plan_nudge(&f.project, &herdr, &[agent], &mut steps::State::default()).unwrap();
+        steps::flush_notices_for_test(&f.project, &herdr);
         assert!(
             runner
                 .calls
@@ -6096,7 +6191,7 @@ mod tests {
     }
 
     #[test]
-    fn replacement_binding_reparents_live_local_lane_on_next_pass() {
+    fn replacement_binding_removes_live_local_push_link_on_next_pass() {
         let f = fixture(false);
         let lane = thread::allocate(&f.project, |t| {
             t.status = thread::Status::Open;
@@ -6139,7 +6234,7 @@ mod tests {
             })
             .unwrap();
         let runner = FakeRunner::new();
-        runner.on("agent list", ok(&with_cwd(r#"{"result":{"agents":[{"pane_id":"w1:p9","tab_id":"w1:t9","workspace_id":"w1","name":"hp-demo-coordinator","agent":"claude","agent_status":"idle"},{"pane_id":"w1:p2","tab_id":"w1:t2","workspace_id":"w1","name":"","cwd":"CWD","agent":"claude","agent_status":"idle"}]}}"#, &f)));
+        runner.on("agent list", ok(&with_cwd(r#"{"result":{"agents":[{"pane_id":"w1:p9","tab_id":"w1:t9","workspace_id":"w1","name":"hp-demo-coordinator","agent":"claude","agent_status":"idle"},{"pane_id":"w1:p2","tab_id":"w1:t2","workspace_id":"w1","name":"","cwd":"CWD","agent":"claude","agent_status":"idle","tokens":{"parent":"w1:p1"}}]}}"#, &f)));
         runner.on("pane list", ok(&with_cwd(r#"{"result":{"panes":[{"pane_id":"w1:p9","tab_id":"w1:t9","workspace_id":"w1","cwd":"CWD"},{"pane_id":"w1:p2","tab_id":"w1:t2","workspace_id":"w1","cwd":"CWD"}]}}"#, &f)));
         runner.on("pane process-info", ok(r#"{"result":{"process_info":{"foreground_processes":[{"pid":42,"name":"claude","argv0":"claude"}]}}}"#));
         runner.on("pane report-metadata", ok(r#"{"result":{}}"#));
@@ -6152,7 +6247,7 @@ mod tests {
         };
         let _ = tick_cheap(&ctx, &f.project, false);
         assert_eq!(
-            runner.count("pane report-metadata w1:p2 --source herdr-ade --token parent=w1:p9"),
+            runner.count("pane report-metadata w1:p2 --source herdr-ade --clear-token parent"),
             1,
             "{}",
             lane.id
