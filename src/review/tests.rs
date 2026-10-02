@@ -1433,6 +1433,210 @@ fn large_landing_shares_every_ticker_pass_with_other_projects_due_work() {
 }
 
 #[test]
+fn landing_verifies_the_push_destination_not_the_box_reviewers_clone() {
+    // review-99 shape: a project may omit the harness repo, and the box's
+    // main can already contain the candidate while the publication does not.
+    for harness in [true, false] {
+        for box_reviewer in [true, false] {
+            for recorded_push in [false, true] {
+                let fx = configured();
+                let published = fx.world.home.path().join("published.git");
+                let box_clone = fx.world.home.path().join("box.git");
+                for repo in [&published, &box_clone] {
+                    git(
+                        &fx.repo,
+                        &[
+                            "clone",
+                            "--bare",
+                            "-q",
+                            fx.repo.to_str().unwrap(),
+                            repo.to_str().unwrap(),
+                        ],
+                    );
+                }
+                git(
+                    &fx.repo,
+                    &["remote", "add", "origin", box_clone.to_str().unwrap()],
+                );
+                git(
+                    &fx.repo,
+                    &[
+                        "remote",
+                        "set-url",
+                        "--push",
+                        "origin",
+                        published.to_str().unwrap(),
+                    ],
+                );
+                if harness {
+                    let (mut settings, body) = fx.project.read_project_md().unwrap();
+                    let mut row = settings.repos.remove(0);
+                    row.push_remote = Some("origin".into());
+                    row.box_path = Some(box_clone.to_string_lossy().into_owned());
+                    row.publish_url = Some(published.to_string_lossy().into_owned());
+                    std::fs::write(
+                        fx.project.project_md(),
+                        format!("+++\n{}+++\n{body}", toml::to_string(&settings).unwrap()),
+                    )
+                    .unwrap();
+                    std::fs::write(
+                        fx.world.ctx().config_dir.join("config.toml"),
+                        format!("[[harness.repos]]\n{}", toml::to_string(&row).unwrap()),
+                    )
+                    .unwrap();
+                }
+                lane(&fx, 1);
+                lane(&fx, 2);
+                let mut review = prepared(&fx);
+                if box_reviewer {
+                    thread::update(&fx.project, review.reviewer.as_deref().unwrap(), |t| {
+                        t.machine = "oci".into();
+                        t.machine_id = "oci-id".into();
+                    })
+                    .unwrap();
+                }
+                let candidate = git(&fx.repo, &["rev-parse", &review.candidate_branch]);
+                git(
+                    &fx.repo,
+                    &[
+                        "push",
+                        box_clone.to_str().unwrap(),
+                        &format!("{candidate}:refs/heads/main"),
+                    ],
+                );
+                assert_ne!(git(&published, &["rev-parse", "main"]), candidate);
+                let remote = if !harness && !box_reviewer {
+                    // Literal URLs can have separate push destinations too.
+                    git(
+                        &fx.repo,
+                        &[
+                            "config",
+                            &format!("url.{}.pushInsteadOf", published.display()),
+                            box_clone.to_str().unwrap(),
+                        ],
+                    );
+                    box_clone.to_str().unwrap()
+                } else {
+                    "origin"
+                };
+                review.push_remote = Some(remote.into());
+                review.push = recorded_push;
+                review.install_required = true;
+                review.phase = Phase::Landing;
+                review.verdict = Some(Verdict {
+                    verdict: "MERGE".into(),
+                    review: review.id.clone(),
+                    candidate: candidate.clone(),
+                    without: BTreeMap::new(),
+                    gates: vec![],
+                    gates_note: String::new(),
+                });
+                save(&fx.project, &review).unwrap();
+                fx.world.runner.calls.borrow_mut().clear();
+                let error = land_with_install(&fx.world.ctx(), &fx.project, &mut review, || {
+                    assert_eq!(
+                        git(&published, &["rev-parse", "main"]),
+                        candidate,
+                        "installation started without publication"
+                    );
+                    bail!("stop after publication")
+                })
+                .unwrap_err();
+                assert_eq!(error.to_string(), "stop after publication");
+                assert!(load(&fx.project, &review.id).unwrap().push);
+                assert_eq!(fx.world.runner.count(&format!("push {remote}")), 1);
+                let calls = fx.world.runner.calls.borrow();
+                assert!(
+                    calls
+                        .iter()
+                        .filter(|cmd| cmd.args.iter().any(|arg| arg == "ls-remote"))
+                        .all(|cmd| cmd.args.contains(&published.to_string_lossy().into_owned()))
+                );
+                assert!(
+                    calls
+                        .iter()
+                        .filter(|cmd| cmd.program == "git")
+                        .all(|cmd| cmd.args[1] == review.repo)
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn unlisted_harness_publish_url_is_the_integration_destination() {
+    let fx = configured();
+    let (mut settings, body) = fx.project.read_project_md().unwrap();
+    let mut row = settings.repos.remove(0);
+    row.publish_url = Some("https://example.test/harness.git".into());
+    std::fs::write(
+        fx.project.project_md(),
+        format!("+++\n{}+++\n{body}", toml::to_string(&settings).unwrap()),
+    )
+    .unwrap();
+    std::fs::write(
+        fx.world.ctx().config_dir.join("config.toml"),
+        format!("[[harness.repos]]\n{}", toml::to_string(&row).unwrap()),
+    )
+    .unwrap();
+    lane(&fx, 1);
+    let review = prepared(&fx);
+    assert!(review.install_required);
+    assert_eq!(review.push_remote, row.publish_url);
+}
+
+#[test]
+fn successful_push_without_remote_candidate_does_not_mark_publication_done() {
+    use crate::runner::{RealRunner, Runner};
+    let fx = configured();
+    lane(&fx, 1);
+    let mut review = prepared(&fx);
+    let candidate = git(&fx.repo, &["rev-parse", &review.candidate_branch]);
+    let published = fx.world.home.path().join("published.git");
+    git(
+        &fx.repo,
+        &[
+            "clone",
+            "--bare",
+            "-q",
+            fx.repo.to_str().unwrap(),
+            published.to_str().unwrap(),
+        ],
+    );
+    review.push_remote = Some(published.to_string_lossy().into_owned());
+    review.verdict = Some(Verdict {
+        verdict: "MERGE".into(),
+        review: review.id.clone(),
+        candidate,
+        without: BTreeMap::new(),
+        gates: vec![],
+        gates_note: String::new(),
+    });
+    review.phase = Phase::Landing;
+    let runner = crate::runner::fake::FakeRunner::new();
+    runner.on_fn(
+        |cmd| cmd.program == "git" && cmd.args.iter().any(|arg| arg == "push"),
+        |_| Ok(crate::runner::fake::ok("")),
+    );
+    runner.on_fn(|_| true, |cmd| RealRunner.run(cmd));
+    let ctx = Ctx {
+        runner: &runner,
+        ..fx.world.ctx()
+    };
+    let error = land_with_install(&ctx, &fx.project, &mut review, || {
+        panic!("unpublished integration installed")
+    })
+    .unwrap_err();
+    assert!(
+        error.to_string().starts_with("integration not published:"),
+        "{error:#}"
+    );
+    assert!(!review.push);
+    assert!(!load(&fx.project, &review.id).unwrap().push);
+    assert_eq!(runner.count("ls-remote"), 2);
+}
+
+#[test]
 fn configured_remote_failure_is_not_treated_as_local_only() {
     let fx = configured();
     lane(&fx, 1);

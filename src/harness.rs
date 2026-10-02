@@ -542,6 +542,7 @@ fn box_build(
     machine: &crate::remote::MachineDeclaration,
     box_path: &str,
     kind: Kind,
+    expected_commit: &str,
 ) -> Result<Option<String>> {
     let zig = if kind == Kind::Fork {
         format!("\n{}", box_zig_script(box_path))
@@ -595,6 +596,11 @@ fn box_build(
         "set -e\n\
          cd {path}\n\
          git fetch --quiet\n\
+         expected_commit={expected_commit}\n\
+         if ! git merge-base --is-ancestor \"$expected_commit\" @{{u}}; then\n\
+           printf 'integration not published: upstream in %s does not contain %s\\n' {path} \"$expected_commit\" >&2\n\
+           exit 1\n\
+         fi\n\
          git merge --ff-only @{{u}}\n\
          # The box clone's files arrive by sync, but its index does not.\n\
          git read-tree HEAD && git update-index -q --refresh\n\
@@ -605,6 +611,7 @@ fn box_build(
          cargo build --release --locked{installs}\n\
          printf 'HERDR_ADE_INSTALLED_HEAD=%s\\n' \"$source_head\"",
         path = remote::quote(box_path),
+        expected_commit = remote::quote(expected_commit),
         build_path = remote::quote(&machine.path),
     );
     let out = remote::ssh(ctx.runner, target, &script, None, BOX_BUILD_TIMEOUT)?;
@@ -1271,7 +1278,14 @@ fn install_for(ctx: &Ctx, current: Option<(&str, &str)>) -> Result<InstallOutcom
                 let mut box_plugin_installed = false;
                 for ((repo, kind), installed_repo) in repos.iter().zip(&kinds).zip(&mut installed) {
                     if let Some(box_path) = box_repo_path(&machine, repo) {
-                        match box_build(ctx, &profile.target, &machine, &box_path, *kind) {
+                        match box_build(
+                            ctx,
+                            &profile.target,
+                            &machine,
+                            &box_path,
+                            *kind,
+                            &installed_repo.commit,
+                        ) {
                             Ok(Some(head)) => {
                                 builds.push(InstalledBuild {
                                     repo: repo.path.clone(),
@@ -1639,9 +1653,16 @@ mod tests {
         let install = |clean| {
             if on_box {
                 assert_eq!(
-                    box_build(&ctx, "box", &machine, repo.to_str().unwrap(), Kind::Plugin)
-                        .unwrap()
-                        .as_deref(),
+                    box_build(
+                        &ctx,
+                        "box",
+                        &machine,
+                        repo.to_str().unwrap(),
+                        Kind::Plugin,
+                        "abc1234"
+                    )
+                    .unwrap()
+                    .as_deref(),
                     Some("abc1234")
                 );
             } else {
@@ -1979,6 +2000,92 @@ mod tests {
     }
 
     #[test]
+    fn box_build_reports_integration_not_published_even_if_local_main_has_it() {
+        let fx = crate::testkit::fixture();
+        let published = fx.world.home.path().join("published.git");
+        let box_clone = fx.world.home.path().join("box");
+        crate::testkit::git(
+            &fx.repo,
+            &[
+                "clone",
+                "--bare",
+                "-q",
+                fx.repo.to_str().unwrap(),
+                published.to_str().unwrap(),
+            ],
+        );
+        crate::testkit::git(
+            &fx.repo,
+            &[
+                "clone",
+                "-q",
+                published.to_str().unwrap(),
+                box_clone.to_str().unwrap(),
+            ],
+        );
+        let candidate = crate::testkit::commit_file(
+            &fx.repo,
+            "candidate.txt",
+            "candidate",
+            "unpublished integration",
+        );
+        let runner = FakeRunner::new();
+        runner.on_fn(
+            |cmd| cmd.program == "ssh",
+            |cmd| {
+                RealRunner.run(
+                    &Cmd::new("/bin/sh", BOX_BUILD_TIMEOUT).args(["-c", cmd.args.last().unwrap()]),
+                )
+            },
+        );
+        let ctx = Ctx {
+            runner: &runner,
+            ..fx.world.ctx()
+        };
+        let machine = remote::MachineDeclaration {
+            path: "/usr/bin:/bin".into(),
+            ade_bin: fx
+                .world
+                .home
+                .path()
+                .join("bin/herdr-ade")
+                .to_string_lossy()
+                .into_owned(),
+            pi_bin: fx
+                .world
+                .home
+                .path()
+                .join("bin/herdr-pi")
+                .to_string_lossy()
+                .into_owned(),
+            ..Default::default()
+        };
+        for candidate_in_clone in [false, true] {
+            if candidate_in_clone {
+                crate::testkit::git(&box_clone, &["fetch", fx.repo.to_str().unwrap(), "main"]);
+                crate::testkit::git(&box_clone, &["merge", "--ff-only", "FETCH_HEAD"]);
+            }
+            let error = box_build(
+                &ctx,
+                "a2",
+                &machine,
+                box_clone.to_str().unwrap(),
+                Kind::Plugin,
+                &candidate,
+            )
+            .unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains("integration not published: upstream"),
+                "{error:#}"
+            );
+            assert!(error.to_string().contains(&candidate), "{error:#}");
+            assert!(!Path::new(&machine.ade_bin).exists());
+        }
+    }
+
+    #[test]
     fn box_build_for_the_fork_resolves_zig_on_the_box() {
         let root = tempfile::tempdir().unwrap();
         let env = crate::paths::Env::for_test(root.path(), &[]);
@@ -2003,6 +2110,7 @@ mod tests {
             &machine,
             "/home/agent/projects/herdr",
             Kind::Fork,
+            "abc1234",
         )
         .unwrap();
         let calls = runner.calls.borrow();
