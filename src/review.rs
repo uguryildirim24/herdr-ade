@@ -2387,7 +2387,11 @@ fn record_holds(project: &Project, current: BTreeMap<String, (String, String)>) 
     }
     Ok(())
 }
-fn working_hold(lane: &Thread, events: &[crate::contracts::Event]) -> Option<&'static str> {
+fn working_hold(
+    lane: &Thread,
+    events: &[crate::contracts::Event],
+    oldest_seal: Option<jiff::Timestamp>,
+) -> Option<&'static str> {
     if !matches!(lane.status, Status::Starting | Status::Open) {
         return None;
     }
@@ -2404,7 +2408,28 @@ fn working_hold(lane: &Thread, events: &[crate::contracts::Event]) -> Option<&'s
     if latest.is_some_and(|event| event.payload.done.is_some() || event.payload.waiting.is_some()) {
         None
     } else {
-        Some("working")
+        // Use the earliest recorded start evidence for this attempt, not a
+        // later brief submission if startup was already underway. Creation
+        // belongs only to attempt 1; `updated` and state-change times move
+        // during work and cannot establish when an attempt began.
+        let started = [
+            (lane.attempt.max(1) == 1).then_some(lane.created.as_str()),
+            Some(lane.startup_wait_started.as_str()),
+            Some(lane.brief_submitted_at.as_str()),
+        ]
+        .into_iter()
+        .flatten()
+        .filter_map(|time| time.parse::<jiff::Timestamp>().ok())
+        .min();
+        // Missing/invalid historical evidence keeps the conservative hold.
+        if started
+            .zip(oldest_seal)
+            .is_some_and(|(start, seal)| start >= seal)
+        {
+            None
+        } else {
+            Some("working")
+        }
     }
 }
 
@@ -2481,10 +2506,21 @@ pub(crate) fn tick_observed(
                     crate::remote::quote(&repo)
                 )));
             }
+            // An unknown seal time cannot prove a lane started later. Keep
+            // the old hold in that case rather than choosing a newer cutoff.
+            let oldest_seal = pile.iter().try_fold(jiff::Timestamp::MAX, |oldest, lane| {
+                let created = sealed(&events, lane)?
+                    .created
+                    .parse::<jiff::Timestamp>()
+                    .ok()?;
+                Some(oldest.min(created))
+            });
             let mut blockers: Vec<String> = threads
                 .iter()
                 .filter(|t| same_repo(&t.repo, &repo) && !reviewers.contains(&t.id))
-                .filter_map(|t| working_hold(t, &events).map(|why| format!("{} ({why})", t.id)))
+                .filter_map(|t| {
+                    working_hold(t, &events, oldest_seal).map(|why| format!("{} ({why})", t.id))
+                })
                 .collect();
             let failed: Vec<_> = threads
                 .iter()
