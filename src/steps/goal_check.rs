@@ -177,8 +177,10 @@ fn snapshot(project: &Project) -> Result<Snapshot> {
 /// Reconcile even while lanes/review run: independent work must not be hidden.
 /// A new request, plan/result change, or exhausted checklist owes judgment.
 pub(crate) fn reconcile(project: &Project, agent: Option<&Agent>, now: u64) -> Result<()> {
-    let snapshot = snapshot(project)?;
+    // Serialize evidence reads with dispositions too: an older snapshot must
+    // not overwrite a command that completed while reconciliation waited.
     let _lock = lock(project)?;
+    let snapshot = snapshot(project)?;
     let mut check = load(project);
     let before = check.clone();
     if check.generation > 0
@@ -319,8 +321,8 @@ pub(crate) fn record(project: &Project, disposition: Disposition, evidence: &str
     if evidence.trim().is_empty() {
         bail!("goal_check: explain the evidence and disposition");
     }
-    let snapshot = snapshot(project)?;
     let _lock = lock(project)?;
+    let snapshot = snapshot(project)?;
     let mut check = load(project);
     if check.generation == 0 {
         bail!("goal_check: no check is owed yet");
@@ -406,15 +408,55 @@ fn wait_affects(wait: &Disposition, task: &str) -> bool {
 #[cfg(test)]
 mod tests;
 
-pub(crate) fn attention(project: &Project) -> Option<String> {
+/// Coordinator obligations belong in the plan, not in Rolf's action list.
+pub(crate) fn status(project: &Project) -> Option<String> {
     let check = load(project);
     if check.generation == 0 {
         return None;
     }
-    match check.disposition {
-        None => Some("Goal check owed: coordinator must link a next action, acceptance evidence, or explicit wait.".into()),
-        Some(Disposition::NeedsRolf) => Some(check.evidence),
-        Some(Disposition::Wait { party, condition, .. }) => Some(format!("Goal check waits for {party}: {condition}; next check on request/result/plan change.")),
-        _ => None,
+    let mut text = match &check.disposition {
+        None => "Goal check owed: coordinator must link a next action, acceptance evidence, or explicit wait.".into(),
+        Some(Disposition::NeedsRolf) => check.evidence.clone(),
+        Some(Disposition::Action { task }) => format!("Goal check action {task}: {}", check.evidence),
+        Some(Disposition::Closed { outcome, .. }) => format!("Goal check closed: {outcome}; {}", check.evidence),
+        Some(Disposition::Wait { .. }) => "Goal check waiting; next check on request/result/plan change.".into(),
+    };
+    for (wait, evidence) in &check.waits {
+        if let Disposition::Wait {
+            tasks,
+            party,
+            condition,
+        } = wait
+        {
+            text.push_str(&format!(
+                "\n  Wait for {party} [{}]: {condition}; {evidence}",
+                tasks.join(", ")
+            ));
+        }
     }
+    Some(text)
+}
+
+/// Only escalation and explicitly personal waits require Rolf's attention.
+pub(crate) fn attention(project: &Project) -> Option<String> {
+    let check = load(project);
+    let mut lines = Vec::new();
+    if check.disposition == Some(Disposition::NeedsRolf) {
+        lines.push(check.evidence);
+    }
+    for (wait, _) in check.waits {
+        if let Disposition::Wait {
+            tasks,
+            party,
+            condition,
+        } = wait
+            && party.eq_ignore_ascii_case("Rolf")
+        {
+            lines.push(format!(
+                "Goal check waits for Rolf [{}]: {condition}",
+                tasks.join(", ")
+            ));
+        }
+    }
+    (!lines.is_empty()).then(|| lines.join("; "))
 }

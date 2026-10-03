@@ -117,6 +117,13 @@ fn absent_plan_articulates_then_links_request_backed_work() {
     let f = fixture();
     reconcile(&f.project, None, 10).unwrap();
     assert!(notice(&f.project).is_some());
+    let (settings, _) = f.project.read_project_md().unwrap();
+    let view = crate::project_view::View::capture(&f.project, &settings, None, None);
+    assert!(
+        view.needs_you.is_empty(),
+        "owed judgment is the coordinator's work"
+    );
+    assert!(view.render(&["Plan"]).contains("Goal check owed"));
     crate::plan::set(
         &f.world.ctx(),
         "demo",
@@ -374,10 +381,40 @@ fn explicit_wait_party_replaces_phrase_inferred_responsibility() {
     let (settings, _) = f.project.read_project_md().unwrap();
     let view = crate::project_view::View::capture(&f.project, &settings, None, None);
     assert!(
-        !view
-            .needs_you
+        view.needs_you.is_empty(),
+        "an upstream wait does not need Rolf"
+    );
+    assert!(view.render(&["Plan"]).contains("data is available"));
+    record(
+        &f.project,
+        Disposition::Wait {
+            tasks: vec!["job-0001".into()],
+            party: "Rolf".into(),
+            condition: "choose the authorized route".into(),
+        },
+        "Only Rolf can resolve this consequential choice",
+    )
+    .unwrap();
+    let independent = f.thread("Independent work");
+    task(&f, "job-0002", vec![independent]);
+    reconcile(&f.project, None, 20).unwrap();
+    record(
+        &f.project,
+        Disposition::Action {
+            task: "job-0002".into(),
+        },
+        "Independent work advances the outcome without the choice",
+    )
+    .unwrap();
+    let view = crate::project_view::View::capture(&f.project, &settings, None, None);
+    assert!(
+        view.needs_you
             .iter()
-            .any(|line| line.starts_with(&format!("{lane}:")))
+            .any(|line| line.contains("choose the authorized route"))
+    );
+    assert!(
+        view.render(&["Plan"])
+            .contains("choose the authorized route")
     );
 }
 

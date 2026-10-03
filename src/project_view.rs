@@ -628,6 +628,9 @@ impl View {
             ));
         }
         let mut steps = Vec::new();
+        if let Some(line) = crate::steps::goal_check::status(project) {
+            steps.push(entry("goal-check", line));
+        }
         if plan["present"] == true {
             steps.push(entry("outcome", outcome.trim()));
         }

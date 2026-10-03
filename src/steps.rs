@@ -662,7 +662,7 @@ fn coordinator_enqueue_at(
             .event
             .is_none_or(|id| !batch.events.iter().any(|old| old == id))
     {
-        if batch.lines.is_empty() {
+        if batch.lines.is_empty() && batch.goals.is_empty() {
             batch.first_at = now;
         }
         batch.lines.push(notice.line.into());
@@ -730,9 +730,10 @@ fn coordinator_enqueue_at(
                 project::write_json(&wake_path(project), &cursor)?;
             }
         }
-        for (token, line) in &batch.goals {
+        // Goal obligations own their retry/rebind state. Putting their text
+        // in the unread-transition journal would replay consumed checks.
+        for (token, _) in &batch.goals {
             goal_check::delivered(project, token, &agent, now)?;
-            record_wake(project, line)?;
         }
         for line in &batch.wake_lines {
             record_wake(project, line)?;
@@ -2028,6 +2029,68 @@ mod tests {
                 .lines
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn goal_batch_keeps_its_deadline_and_consumed_checks_do_not_replay_on_rebind() {
+        let (world, project) = delivery_world();
+        coordinator_state(&world, &project, "idle");
+        goal_check::reconcile(&project, None, 10).unwrap();
+        let (token, line) = goal_check::notice(&project).unwrap();
+        let c = project.coordinator().unwrap();
+        let herdr = Herdr::new(world.env.herdr_bin(), &c.socket, &world.runner);
+        coordinator_enqueue_at(
+            &project,
+            &herdr,
+            &c.pane_id,
+            Some(NoticeInput {
+                line: &line,
+                event: None,
+                digest: None,
+                goal: Some(&token),
+            }),
+            100,
+        )
+        .unwrap();
+        coordinator_notice_at(
+            &project,
+            &herdr,
+            &c.pane_id,
+            Some("Independent notice"),
+            219,
+        )
+        .unwrap();
+        coordinator_notice_at(&project, &herdr, &c.pane_id, None, 220).unwrap();
+        assert_eq!(
+            typed_lines(&world).len(),
+            1,
+            "keep the first notice's deadline"
+        );
+        assert!(typed_lines(&world)[0].contains("Goal check owed"));
+        goal_check::record(
+            &project,
+            goal_check::Disposition::Wait {
+                tasks: vec![],
+                party: "upstream service".into(),
+                condition: "data arrives".into(),
+            },
+            "No authorized work can proceed before the data arrives",
+        )
+        .unwrap();
+        // No context receipt: a rebind must retain ordinary transitions, but
+        // must not turn the consumed goal prompt into untyped new news.
+        project
+            .update_coordinator(|c| {
+                c.generation += 1;
+                c.pane_id = "w1:p9".into();
+            })
+            .unwrap();
+        coordinator_state(&world, &project, "working");
+        prime_unread(&world.ctx(), &project).unwrap();
+        let prompts = typed_lines(&world);
+        assert_eq!(prompts.len(), 2);
+        assert!(prompts[1].contains("Independent notice"));
+        assert!(!prompts[1].contains("Goal check owed"));
     }
 
     #[test]
