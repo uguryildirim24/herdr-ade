@@ -2637,3 +2637,216 @@ fn harness_install_lock_refuses_a_second_install() {
         .to_string();
     assert!(error.contains("harness_install_busy"), "{error}");
 }
+
+// R5: scripted coordinator decisions qualify mechanics, not model reasoning.
+// The native trial must start from PROMPT only, never these derived steps.
+mod goal_chain {
+    use super::*;
+    use crate::steps::goal_check::{self, Disposition};
+    use crate::testkit::{Fx, fixture};
+
+    const PROMPT: &str = "Make source reading trustworthy.";
+
+    fn job(f: &Fx, title: &str, acceptance: &str, lane: &str) -> String {
+        let task = crate::task::add(
+            &f.project,
+            title,
+            vec!["request:q-source".into()],
+            vec![acceptance.into()],
+            None,
+            None,
+        )
+        .unwrap();
+        crate::task::link_attempt(&f.project, &task.id, lane).unwrap();
+        task.id
+    }
+
+    fn action(f: &Fx, task: &str, evidence: &str) {
+        goal_check::reconcile(&f.project, None, 10).unwrap();
+        goal_check::record(
+            &f.project,
+            Disposition::Action { task: task.into() },
+            evidence,
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn partial_read_failed_seal_keeps_dependent_work_blocked_and_independent_work_advances() {
+        let f = fixture();
+        crate::prompt::record_test_request(&f.project, "q-source", PROMPT).unwrap();
+        let research_lane = f.thread("t-0712 partial read");
+        let research = job(
+            &f,
+            "Read assigned sources",
+            "All assigned scope read or explicitly unavailable",
+            &research_lane,
+        );
+        let build_lane = f.thread("Dependent synthesis");
+        let build = job(
+            &f,
+            "Synthesize",
+            "Only inspected evidence supports claims",
+            &build_lane,
+        );
+        crate::plan::step_add(
+            &f.world.ctx(),
+            "demo",
+            "Read",
+            vec![research.clone()],
+            vec![],
+            None,
+        )
+        .unwrap();
+        crate::plan::step_add(
+            &f.world.ctx(),
+            "demo",
+            "Synthesize",
+            vec![build.clone()],
+            vec!["s-1".into()],
+            None,
+        )
+        .unwrap();
+        let wait = f.seal_waiting(
+            &research_lane,
+            1,
+            1,
+            "Partial read: source appendix unavailable; preserve inspected evidence",
+        );
+        let mut failed = crate::events::load(&f.project, &wait).unwrap();
+        failed.id = "partial-read-failed".into();
+        failed.op = failed.id.clone();
+        failed.created = project::now();
+        failed.payload.failed = failed.payload.waiting.take();
+        failed.payload.failed.as_mut().unwrap().class = crate::contracts::FailureClass::WorkFailed;
+        crate::events::seal_create_if_absent(&f.project, &failed).unwrap();
+        assert!(
+            crate::events::latest_event(&crate::events::list(&f.project), &research_lane, 1)
+                .unwrap()
+                .payload
+                .failed
+                .is_some()
+        );
+        crate::plan::sync(&f.world.ctx(), "demo").unwrap();
+        assert!(crate::plan::check_prerequisites(&f.project, &build).is_err());
+        goal_check::reconcile(&f.project, None, 1).unwrap();
+        goal_check::record(
+            &f.project,
+            Disposition::Wait {
+                tasks: vec![research.clone()],
+                party: "source endpoint".into(),
+                condition: "appendix becomes readable, or request-backed scope changes".into(),
+            },
+            "partial-read-failed: no complete-read claim; retain partial evidence",
+        )
+        .unwrap();
+        let independent_lane = f.thread("Independent ledger format");
+        let independent = job(
+            &f,
+            "Ledger format",
+            "Represent unavailable evidence honestly",
+            &independent_lane,
+        );
+        crate::plan::step_add(
+            &f.world.ctx(),
+            "demo",
+            "Ledger format",
+            vec![independent.clone()],
+            vec![],
+            None,
+        )
+        .unwrap();
+        action(
+            &f,
+            &independent,
+            "Formatting is independent of source availability; do not unblock synthesis",
+        );
+        assert_eq!(goal_check::load(&f.project).waits.len(), 1);
+        assert!(crate::plan::check_prerequisites(&f.project, &build).is_err());
+        assert!(
+            goal_check::record(
+                &f.project,
+                Disposition::Action { task: build },
+                "ignore the partial-read failure"
+            )
+            .is_err()
+        );
+        let before = goal_check::load(&f.project);
+        for now in 2..5 {
+            goal_check::reconcile(&f.project, None, now).unwrap();
+            assert_eq!(goal_check::load(&f.project), before);
+        }
+        assert_eq!(
+            crate::events::load(&f.project, &failed.id)
+                .unwrap()
+                .payload
+                .failed
+                .unwrap()
+                .text,
+            failed.payload.failed.unwrap().text
+        );
+    }
+
+    #[test]
+    fn d14_hung_call_records_one_durable_stall_without_killing_the_lane() {
+        let world = World::new();
+        let project = world.project("demo", "a.sock");
+        let screen = "Read(assigned-source) waiting for response";
+        let cwd = world.home.path().join("hung-call");
+        std::fs::create_dir_all(&cwd).unwrap();
+        let lane = world.thread(&project, &cwd, |t| {
+            t.kind = Kind::Tab;
+            t.repo.clear();
+            t.worktree_path.clear();
+            t.last_group = "working".into();
+            t.progress_pane = "w2:p1".into();
+            t.progress_screen = thread::sha256_hex(screen.as_bytes());
+            t.progress_since = "2026-01-01T00:00:00Z".into();
+        });
+        *world.panes.borrow_mut() = format!(
+            "[{},{}]",
+            world.coordinator_pane(&project),
+            pane_json("w2", "w2:t1", "w2:p1", &cwd.to_string_lossy())
+        );
+        *world.agents.borrow_mut() = format!(
+            "[{}]",
+            agent_json(
+                "w2",
+                "w2:t1",
+                "w2:p1",
+                &cwd.to_string_lossy(),
+                &lane.agent_name,
+                "working"
+            )
+        );
+        // Use D14's spinner-free detection contract, never visible activity.
+        world.runner.on_fn(
+            |cmd| cmd.display().contains("pane read"),
+            move |cmd| {
+                assert!(
+                    cmd.args
+                        .windows(2)
+                        .any(|args| args == ["--source", "detection"])
+                );
+                Ok(ok(screen))
+            },
+        );
+        for _ in 0..3 {
+            ticker::tick_project(&world.ctx(), &project).unwrap();
+        }
+        let after = thread::load(&project, &lane.id).unwrap();
+        assert!(after.stall_notified);
+        assert_eq!(
+            after
+                .start_notices
+                .iter()
+                .filter(|n| n.line.starts_with("STALLED"))
+                .count(),
+            1
+        );
+        assert_eq!(after.status, Status::Open);
+        assert_eq!(after.attempt, lane.attempt);
+        assert_eq!(world.runner.count("agent stop"), 0);
+        assert_eq!(world.runner.count("pane send-keys"), 0);
+    }
+}
