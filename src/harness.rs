@@ -202,36 +202,176 @@ pub(crate) struct InstalledRepo {
     pub(crate) boxes: Vec<BoxRepoInstall>,
 }
 
-/// One installed or long-running process checked after installation. `build`
-/// is absent only when the evidence cannot identify the running image.
-#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
-pub(crate) struct ProcessProof {
-    pub(crate) machine: String,
-    pub(crate) process: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub(crate) pid: Option<u32>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub(crate) build: Option<String>,
-    pub(crate) state: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub(crate) reason: Option<String>,
+/// Evidence from the installed image, using the ticker's lock observation.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub(crate) enum TickerProof {
+    Running {
+        pid: std::num::NonZeroU32,
+        build: String,
+    },
+    Stale {
+        pid: std::num::NonZeroU32,
+        build: String,
+    },
+    NotRequired,
+    Unknown {
+        reason: String,
+    },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub(crate) struct Observation {
+    pub(crate) binary: String,
+    pub(crate) ticker: TickerProof,
+}
+
+impl Observation {
+    fn verified(&self, expected: &str) -> bool {
+        crate::build::same_commit(&self.binary, expected)
+            && match &self.ticker {
+                TickerProof::Running { build, .. } => crate::build::same_commit(build, expected),
+                TickerProof::NotRequired => true,
+                _ => false,
+            }
+    }
+}
+
+pub(crate) fn observation(root: &Path) -> Observation {
+    let ticker = match crate::ticker::lock_state(root) {
+        crate::ticker::LockState::Held(info) => match std::num::NonZeroU32::new(info.pid) {
+            Some(pid) if !info.version.is_empty() => {
+                if crate::build::same_commit(&info.version, crate::VERSION) {
+                    TickerProof::Running {
+                        pid,
+                        build: info.version,
+                    }
+                } else {
+                    TickerProof::Stale {
+                        pid,
+                        build: info.version,
+                    }
+                }
+            }
+            _ => TickerProof::Unknown {
+                reason: "ticker lock has no complete build record".into(),
+            },
+        },
+        crate::ticker::LockState::Free if crate::project::list_slugs(root).is_empty() => {
+            TickerProof::NotRequired
+        }
+        crate::ticker::LockState::Free => TickerProof::Unknown {
+            reason: "ticker lock is free".into(),
+        },
+        crate::ticker::LockState::Unknown(reason) => TickerProof::Unknown { reason },
+    };
+    Observation {
+        binary: format!("herdr-ade {}", crate::VERSION),
+        ticker,
+    }
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
-pub(crate) struct TaskInstallProof {
-    pub(crate) project: String,
-    pub(crate) task: String,
-    pub(crate) machine: String,
-    pub(crate) build: String,
-    pub(crate) running_processes: bool,
+#[serde(tag = "state", rename_all = "snake_case")]
+pub(crate) enum ProcessProof {
+    Observed {
+        machine: String,
+        expected: String,
+        observation: Observation,
+    },
+    Unknown {
+        machine: String,
+        reason: String,
+    },
+}
+
+impl ProcessProof {
+    fn verified(&self) -> bool {
+        matches!(self, Self::Observed { expected, observation, .. } if observation.verified(expected))
+    }
+
+    fn running(&self) -> bool {
+        self.verified()
+            && matches!(
+                self,
+                Self::Observed {
+                    observation: Observation {
+                        ticker: TickerProof::Running { .. },
+                        ..
+                    },
+                    ..
+                }
+            )
+    }
+}
+
+impl std::fmt::Display for ProcessProof {
+    fn fmt(&self, out: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Unknown { machine, reason } => write!(out, "{machine}: unknown ({reason})"),
+            Self::Observed {
+                machine,
+                expected,
+                observation,
+            } => {
+                let binary = if crate::build::same_commit(&observation.binary, expected) {
+                    "installed"
+                } else {
+                    "stale"
+                };
+                writeln!(
+                    out,
+                    "{machine} binary: {} ({binary}; expected {expected})",
+                    observation.binary
+                )?;
+                match &observation.ticker {
+                    TickerProof::Running { pid, build } | TickerProof::Stale { pid, build } => {
+                        let state = if matches!(&observation.ticker, TickerProof::Running { .. })
+                            && crate::build::same_commit(build, expected)
+                        {
+                            "running"
+                        } else {
+                            "stale"
+                        };
+                        write!(out, "{machine} ticker pid {pid}: {build} ({state})")
+                    }
+                    TickerProof::NotRequired => {
+                        write!(out, "{machine} ticker: not running (no projects)")
+                    }
+                    TickerProof::Unknown { reason } => {
+                        write!(out, "{machine} ticker: unknown ({reason})")
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[serde(tag = "step", rename_all = "snake_case")]
+pub(crate) enum InstallFailure {
+    Profile { reason: String },
+    Build { repo: String, reason: String },
+    Settings { reason: String },
+    Guard { reason: String },
+}
+
+impl std::fmt::Display for InstallFailure {
+    fn fmt(&self, out: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Build { repo, reason } => write!(out, "{repo}: {reason}"),
+            Self::Profile { reason } | Self::Settings { reason } | Self::Guard { reason } => {
+                out.write_str(reason)
+            }
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub(crate) struct BoxRepoInstall {
     pub(crate) machine: String,
     pub(crate) path: String,
-    pub(crate) installed: bool,
-    pub(crate) commit: Option<String>,
+    pub(crate) commit: String,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -239,7 +379,16 @@ pub(crate) struct BoxInstall {
     pub(crate) machine: String,
     pub(crate) target: String,
     pub(crate) settings_installed: bool,
-    pub(crate) errors: Vec<String>,
+    pub(crate) errors: Vec<InstallFailure>,
+    pub(crate) process: ProcessProof,
+}
+
+impl BoxInstall {
+    fn pending(&self) -> bool {
+        // Unlike the local no-project exemption, a saved worker needs its
+        // courier ticker even before its first project arrives.
+        !self.settings_installed || !self.errors.is_empty() || !self.process.running()
+    }
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -248,21 +397,13 @@ pub(crate) struct InstallOutcome {
     pub(crate) boxes: Vec<BoxInstall>,
     pub(crate) live_handoff_required: bool,
     pub(crate) processes: Vec<ProcessProof>,
-    pub(crate) tasks: Vec<TaskInstallProof>,
     pub(crate) coordinator_hooks: Vec<String>,
-    pub(crate) warnings: Vec<String>,
     pub(crate) checks: check::InstallCheck,
 }
 
 impl InstallOutcome {
     pub(crate) fn box_failed(&self) -> bool {
-        self.boxes
-            .iter()
-            .any(|box_result| !box_result.errors.is_empty())
-            || self
-                .warnings
-                .iter()
-                .any(|warning| warning.starts_with("box pending"))
+        self.boxes.iter().any(BoxInstall::pending)
     }
 
     pub(crate) fn message(&self) -> String {
@@ -277,7 +418,7 @@ impl InstallOutcome {
                 "box {} ({}): {}\n",
                 box_result.machine,
                 box_result.target,
-                if box_result.errors.is_empty() {
+                if !box_result.pending() {
                     "installed"
                 } else {
                     "pending"
@@ -287,28 +428,12 @@ impl InstallOutcome {
         for hook in &self.coordinator_hooks {
             message.push_str(&format!("coordinator hook rebound: {hook}\n"));
         }
-        for process in &self.processes {
-            let identity = process
-                .pid
-                .map_or_else(String::new, |pid| format!(" pid {pid}"));
-            match (&process.build, &process.reason) {
-                (Some(build), Some(reason)) => message.push_str(&format!(
-                    "{} {}{identity}: {} ({}; {reason})\n",
-                    process.machine, process.process, build, process.state
-                )),
-                (Some(build), None) => message.push_str(&format!(
-                    "{} {}{identity}: {} ({})\n",
-                    process.machine, process.process, build, process.state
-                )),
-                (None, Some(reason)) => message.push_str(&format!(
-                    "{} {}{identity}: {} ({reason})\n",
-                    process.machine, process.process, process.state
-                )),
-                (None, None) => message.push_str(&format!(
-                    "{} {}{identity}: {}\n",
-                    process.machine, process.process, process.state
-                )),
-            }
+        for process in self
+            .processes
+            .iter()
+            .chain(self.boxes.iter().map(|result| &result.process))
+        {
+            message.push_str(&format!("{process}\n"));
         }
         if self.live_handoff_required {
             message.push_str("the running server keeps its image; live handoff pending\n");
@@ -322,10 +447,16 @@ impl InstallOutcome {
     }
 
     pub(crate) fn warnings(&self) -> String {
-        self.warnings
-            .iter()
-            .map(|warning| format!("{warning}\n"))
-            .collect()
+        let mut warnings = String::new();
+        for result in &self.boxes {
+            for error in &result.errors {
+                warnings.push_str(&format!("box pending: {}: {error}\n", result.machine));
+            }
+            if !result.process.running() {
+                warnings.push_str(&format!("box pending: {}\n", result.process));
+            }
+        }
+        warnings
     }
 }
 
@@ -719,7 +850,7 @@ fn box_build(
     box_path: &str,
     kind: Kind,
     expected_commit: &str,
-) -> Result<Option<String>> {
+) -> Result<String> {
     let zig = if kind == Kind::Fork {
         format!("\n{}", box_zig_script(box_path))
     } else {
@@ -770,6 +901,7 @@ fn box_build(
     }
     let script = format!(
         "set -e\n\
+         {{\n\
          cd {path}\n\
          git fetch --quiet\n\
          expected_commit={expected_commit}\n\
@@ -785,7 +917,8 @@ fn box_build(
          export PATH={build_path}\n\
          export DEVELOPER_DIR={DEVELOPER_DIR}{zig}{refresh_stamp}\n\
          cargo build --release --locked{installs}\n\
-         printf 'HERDR_ADE_INSTALLED_HEAD=%s\\n' \"$source_head\"",
+         }} >&2\n\
+         printf '%s\\n' \"$source_head\"",
         path = remote::quote(box_path),
         expected_commit = remote::quote(expected_commit),
         build_path = remote::quote(&machine.path),
@@ -797,12 +930,11 @@ fn box_build(
             out.error_text()
         );
     }
-    Ok(out.stdout.lines().find_map(|line| {
-        line.strip_prefix("HERDR_ADE_INSTALLED_HEAD=")
-            .map(str::trim)
-            .filter(|head| !head.is_empty())
-            .map(str::to_string)
-    }))
+    let head = out.stdout.trim();
+    if head.is_empty() || !head.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        bail!("box did not report a valid installed commit: {head}");
+    }
+    Ok(head.to_string())
 }
 
 /// Install only the policy a lane machine consumes. Dispatch recipes and the
@@ -908,361 +1040,122 @@ fn repo_clean(ctx: &Ctx, repo: &str) -> Result<bool> {
 }
 
 fn local_process_proofs(ctx: &Ctx, plugin_version: Option<&str>) -> Result<Vec<ProcessProof>> {
-    let mut proofs = Vec::new();
-    if let Some(version) = plugin_version {
-        proofs.push(ProcessProof {
-            machine: "local".into(),
-            process: "herdr-ade binary".into(),
-            pid: None,
-            build: Some(version.to_string()),
-            state: "installed".into(),
-            reason: None,
-        });
-    }
-
-    if !crate::project::list_slugs(&ctx.root).is_empty() {
-        if ctx.detached_ticker {
-            let bin = ctx.env.home.join(".local/bin/herdr-ade");
-            // A ticker can itself be landing the review. It cannot wait for
-            // its own lock to release. Let the installed image request the
-            // stop asynchronously; its next pass will finish this install.
-            if plugin_version.is_some_and(|version| {
-                matches!(crate::ticker::lock_state(&ctx.root), crate::ticker::LockState::Held(info)
-                    if info.pid == std::process::id() && !crate::build::same_commit(&info.version, version))
-            }) {
-                std::process::Command::new(&bin)
-                    .args(["--root", &ctx.root.to_string_lossy(), "ticker", "start"])
-                    .env("HERDR_ADE_INSTALL_TICKER", "1")
-                    .stdin(std::process::Stdio::null())
-                    .stdout(std::process::Stdio::null())
-                    .stderr(std::process::Stdio::null())
-                    .spawn()
-                    .context("harness_ticker_pending: could not launch installed ticker")?;
-                bail!("harness_ticker_pending: installed ticker is replacing this ticker; landing will resume on its next pass");
-            }
-            let output = ctx.runner.run(
-                &Cmd::new(bin.to_string_lossy(), INSTALL_TIMEOUT)
-                    .env("HERDR_ADE_INSTALL_TICKER", "1")
-                    .args(["--root", &ctx.root.to_string_lossy(), "ticker", "start"]),
-            )?;
-            if !output.success() {
-                bail!(
-                    "harness_ticker_failed: new ticker start: {}",
-                    output.error_text()
-                );
-            }
+    if !crate::project::list_slugs(&ctx.root).is_empty() && ctx.detached_ticker {
+        let bin = ctx.env.home.join(".local/bin/herdr-ade");
+        // A ticker can itself be landing the review. It cannot wait for
+        // its own lock to release. Let the installed image request the
+        // stop asynchronously; its next pass will finish this install.
+        if plugin_version.is_some_and(|version| {
+            matches!(crate::ticker::lock_state(&ctx.root), crate::ticker::LockState::Held(info)
+                if info.pid == std::process::id() && !crate::build::same_commit(&info.version, version))
+        }) {
+            std::process::Command::new(&bin)
+                .args(["--root", &ctx.root.to_string_lossy(), "ticker", "start"])
+                .env("HERDR_ADE_INSTALL_TICKER", "1")
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn()
+                .context("harness_ticker_pending: could not launch installed ticker")?;
+            bail!("harness_ticker_pending: installed ticker is replacing this ticker; landing will resume on its next pass");
         }
-        let ticker: Result<crate::ticker::Info> = {
-            let deadline = Instant::now() + PROCESS_WAIT;
-            loop {
-                if let crate::ticker::LockState::Held(info) = crate::ticker::lock_state(&ctx.root)
-                    && info.pid != 0
-                    && crate::build::same_commit(
-                        &info.version,
-                        plugin_version.unwrap_or(crate::VERSION),
-                    )
-                {
-                    break Ok(info);
-                }
-                if Instant::now() >= deadline {
-                    break Err(anyhow::anyhow!(
-                        "ticker did not report build {}",
-                        plugin_version.unwrap_or(crate::VERSION)
-                    ));
-                }
-                std::thread::sleep(Duration::from_millis(100));
-            }
-        };
-        proofs.push(match ticker {
-            Ok(info) => ProcessProof {
-                machine: "local".into(),
-                process: "ticker".into(),
-                pid: Some(info.pid),
-                build: Some(info.version),
-                state: "running".into(),
-                reason: None,
-            },
-            Err(error) => bail!("harness_ticker_failed: local ticker did not take the lock: {error:#}; lock state: {:?}", crate::ticker::lock_state(&ctx.root)),
-        });
+        let output = ctx.runner.run(
+            &Cmd::new(bin.to_string_lossy(), INSTALL_TIMEOUT)
+                .env("HERDR_ADE_INSTALL_TICKER", "1")
+                .args(["--root", &ctx.root.to_string_lossy(), "ticker", "start"]),
+        )?;
+        if !output.success() {
+            bail!(
+                "harness_ticker_failed: new ticker start: {}",
+                output.error_text()
+            );
+        }
     }
-    Ok(proofs)
+    let bin = ctx.env.home.join(".local/bin/herdr-ade");
+    let deadline = Instant::now() + PROCESS_WAIT;
+    loop {
+        let proof = process_proof(
+            "local",
+            plugin_version.unwrap_or(crate::VERSION),
+            ctx.runner
+                .run(&Cmd::new(bin.to_string_lossy(), VERSION_TIMEOUT).args([
+                    "--root",
+                    &ctx.root.to_string_lossy(),
+                    "--json",
+                    "ticker",
+                    "status",
+                ])),
+        );
+        if proof.verified() {
+            return Ok(vec![proof]);
+        }
+        if Instant::now() >= deadline {
+            bail!("harness_ticker_failed: {proof}");
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
 }
 
-fn box_process_script(
-    machine: &crate::remote::MachineDeclaration,
-    attempts: u32,
-    delay_seconds: &str,
-) -> String {
-    format!(
-        "set -e\n\
-         export PATH={path}\n\
-         bin={bin}\n\
-         root={root}\n\
-         version=\"$($bin --version)\"\n\
-         printf 'HERDR_ADE_BOX_BINARY=%s\\n' \"$version\"\n\
-         expected=\"${{version#herdr-ade }}\"\n\
-         expected=\"${{expected%.*}}\"\n\
-         seen=\n\
-         pid=\n\
-         n=0\n\
-         while [ $n -lt {attempts} ]; do\n\
-           HERDR_ADE_INSTALL_TICKER=1 $bin --root \"$root\" ticker start || :\n\
-           seen=\n\
-           pid=\n\
-           if [ -r \"$root/.ticker.lock\" ] && ! ( flock -n 9 ) 9<>\"$root/.ticker.lock\"; then\n\
-             snapshot=$(cat \"$root/.ticker.lock\" 2>/dev/null) || snapshot=\n\
-             candidate_seen=$(printf '%s\\n' \"$snapshot\" | sed -n 's/.*\"version\":[[:space:]]*\"\\([^\"]*\\)\".*/\\1/p')\n\
-             candidate_pid=$(printf '%s\\n' \"$snapshot\" | sed -n 's/.*\"pid\":[[:space:]]*\\([0-9][0-9]*\\).*/\\1/p')\n\
-             if [ -n \"$candidate_seen\" ] && [ -n \"$candidate_pid\" ]; then\n\
-               seen=$candidate_seen\n\
-               pid=$candidate_pid\n\
-               case \"$seen\" in\n\
-                 \"$expected\"|\"$expected\".*)\n\
-                   printf 'HERDR_ADE_BOX_TICKER=%s:%s\\n' \"$pid\" \"$seen\"\n\
-                   exit 0\n\
-                   ;;\n\
-               esac\n\
-             fi\n\
-           fi\n\
-           n=$((n+1)); sleep {delay_seconds}\n\
-         done\n\
-         if [ -n \"$seen\" ] && [ -n \"$pid\" ]; then\n\
-           printf 'HERDR_ADE_BOX_TICKER_STALE=%s:%s\\n' \"$pid\" \"$seen\"\n\
-         else\n\
-           printf 'HERDR_ADE_BOX_TICKER_UNKNOWN=ticker lock did not contain a complete build record\\n'\n\
-         fi",
-        path = remote::quote(&machine.path),
-        bin = remote::quote(&machine.ade_bin),
-        root = remote::quote(&machine.root),
+fn box_process_script(machine: &crate::remote::MachineDeclaration) -> String {
+    remote::with_path(
+        &machine.path,
+        &format!(
+            "HERDR_ADE_INSTALL_TICKER=1 {bin} --root {root} ticker start >&2 || :\n{bin} --root {root} --json ticker status",
+            bin = remote::quote(&machine.ade_bin),
+            root = remote::quote(&machine.root),
+        ),
     )
+}
+
+fn process_proof(
+    machine: &str,
+    expected: &str,
+    output: Result<crate::runner::Output>,
+) -> ProcessProof {
+    #[derive(Deserialize)]
+    struct Receipt {
+        data: Data,
+    }
+    #[derive(Deserialize)]
+    struct Data {
+        observation: Observation,
+    }
+    let result = output.and_then(|out| {
+        if !out.success() {
+            bail!("{}", out.error_text());
+        }
+        let receipt: Receipt = serde_json::from_str(&out.stdout)?;
+        Ok(receipt.data.observation)
+    });
+    match result {
+        Ok(observation) => ProcessProof::Observed {
+            machine: machine.into(),
+            expected: expected.into(),
+            observation,
+        },
+        Err(error) => ProcessProof::Unknown {
+            machine: machine.into(),
+            reason: format!("{error:#}"),
+        },
+    }
 }
 
 fn box_process_proofs(
     ctx: &Ctx,
     machine: &crate::remote::MachineDeclaration,
     expected: &str,
-) -> Vec<ProcessProof> {
-    let script = box_process_script(machine, 30, "0.1");
-    let target = &machine.target;
-    let out = match remote::ssh(ctx.runner, target, &script, None, Duration::from_secs(140)) {
-        Ok(out) if out.success() => out,
-        Ok(out) => {
-            let reason = out.error_text();
-            return vec![ProcessProof {
-                machine: machine.id.clone(),
-                process: "box binary and ticker".into(),
-                pid: None,
-                build: None,
-                state: "unknown".into(),
-                reason: Some(reason),
-            }];
-        }
-        Err(error) => {
-            return vec![ProcessProof {
-                machine: machine.id.clone(),
-                process: "box binary and ticker".into(),
-                pid: None,
-                build: None,
-                state: "unknown".into(),
-                reason: Some(format!("{error:#}")),
-            }];
-        }
-    };
-    let mut proofs = Vec::new();
-    if let Some(version) = out
-        .stdout
-        .lines()
-        .find_map(|line| line.strip_prefix("HERDR_ADE_BOX_BINARY="))
-    {
-        let current = crate::build::same_commit(version, expected);
-        proofs.push(ProcessProof {
-            machine: machine.id.clone(),
-            process: "herdr-ade binary".into(),
-            pid: None,
-            build: Some(version.to_string()),
-            state: if current { "installed" } else { "stale" }.into(),
-            reason: (!current).then(|| {
-                format!(
-                    "the box binary does not report installed build {}",
-                    expected
-                )
-            }),
-        });
-    } else {
-        proofs.push(ProcessProof {
-            machine: machine.id.clone(),
-            process: "herdr-ade binary".into(),
-            pid: None,
-            build: None,
-            state: "unknown".into(),
-            reason: Some("the box did not report its binary version".into()),
-        });
-    }
-    if let Some(value) = out
-        .stdout
-        .lines()
-        .find_map(|line| line.strip_prefix("HERDR_ADE_BOX_TICKER="))
-    {
-        let (pid, build) = value.split_once(':').unwrap_or(("", value));
-        let pid = pid.parse::<u32>().ok().filter(|pid| *pid != 0);
-        let current = crate::build::same_commit(build, expected);
-        proofs.push(ProcessProof {
-            machine: machine.id.clone(),
-            process: "ticker".into(),
-            pid,
-            build: Some(build.to_string()),
-            state: if !current {
-                "stale"
-            } else if pid.is_some() {
-                "running"
-            } else {
-                "unknown"
-            }
-            .into(),
-            reason: if pid.is_none() {
-                Some("the box ticker did not report a valid pid".into())
-            } else {
-                (!current).then(|| {
-                    format!(
-                        "the box ticker does not report installed build {}",
-                        expected
-                    )
-                })
-            },
-        });
-    } else if let Some(value) = out
-        .stdout
-        .lines()
-        .find_map(|line| line.strip_prefix("HERDR_ADE_BOX_TICKER_STALE="))
-    {
-        let (pid, build) = value.split_once(':').unwrap_or(("", value));
-        proofs.push(ProcessProof {
-            machine: machine.id.clone(),
-            process: "ticker".into(),
-            pid: pid.parse().ok(),
-            build: Some(build.to_string()),
-            state: "stale".into(),
-            reason: Some(format!(
-                "the box ticker does not report installed build {}",
-                expected
-            )),
-        });
-    } else {
-        proofs.push(ProcessProof {
-            machine: machine.id.clone(),
-            process: "ticker".into(),
-            pid: None,
-            build: None,
-            state: "unknown".into(),
-            reason: Some(
-                out.stdout
-                    .lines()
-                    .find_map(|line| line.strip_prefix("HERDR_ADE_BOX_TICKER_UNKNOWN="))
-                    .unwrap_or("the box did not report ticker evidence")
-                    .to_string(),
-            ),
-        });
-    }
-    proofs
-}
-
-fn require_running_tickers(processes: &[ProcessProof], expected: &[&str]) -> Result<()> {
-    for machine in expected {
-        if !processes
-            .iter()
-            .any(|proof| proof.machine == *machine && proof.process == "ticker")
-        {
-            let evidence = processes
-                .iter()
-                .filter(|proof| proof.machine == *machine)
-                .collect::<Vec<_>>();
-            bail!("harness_ticker_failed: {machine} did not report a ticker: {evidence:?}");
-        }
-    }
-    for proof in processes {
-        if proof.process == "ticker" && proof.state != "running" {
-            bail!(
-                "harness_ticker_failed: {} ticker pid {:?}, build {:?}: {}",
-                proof.machine,
-                proof.pid,
-                proof.build,
-                proof.reason.as_deref().unwrap_or(&proof.state)
-            );
-        }
-    }
-    Ok(())
-}
-
-#[derive(Debug, Clone)]
-struct InstalledBuild {
-    repo: String,
-    machine: String,
-    head: String,
-}
-
-fn review_in_build(ctx: &Ctx, repo: &str, review_head: &str, build_head: &str) -> Result<bool> {
-    let out = ctx.runner.run(&Cmd::new("git", VERSION_TIMEOUT).args([
-        "-C",
-        repo,
-        "merge-base",
-        "--is-ancestor",
-        review_head,
-        build_head,
-    ]))?;
-    out.boolean_answer().context("git ancestry check failed")
-}
-
-fn record_task_proofs(
-    ctx: &Ctx,
-    builds: &[InstalledBuild],
-    processes: &[ProcessProof],
-) -> Result<Vec<TaskInstallProof>> {
-    let processes_pass = !processes.is_empty()
-        && processes
-            .iter()
-            .all(|p| matches!(p.state.as_str(), "running" | "installed"));
-    let mut proofs = Vec::new();
-    for slug in crate::project::list_slugs(&ctx.root) {
-        let project = crate::project::Project::load(&ctx.root, &slug)?;
-        let reviews = crate::review::list(&project)?;
-        for task in crate::task::list_with_errors(&project).0 {
-            if !task.dropped.is_empty() {
-                continue;
-            }
-            for build in builds {
-                for review in reviews
-                    .iter()
-                    .filter(|r| r.fast_forward && r.install_required)
-                {
-                    if !review.members.iter().any(|m| {
-                        task.attempts.contains(&m.thread)
-                            && !review
-                                .verdict
-                                .as_ref()
-                                .is_some_and(|v| v.without.contains_key(&m.thread))
-                    }) {
-                        continue;
-                    }
-                    if canonical_or(&review.repo) == canonical_or(&build.repo)
-                        && let Some(verdict) = &review.verdict
-                        && review_in_build(ctx, &build.repo, &verdict.candidate, &build.head)?
-                    {
-                        proofs.push(TaskInstallProof {
-                            project: slug.clone(),
-                            task: task.id.clone(),
-                            machine: build.machine.clone(),
-                            build: build.head.clone(),
-                            running_processes: processes_pass,
-                        });
-                        break;
-                    }
-                }
-            }
-        }
-    }
-    // Installation state is committed by the review only after this entire
-    // installer succeeds. A partial machine install is not task completion.
-    Ok(proofs)
+) -> ProcessProof {
+    process_proof(
+        &machine.id,
+        expected,
+        remote::ssh(
+            ctx.runner,
+            &machine.target,
+            &box_process_script(machine),
+            None,
+            Duration::from_secs(140),
+        ),
+    )
 }
 
 fn refresh_local_guard(ctx: &Ctx) -> Result<()> {
@@ -1378,7 +1271,6 @@ fn install_for(ctx: &Ctx, current: Option<(&str, &str)>) -> Result<InstallOutcom
     let mut fork = false;
     let mut kinds = Vec::new();
     let mut installed = Vec::new();
-    let mut builds = Vec::new();
     let mut checks = check::InstallCheck {
         before: check::snapshot(&ctx.root),
         after: Vec::new(),
@@ -1405,11 +1297,6 @@ fn install_for(ctx: &Ctx, current: Option<(&str, &str)>) -> Result<InstallOutcom
                 previous.remember(&ctx.env.home, bin)?;
                 local_install(ctx, &repo.path, bin, &commit, source_clean)?;
             }
-            builds.push(InstalledBuild {
-                repo: repo.path.clone(),
-                machine: "local".into(),
-                head: commit.clone(),
-            });
             let mut binaries = Vec::new();
             for bin in kind.binaries() {
                 binaries.push(installed_version(ctx, bin)?);
@@ -1466,17 +1353,25 @@ fn install_for(ctx: &Ctx, current: Option<(&str, &str)>) -> Result<InstallOutcom
             install_ticker_agent(ctx)?;
         }
     }
-    let mut warnings = Vec::new();
+    let plugin_version = installed
+        .iter()
+        .flat_map(|repo| &repo.binaries)
+        .find(|binary| binary.name == "herdr-ade")
+        .map(|binary| binary.version.clone());
+    let processes = local_process_proofs(ctx, plugin_version.as_deref())?;
 
     // Finish with this invocation's image even if its on-disk binary changed.
     let mut boxes = Vec::new();
-    let mut box_paths = Vec::new();
     for label in remote::declared_machine_labels(&ctx.config_dir)? {
         let mut result = BoxInstall {
             machine: label.clone(),
             target: String::new(),
             settings_installed: false,
             errors: Vec::new(),
+            process: ProcessProof::Unknown {
+                machine: label.clone(),
+                reason: "machine not reached".into(),
+            },
         };
         match install_box(ctx, &label) {
             Ok((profile, mut machine)) => {
@@ -1496,132 +1391,65 @@ fn install_for(ctx: &Ctx, current: Option<(&str, &str)>) -> Result<InstallOutcom
                             *kind,
                             &installed_repo.commit,
                         ) {
-                            Ok(Some(head)) => {
-                                builds.push(InstalledBuild {
-                                    repo: repo.path.clone(),
-                                    machine: machine.id.clone(),
-                                    head: head.clone(),
-                                });
+                            Ok(head) => {
                                 installed_repo.boxes.push(BoxRepoInstall {
                                     machine: label.clone(),
                                     path: box_path,
-                                    installed: true,
-                                    commit: Some(head),
+                                    commit: head,
                                 });
                                 if *kind == Kind::Plugin {
                                     box_plugin_installed = true;
                                 }
                             }
-                            Ok(None) => {
-                                result.errors.push(format!(
-                                    "{} did not report its installed commit",
-                                    repo.path
-                                ));
-                                installed_repo.boxes.push(BoxRepoInstall {
-                                    machine: label.clone(),
-                                    path: box_path,
-                                    installed: false,
-                                    commit: None,
-                                });
-                            }
                             Err(error) => {
-                                result.errors.push(format!("{error:#}"));
-                                installed_repo.boxes.push(BoxRepoInstall {
-                                    machine: label.clone(),
-                                    path: box_path,
-                                    installed: false,
-                                    commit: None,
+                                result.errors.push(InstallFailure::Build {
+                                    repo: repo.path.clone(),
+                                    reason: format!("{error:#}"),
                                 });
                             }
                         }
                     } else {
-                        result
-                            .errors
-                            .push(format!("{} has no box_path on {label}", repo.path));
+                        result.errors.push(InstallFailure::Build {
+                            repo: repo.path.clone(),
+                            reason: format!("no box_path on {label}"),
+                        });
                     }
                 }
                 match box_settings(ctx, &profile.target, &machine) {
                     Ok(()) => result.settings_installed = true,
-                    Err(error) => result.errors.push(format!("{error:#}")),
+                    Err(error) => result.errors.push(InstallFailure::Settings {
+                        reason: format!("{error:#}"),
+                    }),
                 }
                 if box_plugin_installed
                     && let Err(error) = refresh_box_guard(ctx, &profile.target, &machine)
                 {
-                    result.errors.push(format!("{error:#}"));
+                    result.errors.push(InstallFailure::Guard {
+                        reason: format!("{error:#}"),
+                    });
                 }
-                box_paths.push(machine);
+                result.process = box_process_proofs(
+                    ctx,
+                    &machine,
+                    plugin_version.as_deref().unwrap_or(crate::VERSION),
+                );
             }
-            Err(error) => result.errors.push(format!("{error:#}")),
+            Err(error) => result.errors.push(InstallFailure::Profile {
+                reason: format!("{error:#}"),
+            }),
         }
-        warnings.extend(
-            result
-                .errors
-                .iter()
-                .map(|error| format!("box pending: {label}: {error}")),
-        );
         boxes.push(result);
     }
     let coordinator_hooks = crate::hook::reinstall_open(ctx)?;
-    let plugin_version = installed
-        .iter()
-        .flat_map(|repo| &repo.binaries)
-        .find(|binary| binary.name == "herdr-ade")
-        .map(|binary| binary.version.clone());
-    let mut processes = local_process_proofs(ctx, plugin_version.as_deref())?;
-    for machine in &box_paths {
-        processes.extend(box_process_proofs(
-            ctx,
-            machine,
-            plugin_version.as_deref().unwrap_or(crate::VERSION),
-        ));
-    }
-    let mut expected = Vec::new();
-    if !crate::project::list_slugs(&ctx.root).is_empty() {
-        expected.push("local");
-    }
-    expected.extend(box_paths.iter().map(|machine| machine.id.as_str()));
-    if let Err(error) = require_running_tickers(&processes, &expected) {
-        let box_ticker_pending = box_paths.iter().any(|machine| {
-            !processes.iter().any(|proof| {
-                proof.machine == machine.id && proof.process == "ticker" && proof.state == "running"
-            })
-        });
-        warnings.push(format!(
-            "{} pending: {error:#}",
-            if box_ticker_pending { "box" } else { "ticker" }
-        ));
-    }
-    for machine in &box_paths {
-        for proof in processes.iter().filter(|proof| {
-            proof.machine == machine.id
-                && (proof.process == "herdr-ade binary" && proof.state != "installed"
-                    || proof.process == "ticker" && proof.state != "running"
-                    || proof.process == "box binary and ticker" && proof.state != "running")
-        }) {
-            let error = format!(
-                "{}: {}",
-                proof.process,
-                proof.reason.as_deref().unwrap_or(&proof.state)
-            );
-            warnings.push(format!("box pending: {}: {error}", machine.label));
-            if let Some(result) = boxes
-                .iter_mut()
-                .find(|result| result.machine == machine.label)
-            {
-                result.errors.push(error);
-            }
-        }
-    }
-    let tasks = record_task_proofs(ctx, &builds, &processes)?;
     let mut machines = vec!["mac".to_string()];
     machines.extend(
         boxes
             .iter()
-            .filter(|result| result.errors.is_empty())
+            .filter(|result| !result.pending())
             .map(|result| result.machine.clone()),
     );
     checks.result = format!("installed on {}; {}", machines.join(", "), checks.summary());
-    if boxes.iter().any(|result| !result.errors.is_empty()) {
+    if boxes.iter().any(BoxInstall::pending) {
         checks.result.push_str("; boxes pending");
     }
     checks.record(&ctx.config_dir)?;
@@ -1630,9 +1458,7 @@ fn install_for(ctx: &Ctx, current: Option<(&str, &str)>) -> Result<InstallOutcom
         boxes,
         live_handoff_required: fork,
         processes,
-        tasks,
         coordinator_hooks,
-        warnings,
         checks,
     })
 }
@@ -1722,6 +1548,7 @@ mod tests {
         let env = crate::paths::Env::for_test(home.path(), &[]);
         let runner = FakeRunner::new();
         runner.on("ticker start", ok(""));
+        runner.on("ticker status", ok(&status_receipt(&observation(&root))));
         let ctx = Ctx {
             env: &env,
             root,
@@ -1730,21 +1557,16 @@ mod tests {
             detached_ticker: true,
         };
         let proof = local_process_proofs(&ctx, Some(crate::VERSION)).unwrap();
-        let ticker = proof
-            .iter()
-            .find(|proof| proof.process == "ticker")
-            .unwrap();
-        assert_eq!(ticker.pid, Some(4321));
-        assert_eq!(ticker.build.as_deref(), Some(crate::VERSION));
-        assert_eq!(ticker.state, "running");
+        assert!(proof[0].verified());
+        assert!(
+            matches!(&proof[0], ProcessProof::Observed { observation: Observation { ticker: TickerProof::Running { pid, build }, .. }, .. } if pid.get() == 4321 && build == crate::VERSION)
+        );
         let message = InstallOutcome {
             repositories: vec![],
             boxes: vec![],
             live_handoff_required: false,
             processes: proof,
-            tasks: vec![],
             coordinator_hooks: vec![],
-            warnings: vec![],
             checks: check::InstallCheck {
                 before: vec![],
                 after: vec![],
@@ -1752,49 +1574,74 @@ mod tests {
             },
         }
         .message();
-        assert!(message.contains(&format!(
-            "local ticker pid 4321: {} (running)",
-            crate::VERSION
-        )));
+        assert!(message.contains("4321") && message.contains(crate::VERSION));
     }
 
     #[test]
     fn box_stale_ticker_is_an_install_failure_not_a_warning() {
-        let error = require_running_tickers(
-            &[ProcessProof {
-                machine: "buildbox".into(),
-                process: "ticker".into(),
-                pid: Some(42928),
-                build: Some("0.1.0+4083d1b.1".into()),
-                state: "stale".into(),
-                reason: Some("old ticker did not release the lock".into()),
-            }],
-            &["buildbox"],
-        )
-        .unwrap_err()
-        .to_string();
-        assert!(
-            error.contains("buildbox") && error.contains("42928") && error.contains("4083d1b"),
-            "{error}"
+        let proof = process_proof(
+            "buildbox",
+            crate::VERSION,
+            Ok(ok(&status_receipt(&Observation {
+                binary: format!("herdr-ade {}", crate::VERSION),
+                ticker: TickerProof::Stale {
+                    pid: std::num::NonZeroU32::new(42928).unwrap(),
+                    build: "0.1.0+4083d1b.1".into(),
+                },
+            }))),
         );
+        let mut outcome = empty_outcome();
+        outcome.boxes.push(BoxInstall {
+            machine: "buildbox".into(),
+            target: "box".into(),
+            settings_installed: true,
+            errors: vec![],
+            process: proof,
+        });
+        assert!(outcome.box_failed());
+        assert!(outcome.warnings().contains("42928"));
     }
 
     #[test]
     fn box_connection_failure_cannot_pass_without_a_ticker_proof() {
-        let error = require_running_tickers(
-            &[ProcessProof {
-                machine: "buildbox".into(),
-                process: "box binary and ticker".into(),
-                pid: None,
-                build: None,
-                state: "unknown".into(),
-                reason: Some("connection refused".into()),
-            }],
-            &["buildbox"],
-        )
-        .unwrap_err()
-        .to_string();
-        assert!(error.contains("connection refused"), "{error}");
+        let proof = process_proof(
+            "buildbox",
+            crate::VERSION,
+            Ok(fail(255, "connection refused")),
+        );
+        assert!(!proof.verified());
+        assert!(
+            matches!(proof, ProcessProof::Unknown { reason, .. } if reason.contains("connection refused"))
+        );
+    }
+
+    fn status_receipt(observation: &Observation) -> String {
+        serde_json::json!({"data": {"observation": observation}}).to_string()
+    }
+
+    fn current_receipt() -> String {
+        status_receipt(&Observation {
+            binary: format!("herdr-ade {}", crate::VERSION),
+            ticker: TickerProof::Running {
+                pid: std::num::NonZeroU32::new(42).unwrap(),
+                build: crate::VERSION.into(),
+            },
+        })
+    }
+
+    fn empty_outcome() -> InstallOutcome {
+        InstallOutcome {
+            repositories: vec![],
+            boxes: vec![],
+            live_handoff_required: false,
+            processes: vec![],
+            coordinator_hooks: vec![],
+            checks: check::InstallCheck {
+                before: vec![],
+                after: vec![],
+                result: String::new(),
+            },
+        }
     }
 
     fn write_version_binary(path: &Path, version: &str, tag: &str) {
@@ -1911,9 +1758,8 @@ mod tests {
                         Kind::Plugin,
                         "abc1234"
                     )
-                    .unwrap()
-                    .as_deref(),
-                    Some("abc1234")
+                    .unwrap(),
+                    "abc1234"
                 );
             } else {
                 local_build(&ctx, repo.to_str().unwrap(), Kind::Plugin, clean).unwrap();
@@ -2171,7 +2017,14 @@ mod tests {
             }];
             let json = serde_json::to_string(&after).unwrap();
             let source = repo.join("target/release/herdr-ade");
-            std::fs::write(&source, format!("#!/bin/sh\nif [ \"$1\" = --version ]; then echo 'herdr-ade {}'; else printf '%s\\n' '{}'; fi\n", crate::VERSION, json)).unwrap();
+            let status = status_receipt(&Observation {
+                binary: format!("herdr-ade {}", crate::VERSION),
+                ticker: TickerProof::Running {
+                    pid: std::num::NonZeroU32::new(4321).unwrap(),
+                    build: crate::VERSION.into(),
+                },
+            });
+            std::fs::write(&source, format!("#!/bin/sh\nif [ \"$1\" = --version ]; then echo 'herdr-ade {}'; else case \"$*\" in *'ticker status') printf '%s\\n' '{}' ;; *) printf '%s\\n' '{}' ;; esac; fi\n", crate::VERSION, status, json)).unwrap();
             let before_image = std::fs::read(installed_dir.join("herdr-ade")).unwrap();
             let runner = FakeRunner::new();
             runner.on("rev-parse HEAD", ok("new1234"));
@@ -2186,6 +2039,7 @@ mod tests {
                         || cmd.args == ["--version"]
                         || cmd.display().contains("install-check")
                         || cmd.display().contains("ticker start")
+                        || cmd.display().contains("ticker status")
                 },
                 |cmd| {
                     let output = RealRunner.run(cmd)?;
@@ -2253,7 +2107,17 @@ mod tests {
                 assert_eq!(runner.count("machine list"), 0);
                 assert_eq!(runner.count("ticker start"), 1);
             } else {
-                assert!(result.unwrap().summary().contains("records load"));
+                let outcome = result.unwrap();
+                assert!(outcome.summary().contains("records load"));
+                assert!(
+                    serde_json::to_value(outcome)
+                        .unwrap()
+                        .get("tasks")
+                        .is_none()
+                );
+                assert_eq!(runner.count("merge-base"), 0);
+                assert_eq!(crate::plan::counts(&project).unwrap(), (1, 1));
+                assert_eq!(crate::task::list_with_errors(&project).0.len(), 1);
                 assert_ne!(
                     std::fs::read(installed_dir.join("herdr-ade")).unwrap(),
                     before_image
@@ -2297,6 +2161,7 @@ mod tests {
             let runner = FakeRunner::new();
             runner.on("machine list --json", ok("[]"));
             runner.on("install-check", ok("[]"));
+            runner.on("ticker status", ok(&current_receipt()));
             runner.on_fn(
                 |cmd| cmd.program == "git" && cmd.display().contains("rev-parse HEAD"),
                 |_| Ok(ok("abc123\n")),
@@ -2320,14 +2185,10 @@ mod tests {
                     let display = cmd.display();
                     if fail_first && display.contains("alpha") && display.contains("git fetch") {
                         Ok(fail(1, "fetch failed"))
-                    } else if display.contains("HERDR_ADE_BOX_BINARY") {
-                        Ok(ok(&format!(
-                            "HERDR_ADE_BOX_BINARY=herdr-ade {}\nHERDR_ADE_BOX_TICKER=42:{}\n",
-                            crate::VERSION,
-                            crate::VERSION
-                        )))
+                    } else if display.contains("ticker status") {
+                        Ok(ok(&current_receipt()))
                     } else if display.contains("git fetch") {
-                        Ok(ok("HERDR_ADE_INSTALLED_HEAD=abc123\n"))
+                        Ok(ok("abc123\n"))
                     } else {
                         Ok(ok(""))
                     }
@@ -2347,7 +2208,7 @@ mod tests {
                 outcome.boxes[0]
                     .errors
                     .iter()
-                    .any(|e| e.contains("fetch failed")),
+                    .any(|e| matches!(e, InstallFailure::Build { reason, .. } if reason.contains("fetch failed"))),
                 fail_first,
                 "{:?}",
                 outcome.boxes
@@ -2357,17 +2218,16 @@ mod tests {
                 assert!(outcome.boxes[0].errors.is_empty(), "{:?}", outcome.boxes[0]);
             }
             assert_eq!(
-                outcome
-                    .warnings
-                    .iter()
-                    .any(|w| w.contains("box pending: alpha")),
+                outcome.warnings().contains("box pending: alpha"),
                 fail_first
             );
             assert!(
                 outcome.repositories[0]
                     .boxes
                     .iter()
-                    .any(|r| r.machine == "beta" && r.installed && r.path == "/home/beta/fork")
+                    .any(|r| r.machine == "beta"
+                        && r.commit == "abc123"
+                        && r.path == "/home/beta/fork")
             );
             assert_eq!(runner.count("git fetch"), 2);
             assert!(outcome.boxes.iter().all(|b| b.settings_installed));
@@ -2479,7 +2339,7 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let env = crate::paths::Env::for_test(root.path(), &[]);
         let runner = FakeRunner::new();
-        runner.on("ssh", ok(""));
+        runner.on("ssh", ok("abc1234\n"));
         let ctx = Ctx {
             env: &env,
             root: root.path().to_path_buf(),
@@ -2538,15 +2398,8 @@ mod tests {
             ..Default::default()
         };
         let proofs = box_process_proofs(&ctx, &machine, crate::VERSION);
-        assert_eq!(proofs.len(), 1);
-        assert_eq!(proofs[0].machine, "lab");
-        assert_eq!(proofs[0].state, "unknown");
-        assert_eq!(proofs[0].build, None);
         assert!(
-            proofs[0]
-                .reason
-                .as_deref()
-                .is_some_and(|reason| reason.contains("connection refused"))
+            matches!(proofs, ProcessProof::Unknown { machine, reason } if machine == "lab" && reason.contains("connection refused"))
         );
     }
 
@@ -2567,28 +2420,8 @@ mod tests {
         std::io::stdin().read_to_end(&mut Vec::new()).unwrap();
     }
 
-    /// The box has util-linux `flock`; macOS does not. Give the local
-    /// shell-driven box tests a real nonblocking lock command on macOS so a
-    /// missing executable cannot masquerade as a held ticker lock.
-    fn test_box_path(root: &Path) -> String {
-        #[cfg(target_os = "macos")]
-        {
-            let flock = root.join("flock");
-            std::fs::write(
-                &flock,
-                "#!/bin/sh\n[ \"$1\" = -n ] && [ \"$2\" = 9 ] || exit 2\nexec /usr/bin/perl -e 'open my $fd, \"+<&=9\" or exit 2; flock($fd, 2 | 4) or exit 1'\n",
-            )
-            .unwrap();
-            let mut permissions = std::fs::metadata(&flock).unwrap().permissions();
-            permissions.set_mode(0o755);
-            std::fs::set_permissions(&flock, permissions).unwrap();
-            format!("{}:/usr/bin:/bin", root.display())
-        }
-        #[cfg(not(target_os = "macos"))]
-        {
-            let _ = root;
-            "/usr/bin:/bin".into()
-        }
+    fn test_box_path(_root: &Path) -> String {
+        "/usr/bin:/bin".into()
     }
 
     #[test]
@@ -2601,7 +2434,16 @@ mod tests {
         let bin = root.path().join("herdr-ade");
         std::fs::write(
             &bin,
-            format!("#!/bin/sh\nif [ \"$1\" = --version ]; then echo '{box_binary}'; fi\n"),
+            format!(
+                "#!/bin/sh\ncase \"$*\" in *'ticker status') echo '{}' ;; esac\n",
+                status_receipt(&Observation {
+                    binary: box_binary.clone(),
+                    ticker: TickerProof::Running {
+                        pid: std::num::NonZeroU32::new(42).unwrap(),
+                        build: box_build.clone()
+                    }
+                })
+            ),
         )
         .unwrap();
         let mut permissions = std::fs::metadata(&bin).unwrap().permissions();
@@ -2673,23 +2515,25 @@ mod tests {
 
         let proofs = box_process_proofs(&ctx, &machine, crate::VERSION);
 
-        assert_eq!(proofs.len(), 2);
-        assert_eq!(proofs[0].state, "installed");
-        assert_eq!(proofs[0].build.as_deref(), Some(box_binary.as_str()));
-        assert_eq!(proofs[1].state, "running");
-        assert_eq!(proofs[1].pid, Some(42));
-        assert_eq!(proofs[1].build.as_deref(), Some(box_build.as_str()));
+        assert!(proofs.verified());
+        assert!(
+            matches!(&proofs, ProcessProof::Observed { observation: Observation { binary, ticker: TickerProof::Running { pid, build } }, .. } if binary == &box_binary && pid.get() == 42 && build == &box_build)
+        );
         let newer = crate::VERSION.replace(commit, "other-commit");
-        let stale = box_process_proofs(&ctx, &machine, &newer);
-        assert_eq!(stale[0].state, "stale");
-        assert_eq!(stale[1].state, "stale");
-        assert!(require_running_tickers(&stale, &["buildbox"]).is_err());
-
+        assert!(!box_process_proofs(&ctx, &machine, &newer).verified());
+        assert!(
+            matches!(observation(&box_root).ticker, TickerProof::Running { pid, build } if pid.get() == 42 && build == box_build)
+        );
         drop(holder.stdin.take());
         assert!(holder.wait().unwrap().success());
-        let proofs = box_process_proofs(&ctx, &machine, crate::VERSION);
-        assert_eq!(proofs[1].state, "unknown");
-        assert_eq!(proofs[1].pid, None);
+        // A leftover record is not evidence of a running process.
+        assert_eq!(observation(&box_root).ticker, TickerProof::NotRequired);
+        let script = box_process_script(&machine);
+        assert!(
+            !script.contains("flock")
+                && !script.contains("sed")
+                && !script.contains(".ticker.lock")
+        );
     }
 
     #[test]
@@ -2700,8 +2544,8 @@ mod tests {
         std::fs::write(
             &bin,
             format!(
-                "#!/bin/sh\nif [ \"$1\" = --version ]; then echo 'herdr-ade {}'; fi\n",
-                crate::VERSION
+                "#!/bin/sh\ncase \"$*\" in *'ticker status') echo '{}' ;; esac\n",
+                status_receipt(&observation(&root.path().join("ade-root")))
             ),
         )
         .unwrap();
@@ -2737,9 +2581,22 @@ mod tests {
             detached_ticker: false,
         };
         let proofs = box_process_proofs(&ctx, &machine, crate::VERSION);
-        assert_eq!(proofs[0].state, "installed");
-        assert_eq!(proofs[1].state, "unknown");
-        assert!(require_running_tickers(&proofs, &["buildbox"]).is_err());
+        let result = BoxInstall {
+            machine: "buildbox".into(),
+            target: "box".into(),
+            settings_installed: true,
+            errors: vec![],
+            process: proofs,
+        };
+        assert!(result.pending());
+        assert!(
+            process_proof(
+                "local",
+                crate::VERSION,
+                Ok(ok(&status_receipt(&observation(&box_root))))
+            )
+            .verified()
+        );
     }
 
     #[test]
@@ -2747,14 +2604,7 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let env = crate::paths::Env::for_test(root.path(), &[]);
         let runner = FakeRunner::new();
-        runner.on(
-            "ssh",
-            ok(&format!(
-                "HERDR_ADE_BOX_BINARY=herdr-ade {}\nHERDR_ADE_BOX_TICKER=0:{}\n",
-                crate::VERSION,
-                crate::VERSION
-            )),
-        );
+        runner.on("ssh", ok(&serde_json::json!({ "data": { "observation": { "binary": format!("herdr-ade {}", crate::VERSION), "ticker": {"state": "running", "pid": 0, "build": crate::VERSION} } } }).to_string()));
         let ctx = Ctx {
             env: &env,
             root: root.path().to_path_buf(),
@@ -2768,50 +2618,27 @@ mod tests {
             ..Default::default()
         };
         let proofs = box_process_proofs(&ctx, &machine, crate::VERSION);
-        assert_eq!(proofs[1].state, "unknown");
-        assert!(require_running_tickers(&proofs, &["buildbox"]).is_err());
+        assert!(matches!(proofs, ProcessProof::Unknown { .. }));
     }
 
     #[test]
     fn an_incomplete_box_ticker_record_is_unknown_not_empty_stale() {
         let root = tempfile::tempdir().unwrap();
-        let bin = root.path().join("herdr-ade");
-        std::fs::write(
-            &bin,
-            "#!/bin/sh\nif [ \"$1\" = --version ]; then echo 'herdr-ade 0.1.0+old.1'; fi\n",
-        )
-        .unwrap();
-        let mut permissions = std::fs::metadata(&bin).unwrap().permissions();
-        permissions.set_mode(0o755);
-        std::fs::set_permissions(&bin, permissions).unwrap();
-        let box_root = root.path().join("ade-root");
-        std::fs::create_dir(&box_root).unwrap();
-        std::fs::write(
-            box_root.join(".ticker.lock"),
-            "{\n  \"version\": \"0.1.0+old.1\"\n}",
-        )
-        .unwrap();
-        let machine = crate::remote::MachineDeclaration {
-            root: box_root.to_string_lossy().into_owned(),
-            path: test_box_path(root.path()),
-            ade_bin: bin.to_string_lossy().into_owned(),
-            ..Default::default()
-        };
-
-        let out = RealRunner
-            .run(
-                &Cmd::new("sh", VERSION_TIMEOUT)
-                    .args(["-c".into(), box_process_script(&machine, 2, "0.01")]),
-            )
+        let path = crate::ticker::lock_path(root.path());
+        std::fs::write(&path, "{\"version\":\"0.1.0+old.1\"}").unwrap();
+        let holder = std::fs::File::options()
+            .read(true)
+            .write(true)
+            .open(&path)
             .unwrap();
-
-        assert!(out.success(), "{}", out.error_text());
-        assert!(
-            out.stdout.contains("HERDR_ADE_BOX_TICKER_UNKNOWN="),
-            "{}",
-            out.stdout
-        );
-        assert!(!out.stdout.contains("HERDR_ADE_BOX_TICKER_STALE="));
+        holder.lock().unwrap();
+        assert!(matches!(
+            observation(root.path()).ticker,
+            TickerProof::Unknown { .. }
+        ));
+        for text in ["{}", "not json", "{\"data\":{}}"] {
+            assert!(!process_proof("box", crate::VERSION, Ok(ok(text))).verified());
+        }
     }
 
     #[test]

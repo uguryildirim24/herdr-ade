@@ -2459,7 +2459,11 @@ fn write_harness_config(world: &World, repos: &[(&str, &str)]) {
     .unwrap();
     std::fs::write(dir.join("RULES.md"), "# Lane rules\n").unwrap();
     world.runner.on("herdr-pi refresh-guard", ok(""));
+    world
+        .runner
+        .on_fn(|cmd| cmd.program == "touch", |_| Ok(ok("")));
     world.runner.on("install-check", ok("[]"));
+    world.runner.on("ticker status", ok(&serde_json::json!({"data": {"observation": {"binary": format!("herdr-ade {}", crate::VERSION), "ticker": {"state": "running", "pid": 42, "build": crate::VERSION}}}}).to_string()));
 }
 
 #[test]
@@ -2489,7 +2493,7 @@ fn harness_install_runs_the_box_steps_only_when_buildbox_is_saved() {
                     .last()
                     .is_some_and(|arg| arg.contains("git fetch --quiet"))
         },
-        |_| Ok(ok("HERDR_ADE_INSTALLED_HEAD=abc123\n")),
+        |_| Ok(ok("abc123\n")),
     );
     with_box.runner.on("cargo build", ok(""));
     with_box.runner.on("cp ", ok(""));
@@ -2503,24 +2507,22 @@ fn harness_install_runs_the_box_steps_only_when_buildbox_is_saved() {
                     .is_some_and(|arg| arg.contains("ticker start"))
         },
         |_| {
-            Ok(ok(&format!(
-                "HERDR_ADE_BOX_BINARY=herdr-ade {}\nHERDR_ADE_BOX_TICKER=42:{}\n",
-                crate::VERSION,
-                crate::VERSION
-            )))
+            Ok(ok(&serde_json::json!({"data": {"observation": {"binary": format!("herdr-ade {}", crate::VERSION), "ticker": {"state": "running", "pid": 42, "build": crate::VERSION}}}}).to_string()))
         },
     );
-    with_box.runner.on("--version", ok("installed version\n"));
+    with_box
+        .runner
+        .on("--version", ok(&format!("herdr-ade {}\n", crate::VERSION)));
     with_box.runner.on("ssh", ok(""));
     with_box.runner.on(
         "machine list --json",
         ok(r#"[{"id":"buildbox","label":"buildbox","target":"buildbox-pi","session":"default","enabled":true}]"#),
     );
-    crate::harness::install(&with_box.ctx()).unwrap();
+    let outcome = crate::harness::install(&with_box.ctx()).unwrap();
     assert_eq!(
         with_box.runner.count("ssh"),
         5,
-        "one box build per repo plus lane settings, the pi guard, and the running-process check"
+        "one box build per repo plus lane settings, the pi guard, and the running-process check: {outcome:?}"
     );
     let calls = with_box.runner.calls.borrow();
     let local_guard = calls
@@ -2600,7 +2602,7 @@ fn harness_install_runs_the_box_steps_only_when_buildbox_is_saved() {
     without_box.runner.on("mv -f", ok(""));
     without_box
         .runner
-        .on("--version", ok("installed version\n"));
+        .on("--version", ok(&format!("herdr-ade {}\n", crate::VERSION)));
     without_box.runner.on("machine list --json", ok("[]"));
     without_box.runner.on("ssh", ok(""));
     crate::harness::install(&without_box.ctx()).unwrap();
@@ -2616,14 +2618,16 @@ fn harness_install_reports_unavailable_box_without_reexec() {
     world.runner.on("cargo build", ok(""));
     world.runner.on("cp ", ok(""));
     world.runner.on("mv -f", ok(""));
-    world.runner.on("--version", ok("installed version\n"));
+    world
+        .runner
+        .on("--version", ok(&format!("herdr-ade {}\n", crate::VERSION)));
 
     world
         .runner
         .on("machine list --json", fail(1, "machine list unavailable"));
     let outcome = crate::harness::install(&world.ctx()).unwrap();
     assert_eq!(world.runner.count("cargo build"), 1);
-    assert!(!outcome.warnings.is_empty());
+    assert!(!outcome.warnings().is_empty());
 }
 
 #[test]

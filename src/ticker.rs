@@ -723,6 +723,10 @@ pub(crate) fn stop(root: &Path) -> Result<()> {
 }
 
 pub(crate) fn status(root: &Path) -> Result<()> {
+    crate::output::insert(
+        "observation",
+        serde_json::to_value(crate::harness::observation(root))?,
+    );
     let (_, detail) = health_report(root);
     println!("ticker: {detail}");
     match lock_state(root) {

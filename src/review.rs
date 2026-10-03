@@ -1775,7 +1775,7 @@ fn land(ctx: &Ctx, project: &Project, review: &mut Review) -> Result<()> {
         if installed.box_failed() {
             anyhow::bail!(
                 "box pending: local installation finished; box installation still needs to complete: {}",
-                installed.warnings.join("; ")
+                installed.warnings().trim()
             );
         }
         Ok(installed.summary().to_string())
