@@ -230,8 +230,23 @@ No plugin code is involved: install Herdr and this plugin on an always-on machin
 
 ## Development
 
+CI runs these gates on Linux and macOS:
+
 ```bash
+cargo fmt --check
 cargo test
+cargo clippy --all-targets -- -D warnings
+cargo build --bin herdr-ade
+node --test tests/pi_extension.test.mjs
+claude plugin test mods/coordinator-handoff
+git diff --check
 ```
+
+The extension suite needs Node 24 and the built debug `herdr-ade` binary
+(`CARGO_TARGET_DIR` is honored). The handoff suite uses Claude Code 2.1.287's
+`plugin test` command: it runs each `*.test.ts` in a child of the Claude binary,
+with the mod-hook environment and the `claude-code/testing` kit. It is not a
+Node test-runner suite and needs no provider login or live model calls. CI
+installs that version via `npm install --global @anthropic-ai/claude-code@2.1.287`.
 
 Never develop against your default session or `~/.herdr-ade`. Use `HERDR_ADE_ROOT` and `XDG_CONFIG_HOME` under `/var/tmp`.

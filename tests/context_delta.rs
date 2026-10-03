@@ -153,11 +153,12 @@ fn a_failing_writer_consumes_nothing_in_text_or_json() {
         if json {
             command.arg("--json");
         }
-        let full = std::fs::OpenOptions::new()
-            .write(true)
-            .open("/dev/full")
-            .unwrap();
-        let failed = command.stdout(Stdio::from(full)).output().unwrap();
+        // A closed socket reader makes every stdout write fail on Linux and
+        // macOS, without relying on Linux's /dev/full device.
+        let (writer, reader) = std::os::unix::net::UnixStream::pair().unwrap();
+        drop(reader);
+        let writer: std::os::fd::OwnedFd = writer.into();
+        let failed = command.stdout(Stdio::from(writer)).output().unwrap();
         assert!(!failed.status.success(), "json={json}");
         assert_eq!(std::fs::read(&cursor).unwrap(), before);
         assert!(!fixture.project.join(".state/inbox-seen.json").exists());

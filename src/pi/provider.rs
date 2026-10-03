@@ -10,7 +10,7 @@
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, ensure};
 use serde_json::{Value, json};
 
 /// The provider that serves the DeepSeek rows.
@@ -26,36 +26,22 @@ const PI_RESERVE_TOKENS: u64 = 16_384;
 pub(crate) const DEEPSEEK_CONTEXT_WINDOW: u64 = DEEPSEEK_COMPACT_AT + PI_RESERVE_TOKENS;
 
 /// Merge the DeepSeek `contextWindow` overrides into `models.json`, keeping
-/// every other provider, overrides and keys. A missing or unreadable file
-/// starts from the empty table. Idempotent.
+/// every other provider, overrides and keys. Only a missing file starts
+/// from the empty table. Read or shape errors leave the file untouched.
 pub(crate) fn write_overrides(path: &Path, deepseek_models: &[String]) -> Result<()> {
     let mut root: Value = match std::fs::read_to_string(path) {
-        Ok(text) if !text.trim().is_empty() => serde_json::from_str(&text)
+        Ok(text) => serde_json::from_str(&text)
             .with_context(|| format!("{} does not parse", path.display()))?,
-        _ => json!({"providers": {}}),
-    };
-    if !root.is_object() {
-        root = json!({"providers": {}});
-    }
-    if root.get("providers").and_then(Value::as_object).is_none() {
-        root["providers"] = json!({});
-    }
-    let provider = &mut root["providers"][PROVIDER_ID];
-    if !provider.is_object() {
-        *provider = json!({});
-    }
-    if provider
-        .get("modelOverrides")
-        .and_then(Value::as_object)
-        .is_none()
-    {
-        provider["modelOverrides"] = json!({});
-    }
-    for model in deepseek_models {
-        let entry = &mut provider["modelOverrides"][model];
-        if !entry.is_object() {
-            *entry = json!({});
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => json!({"providers": {}}),
+        Err(error) => {
+            return Err(error).with_context(|| format!("could not read {}", path.display()));
         }
+    };
+    let providers = object_entry(&mut root, "providers")?;
+    let provider = object_entry(providers, PROVIDER_ID)?;
+    let overrides = object_entry(provider, "modelOverrides")?;
+    for model in deepseek_models {
+        let entry = object_entry(overrides, model)?;
         entry["contextWindow"] = json!(DEEPSEEK_CONTEXT_WINDOW);
     }
 
@@ -71,6 +57,16 @@ pub(crate) fn write_overrides(path: &Path, deepseek_models: &[String]) -> Result
         .with_context(|| format!("could not protect {}", tmp.display()))?;
     std::fs::rename(&tmp, path).with_context(|| format!("could not replace {}", path.display()))?;
     Ok(())
+}
+
+/// Create absent objects, but never replace a configuration value of another shape.
+fn object_entry<'a>(parent: &'a mut Value, key: &str) -> Result<&'a mut Value> {
+    let object = parent
+        .as_object_mut()
+        .context("models.json configuration must be an object")?;
+    let value = object.entry(key).or_insert_with(|| json!({}));
+    ensure!(value.is_object(), "models.json `{key}` must be an object");
+    Ok(value)
 }
 
 /// The DeepSeek recipe models whose `models.json` `contextWindow` is missing
@@ -101,6 +97,34 @@ mod tests {
 
     fn models() -> Vec<String> {
         vec!["deepseek-v4.1-flash".into()]
+    }
+
+    #[test]
+    fn read_and_shape_errors_leave_models_untouched() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("models.json");
+        // Mode 000 reproduces the original read failure without relying on /dev.
+        let original = r#"{"providers":{"custom":{"apiKey":"keep"}},"sentinel":true}"#;
+        std::fs::write(&path, original).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000)).unwrap();
+        assert!(write_overrides(&path, &models()).is_err());
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
+        for invalid in [
+            "",
+            "[]",
+            r#"{"providers":null}"#,
+            r#"{"providers":{"opencode-go":[]},"sentinel":true}"#,
+            r#"{"providers":{"opencode-go":{"modelOverrides":false}}}"#,
+            r#"{"providers":{"opencode-go":{"modelOverrides":{"deepseek-v4.1-flash":null}}}}"#,
+        ] {
+            std::fs::write(&path, invalid).unwrap();
+            assert!(write_overrides(&path, &models()).is_err(), "{invalid}");
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), invalid);
+        }
+        std::fs::remove_file(&path).unwrap();
+        write_overrides(&path, &models()).unwrap();
+        assert!(missing_overrides(&path, &models()).unwrap().is_empty());
     }
 
     #[test]

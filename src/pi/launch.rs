@@ -161,36 +161,81 @@ pub(crate) fn write_wrapper(layout: &super::Layout) -> Result<PathBuf> {
     Ok(path)
 }
 
-/// A `kind = "pi"` recipe is refused when it carries a session or trust flag
-/// (SPEC-pi v2 §3.5). The code is part of the message, so callers can name it.
-pub(crate) fn validate_args(args: &[String]) -> Result<()> {
-    for arg in args {
-        let flag = arg.split('=').next().unwrap_or(arg);
+/// The complete interactive recipe contract, independent of argv spelling.
+#[derive(Debug)]
+pub(crate) struct PiArgs {
+    provider: String,
+    model: String,
+    thinking: String,
+}
+
+impl PiArgs {
+    pub(crate) fn argv(&self) -> Vec<String> {
+        vec![
+            "--provider".into(),
+            self.provider.clone(),
+            "--model".into(),
+            self.model.clone(),
+            "--thinking".into(),
+            self.thinking.clone(),
+            "--no-skills".into(),
+        ]
+    }
+}
+
+/// Parse only the four admitted options, once each. Session, trust and
+/// extension flags remain excluded, as do print mode and all other options.
+pub(crate) fn parse_args(args: &[String]) -> Result<PiArgs> {
+    let (mut provider, mut model, mut thinking) = (None, None, None);
+    let mut no_skills = false;
+    let mut iter = args.iter();
+    while let Some(arg) = iter.next() {
+        let (flag, inline) = arg
+            .split_once('=')
+            .map_or((arg.as_str(), None), |(k, v)| (k, Some(v)));
         if FORBIDDEN_ARGS.contains(&flag) {
             bail!("pi_args_forbidden: `{flag}` is not allowed on a pi row");
         }
+        if flag == "--no-skills" && inline.is_none() && !no_skills {
+            no_skills = true;
+            continue;
+        }
+        let slot = match flag {
+            "--provider" => &mut provider,
+            "--model" => &mut model,
+            "--thinking" => &mut thinking,
+            _ => bail!("pi_args_forbidden: `{arg}` is not an interactive recipe option"),
+        };
+        if slot.is_some() {
+            bail!("pi_args_forbidden: duplicate `{flag}`");
+        }
+        let value = inline.or_else(|| iter.next().map(String::as_str));
+        let value = value
+            .filter(|v| !v.is_empty() && !v.starts_with('-'))
+            .ok_or_else(|| anyhow::anyhow!("pi_args_forbidden: `{flag}` requires a value"))?;
+        *slot = Some(value.to_string());
     }
-    if args.iter().any(|a| a == "--force") {
-        bail!("pi_args_forbidden: `--force` never appears on a pi row");
-    }
-    flag_value(args, "--provider")
-        .ok_or_else(|| anyhow::anyhow!("pi_args_forbidden: `--provider` is required"))?;
-    // Every pi row, a known provider or not (the T3 mock row too).
-    if flag_value(args, "--model").is_none_or(|model| model.is_empty()) {
-        bail!("pi_args_forbidden: `--model` is required on a pi row");
-    }
-    if !args.iter().any(|a| a == "--no-skills") {
+    if !no_skills {
         bail!("pi_args_forbidden: `--no-skills` is required on a pi row");
     }
-    Ok(())
+    let required = |value: Option<String>, flag| {
+        value.ok_or_else(|| anyhow::anyhow!("pi_args_forbidden: `{flag}` is required"))
+    };
+    Ok(PiArgs {
+        provider: required(provider, "--provider")?,
+        model: required(model, "--model")?,
+        thinking: required(thinking, "--thinking")?,
+    })
 }
 
-/// `provider` equals the `--provider` the args carry (SPEC-pi v2 §3.5).
+/// Check the provider column against the parsed interactive recipe.
 pub(crate) fn validate_provider_column(provider: &str, args: &[String]) -> Result<()> {
-    let in_args = flag_value(args, "--provider")
-        .ok_or_else(|| anyhow::anyhow!("pi_args_forbidden: `--provider` is required"))?;
-    if provider != in_args {
-        bail!("pi_args_forbidden: provider `{provider}` does not equal --provider `{in_args}`");
+    let parsed = parse_args(args)?;
+    if provider != parsed.provider {
+        bail!(
+            "pi_args_forbidden: provider `{provider}` does not equal --provider `{}`",
+            parsed.provider
+        );
     }
     Ok(())
 }
@@ -202,20 +247,18 @@ pub(crate) fn validate_recipe(
     args: &[String],
     env: &[String],
 ) -> Result<String> {
-    validate_args(args)?;
-    validate_provider_column(provider, args)?;
-    let model = flag_value(args, "--model")
-        .ok_or_else(|| anyhow::anyhow!("pi_args_forbidden: `{id}` has no --model"))?;
-    let thinking = flag_value(args, "--thinking")
-        .ok_or_else(|| anyhow::anyhow!("pi_args_forbidden: `{id}` has no --thinking"))?;
-    validate_thinking(provider, &model, &thinking)?;
-    if args.len() != 7 {
-        bail!("pi_args_forbidden: `{id}` must carry exactly four flags");
+    let parsed = parse_args(args)?;
+    if provider != parsed.provider {
+        bail!(
+            "pi_args_forbidden: provider `{provider}` does not equal --provider `{}`",
+            parsed.provider
+        );
     }
+    validate_thinking(provider, &parsed.model, &parsed.thinking)?;
     if !env.is_empty() {
         bail!("pi_env_forbidden: `{id}` must leave the pi environment empty");
     }
-    Ok(model)
+    Ok(parsed.model)
 }
 
 /// The value of `--flag value` or `--flag=value`.
@@ -270,7 +313,7 @@ mod tests {
     fn forbidden_flags_are_refused() {
         for flag in FORBIDDEN_ARGS {
             let bad = args(&["--provider", "kimi-coding", "--model", "x", flag]);
-            let error = validate_args(&bad).unwrap_err().to_string();
+            let error = parse_args(&bad).unwrap_err().to_string();
             assert!(error.contains("pi_args_forbidden"), "{flag}: {error}");
         }
     }
@@ -286,22 +329,66 @@ mod tests {
             "low",
             "--no-skills",
         ]);
-        assert!(validate_args(&mock).is_ok());
+        assert!(parse_args(&mock).is_ok());
         for bad in [
             args(&["--provider", "mock-provider", "--no-skills"]),
             args(&["--provider", "mock-provider", "--model", "m"]),
             args(&["--provider", "kimi-coding", "--model", "", "--no-skills"]),
         ] {
-            let error = validate_args(&bad).unwrap_err().to_string();
+            let error = parse_args(&bad).unwrap_err().to_string();
             assert!(error.contains("pi_args_forbidden"), "{bad:?}: {error}");
         }
     }
 
     #[test]
     fn the_provider_column_must_match() {
-        let row = args(&["--provider", "kimi-coding", "--model", "x", "--no-skills"]);
-        assert!(validate_provider_column("kimi-coding", &row).is_ok());
-        assert!(validate_provider_column("opencode-go", &row).is_err());
+        let row = args(&[
+            "--provider",
+            "kimi-coding",
+            "--model",
+            "x",
+            "--thinking",
+            "low",
+            "--no-skills",
+        ]);
+        assert!(validate_recipe("row", "kimi-coding", &row, &[]).is_ok());
+        assert!(validate_recipe("row", "opencode-go", &row, &[]).is_err());
+    }
+
+    #[test]
+    fn equals_style_cannot_smuggle_noninteractive_options() {
+        let base = args(&[
+            "--provider=kimi-coding",
+            "--model=k3",
+            "--thinking=high",
+            "--no-skills",
+        ]);
+        assert!(validate_recipe("row", "kimi-coding", &base, &[]).is_ok());
+        assert_eq!(
+            parse_args(&base).unwrap().argv(),
+            args(&[
+                "--provider",
+                "kimi-coding",
+                "--model",
+                "k3",
+                "--thinking",
+                "high",
+                "--no-skills"
+            ])
+        );
+        for extra in [
+            args(&["--print", "hello", "--no-tools"]),
+            args(&["--model=other"]),
+            args(&["--no-skills"]),
+            args(&["--no-skills=true"]),
+            args(&["--extension=x"]),
+        ] {
+            let bad = [base.clone(), extra].concat();
+            assert!(
+                validate_recipe("row", "kimi-coding", &bad, &[]).is_err(),
+                "{bad:?}"
+            );
+        }
     }
 
     /// The wrapper, run for real with `sh` and a fake `node` that prints

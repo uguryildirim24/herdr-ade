@@ -833,6 +833,11 @@ fn auth_check_uncached(
         .map_err(|error| {
             unknown_auth(format!("provider readiness check could not run: {error:#}"))
         })?;
+    if output.timed_out || output.code.is_none() {
+        return Err(unknown_auth(
+            "provider readiness check timed out or was terminated by a signal",
+        ));
+    }
     let answer = if output.stdout.trim().is_empty() {
         output.stderr.trim()
     } else {
@@ -1296,6 +1301,32 @@ mod tests {
             .unwrap();
         assert_eq!(probe.timeout, LIVE_PROBE_TIMEOUT);
         assert_eq!(probe.timeout, Duration::from_secs(30));
+    }
+
+    #[test]
+    fn interrupted_auth_json_is_unknown_and_never_cached() {
+        for timed_out in [true, false] {
+            let dir = tempfile::tempdir().unwrap();
+            let layout = installed_layout(dir.path());
+            let runner = FakeRunner::new();
+            runner.on(
+                "auth check --provider opencode-go",
+                sh::Output {
+                    code: None,
+                    stdout: r#"{"status":"not_ready","reason":"credentials_not_configured"}"#
+                        .into(),
+                    timed_out,
+                    ..Default::default()
+                },
+            );
+            for _ in 0..2 {
+                let failure = auth_check(&runner, &layout, "opencode-go").unwrap_err();
+                assert_eq!(failure.evidence, FailureEvidence::Unknown);
+                assert!(!probe_cache_path(&layout, "opencode-go").exists());
+            }
+            assert_eq!(runner.count("auth check"), 2);
+            assert_eq!(runner.count("--print"), 0);
+        }
     }
 
     #[test]
