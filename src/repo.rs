@@ -142,58 +142,6 @@ impl<'a> Git<'a> {
             .map(|l| l[3..].trim().trim_matches('"').to_string())
             .collect())
     }
-
-    /// The tree of merging `other` into `into`, written nowhere. Uses
-    /// `git merge-tree --write-tree` (git 2.38+): exit 1 with conflict
-    /// diagnostics is a conflict; other failures are not. The first
-    /// output line on success is the tree object id.
-    pub fn merge_tree(&self, into: &str, other: &str) -> Result<String> {
-        let out = self.output(&["merge-tree", "--write-tree", into, other])?;
-        if out.code == Some(1)
-            && (out.stdout.contains("CONFLICT (") || out.stderr.contains("CONFLICT ("))
-        {
-            return Err(crate::refusal::error(
-                format!("merge_conflict: {other} does not merge cleanly into {into}"),
-                "resolve the merge conflict in the integration repository, then retry the merge",
-            ));
-        }
-        if !out.success() {
-            bail!(
-                "`git merge-tree --write-tree {into} {other}` failed: {}",
-                out.error_text()
-            );
-        }
-        out.stdout
-            .lines()
-            .next()
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-            .map(str::to_string)
-            .with_context(|| {
-                format!("`git merge-tree --write-tree {into} {other}` printed no tree")
-            })
-    }
-
-    /// A two-parent merge commit for `tree`, made without touching any
-    /// checkout. The caller updates the branch ref under the lock.
-    pub fn commit_tree(
-        &self,
-        tree: &str,
-        first: &str,
-        second: &str,
-        message: &str,
-    ) -> Result<String> {
-        self.run(&[
-            "commit-tree",
-            tree,
-            "-p",
-            first,
-            "-p",
-            second,
-            "-m",
-            message,
-        ])
-    }
 }
 
 #[cfg(test)]
@@ -230,7 +178,6 @@ mod tests {
             git.run(&["rev-parse", "HEAD"]).unwrap_err(),
             git.branch_head("main").unwrap_err(),
             git.is_repository().unwrap_err(),
-            git.merge_tree("main", "lane").unwrap_err(),
         ] {
             assert!(
                 error
@@ -239,47 +186,6 @@ mod tests {
             );
             assert!(!crate::refusal::is(&error));
         }
-    }
-
-    #[test]
-    fn merge_conflict_is_git_specific_and_other_failures_remain_errors() {
-        for stderr in [false, true] {
-            let runner = FakeRunner::new();
-            let mut output = fail(1, "");
-            if stderr {
-                output.stderr = "CONFLICT (content)".into();
-            } else {
-                output.stdout = "tree\nCONFLICT (content)".into();
-            }
-            runner.on("merge-tree", output);
-            let error = Git::new(&runner, "/repo")
-                .merge_tree("main", "lane")
-                .unwrap_err();
-            assert!(crate::refusal::is(&error));
-            assert!(error.to_string().starts_with("merge_conflict:"));
-        }
-        for output in [
-            fail(1, "broken object"),
-            fail(2, "CONFLICT (content)"),
-            timeout(),
-            Output::default(),
-            ok(""),
-        ] {
-            let runner = FakeRunner::new();
-            runner.on("merge-tree", output);
-            let error = Git::new(&runner, "/repo")
-                .merge_tree("main", "lane")
-                .unwrap_err();
-            assert!(!crate::refusal::is(&error), "{error}");
-        }
-        let runner = FakeRunner::new();
-        runner.on("merge-tree", ok("tree-id\n"));
-        assert_eq!(
-            Git::new(&runner, "/repo")
-                .merge_tree("main", "lane")
-                .unwrap(),
-            "tree-id"
-        );
     }
 
     #[test]
@@ -308,7 +214,6 @@ mod tests {
         for error in [
             git.run(&["status"]).unwrap_err(),
             git.is_ancestor("a", "b").unwrap_err(),
-            git.merge_tree("a", "b").unwrap_err(),
         ] {
             assert!(error.downcast_ref::<IncompleteOutput>().is_some());
         }
