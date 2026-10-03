@@ -2452,6 +2452,11 @@ fn launch_pass(
     let Some(first) = pending.first() else {
         return false;
     };
+    let parent = pass
+        .project
+        .coordinator()
+        .filter(|_| !first.is_remote())
+        .map(|coordinator| coordinator.pane_id);
     let starts: Vec<_> = pending
         .iter()
         .map(|t| crate::herdr::AgentStart {
@@ -2460,8 +2465,7 @@ fn launch_pass(
             pane: &t.pane_id,
             agent_args: &t.launch.args,
             launch_bin: None,
-            // ADE owns notices so fork exits cannot bypass idle batching.
-            parent: None,
+            parent: parent.as_deref(),
             // `agent start` need not hold the ticker for the whole observation
             // window: subsequent passes watch the pane for the remaining time.
             ready_timeout_ms: agent_start_timeout(&t.launch)
@@ -2583,7 +2587,7 @@ fn tick_cheap(ctx: &Ctx, project: &Project, refresh_tokens: bool) -> Result<Opti
     // checks agent identity on each machine before touching parent metadata.
     let state = steps::load_state(project);
     if !state.lanes_parented_to.is_empty() && state.lanes_parented_to != record.pane_id {
-        match crate::threads::clear_push_links(ctx, project) {
+        match crate::threads::relink_binding(ctx, project, &record.pane_id) {
             Ok(()) => {
                 let mut state = steps::load_state(project);
                 state.lanes_parented_to = record.pane_id.clone();
@@ -6191,7 +6195,7 @@ mod tests {
     }
 
     #[test]
-    fn replacement_binding_removes_live_local_push_link_on_next_pass() {
+    fn replacement_binding_reparents_live_local_lane_on_next_pass() {
         let f = fixture(false);
         let lane = thread::allocate(&f.project, |t| {
             t.status = thread::Status::Open;
@@ -6247,7 +6251,7 @@ mod tests {
         };
         let _ = tick_cheap(&ctx, &f.project, false);
         assert_eq!(
-            runner.count("pane report-metadata w1:p2 --source herdr-ade --clear-token parent"),
+            runner.count("pane report-metadata w1:p2 --source herdr-ade --token parent=w1:p9"),
             1,
             "{}",
             lane.id
