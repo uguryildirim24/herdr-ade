@@ -341,7 +341,7 @@ mod tests {
 
     #[test]
     fn adopting_a_starting_agent_waits_until_ready_before_prompting() {
-        let (world, _project, cwd) = world_with_agent("starting", "my-agent");
+        let (world, project, cwd) = world_with_agent("starting", "my-agent");
         world.runner.on(
             "agent wait",
             ok(&format!(
@@ -353,6 +353,35 @@ mod tests {
 
         let t = adopt(&world.ctx(), "demo", "w5:p1", "Starting", None, lane()).unwrap();
         assert!(!t.prompt_pending);
+        // A report-only adopted lane follows the same no-empty-commit finish.
+        let folder = Path::new(&t.worktree_path);
+        std::fs::write(folder.join("report.md"), "Report-only result\n").unwrap();
+        std::fs::create_dir(folder.join("library")).unwrap();
+        std::fs::write(folder.join("library/note.txt"), "deliverable\n").unwrap();
+        let op = crate::ops::reserve_done(
+            &project,
+            crate::ops::Reservation {
+                thread: &t.id,
+                pane: &t.pane_id,
+                attempt: t.attempt.max(1),
+                kind: crate::contracts::OpKind::Done,
+                recipient: crate::contracts::Recipient::default(),
+                requested: crate::contracts::Requested::Done {
+                    sha: t.base.clone(),
+                    report_path: t.report_path(),
+                },
+                helper_pid: 1,
+            },
+            folder,
+        )
+        .unwrap();
+        let staged =
+            crate::ops::stage_done(&project, &op.op, folder, &crate::runner::RealRunner).unwrap();
+        assert_eq!(staged.has_changes, Some(false));
+        assert_eq!(
+            crate::git::rev_parse(&crate::runner::RealRunner, &t.worktree_path, "HEAD").unwrap(),
+            t.base
+        );
         let calls = world.runner.calls.borrow();
         let waited = calls
             .iter()

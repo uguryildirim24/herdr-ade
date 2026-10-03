@@ -832,7 +832,7 @@ fn task(project: &Project, review: &Review) -> String {
             gate.command, gate.env
         ));
     }
-    out.push_str(&format!("\nWrite a report with TOML front matter:\n+++\nreview = \"{}\"\nverdict = \"MERGE\" # or REJECT\ncandidate = \"<your exact HEAD>\"\ngates = [{{ command = \"<selected command>\", exit = 0 }}]\n# Optional: without = {{ t-0001 = \"one-line reason\" }}\n+++\n\nUse gates = [] if none are selected. If excluding lanes, rebuild from the integration base without those lanes before running gates; their commits must not remain ancestors of your candidate. Include gate output and findings. Commit your fixes, then `ha done --report <report in your git folder> --sha <your HEAD>`. Output in another repository belongs in the report.\n", review.id));
+    out.push_str(&format!("\nWrite a report with TOML front matter:\n+++\nreview = \"{}\"\nverdict = \"MERGE\" # or REJECT\ncandidate = \"<your exact HEAD>\"\ngates = [{{ command = \"<selected command>\", exit = 0 }}]\n# Optional: without = {{ t-0001 = \"one-line reason\" }}\n+++\n\nUse gates = [] if none are selected. If excluding lanes, rebuild from the integration base without those lanes before running gates; their commits must not remain ancestors of your candidate. Include gate output and findings. Commit repository changes if any, leave runtime deliverables untracked, then `ha done`. Output in another repository belongs in the report.\n", review.id));
     out
 }
 #[derive(Serialize)]

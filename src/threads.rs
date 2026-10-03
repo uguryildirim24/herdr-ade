@@ -1241,8 +1241,8 @@ fn push_branch(runner: &dyn Runner, repo: &str, url: &str, branch: &str, sha: &s
 }
 
 /// Makes the project-owned git folder used by a thread with no code
-/// repository. Its first commit contains only `brief.md`; the lane creates and
-/// commits report or deliverable files there before calling `done`.
+/// repository. Its first commit contains only `brief.md`; report and library
+/// deliverables stay untracked and are captured by `done` and retirement.
 pub(crate) fn prepare_managed_git_folder(
     runner: &dyn Runner,
     folder: &Path,
@@ -1282,6 +1282,7 @@ pub(crate) fn prepare_managed_git_folder(
             );
         }
         let bytes = std::fs::read(&brief_path)?;
+        exclude_paths_from_git(runner, &folder_text, &["/report.md", "/library/"])?;
         return Ok((folder, thread::sha256_hex(&bytes), head));
     }
 
@@ -1318,6 +1319,7 @@ pub(crate) fn prepare_managed_git_folder(
         GIT_TIMEOUT,
     )?;
     let head = git(runner, &folder_text, &["rev-parse", "HEAD"], GIT_TIMEOUT)?;
+    exclude_paths_from_git(runner, &folder_text, &["/report.md", "/library/"])?;
     Ok((folder, thread::sha256_hex(brief.as_bytes()), head))
 }
 
@@ -1340,6 +1342,10 @@ fn prepare_local_dir(ctx: &Ctx, project: &Project, placed: &Thread) -> Result<()
 /// Adds `.herdr-project/` to the repository's `info/exclude` if it is not
 /// already listed, so nothing in the thread directory is ever committed.
 pub fn exclude_from_git(runner: &dyn Runner, cwd: &str) -> Result<()> {
+    exclude_paths_from_git(runner, cwd, &[".herdr-project/"])
+}
+
+fn exclude_paths_from_git(runner: &dyn Runner, cwd: &str, patterns: &[&str]) -> Result<()> {
     let Ok(path) = git(
         runner,
         cwd,
@@ -1350,7 +1356,11 @@ pub fn exclude_from_git(runner: &dyn Runner, cwd: &str) -> Result<()> {
     };
     let path = Path::new(cwd).join(path);
     let current = std::fs::read_to_string(&path).unwrap_or_default();
-    if current.lines().any(|line| line.trim() == ".herdr-project/") {
+    let missing: Vec<_> = patterns
+        .iter()
+        .filter(|pattern| !current.lines().any(|line| line.trim() == **pattern))
+        .collect();
+    if missing.is_empty() {
         return Ok(());
     }
     if let Some(parent) = path.parent() {
@@ -1360,7 +1370,10 @@ pub fn exclude_from_git(runner: &dyn Runner, cwd: &str) -> Result<()> {
     if !text.is_empty() && !text.ends_with('\n') {
         text.push('\n');
     }
-    text.push_str(".herdr-project/\n");
+    for pattern in missing {
+        text.push_str(pattern);
+        text.push('\n');
+    }
     std::fs::write(&path, text).with_context(|| format!("could not update {}", path.display()))
 }
 

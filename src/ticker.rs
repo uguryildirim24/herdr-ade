@@ -1131,6 +1131,7 @@ pub(crate) fn resume_provider_starts(
         if lane.status == thread::Status::Open {
             if let Err(error) = thread::update(project, &lane.id, |t| {
                 t.provider_wait_started.clear();
+                t.startup_wait_started = project::now();
                 t.error = "provider ready".into();
             }) {
                 report(error);
@@ -2389,7 +2390,13 @@ fn launch_pass(
                 continue;
             }
             errors.extend(
-                thread::update(pass.project, &t.id, |record| record.error = message.clone()).err(),
+                thread::update(pass.project, &t.id, |record| {
+                    if message.starts_with("disk_low:") {
+                        record.startup_wait_started.clear();
+                    }
+                    record.error = message.clone();
+                })
+                .err(),
             );
             continue;
         }
@@ -3302,7 +3309,7 @@ mod tests {
     }
 
     #[test]
-    fn deferred_launch_waits_for_disk_then_submits() {
+    fn deferred_launch_waits_for_disk_without_expiring_then_submits() {
         use crate::scenarios::{World, pane_json};
         let world = World::new();
         let project = world.project("demo", "a.sock");
@@ -3312,6 +3319,11 @@ mod tests {
             record.launch.kind = "claude".into();
         });
         let runner = FakeRunner::new();
+        let lane = thread::update(&project, &lane.id, |t| {
+            t.startup_wait_started = "2020-01-01T00:00:00Z".into();
+            t.launch.ready_timeout_ms = 60_000;
+        })
+        .unwrap();
         let free = std::rc::Rc::new(std::cell::Cell::new(5_u64));
         let current = free.clone();
         runner.on_fn(|cmd| cmd.display().contains("df -Pk"), move |_| {
@@ -3354,10 +3366,30 @@ mod tests {
                 .error
                 .starts_with("disk_low:")
         );
+        let waiting = thread::load(&project, &lane.id).unwrap();
+        assert!(waiting.startup_wait_started.is_empty());
+        let checked = thread_pass(
+            &LaunchPass {
+                threads: std::slice::from_ref(&waiting),
+                ..pass
+            },
+            "ha",
+            None,
+            false,
+            None,
+        )
+        .unwrap();
+        assert!(checked.error.is_none(), "{:?}", checked.error);
+        assert_eq!(
+            thread::load(&project, &lane.id).unwrap().status,
+            thread::Status::Open
+        );
         free.set(20);
         launch_pass(&pass, &mut true, false, &mut errors);
         assert_eq!(runner.count("agent start"), 1);
-        assert_eq!(thread::load(&project, &lane.id).unwrap().launch_attempts, 1);
+        let launched = thread::load(&project, &lane.id).unwrap();
+        assert_eq!(launched.launch_attempts, 1);
+        assert!(thread::in_start_window(&launched, jiff::Timestamp::now()));
     }
 
     #[test]
@@ -4696,6 +4728,27 @@ mod tests {
         );
         assert_eq!(world.runner.count("tab close"), 0);
         assert_eq!(world.runner.count("workspace close"), 0);
+        // Readiness can disappear after placement but before submission. A
+        // provider pause must not use up this attempt's startup window.
+        thread::update(&project, &lane.id, |t| {
+            t.status = thread::Status::Open;
+            t.provider_wait_started = project::now();
+            t.startup_wait_started = "2020-01-01T00:00:00Z".into();
+        })
+        .unwrap();
+        let mut ready = BTreeMap::from([(
+            (crate::contracts::MACHINE_LOCAL.into(), String::new()),
+            Ok(()),
+        )]);
+        resume_provider_starts(&ctx, &project, &mut ready, |error| panic!("{error:#}"));
+        let resumed = thread::load(&project, &lane.id).unwrap();
+        assert!(resumed.provider_wait_started.is_empty());
+        assert!(thread::in_start_window(&resumed, jiff::Timestamp::now()));
+        check();
+        let resumed = thread::load(&project, &lane.id).unwrap();
+        assert_eq!(resumed.status, thread::Status::Open);
+        assert_eq!(resumed.attempt, 2);
+        assert_eq!(world.runner.count("tab close"), 0);
         thread::update(&project, &lane.id, |t| {
             t.startup_wait_started = "2020-01-01T00:00:00Z".into();
         })
