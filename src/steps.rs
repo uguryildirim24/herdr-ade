@@ -23,15 +23,56 @@ pub(crate) const DONE_RETENTION_DAYS: u64 = 30;
 /// A transport submission is not a context receipt. Keep the unsighted lines
 /// until the bound coordinator actually asks for its context.
 #[derive(Debug, Default, Serialize, Deserialize)]
-#[serde(default)]
+#[serde(from = "WakeHistory")]
 struct WakeCursor {
-    binding: String,
     revision: u64,
-    lines: Vec<String>,
-    primed_binding: String,
-    /// Binding that heard each line; absent entries use historical cursor.binding.
-    heard_bindings: Vec<String>,
+    notices: Vec<HeardNotice>,
     pending_announced: bool,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct HeardNotice {
+    entry: OutboxEntry,
+    binding: String,
+}
+
+// Aligned vectors exist only at the historical read boundary, never at runtime.
+#[derive(Default, Deserialize)]
+#[serde(default)]
+struct WakeHistory {
+    revision: u64,
+    notices: Vec<HeardNotice>,
+    pending_announced: bool,
+    lines: Vec<String>,
+    heard_bindings: Vec<String>,
+    binding: String,
+    primed_binding: String,
+}
+
+impl From<WakeHistory> for WakeCursor {
+    fn from(old: WakeHistory) -> Self {
+        let binding = if old.primed_binding.is_empty() {
+            old.binding
+        } else {
+            old.primed_binding
+        };
+        let mut notices = old.notices;
+        notices.extend(old.lines.into_iter().enumerate().map(|(i, line)| {
+            HeardNotice {
+                entry: OutboxEntry::new(NoticeSource::Transition(line.clone()), &line),
+                binding: old
+                    .heard_bindings
+                    .get(i)
+                    .cloned()
+                    .unwrap_or_else(|| binding.clone()),
+            }
+        }));
+        Self {
+            revision: old.revision,
+            notices,
+            pending_announced: old.pending_announced,
+        }
+    }
 }
 
 fn wake_path(project: &Project) -> std::path::PathBuf {
@@ -64,33 +105,8 @@ pub(crate) fn receipt(project: &Project, observed: u64) -> Result<()> {
     if cursor.revision != observed {
         return Ok(());
     }
-    cursor.lines.clear();
-    cursor.heard_bindings.clear();
+    cursor.notices.clear();
     cursor.revision += 1;
-    cursor.binding = wake_binding(project);
-    cursor.primed_binding.clear();
-    cursor.pending_announced = false;
-    project::write_json(&wake_path(project), &cursor)
-}
-
-fn record_wake(project: &Project, line: &str) -> Result<()> {
-    let _lock = project.lock()?;
-    let mut cursor: WakeCursor = project::read_json(&wake_path(project)).unwrap_or_default();
-    if cursor.lines.is_empty() {
-        cursor.binding = wake_binding(project);
-    }
-    let historical_heard = if cursor.primed_binding.is_empty() {
-        &cursor.binding
-    } else {
-        &cursor.primed_binding
-    };
-    cursor
-        .heard_bindings
-        .resize(cursor.lines.len(), historical_heard.clone());
-    cursor.lines.push(line.into());
-    cursor.heard_bindings.push(wake_binding(project));
-    cursor.revision += 1;
-    cursor.primed_binding.clear();
     cursor.pending_announced = false;
     project::write_json(&wake_path(project), &cursor)
 }
@@ -121,36 +137,15 @@ fn announce_pending(project: &Project, cursor: &WakeCursor) -> Result<()> {
 /// Prime only transitions this binding never heard. Missing a context receipt
 /// is not new news and must not wake the same binding again.
 fn prime_unread(ctx: &Ctx, project: &Project) -> Result<()> {
-    let bound = project.coordinator();
     let binding = wake_binding(project);
     let cursor: WakeCursor = project::read_json(&wake_path(project)).unwrap_or_default();
     let unheard: Vec<_> = cursor
-        .lines
+        .notices
         .iter()
-        .enumerate()
-        .filter_map(|(i, line)| {
-            let heard = cursor.heard_bindings.get(i).unwrap_or(&cursor.binding);
-            (heard != &binding && cursor.primed_binding != binding).then_some(line.as_str())
-        })
+        .filter(|notice| notice.binding != binding)
+        .map(|notice| notice.entry.line.as_str())
         .collect();
     if unheard.is_empty() {
-        return Ok(());
-    }
-    let Some(bound) = bound else {
-        announce_pending(project, &cursor)?;
-        return Ok(());
-    };
-    let herdr = Herdr::new(ctx.env.herdr_bin(), &bound.socket, ctx.runner);
-    let agent = herdr
-        .agent_list()
-        .unwrap_or_default()
-        .into_iter()
-        .find(|a| crate::coordinator::agent_matches(&bound, a));
-    let Some(agent) = agent else {
-        announce_pending(project, &cursor)?;
-        return Ok(());
-    };
-    if !agent.promptable() {
         return Ok(());
     }
     let line = format!(
@@ -160,25 +155,19 @@ fn prime_unread(ctx: &Ctx, project: &Project) -> Result<()> {
         project.slug
     );
     // The digest shares batching, but must not become another unread line.
-    if !coordinator_enqueue_at(
+    enqueue(
         project,
-        &herdr,
-        &bound.pane_id,
-        Some(NoticeInput {
-            line: &line,
-            event: None,
-            digest: Some(cursor.revision),
-            goal: None,
-        }),
+        OutboxEntry::new(
+            NoticeSource::Digest {
+                revision: cursor.revision,
+                binding,
+            },
+            &line,
+        ),
         wake_now(),
-    )? {
-        return Ok(());
-    }
-    let _lock = project.lock()?;
-    let mut latest: WakeCursor = project::read_json(&wake_path(project)).unwrap_or_default();
-    if latest.revision == cursor.revision && wake_binding(project) == binding {
-        latest.primed_binding = binding;
-        project::write_json(&wake_path(project), &latest)?;
+    )?;
+    if !flush_coordinator_notices(ctx, project)? {
+        announce_pending(project, &cursor)?;
     }
     Ok(())
 }
@@ -192,35 +181,18 @@ pub(crate) struct Notice {
 }
 
 pub(crate) fn deliver_transition_notices(ctx: &Ctx, project: &Project) -> Result<()> {
-    let Some(coordinator) = project.coordinator() else {
-        return Ok(());
-    };
     let reviews = crate::review::list(project)?;
     let holds = crate::review::hold_notices(project)?;
     let lanes = thread::list_live(project);
-    if !holds.iter().any(|n| !n.submitted)
-        && !reviews
-            .iter()
-            .any(|r| r.notices.iter().any(|n| !n.submitted))
-        && !lanes
-            .iter()
-            .any(|t| t.start_notices.iter().any(|n| !n.submitted))
-    {
-        return Ok(());
-    }
-    let herdr = Herdr::new(ctx.env.herdr_bin(), &coordinator.socket, ctx.runner);
-    let ready = herdr.agent_list()?.into_iter().any(|agent| {
-        agent.pane_id == coordinator.pane_id
-            && agent.name == coordinator.agent_name
-            && agent.promptable()
-    });
-    if !ready {
-        return Ok(());
-    }
     for (index, notice) in holds.iter().enumerate().filter(|(_, n)| !n.submitted) {
-        if !deliver_coordinator_prompt(project, &herdr, &coordinator.pane_id, &notice.line)? {
-            return Ok(());
-        }
+        enqueue(
+            project,
+            OutboxEntry::new(
+                NoticeSource::Transition(format!("hold:{index}")),
+                &notice.line,
+            ),
+            wake_now(),
+        )?;
         crate::review::mark_hold_submitted(project, index)?;
     }
     for old in reviews {
@@ -229,23 +201,28 @@ pub(crate) fn deliver_transition_notices(ctx: &Ctx, project: &Project) -> Result
         };
         let review = crate::review::load(project, &old.id)?;
         for notice in review.notices.iter().filter(|n| !n.submitted) {
-            if !deliver_coordinator_prompt(project, &herdr, &coordinator.pane_id, &notice.line)? {
-                return Ok(());
-            }
+            enqueue(
+                project,
+                OutboxEntry::new(
+                    NoticeSource::Transition(format!("review:{}:{}", review.id, notice.line)),
+                    &notice.line,
+                ),
+                wake_now(),
+            )?;
             crate::review::mark_notice_submitted(project, &review.id, &notice.line)?;
         }
     }
     for lane in lanes {
         for index in 0..lane.start_notices.len() {
             if !lane.start_notices[index].submitted {
-                if !deliver_coordinator_prompt(
+                enqueue(
                     project,
-                    &herdr,
-                    &coordinator.pane_id,
-                    &lane.start_notices[index].line,
-                )? {
-                    return Ok(());
-                }
+                    OutboxEntry::new(
+                        NoticeSource::Transition(format!("lane:{}:{index}", lane.id)),
+                        &lane.start_notices[index].line,
+                    ),
+                    wake_now(),
+                )?;
                 thread::update(project, &lane.id, |t| {
                     if let Some(notice) = t.start_notices.get_mut(index) {
                         notice.submitted = true;
@@ -254,6 +231,7 @@ pub(crate) fn deliver_transition_notices(ctx: &Ctx, project: &Project) -> Result
             }
         }
     }
+    flush_coordinator_notices(ctx, project)?;
     Ok(())
 }
 
@@ -292,7 +270,7 @@ pub(crate) fn save_state(project: &Project, state: &State) -> Result<()> {
 }
 
 /// Delivers every sealed event not already submitted or durably queued. The event, not the typed line or report hash, is authoritative.
-/// A draft-held notice holds later notices, preserving their seal order.
+/// The outbox preserves seal order even while a draft holds transport.
 /// An event whose journal already holds `queued` or `submitted` is not typed
 /// again; one read before its line went out (`acknowledged` or `handled` with
 /// no `submitted`) is still typed once, so the wake-up always happens. An
@@ -343,22 +321,6 @@ pub(crate) fn deliver_events(ctx: &Ctx, project: &Project) -> Result<()> {
         if thread::load(project, &event.thread).is_ok_and(|lane| lane.status == Status::Resolved) {
             continue;
         }
-        let states = match crate::events::states(project, &event.id) {
-            Ok(states) => states,
-            Err(error) => {
-                first.get_or_insert(error);
-                continue;
-            }
-        };
-        // Context reads sealed work directly, including seals submitted to a
-        // previous coordinator. Never replay a line already typed once.
-        if states.contains(&crate::contracts::DeliveryState::Submitted)
-            || states.contains(&crate::contracts::DeliveryState::Queued)
-        {
-            continue;
-        }
-        // No `submitted` yet: fresh, or read before its wake-up line was
-        // typed. Both still owe exactly one typed line.
         if thread::load(project, &event.thread)
             .is_ok_and(|lane| lane.attempt.max(1) != event.attempt)
         {
@@ -366,13 +328,6 @@ pub(crate) fn deliver_events(ctx: &Ctx, project: &Project) -> Result<()> {
         }
         if let Err(error) = deliver_notice(ctx, project, &event) {
             first.get_or_insert(error.context(format!("event {}", event.id)));
-            break;
-        }
-        // A held notice must not be overtaken by a later one.
-        let states = crate::events::states(project, &event.id)?;
-        if !states.contains(&crate::contracts::DeliveryState::Submitted)
-            && !states.contains(&crate::contracts::DeliveryState::Queued)
-        {
             break;
         }
     }
@@ -422,17 +377,6 @@ fn deliver_notice(ctx: &Ctx, project: &Project, event: &crate::contracts::Event)
     {
         return Ok(());
     }
-    let coordinator = project
-        .coordinator()
-        .ok_or_else(|| anyhow::anyhow!("recipient_unavailable: project has no coordinator"))?;
-    if coordinator.pane_id != event.recipient.pane
-        || coordinator.attempt() != event.recipient.coordinator_attempt
-    {
-        // The new binding sees this seal in context; it must not receive a
-        // second inbox projection or a line addressed to the old binding.
-        return Ok(());
-    }
-    let herdr = Herdr::new(ctx.env.herdr_bin(), &coordinator.socket, ctx.runner);
     let lane = thread::load(project, &event.thread)?;
     if lane.attempt.max(1) != event.attempt {
         bail!(
@@ -458,7 +402,11 @@ fn deliver_notice(ctx: &Ctx, project: &Project, event: &crate::contracts::Event)
     // A box lane's tokens were set by the box's own `ha done`; the Mac has no
     // socket into that server, so delivery never projects them again
     // (SPEC-remote §4.3).
-    if !lane.is_remote() && !lane.pane_id.is_empty() {
+    if !lane.is_remote()
+        && !lane.pane_id.is_empty()
+        && let Some(coordinator) = project.coordinator()
+    {
+        let herdr = Herdr::new(ctx.env.herdr_bin(), &coordinator.socket, ctx.runner);
         let _ = herdr.pane_clear_tokens(&lane.pane_id, &["done", "waiting"]);
         let value = event
             .payload
@@ -516,14 +464,6 @@ fn deliver_notice(ctx: &Ctx, project: &Project, event: &crate::contracts::Event)
             ),
         )?;
     }
-    let agent = herdr.agent_list()?.into_iter().find(|agent| {
-        agent.pane_id == event.recipient.pane
-            && agent.name == coordinator.agent_name
-            && agent.promptable()
-    });
-    let Some(_agent) = agent else {
-        return Ok(());
-    };
     let mut line = crate::events::typed_line(project, event)?;
     if !queued.is_empty() {
         line.push_str(&format!(
@@ -531,35 +471,52 @@ fn deliver_notice(ctx: &Ctx, project: &Project, event: &crate::contracts::Event)
             queued.join("; ")
         ));
     }
-    if coordinator_enqueue_at(
+    enqueue(
         project,
-        &herdr,
-        &event.recipient.pane,
-        Some(NoticeInput {
-            line: &line,
-            event: Some(&event.id),
-            digest: None,
-            goal: None,
-        }),
+        OutboxEntry::new(NoticeSource::Event(event.id.clone()), &line),
         wake_now(),
-    )? && !crate::events::states(project, &event.id)?
-        .contains(&crate::contracts::DeliveryState::Submitted)
-    {
-        crate::events::append_delivery(
-            project,
-            &event.id,
-            crate::contracts::DeliveryState::Queued,
-        )?;
-    }
+    )?;
+    flush_coordinator_notices(ctx, project)?;
     Ok(())
 }
 
 /// Durable outbox shared by automated notices. Source journals advance after
 /// acceptance here; a held batch survives seals, cleanup and rebinds.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+enum NoticeSource {
+    Transition(String),
+    Event(String),
+    Digest { revision: u64, binding: String },
+    Goal(String),
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct OutboxEntry {
+    source: NoticeSource,
+    line: String,
+}
+
+impl OutboxEntry {
+    fn new(source: NoticeSource, line: &str) -> Self {
+        Self {
+            source,
+            line: line.into(),
+        }
+    }
+}
+
 #[derive(Default, Serialize, Deserialize)]
-#[serde(default)]
+#[serde(from = "BatchHistory")]
 struct NoticeBatch {
     first_at: u64,
+    entries: Vec<OutboxEntry>,
+}
+
+#[derive(Default, Deserialize)]
+#[serde(default)]
+struct BatchHistory {
+    first_at: u64,
+    entries: Vec<OutboxEntry>,
     lines: Vec<String>,
     events: Vec<String>,
     wake_lines: Vec<String>,
@@ -567,11 +524,41 @@ struct NoticeBatch {
     goals: Vec<(String, String)>,
 }
 
-struct NoticeInput<'a> {
-    line: &'a str,
-    event: Option<&'a str>,
-    digest: Option<u64>,
-    goal: Option<&'a str>,
+impl From<BatchHistory> for NoticeBatch {
+    fn from(old: BatchHistory) -> Self {
+        let mut entries = old.entries;
+        let mut digests = old.digests.into_iter();
+        let mut events = old.events;
+        for line in old.lines {
+            let event = events.iter().position(|id| {
+                line.split_whitespace()
+                    .nth(1)
+                    .is_some_and(|thread| id.starts_with(&format!("{thread}-")))
+            });
+            let source = if let Some(index) = event {
+                NoticeSource::Event(events.remove(index))
+            } else if !old.wake_lines.contains(&line)
+                && let Some(revision) = digests.next()
+            {
+                NoticeSource::Digest {
+                    revision,
+                    binding: String::new(),
+                }
+            } else {
+                NoticeSource::Transition(line.clone())
+            };
+            entries.push(OutboxEntry::new(source, &line));
+        }
+        entries.extend(
+            old.goals
+                .into_iter()
+                .map(|(token, line)| OutboxEntry::new(NoticeSource::Goal(token), &line)),
+        );
+        Self {
+            first_at: old.first_at,
+            entries,
+        }
+    }
 }
 
 fn batch_path(project: &Project) -> std::path::PathBuf {
@@ -599,18 +586,13 @@ pub(crate) fn deliver_goal_check(
     token: &str,
     line: &str,
 ) -> Result<bool> {
-    coordinator_enqueue_at(
+    enqueue(
         project,
-        herdr,
-        pane,
-        Some(NoticeInput {
-            line,
-            event: None,
-            digest: None,
-            goal: Some(token),
-        }),
+        OutboxEntry::new(NoticeSource::Goal(token.into()), line),
         wake_now(),
-    )
+    )?;
+    flush_notices_at(project, herdr, pane, wake_now())?;
+    Ok(true)
 }
 
 fn coordinator_notice_at(
@@ -620,27 +602,37 @@ fn coordinator_notice_at(
     line: Option<&str>,
     now: u64,
 ) -> Result<bool> {
-    coordinator_enqueue_at(
-        project,
-        herdr,
-        pane,
-        line.map(|line| NoticeInput {
-            line,
-            event: None,
-            digest: None,
-            goal: None,
-        }),
-        now,
-    )
+    if let Some(line) = line {
+        enqueue(
+            project,
+            OutboxEntry::new(NoticeSource::Transition(line.into()), line),
+            now,
+        )?;
+    }
+    flush_notices_at(project, herdr, pane, now)?;
+    Ok(true)
 }
 
-fn coordinator_enqueue_at(
-    project: &Project,
-    herdr: &Herdr<'_>,
-    pane: &str,
-    notice: Option<NoticeInput<'_>>,
-    now: u64,
-) -> Result<bool> {
+fn enqueue(project: &Project, entry: OutboxEntry, now: u64) -> Result<()> {
+    let _writer = crate::prompt::writer_lock(project)?;
+    let mut batch: NoticeBatch = project::read_json(&batch_path(project)).unwrap_or_default();
+    if !batch.entries.iter().any(|old| old.source == entry.source) {
+        if batch.entries.is_empty() {
+            batch.first_at = now;
+        }
+        batch.entries.push(entry.clone());
+        save_batch(project, &batch)?;
+    }
+    match &entry.source {
+        NoticeSource::Event(id) => {
+            events::append_delivery(project, id, crate::contracts::DeliveryState::Queued)
+        }
+        NoticeSource::Goal(token) => goal_check::queued(project, token),
+        _ => Ok(()),
+    }
+}
+
+fn flush_notices_at(project: &Project, herdr: &Herdr<'_>, pane: &str, now: u64) -> Result<bool> {
     if project.coordinator().is_some_and(|record| {
         crate::adapters::dependency_waiting(
             &project.root,
@@ -664,54 +656,26 @@ fn coordinator_enqueue_at(
     if !crate::prompt::coordinator_prompt_clear(project, herdr, pane)? {
         return Ok(false);
     }
-    let path = batch_path(project);
-    let mut batch: NoticeBatch = project::read_json(&path).unwrap_or_default();
-    if let Some(notice) = notice.as_ref().filter(|n| n.goal.is_none())
-        && notice
-            .event
-            .is_none_or(|id| !batch.events.iter().any(|old| old == id))
-    {
-        if batch.lines.is_empty() && batch.goals.is_empty() {
-            batch.first_at = now;
-        }
-        batch.lines.push(notice.line.into());
-        if let Some(event) = notice.event {
-            batch.events.push(event.into());
-        }
-        if let Some(revision) = notice.digest {
-            batch.digests.push(revision);
-        } else {
-            batch.wake_lines.push(notice.line.into());
-        }
+    let mut batch: NoticeBatch = project::read_json(&batch_path(project)).unwrap_or_default();
+    let binding = wake_binding(project);
+    let mut cursor: WakeCursor = project::read_json(&wake_path(project)).unwrap_or_default();
+    let before = batch.entries.len();
+    batch.entries.retain(|entry| match &entry.source {
+        NoticeSource::Goal(token) => goal_check::current(project, token),
+        NoticeSource::Digest {
+            binding: target,
+            revision,
+        } => (target.is_empty() || target == &binding) && *revision == cursor.revision,
+        _ => true,
+    });
+    if batch.entries.len() != before {
         save_batch(project, &batch)?;
     }
-    if let Some(notice) = notice.as_ref()
-        && let Some(token) = notice.goal
-    {
-        if batch.lines.is_empty() && batch.goals.is_empty() {
-            batch.first_at = now;
-        }
-        if !batch.goals.iter().any(|(old, _)| old == token) {
-            batch.goals.push((token.into(), notice.line.into()));
-            save_batch(project, &batch)?;
-        }
-        goal_check::queued(project, token)?;
-    }
-    let before = batch.goals.len();
-    batch
-        .goals
-        .retain(|(token, _)| goal_check::current(project, token));
-    if batch.goals.len() != before {
-        save_batch(project, &batch)?;
-    }
-    if (!batch.lines.is_empty() || !batch.goals.is_empty())
-        && (!agent.ready() || now.saturating_sub(batch.first_at) >= 120)
-    {
+    if !batch.entries.is_empty() && (!agent.ready() || now.saturating_sub(batch.first_at) >= 120) {
         let text = batch
-            .lines
+            .entries
             .iter()
-            .chain(batch.goals.iter().map(|(_, line)| line))
-            .cloned()
+            .map(|entry| entry.line.as_str())
             .collect::<Vec<_>>()
             .join("\n");
         crate::prompt::mark_automated_prompt(project, pane, &text)?;
@@ -721,50 +685,58 @@ fn coordinator_enqueue_at(
             eprintln!("{}: notice batch will retry: {error}", project.slug);
             return Ok(true);
         }
-        for event in &batch.events {
-            crate::events::append_delivery(
-                project,
-                event,
-                crate::contracts::DeliveryState::Submitted,
-            )?;
-        }
-        if !batch.digests.is_empty() {
-            let _lock = project.lock()?;
-            let mut cursor: WakeCursor =
-                project::read_json(&wake_path(project)).unwrap_or_default();
-            if batch.digests.contains(&cursor.revision) {
-                let binding = wake_binding(project);
-                cursor.heard_bindings = vec![binding.clone(); cursor.lines.len()];
-                cursor.primed_binding = binding;
-                project::write_json(&wake_path(project), &cursor)?;
+        for entry in &batch.entries {
+            match &entry.source {
+                NoticeSource::Event(id) => events::append_delivery(
+                    project,
+                    id,
+                    crate::contracts::DeliveryState::Submitted,
+                )?,
+                NoticeSource::Goal(token) => goal_check::delivered(project, token, &agent, now)?,
+                _ => {}
             }
         }
-        // Goal obligations own their retry/rebind state. Putting their text
-        // in the unread-transition journal would replay consumed checks.
-        for (token, _) in &batch.goals {
-            goal_check::delivered(project, token, &agent, now)?;
+        let _lock = project.lock()?;
+        cursor = project::read_json(&wake_path(project)).unwrap_or_default();
+        let observed = cursor.revision;
+        for entry in batch.entries {
+            match entry.source {
+                NoticeSource::Digest { revision, .. } => {
+                    if revision == observed {
+                        for notice in &mut cursor.notices {
+                            notice.binding.clone_from(&binding);
+                        }
+                    }
+                }
+                // Goal obligations own their retry/rebind state, not the unread journal.
+                NoticeSource::Goal(_) => {}
+                _ => {
+                    cursor.notices.push(HeardNotice {
+                        entry,
+                        binding: binding.clone(),
+                    });
+                    cursor.revision += 1;
+                    cursor.pending_announced = false;
+                }
+            }
         }
-        for line in &batch.wake_lines {
-            record_wake(project, line)?;
-        }
-        save_batch(project, &NoticeBatch::default())?;
+        project::write_json(&wake_path(project), &cursor)?;
+        project::write_json(&batch_path(project), &NoticeBatch::default())?;
     }
     Ok(true)
 }
 
 /// The cheap ticker flushes even when no new transitions arrive.
-pub(crate) fn flush_coordinator_notices(ctx: &Ctx, project: &Project) -> Result<()> {
+pub(crate) fn flush_coordinator_notices(ctx: &Ctx, project: &Project) -> Result<bool> {
     let Some(c) = project.coordinator() else {
-        return Ok(());
+        return Ok(false);
     };
-    if project::read_json::<NoticeBatch>(&batch_path(project))
-        .is_none_or(|b| b.lines.is_empty() && b.goals.is_empty())
+    if project::read_json::<NoticeBatch>(&batch_path(project)).is_none_or(|b| b.entries.is_empty())
     {
-        return Ok(());
+        return Ok(true);
     }
     let herdr = Herdr::new(ctx.env.herdr_bin(), &c.socket, ctx.runner);
-    coordinator_notice_at(project, &herdr, &c.pane_id, None, wake_now())?;
-    Ok(())
+    flush_notices_at(project, &herdr, &c.pane_id, wake_now())
 }
 
 #[cfg(test)]
@@ -2028,7 +2000,7 @@ mod tests {
         assert!(
             project::read_json::<NoticeBatch>(&batch_path(&project))
                 .unwrap()
-                .lines
+                .entries
                 .is_empty()
         );
     }
@@ -2041,16 +2013,9 @@ mod tests {
         let (token, line) = goal_check::notice(&project).unwrap();
         let c = project.coordinator().unwrap();
         let herdr = Herdr::new(world.env.herdr_bin(), &c.socket, &world.runner);
-        coordinator_enqueue_at(
+        enqueue(
             &project,
-            &herdr,
-            &c.pane_id,
-            Some(NoticeInput {
-                line: &line,
-                event: None,
-                digest: None,
-                goal: Some(&token),
-            }),
+            OutboxEntry::new(NoticeSource::Goal(token), &line),
             100,
         )
         .unwrap();
@@ -2125,7 +2090,10 @@ mod tests {
         assert_eq!(
             project::read_json::<NoticeBatch>(&batch_path(&project))
                 .unwrap()
-                .lines,
+                .entries
+                .into_iter()
+                .map(|entry| entry.line)
+                .collect::<Vec<_>>(),
             ["DONE t-0001"]
         );
         project
@@ -2162,7 +2130,7 @@ mod tests {
         assert_eq!(
             project::read_json::<NoticeBatch>(&batch_path(&project))
                 .unwrap()
-                .lines
+                .entries
                 .len(),
             1
         );
@@ -2179,6 +2147,167 @@ mod tests {
         );
         deliver_event(&world.ctx(), &project, &event).unwrap();
         assert_eq!(typed_lines(&world).len(), 1);
+    }
+
+    #[test]
+    fn offline_transition_sources_queue_once_even_when_their_text_is_identical() {
+        let (world, project) = delivery_world();
+        *world.agents.borrow_mut() = "[]".into();
+        for _ in 0..2 {
+            thread::allocate(&project, |t| {
+                t.status = Status::Open;
+                t.start_notices.push(Notice {
+                    line: "Same transition".into(),
+                    submitted: false,
+                });
+            })
+            .unwrap();
+        }
+        for _ in 0..3 {
+            deliver_transition_notices(&world.ctx(), &project).unwrap();
+        }
+        let batch: NoticeBatch = project::read_json(&batch_path(&project)).unwrap();
+        assert_eq!(batch.entries.len(), 2);
+        assert_ne!(batch.entries[0].source, batch.entries[1].source);
+        assert!(
+            thread::list_live(&project)
+                .iter()
+                .all(|lane| lane.start_notices[0].submitted)
+        );
+        assert!(typed_lines(&world).is_empty());
+        coordinator_state(&world, &project, "working");
+        deliver_transition_notices(&world.ctx(), &project).unwrap();
+        assert_eq!(typed_lines(&world).len(), 1);
+        let cursor: WakeCursor = project::read_json(&wake_path(&project)).unwrap();
+        assert_eq!(cursor.notices.len(), 2);
+        receipt(&project, cursor.revision).unwrap();
+        assert!(
+            project::read_json::<WakeCursor>(&wake_path(&project))
+                .unwrap()
+                .notices
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn offline_event_keeps_queue_transport_and_context_receipts_separate() {
+        let (world, project) = delivery_world();
+        let lane = thread::allocate(&project, |t| t.status = Status::Open).unwrap();
+        let event = sealed_done(&project, &lane.id);
+        *world.agents.borrow_mut() = "[]".into();
+        for _ in 0..3 {
+            deliver_events(&world.ctx(), &project).unwrap();
+        }
+        events::append_delivery(
+            &project,
+            &event.id,
+            crate::contracts::DeliveryState::Acknowledged,
+        )
+        .unwrap();
+        assert_eq!(
+            events::states(&project, &event.id).unwrap(),
+            [
+                crate::contracts::DeliveryState::Queued,
+                crate::contracts::DeliveryState::Acknowledged
+            ]
+        );
+        assert!(typed_lines(&world).is_empty());
+        assert_eq!(
+            project::read_json::<NoticeBatch>(&batch_path(&project))
+                .unwrap()
+                .entries
+                .len(),
+            1
+        );
+        coordinator_state(&world, &project, "working");
+        deliver_events(&world.ctx(), &project).unwrap();
+        assert_eq!(
+            events::states(&project, &event.id).unwrap(),
+            [
+                crate::contracts::DeliveryState::Queued,
+                crate::contracts::DeliveryState::Acknowledged,
+                crate::contracts::DeliveryState::Submitted
+            ]
+        );
+        assert_eq!(typed_lines(&world).len(), 1);
+    }
+
+    #[test]
+    fn historical_batch_decodes_distinct_event_digest_goal_and_transition_entries() {
+        let batch: NoticeBatch = serde_json::from_value(serde_json::json!({
+            "first_at": 100,
+            "lines": ["A transition", "WAITING t-0001 input", "DONE t-0001 report sha", "Unread transitions"],
+            "events": ["t-0001-1-1", "t-0001-1-2"],
+            "wake_lines": ["A transition", "WAITING t-0001 input", "DONE t-0001 report sha"],
+            "digests": [7], "goals": [["goal-token", "Goal check owed"]]
+        })).unwrap();
+        assert_eq!(batch.first_at, 100);
+        assert_eq!(
+            batch
+                .entries
+                .iter()
+                .map(|entry| entry.source.clone())
+                .collect::<Vec<_>>(),
+            [
+                NoticeSource::Transition("A transition".into()),
+                NoticeSource::Event("t-0001-1-1".into()),
+                NoticeSource::Event("t-0001-1-2".into()),
+                NoticeSource::Digest {
+                    revision: 7,
+                    binding: String::new()
+                },
+                NoticeSource::Goal("goal-token".into())
+            ]
+        );
+        let saved = serde_json::to_value(&batch).unwrap();
+        assert!(saved.get("lines").is_none());
+        assert_eq!(
+            serde_json::from_value::<NoticeBatch>(saved)
+                .unwrap()
+                .entries
+                .len(),
+            5
+        );
+        let cursor: WakeCursor = serde_json::from_value(serde_json::json!({
+            "revision": 7, "binding": "old", "lines": ["A", "B"], "heard_bindings": ["new"]
+        }))
+        .unwrap();
+        assert_eq!(cursor.notices[0].binding, "new");
+        assert_eq!(cursor.notices[1].binding, "old");
+        assert!(
+            serde_json::to_value(cursor)
+                .unwrap()
+                .get("heard_bindings")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn context_receipt_cancels_an_idle_queued_digest() {
+        let (world, project) = delivery_world();
+        type_remote_line(&world.ctx(), &project, "REVIEW old transition").unwrap();
+        project
+            .update_coordinator(|c| {
+                c.generation += 2;
+            })
+            .unwrap();
+        coordinator_state(&world, &project, "idle");
+        prime_unread(&world.ctx(), &project).unwrap();
+        assert_eq!(
+            project::read_json::<NoticeBatch>(&batch_path(&project))
+                .unwrap()
+                .entries
+                .len(),
+            1
+        );
+        receipt(&project, wake_revision(&project)).unwrap();
+        coordinator_state(&world, &project, "working");
+        flush_coordinator_notices(&world.ctx(), &project).unwrap();
+        assert_eq!(
+            typed_lines(&world).len(),
+            1,
+            "received transitions are not replayed from a queued digest"
+        );
     }
 
     #[test]
@@ -2535,7 +2664,7 @@ mod tests {
         );
         receipt(&project, observed).unwrap();
         let cursor: WakeCursor = project::read_json(&wake_path(&project)).unwrap();
-        assert_eq!(cursor.lines.len(), 1);
+        assert_eq!(cursor.notices.len(), 1);
     }
 
     #[test]
@@ -2626,6 +2755,7 @@ mod tests {
             crate::events::states(&project, &event.id).unwrap(),
             vec![
                 crate::contracts::DeliveryState::Acknowledged,
+                crate::contracts::DeliveryState::Queued,
                 crate::contracts::DeliveryState::Submitted
             ]
         );
@@ -2696,16 +2826,23 @@ mod tests {
         assert!(typed_lines(&world).is_empty());
         assert!(!state.announced.is_empty());
         assert_eq!(world.runner.count("notification show"), 1);
-        assert!(events::states(&project, &a.id).unwrap().is_empty());
-        assert!(events::states(&project, &b.id).unwrap().is_empty());
+        assert_eq!(
+            events::states(&project, &a.id).unwrap(),
+            [crate::contracts::DeliveryState::Queued]
+        );
+        assert_eq!(
+            events::states(&project, &b.id).unwrap(),
+            [crate::contracts::DeliveryState::Queued]
+        );
         *screen.borrow_mut() = "❯ \n".into();
         deliver_events(&ctx, &project).unwrap();
         let lines = typed_lines(&world);
-        assert_eq!(lines.len(), 2, "{lines:?}");
-        assert!(lines[0].contains(&first.id));
-        assert!(lines[1].contains(&second.id));
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        let first_at = lines[0].find(&first.id).unwrap();
+        let second_at = lines[0].find(&second.id).unwrap();
+        assert!(first_at < second_at, "{lines:?}");
         announce_inbox(&project, &mut state, &herdr).unwrap();
-        assert_eq!(typed_lines(&world).len(), 2);
+        assert_eq!(typed_lines(&world).len(), 1);
         assert_eq!(world.runner.count("notification show"), 1);
     }
 
@@ -2908,7 +3045,10 @@ mod tests {
         assert_eq!(typed_lines(&world).len(), 1);
         assert_eq!(
             crate::events::states(&project, &event.id).unwrap(),
-            vec![crate::contracts::DeliveryState::Submitted]
+            vec![
+                crate::contracts::DeliveryState::Queued,
+                crate::contracts::DeliveryState::Submitted
+            ]
         );
 
         deliver_events(&ctx, &project).unwrap();
