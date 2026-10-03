@@ -9,7 +9,7 @@ How Herdr ADE works, what it writes where, and how to run threads on other machi
 - **Files are the record, prompts are wake-ups.** Thread and review records own their state; `context` renders it directly at the start of every turn. The inbox holds only messages such as courier deliveries and machine notices. A missed prompt loses nothing.
 - **One ticker per projects root** checks every 15 seconds: thread state and groups, pending prompts, changed reports, pending cleanup. Remote machines are polled once a minute.
 - **Tools are found even under a bare `PATH`.** A Herdr server started outside a login shell gives its plugins a minimal `PATH`; the binary appends `/opt/homebrew/bin`, `/usr/local/bin`, `~/.local/bin` and `~/.cargo/bin` to its own, so the ticker finds `gh`, `rsync` and friends. `ticker status` and `doctor` show what resolved.
-- **Cleanup follows a landed review.** The binary prunes finished lane and closed review branches after worktree cleanup, with a lease for published refs. A one-time ticker sweep prunes leftovers only for resolved lanes whose tips are merged into main; dirty worktrees are kept. Text from reports and command output is never placed in a prompt.
+- **Cleanup follows a landed review.** The binary prunes finished lane and closed review branches after worktree cleanup, with a lease for published refs. Text from reports and command output is never placed in a prompt.
 
 ## Where things live
 
@@ -46,7 +46,7 @@ Ignored files are disposable only when their path is covered by the editable glo
 disposable = ["target", ".target", "zig-out", ".zig-cache", "node_modules"]
 ```
 
-`doctor` reports remote build folders with no open thread and free space on the local machine and every saved remote machine. Branch and finished-worktree scans no longer run in doctor; the ticker sweeps landed, resolved leftovers once after install. The failure threshold is editable and defaults to 12 GB:
+`doctor` reports remote build folders with no open thread and free space on the local machine and every saved remote machine. Branch and finished-worktree scans do not run in doctor. The failure threshold is editable and defaults to 12 GB:
 
 ```toml
 [doctor]
