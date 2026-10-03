@@ -210,13 +210,6 @@ struct SnapshotObservation {
 }
 
 impl ProbePlan {
-    fn pi(models: &[(String, String)]) -> Self {
-        Self {
-            models: models.to_vec(),
-            ..Default::default()
-        }
-    }
-
     fn launch(ctx: &Ctx, launch: &crate::contracts::Launch) -> Result<Self> {
         let adapter = crate::adapters::declaration(&ctx.config_dir, &launch.kind)?;
         if adapter.doctor.readiness == "pi" {
@@ -224,7 +217,15 @@ impl ProbePlan {
                 .context("pi_args_forbidden: a provider launch names no --provider")?;
             let model = crate::pi::launch::flag_value(&launch.args, "--model")
                 .context("pi_args_forbidden: a provider launch names no --model")?;
-            return Ok(Self::pi(&[(provider, model)]));
+            let mut plan = Self::default();
+            if !launch.recipe_id.is_empty() {
+                plan.pi_ids.insert(
+                    format!("provider {provider}/{model}"),
+                    vec![launch.recipe_id.clone()],
+                );
+            }
+            plan.models.push((provider, model));
+            return Ok(plan);
         }
         let recipe = crate::contracts::Recipe {
             kind: launch.kind.clone(),
@@ -239,7 +240,11 @@ impl ProbePlan {
         })?;
         Ok(Self {
             natives: vec![(
-                launch.kind.clone(),
+                if launch.recipe_id.is_empty() {
+                    launch.kind.clone()
+                } else {
+                    launch.recipe_id.clone()
+                },
                 probe,
                 launch.ready_timeout_ms.max(1_000),
             )],
@@ -283,8 +288,13 @@ fn selected_plan(
                     recipe.kind
                 )
             })?;
+            let timeout = if recipe.ready_timeout_ms == 0 {
+                adapter.ready_timeout_ms
+            } else {
+                recipe.ready_timeout_ms
+            };
             plan.natives
-                .push((id.to_string(), probe, adapter.ready_timeout_ms.max(1_000)));
+                .push((id.to_string(), probe, timeout.max(1_000)));
         }
     }
     Ok(plan)
@@ -667,8 +677,8 @@ fn recipe_ready_local_probe(ctx: &Ctx, launch: &crate::contracts::Launch) -> Res
 }
 
 /// Whether the chosen recipe can run on a saved box. SSH injects the exact
-/// lane PATH, so `command -v` and the login command measure the environment a
-/// fresh lane receives. Pi keeps using `herdr-pi check`, as the doctor does.
+/// lane PATH, so the selected probes measure the environment a fresh lane
+/// receives. The target runs the same plan executor as local doctor.
 pub(crate) fn recipe_ready_on_box(
     ctx: &Ctx,
     profile: &crate::contracts::MachineProfile,
@@ -1906,6 +1916,28 @@ recipe = "claude_fable_xhigh"
 "#;
 
     #[test]
+    fn selected_and_launch_plans_keep_recipe_identity_and_deadline_overrides() {
+        let world = crate::scenarios::World::new();
+        let ctx = world.ctx();
+        let mut config = crate::launch::parse_launch_config(&ctx.config_dir).unwrap();
+        let id = "test_claude";
+        for (timeout, expected) in [(0, 300_000), (500, 1_000), (72_000, 72_000)] {
+            config.recipes.get_mut(id).unwrap().ready_timeout_ms = timeout;
+            let selected = selected_plan(&config, None).unwrap();
+            assert_eq!(selected.natives[0].2, expected);
+            let launch = crate::contracts::Launch {
+                kind: "claude".into(),
+                recipe_id: id.into(),
+                args: config.recipes[id].args.clone(),
+                ready_timeout_ms: expected,
+                ..Default::default()
+            };
+            let launched = ProbePlan::launch(&ctx, &launch).unwrap();
+            assert_eq!(launched.natives[0].0, selected.natives[0].0);
+        }
+    }
+
+    #[test]
     fn local_and_remote_execute_the_same_selected_inputs_and_deadlines() {
         let world = std::rc::Rc::new(crate::scenarios::World::new());
         let runner = std::rc::Rc::new(FakeRunner::new());
@@ -2026,6 +2058,7 @@ recipe = "claude_fable_xhigh"
             };
             let launch = crate::contracts::Launch {
                 kind: "pi".into(),
+                recipe_id: "selected-pi".into(),
                 args: vec![
                     "--provider".into(),
                     "openai-codex".into(),
@@ -2036,6 +2069,7 @@ recipe = "claude_fable_xhigh"
             };
             let error = recipe_ready_on_box_probe(&ctx, &box_profile(), &launch).unwrap_err();
             assert!(error.to_string().contains("original target diagnostic"));
+            assert!(error.to_string().contains("recipe selected-pi"));
             assert_eq!(
                 crate::pi_ade::failure_class(&error),
                 match evidence {
