@@ -2217,20 +2217,27 @@ pub(crate) fn observation_pass(
                 return Ok(());
             }
             let group = thread::group(&current, &observation.live, view.now);
-            if current.last_group == group.token() {
+            let blocked = observation.live.agent_state.as_deref() == Some("blocked");
+            if current.last_group == group.token() && (!blocked || current.last_state == "blocked")
+            {
                 return Ok(());
             }
-            // Claim the group and its durable notice together, before transport.
+            // A missing snapshot can already have selected WaitingOnYou. Claim
+            // the blocked state and its notice together, before transport.
             thread::update(project, &lane.id, |record| {
                 if !owns(record) {
                     return;
                 }
                 if record.status == thread::Status::Open
                     && record.startup_wait_started.is_empty()
-                    && observation.live.agent_state.as_deref() == Some("blocked")
+                    && blocked
                     && group == thread::Group::WaitingOnYou
-                    && record.last_group != group.token()
+                    && (record.last_group != group.token() || record.last_state != "blocked")
                 {
+                    if record.last_state != "blocked" {
+                        record.last_state = "blocked".into();
+                        record.last_state_change = project::now();
+                    }
                     record.start_notices.push(steps::Notice {
                         line: format!("BLOCKED {} needs input in {}; inspect the current question; no keys were sent.", record.id, record.pane_id),
                         submitted: false,
@@ -5981,6 +5988,62 @@ mod tests {
         assert_eq!(world.runner.count("agent prompt"), 1);
         assert_eq!(world.runner.count("pane submit-text"), 0);
         assert_eq!(world.runner.count("--clear-token parent"), 0);
+    }
+
+    #[test]
+    fn box_blocked_after_an_absent_snapshot_still_queues_one_notice() {
+        let world = crate::scenarios::World::new();
+        let project = world.project("demo", "a.sock");
+        let lane = world.thread(&project, world.home.path(), |t| {
+            t.machine = "box".into();
+            t.machine_id = "box".into();
+            t.last_state = "working".into();
+            t.last_group = "working".into();
+        });
+        let ctx = world.ctx();
+        let observe = |agents: &[Agent]| {
+            let current = thread::load(&project, &lane.id).unwrap();
+            let errors = observation_pass(
+                &ctx,
+                &project,
+                ObservationView {
+                    machine_id: "box",
+                    threads: std::slice::from_ref(&current),
+                    agents,
+                    panes: &[],
+                    boot_id: "boot-1",
+                    now: jiff::Timestamp::now(),
+                },
+            );
+            assert!(errors.is_empty(), "{errors:?}");
+        };
+        observe(&[]);
+        let missing = thread::load(&project, &lane.id).unwrap();
+        assert_eq!(missing.status, thread::Status::Open);
+        assert_eq!(missing.last_group, "waiting-on-you");
+        assert_eq!(
+            crate::events::remote_state(&project, "box")
+                .missing
+                .get(&lane.id),
+            Some(&1)
+        );
+        let agent = Agent {
+            pane_id: lane.pane_id.clone(),
+            tab_id: lane.tab_id.clone(),
+            workspace_id: lane.workspace_id.clone(),
+            cwd: lane.cwd.clone(),
+            name: lane.agent_name.clone(),
+            agent_status: "blocked".into(),
+            ..Default::default()
+        };
+        for _ in 0..3 {
+            observe(std::slice::from_ref(&agent));
+        }
+        let saved = thread::load(&project, &lane.id).unwrap();
+        assert_eq!(saved.status, thread::Status::Open);
+        assert_eq!(saved.start_notices.len(), 1);
+        assert!(saved.start_notices[0].line.starts_with("BLOCKED"));
+        assert_eq!(world.runner.count("agent prompt"), 0);
     }
 
     #[test]
