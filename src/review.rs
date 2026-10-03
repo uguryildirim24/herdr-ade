@@ -69,6 +69,9 @@ pub(crate) struct Review {
     pub repo: String,
     pub integration: String,
     pub base: String,
+    /// Only historical reviews own a synthetic branch. New candidates live
+    /// solely in the reviewer's checkout; landing always uses the sealed SHA.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub candidate_branch: String,
     pub members: Vec<Member>,
     pub gates: Vec<project::Gate>,
@@ -592,21 +595,20 @@ fn pending(
     events: &[crate::contracts::Event],
     reviewers: &std::collections::BTreeSet<String>,
 ) -> Vec<Thread> {
-    pending_from(thread::list_live(project), repo, events, reviewers)
+    pending_from(thread::list_live(project), events, reviewers)
+        .into_iter()
+        .filter(|t| same_repo(&t.repo, repo))
+        .collect()
 }
 fn pending_from(
     lanes: Vec<Thread>,
-    repo: &str,
     events: &[crate::contracts::Event],
     reviewers: &std::collections::BTreeSet<String>,
 ) -> Vec<Thread> {
     lanes
         .into_iter()
         .filter(|t| {
-            t.status != Status::Resolved
-                && !reviewers.contains(&t.id)
-                && same_repo(&t.repo, repo)
-                && t.merged_sha.is_empty()
+            t.status != Status::Resolved && !reviewers.contains(&t.id) && t.merged_sha.is_empty()
         })
         .filter(|t| sealed(events, t).is_some_and(|e| changes(t, e) != Some(false)))
         .collect()
@@ -650,11 +652,17 @@ pub(crate) fn start(ctx: &Ctx, slug: &str, repo: Option<&str>) -> Result<Option<
     if let Some((_, review)) = active_for_repo(ctx, &row.path)? {
         return Ok(Some(review));
     }
-    start_locked(ctx, &project, row)
+    let events = crate::events::checked(&project)?;
+    let pile = pending(&project, &row.path, &events, &reviewer_ids(&project)?);
+    start_locked(ctx, &project, row, pile, &events)
 }
-fn start_locked(ctx: &Ctx, project: &Project, row: project::Repo) -> Result<Option<Review>> {
-    let events = crate::events::checked(project)?;
-    let pile = pending(project, &row.path, &events, &reviewer_ids(project)?);
+fn start_locked(
+    ctx: &Ctx,
+    project: &Project,
+    row: project::Repo,
+    pile: Vec<Thread>,
+    events: &[crate::contracts::Event],
+) -> Result<Option<Review>> {
     if pile.is_empty() {
         return Ok(None);
     }
@@ -694,7 +702,7 @@ fn start_locked(ctx: &Ctx, project: &Project, row: project::Repo) -> Result<Opti
     let mut members = Vec::new();
     let mut changed = Vec::new();
     for lane in pile {
-        let event = sealed(&events, &lane).context("pile changed while preparing review")?;
+        let event = sealed(events, &lane).context("pile changed while preparing review")?;
         let done = event.payload.done.as_ref().expect("sealed done");
         if lane.is_remote() {
             let (settings, _) = project.read_project_md()?;
@@ -779,7 +787,7 @@ fn start_locked(ctx: &Ctx, project: &Project, row: project::Repo) -> Result<Opti
         + 1;
     let id = format!("review-{next}");
     let mut review = Review {
-        candidate_branch: format!("review/{}/{id}", project.slug),
+        candidate_branch: String::new(),
         id,
         repo: row.path.clone(),
         integration,
@@ -818,8 +826,8 @@ fn start_locked(ctx: &Ctx, project: &Project, row: project::Repo) -> Result<Opti
 }
 fn task(project: &Project, review: &Review) -> String {
     let mut out = format!(
-        "Run `ha skill reviewer`. Review the whole repository pile {}. Your branch starts from candidate `{}` on integration base `{}`. Merge every included SHA below (some may already be merged); resolve conflicts, fix small issues, and judge each original acceptance criterion. ADE runs the path-selected gates on your sealed candidate, on your machine, before landing. Do not push or install.\n\n",
-        review.id, review.candidate_branch, review.base
+        "Run `ha skill reviewer`. Review the whole repository pile {}. Your checkout owns the candidate, starting at frozen integration base `{}`. Merge every included SHA below (preserve any merges/fixes already in a recovered checkout); resolve conflicts, fix small issues, and judge each original acceptance criterion. ADE runs the path-selected gates on your sealed candidate, on your machine, before landing. Do not push or install.\n\n",
+        review.id, review.base
     );
     for member in &review.members {
         out.push_str(&format!(
@@ -919,38 +927,9 @@ struct GatePolicy {
 }
 fn prepare(ctx: &Ctx, project: &Project, review: &mut Review) -> Result<()> {
     let git = Git::new(ctx.runner, &review.repo);
-    if git.branch_head(&review.candidate_branch)?.is_none() {
+    if !review.candidate_branch.is_empty() && git.branch_head(&review.candidate_branch)?.is_none() {
         let _lock = crate::git::lock(ctx.runner, &review.repo)?;
         git.run(&["branch", &review.candidate_branch, &review.base])?;
-    }
-    // Pure merges do not leave a conflicted index. Stop at the first conflict;
-    // the one reviewer completes this same candidate in its checkout.
-    let mut head = git
-        .branch_head(&review.candidate_branch)?
-        .context("candidate missing")?;
-    for member in &review.members {
-        if git.is_ancestor(&member.sha, &head)? {
-            continue;
-        }
-        let tree = match git.merge_tree(&head, &member.sha) {
-            Ok(tree) => tree,
-            Err(e) if e.to_string().starts_with("merge_conflict:") => break,
-            Err(e) => return Err(e),
-        };
-        let merged = git.commit_tree(
-            &tree,
-            &head,
-            &member.sha,
-            &format!("Pile {}: {}", review.id, member.thread),
-        )?;
-        let _lock = crate::git::lock(ctx.runner, &review.repo)?;
-        git.run(&[
-            "update-ref",
-            &format!("refs/heads/{}", review.candidate_branch),
-            &merged,
-            &head,
-        ])?;
-        head = merged;
     }
     if review.reviewer.is_none() {
         // The identity is written into the thread before placement. Recover a
@@ -975,7 +954,14 @@ fn prepare(ctx: &Ctx, project: &Project, review: &mut Review) -> Result<()> {
                     title: format!("Review pile {}", review.id),
                     repo: Some(review.repo.clone()),
                     machine: None,
-                    base: Some(review.candidate_branch.clone()),
+                    // An in-flight historical review keeps its starting
+                    // candidate and fixes; new reviews start at the frozen base.
+                    base: Some(if review.candidate_branch.is_empty() {
+                        review.base.clone()
+                    } else {
+                        git.branch_head(&review.candidate_branch)?
+                            .context("candidate missing")?
+                    }),
                     task: task(project, review),
                     workflow: Some("reviewer".into()),
                     recipe: None,
@@ -1577,76 +1563,53 @@ fn advance(ctx: &Ctx, project: &Project, review: &mut Review) -> Result<()> {
         let latest =
             crate::events::latest_done_event(&events, &reviewer.id, reviewer.attempt.max(1));
         let pending = crate::threads::follow_up_pending_for_seal(&reviewer, latest);
-        if pending {
-            if let Some(event) =
-                latest.filter(|e| e.id != review.reviewer_after && e.id != review.checked_event)
-            {
-                // A local checkout already advanced for the correction has
-                // superseded this report. Wait for its next seal instead.
-                if !reviewer.is_remote()
-                    && !reviewer.worktree_path.is_empty()
-                    && Git::new(ctx.runner, &reviewer.worktree_path)
-                        .run(&["rev-parse", "HEAD"])
-                        .is_ok_and(|head| head != event.payload.done.as_ref().expect("seal").sha)
-                {
-                    return Ok(());
-                }
-                let git = Git::new(ctx.runner, &review.repo);
-                fetch_reviewer(ctx, project, review, &reviewer, event, &git)?;
-                match verdict(ctx, project, review, event, &git) {
-                    Ok(checked) => {
-                        review.verdict = Some(checked);
-                        review.checked_event = event.id.clone();
-                        review.attention.clear();
-                        save(project, review)?;
-                    }
-                    Err(error) => {
-                        review.verdict = None;
-                        review.checked_event = event.id.clone();
-                        review.attention = format!("{error:#}");
-                        needs_coordinator(project, review, &review.attention.clone())?;
-                        return Err(error);
-                    }
-                }
-            }
-            return Ok(());
-        }
-        let Some(event) = sealed(&events, &reviewer).filter(|e| {
+        let Some(event) = (if pending {
+            latest
+        } else {
+            sealed(&events, &reviewer)
+        })
+        .filter(|e| {
             e.id != review.reviewer_after
                 && (e.id != review.checked_event
-                    || review.verdict.is_some()
-                        && review.verdict_event.is_empty()
+                    || !pending
+                        && review.verdict.is_some()
+                        && review.verdict_event != e.id
                         && review.attention.is_empty())
         }) else {
             return Ok(());
         };
+        // A correction that already advanced the local checkout supersedes
+        // its old report. A fresh seal must establish the changed candidate.
+        if pending
+            && !reviewer.is_remote()
+            && !reviewer.worktree_path.is_empty()
+            && Git::new(ctx.runner, &reviewer.worktree_path)
+                .run(&["rev-parse", "HEAD"])
+                .is_ok_and(|head| head != event.payload.done.as_ref().expect("seal").sha)
+        {
+            return Ok(());
+        }
         let git = Git::new(ctx.runner, &review.repo);
         fetch_reviewer(ctx, project, review, &reviewer, event, &git)?;
-        let verdict = match verdict(ctx, project, review, event, &git) {
-            Ok(verdict) => verdict,
-            Err(error) => {
-                review.verdict = None;
-                review.checked_event = event.id.clone();
-                review.attention = format!("{error:#}");
-                needs_coordinator(project, review, &review.attention.clone())?;
-                return Err(error);
+        if event.id != review.checked_event {
+            review.checked_event = event.id.clone();
+            match verdict(ctx, project, review, event, &git) {
+                Ok(checked) => {
+                    review.verdict = Some(checked);
+                    review.attention.clear();
+                    save(project, review)?;
+                }
+                Err(error) => {
+                    review.verdict = None;
+                    needs_coordinator(project, review, &format!("{error:#}"))?;
+                    return Err(error);
+                }
             }
-        };
-        if verdict.verdict == "MERGE" {
-            let _git_lock = crate::git::lock(ctx.runner, &review.repo)?;
-            let old = git
-                .branch_head(&review.candidate_branch)?
-                .context("candidate branch missing")?;
-            git.run(&[
-                "update-ref",
-                &format!("refs/heads/{}", review.candidate_branch),
-                &verdict.candidate,
-                &old,
-            ])?;
         }
-        review.attention.clear();
+        if pending {
+            return Ok(());
+        }
         review.verdict_event = event.id.clone();
-        review.verdict = Some(verdict);
         if review
             .verdict
             .as_ref()
@@ -1958,15 +1921,7 @@ fn land_with_install(
         save(project, review)?;
     }
     if !review.prune {
-        let _git_lock = crate::git::lock(ctx.runner, &review.repo)?;
-        if let Some(head) = git.branch_head(&review.candidate_branch)? {
-            git.run(&[
-                "update-ref",
-                "-d",
-                &format!("refs/heads/{}", review.candidate_branch),
-                &head,
-            ])?;
-        }
+        prune_candidate(ctx, review)?;
         review.prune = true;
         save(project, review)?;
     }
@@ -1991,6 +1946,23 @@ fn land_with_install(
     review.attention.clear();
     save(project, review)?;
     project::refresh_page(project)
+}
+/// Historical synthetic candidates keep their fixes until the review closes.
+/// Delete with an expected old SHA, never an unverified branch removal.
+fn prune_candidate(ctx: &Ctx, review: &Review) -> Result<()> {
+    if !review.candidate_branch.is_empty() {
+        let git = Git::new(ctx.runner, &review.repo);
+        let _git_lock = crate::git::lock(ctx.runner, &review.repo)?;
+        if let Some(head) = git.branch_head(&review.candidate_branch)? {
+            git.run(&[
+                "update-ref",
+                "-d",
+                &format!("refs/heads/{}", review.candidate_branch),
+                &head,
+            ])?;
+        }
+    }
+    Ok(())
 }
 fn cancel_record(ctx: &Ctx, project: &Project, review: &mut Review, reason: &str) -> Result<()> {
     if !review.fast_forward && review.phase == Phase::Landing {
@@ -2024,16 +1996,7 @@ fn cancel_record(ctx: &Ctx, project: &Project, review: &mut Review, reason: &str
     }
     review.close = true;
     save(project, review)?;
-    let git = Git::new(ctx.runner, &review.repo);
-    let _git_lock = crate::git::lock(ctx.runner, &review.repo)?;
-    if let Some(head) = git.branch_head(&review.candidate_branch)? {
-        git.run(&[
-            "update-ref",
-            "-d",
-            &format!("refs/heads/{}", review.candidate_branch),
-            &head,
-        ])?;
-    }
+    prune_candidate(ctx, review)?;
     review.prune = true;
     review.phase = Phase::Cancelled;
     save(project, review)
@@ -2064,7 +2027,9 @@ pub(crate) fn retry(ctx: &Ctx, slug: &str, repo: Option<&str>) -> Result<Option<
                     && review.verdict.as_ref().is_some_and(|v| v.evidence_only)
             })
         {
-            return start_locked(ctx, &project, row);
+            let events = crate::events::checked(&project)?;
+            let pile = pending(&project, &row.path, &events, &reviewer_ids(&project)?);
+            return start_locked(ctx, &project, row, pile, &events);
         }
         return Err(crate::refusal::error(
             "no active pile review",
@@ -2474,15 +2439,17 @@ pub(crate) fn tick_observed(
     let events = crate::events::for_unresolved_threads(project);
     let threads = thread::list_live(project);
     let reviewers = reviewer_ids(project)?;
-    let repos: BTreeMap<_, _> = threads
-        .iter()
-        .filter(|t| !reviewers.contains(&t.id) && t.status != Status::Resolved)
-        .map(|t| (repo_identity(&t.repo), t.repo.clone()))
-        .collect();
+    let mut piles: BTreeMap<PathBuf, Vec<Thread>> = BTreeMap::new();
+    for lane in pending_from(threads.clone(), &events, &reviewers) {
+        piles
+            .entry(repo_identity(&lane.repo))
+            .or_default()
+            .push(lane);
+    }
     let mut holds = BTreeMap::new();
-    for repo in repos.into_values() {
-        let mut pile = pending(project, &repo, &events, &reviewers);
-        if repo.is_empty() || pile.is_empty() {
+    for mut pile in piles.into_values() {
+        let repo = pile[0].repo.clone();
+        if repo.is_empty() {
             continue;
         }
         let outcome = (|| -> Result<Option<String>> {
@@ -2575,7 +2542,7 @@ pub(crate) fn tick_observed(
                 }
             }
             if let Some(row) = configured {
-                start_locked(ctx, project, row)?;
+                start_locked(ctx, project, row, pile.clone(), &events)?;
                 Ok(None)
             } else {
                 Ok(Some(unconfigured.join(", ")))

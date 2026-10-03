@@ -55,7 +55,7 @@ fn unlisted_harness_repo_selects_all_four_harness_gates() {
     for gate in four_gates() {
         assert!(brief.contains(&gate.command));
     }
-    let candidate = git(&fx.repo, &["rev-parse", &review.candidate_branch]);
+    let candidate = candidate(&fx, &review);
     seal_verdict(
         &fx,
         &review,
@@ -273,12 +273,110 @@ fn reviewer_placement_leaves_launch_pending_and_releases_the_lock() {
     assert_eq!(reviewer.status, Status::Starting);
     assert!(reviewer.worktree_path.is_empty());
     assert!(reviewer.pane_id.is_empty());
+    assert_eq!(reviewer.base, review.base);
+    assert!(review.candidate_branch.is_empty());
+    assert!(git(&fx.repo, &["branch", "--list", "review/*"]).is_empty());
+    assert_eq!(fx.world.runner.count("merge-tree"), 0);
+    assert_eq!(fx.world.runner.count("commit-tree"), 0);
+    assert!(
+        !Git::new(fx.world.ctx().runner, &fx.repo)
+            .is_ancestor(&review.members[0].sha, &reviewer.base)
+            .unwrap()
+    );
     let held = try_operation_lock(&fx.world.ctx(), &review.repo).unwrap();
     assert!(held.is_some(), "review lock must be free before launch");
     drop(held);
     // A second ticker pass can enter while startup remains pending.
     tick(&fx.world.ctx(), &fx.project).unwrap();
     assert_eq!(list(&fx.project).unwrap()[0].reviewer, review.reviewer);
+}
+
+#[test]
+fn preparing_review_uses_the_frozen_commit_after_integration_moves() {
+    let fx = configured();
+    lane(&fx, 1);
+    *fx.world.panes.borrow_mut() = format!("[{}]", fx.world.coordinator_pane(&fx.project));
+    let mut review = start(&fx.world.ctx(), "demo", None).unwrap().unwrap();
+    // Resume a preparing intent with no surviving reviewer allocation.
+    thread::update(&fx.project, review.reviewer.as_deref().unwrap(), |t| {
+        t.status = Status::Resolved
+    })
+    .unwrap();
+    review.reviewer = None;
+    review.phase = Phase::Preparing;
+    let base = review.base.clone();
+    commit_file(
+        &fx.repo,
+        "later.txt",
+        "later",
+        "integration moved before allocation",
+    );
+    prepare(&fx.world.ctx(), &fx.project, &mut review).unwrap();
+    let reviewer = thread::load(&fx.project, review.reviewer.as_deref().unwrap()).unwrap();
+    assert_eq!(reviewer.base, base);
+    assert_ne!(reviewer.base, git(&fx.repo, &["rev-parse", "main"]));
+    assert_eq!(review.members.len(), 1);
+}
+
+#[test]
+fn historical_candidate_and_checkout_fixes_survive_until_verified_cleanup() {
+    for cancel in [false, true] {
+        let fx = configured();
+        lane(&fx, 1);
+        let mut review = prepared(&fx);
+        review.candidate_branch = "review/demo/review-1".into();
+        let premerged = candidate(&fx, &review);
+        git(&fx.repo, &["branch", &review.candidate_branch, &premerged]);
+        let reviewer = thread::load(&fx.project, review.reviewer.as_deref().unwrap()).unwrap();
+        let fixed = commit_file(
+            Path::new(&reviewer.worktree_path),
+            "fix.txt",
+            "fix",
+            "historical reviewer fix",
+        );
+        // Old records load and allocation-before-binding recovers the same
+        // checkout, without resetting its fixes or rewriting the old branch.
+        review.phase = Phase::Preparing;
+        review.reviewer = None;
+        save(&fx.project, &review).unwrap();
+        review = load(&fx.project, &review.id).unwrap();
+        prepare(&fx.world.ctx(), &fx.project, &mut review).unwrap();
+        assert_eq!(review.reviewer.as_deref(), Some(reviewer.id.as_str()));
+        assert_eq!(candidate(&fx, &review), fixed);
+        assert_eq!(
+            git(&fx.repo, &["rev-parse", &review.candidate_branch]),
+            premerged
+        );
+        if cancel {
+            cancel_record(
+                &fx.world.ctx(),
+                &fx.project,
+                &mut review,
+                "cancel old review",
+            )
+            .unwrap();
+            assert_eq!(git(&fx.repo, &["rev-parse", "main"]), review.base);
+        } else {
+            seal_verdict(&fx, &review, &fixed, "MERGE", BTreeMap::new(), vec![], 1);
+            advance(&fx.world.ctx(), &fx.project, &mut review).unwrap();
+            assert_eq!(git(&fx.repo, &["rev-parse", "main"]), fixed);
+        }
+        assert!(review.close && review.prune);
+        assert!(git(&fx.repo, &["branch", "--list", &review.candidate_branch]).is_empty());
+        assert!(
+            fx.world
+                .runner
+                .calls
+                .borrow()
+                .iter()
+                .any(|cmd| cmd.args.ends_with(&[
+                    "update-ref".into(),
+                    "-d".into(),
+                    format!("refs/heads/{}", review.candidate_branch),
+                    premerged.clone()
+                ]))
+        );
+    }
 }
 
 #[test]
@@ -424,7 +522,7 @@ fn conflicts_are_left_for_the_one_reviewer_without_a_dirty_integration_checkout(
     assert_eq!(review.phase, Phase::Reviewing);
     assert_eq!(git(&fx.repo, &["status", "--porcelain"]), "");
     assert_eq!(git(&fx.repo, &["rev-parse", "main"]), review.base);
-    let candidate = git(&fx.repo, &["rev-parse", &review.candidate_branch]);
+    let candidate = candidate(&fx, &review);
     let git = Git::new(fx.world.ctx().runner, &fx.repo);
     assert!(git.is_ancestor(&review.members[0].sha, &candidate).unwrap());
     assert!(!git.is_ancestor(&review.members[1].sha, &candidate).unwrap());
@@ -435,7 +533,7 @@ fn a_crash_during_cancel_cannot_accept_the_old_merge_verdict() {
     let fx = configured();
     lane(&fx, 1);
     let mut review = prepared(&fx);
-    let candidate = git(&fx.repo, &["rev-parse", &review.candidate_branch]);
+    let candidate = candidate(&fx, &review);
     seal_verdict(
         &fx,
         &review,

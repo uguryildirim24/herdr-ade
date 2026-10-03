@@ -341,25 +341,36 @@ pub fn start(ctx: &Ctx, slug: &str, args: StartArgs) -> Result<Thread> {
         .with_timeout(GIT_TIMEOUT)
         .run(&["rev-parse", "--show-toplevel"])
         .with_context(|| format!("{repo} is not a git repository"))?;
-    let integration = integration_branch(
-        ctx.runner,
-        &Thread {
-            repo: repo.clone(),
-            base: args.base.clone().unwrap_or_default(),
-            ..Thread::default()
-        },
-    )?;
-    let base = crate::repo::Git::new(ctx.runner, &repo)
-        .with_timeout(Duration::from_secs(5))
-        .branch_head(&integration)?
-        .ok_or_else(|| {
+    let git = crate::repo::Git::new(ctx.runner, &repo).with_timeout(Duration::from_secs(5));
+    let base = if role == "reviewer" && !args.review_id.is_empty() {
+        // Internal pile starts freeze a commit, not a branch that can move
+        // between review allocation and checkout creation.
+        git.run(&[
+            "rev-parse",
+            "--verify",
+            &format!(
+                "{}^{{commit}}",
+                args.base.as_deref().context("review base missing")?
+            ),
+        ])?
+    } else {
+        let integration = integration_branch(
+            ctx.runner,
+            &Thread {
+                repo: repo.clone(),
+                base: args.base.clone().unwrap_or_default(),
+                ..Thread::default()
+            },
+        )?;
+        git.branch_head(&integration)?.ok_or_else(|| {
             crate::refusal::error(
                 format!("integration_branch_required: `{integration}` is not a local branch"),
                 format!(
                     "ha thread start {slug} --base <existing-branch> --job <job> --task-file <file>"
                 ),
             )
-        })?;
+        })?
+    };
     let origin = crate::repo::Git::new(ctx.runner, &repo)
         .with_timeout(GIT_TIMEOUT)
         .run(&["remote", "get-url", "origin"])

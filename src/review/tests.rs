@@ -9,7 +9,7 @@ fn configured() -> Fx {
     let fx = fixture();
     std::fs::write(
         fx.repo.join(".git/info/exclude"),
-        ".worktrees/\n.herdr-project/\n",
+        ".worktrees/\n.herdr-project/\n.reports/\n",
     )
     .unwrap();
     let (mut settings, body) = fx.project.read_project_md().unwrap();
@@ -67,7 +67,7 @@ fn prepared(fx: &Fx) -> Review {
             "-b",
             &branch,
             checkout.to_str().unwrap(),
-            &review.candidate_branch,
+            &review.base,
         ],
     );
     thread::update(&fx.project, &id, |t| {
@@ -80,7 +80,58 @@ fn prepared(fx: &Fx) -> Review {
         t.base = review.base.clone();
     })
     .unwrap();
+    // The reviewer, not review preparation, integrates the frozen member set.
+    for member in &review.members {
+        let out = std::process::Command::new("git")
+            .args(["merge", "--no-edit", &member.sha])
+            .current_dir(&checkout)
+            .output()
+            .unwrap();
+        if !out.status.success() {
+            git(&checkout, &["merge", "--abort"]);
+            break;
+        }
+    }
     review
+}
+fn landing_verdict(review: &mut Review, candidate: &str) {
+    review.verdict = Some(Verdict {
+        verdict: "MERGE".into(),
+        review: review.id.clone(),
+        candidate: candidate.into(),
+        without: BTreeMap::new(),
+        gates: vec![],
+        gates_note: String::new(),
+        evidence_only: false,
+    });
+    review.phase = Phase::Landing;
+}
+fn post_seal_follow_up(fx: &Fx, id: &str, event: &crate::contracts::Event) -> PathBuf {
+    let checkout = thread::load(&fx.project, id).unwrap().worktree_path;
+    let done = event.payload.done.as_ref().unwrap();
+    let path = Path::new(&checkout).join(&done.report_path);
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::write(
+        &path,
+        thread::artifact(&fx.project, &done.artifact).unwrap(),
+    )
+    .unwrap();
+    thread::update(&fx.project, id, |lane| {
+        lane.review_after = event.id.clone();
+        lane.follow_ups.push(thread::FollowUp {
+            attempt: 1,
+            state: thread::FollowUpState::Delivered,
+            after_seal: event.id.clone(),
+            delivered_at: "2026-09-18T00:00:00Z".into(),
+            ..Default::default()
+        });
+    })
+    .unwrap();
+    path
+}
+fn candidate(fx: &Fx, review: &Review) -> String {
+    let reviewer = thread::load(&fx.project, review.reviewer.as_deref().unwrap()).unwrap();
+    git(Path::new(&reviewer.worktree_path), &["rev-parse", "HEAD"])
 }
 fn seal_verdict(
     fx: &Fx,
@@ -206,7 +257,7 @@ fn retry_rebuilds_pre_contract_packet_and_delivers_it_to_a_parked_reviewer() {
             t.parked = parked;
         })
         .unwrap();
-        let candidate = git(&fx.repo, &["rev-parse", &review.candidate_branch]);
+        let candidate = candidate(&fx, &review);
         fx.seal_done(&reviewer, 1, 1, &candidate, &format!(
             "+++\nreview = {:?}\nverdict = \"MERGE\"\ncandidate = {candidate:?}\n+++\nOld review contract\n", review.id
         ));
@@ -260,7 +311,7 @@ fn evidence_only_rejection_allows_retry_or_automatic_review_without_member_follo
         let fx = configured();
         let (id, _) = lane(&fx, 1);
         let mut review = prepared(&fx);
-        let candidate = git(&fx.repo, &["rev-parse", &review.candidate_branch]);
+        let candidate = candidate(&fx, &review);
         // The reviewer can read neither the member's original brief nor its
         // task record. This is not a verdict about the implementation.
         std::fs::write(
@@ -320,7 +371,7 @@ fn evidence_only_cannot_be_used_for_merge_or_member_exclusions() {
     let fx = configured();
     lane(&fx, 1);
     let review = prepared(&fx);
-    let candidate = git(&fx.repo, &["rev-parse", &review.candidate_branch]);
+    let candidate = candidate(&fx, &review);
     let git = Git::new(&fx.world.runner, fx.repo.to_str().unwrap());
     for (n, word, without) in [
         (1, "MERGE", String::new()),
@@ -387,7 +438,7 @@ fn idle_reviewer_warns_once_and_a_new_verdict_lands() {
     assert!(review.notices[0].line.contains("no merge attempted"));
     watch_no_verdict(&fx.world.ctx(), &fx.project, &mut review).unwrap();
     assert_eq!(review.notices.len(), count);
-    let candidate = git(&fx.repo, &["rev-parse", &review.candidate_branch]);
+    let candidate = candidate(&fx, &review);
     seal_verdict(
         &fx,
         &review,
@@ -410,7 +461,7 @@ fn offline_box_does_not_hold_local_task_or_local_pile_in_the_same_project() {
     let fx = configured();
     lane(&fx, 1);
     let review = prepared(&fx);
-    let candidate = git(&fx.repo, &["rev-parse", &review.candidate_branch]);
+    let candidate = candidate(&fx, &review);
     seal_verdict(
         &fx,
         &review,
@@ -490,49 +541,56 @@ fn sleep_does_not_age_the_stuck_review_notice() {
 
 #[test]
 fn follow_up_after_seal_checks_verdict_now_but_waits_to_land() {
-    let fx = configured();
-    lane(&fx, 1);
-    let review = prepared(&fx);
-    let reviewer = review.reviewer.as_deref().unwrap();
-    let candidate = git(&fx.repo, &["rev-parse", &review.candidate_branch]);
-    seal_verdict(
-        &fx,
-        &review,
-        &candidate,
-        "REJECT",
-        BTreeMap::new(),
-        vec![],
-        1,
-    );
-    let seal = crate::events::latest_done_event(&crate::events::list(&fx.project), reviewer, 1)
-        .unwrap()
-        .id
-        .clone();
-    thread::update(&fx.project, reviewer, |lane| {
-        lane.review_after = seal.clone();
-        lane.follow_ups.push(thread::FollowUp {
-            attempt: 1,
-            state: thread::FollowUpState::Delivered,
-            after_seal: seal.clone(),
+    for word in ["REJECT", "MERGE"] {
+        let fx = configured();
+        lane(&fx, 1);
+        let mut review = prepared(&fx);
+        review.gates = vec![project::Gate {
+            command: "printf proof".into(),
             ..Default::default()
-        });
-    })
-    .unwrap();
-    tick(&fx.world.ctx(), &fx.project).unwrap();
-    let checked = load(&fx.project, &review.id).unwrap();
-    assert_eq!(checked.phase, Phase::Reviewing);
-    assert_eq!(checked.checked_event, seal);
-    assert_eq!(checked.verdict.as_ref().unwrap().verdict, "REJECT");
-    thread::update(&fx.project, reviewer, |lane| {
-        lane.review_after.clear();
-        lane.follow_ups[0].state = thread::FollowUpState::Closed;
-    })
-    .unwrap();
-    tick(&fx.world.ctx(), &fx.project).unwrap();
-    assert_eq!(
-        load(&fx.project, &review.id).unwrap().phase,
-        Phase::Rejected
-    );
+        }];
+        save(&fx.project, &review).unwrap();
+        fx.world.runner.on_fn(
+            |cmd| cmd.program == "sh",
+            |cmd| crate::runner::Runner::run(&crate::runner::RealRunner, cmd),
+        );
+        let reviewer = review.reviewer.as_deref().unwrap();
+        let candidate = candidate(&fx, &review);
+        seal_verdict(&fx, &review, &candidate, word, BTreeMap::new(), vec![], 1);
+        let event =
+            crate::events::latest_done_event(&crate::events::list(&fx.project), reviewer, 1)
+                .unwrap()
+                .clone();
+        post_seal_follow_up(&fx, reviewer, &event);
+        let seal = event.id;
+        tick(&fx.world.ctx(), &fx.project).unwrap();
+        let checked = load(&fx.project, &review.id).unwrap();
+        assert_eq!(checked.phase, Phase::Reviewing);
+        assert_eq!(checked.checked_event, seal);
+        assert_eq!(checked.verdict.as_ref().unwrap().verdict, word);
+        let runs = fx.world.runner.count("printf proof");
+        tick(&fx.world.ctx(), &fx.project).unwrap();
+        assert_eq!(fx.world.runner.count("printf proof"), runs);
+        thread::update(&fx.project, reviewer, |lane| {
+            lane.review_after.clear();
+            lane.follow_ups[0].state = thread::FollowUpState::Closed;
+        })
+        .unwrap();
+        tick(&fx.world.ctx(), &fx.project).unwrap();
+        assert_eq!(
+            load(&fx.project, &review.id).unwrap().phase,
+            if word == "REJECT" {
+                Phase::Rejected
+            } else {
+                Phase::Complete
+            }
+        );
+        assert_eq!(
+            fx.world.runner.count("printf proof"),
+            runs,
+            "release reuses the checked seal without executing gates twice"
+        );
+    }
 }
 
 #[test]
@@ -540,7 +598,7 @@ fn sealed_reviewer_verdict_is_checked_in_the_arrival_pass_without_a_local_sessio
     let fx = configured();
     lane(&fx, 1);
     let review = prepared(&fx);
-    let candidate = git(&fx.repo, &["rev-parse", &review.candidate_branch]);
+    let candidate = candidate(&fx, &review);
     seal_verdict(
         &fx,
         &review,
@@ -573,7 +631,7 @@ fn idle_unchanged_follow_up_restores_reviewer_seal_and_verdict_in_same_pass() {
     lane(&fx, 1);
     let review = prepared(&fx);
     let reviewer = review.reviewer.as_deref().unwrap();
-    let candidate = git(&fx.repo, &["rev-parse", &review.candidate_branch]);
+    let candidate = candidate(&fx, &review);
     seal_verdict(
         &fx,
         &review,
@@ -587,31 +645,7 @@ fn idle_unchanged_follow_up_restores_reviewer_seal_and_verdict_in_same_pass() {
         crate::events::latest_done_event(&crate::events::list(&fx.project), reviewer, 1)
             .unwrap()
             .clone();
-    let checkout = thread::load(&fx.project, reviewer).unwrap().worktree_path;
-    let report = thread::artifact(
-        &fx.project,
-        &sealed_event.payload.done.as_ref().unwrap().artifact,
-    )
-    .unwrap();
-    let path = Path::new(&checkout).join(&sealed_event.payload.done.as_ref().unwrap().report_path);
-    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-    std::fs::write(&path, report).unwrap();
-    std::fs::write(
-        fx.repo.join(".git/info/exclude"),
-        ".worktrees/\n.herdr-project/\n.reports/\n",
-    )
-    .unwrap();
-    thread::update(&fx.project, reviewer, |lane| {
-        lane.review_after = sealed_event.id.clone();
-        lane.follow_ups.push(thread::FollowUp {
-            attempt: 1,
-            state: thread::FollowUpState::Delivered,
-            after_seal: sealed_event.id.clone(),
-            delivered_at: "2026-09-18T00:00:00Z".into(),
-            ..Default::default()
-        })
-    })
-    .unwrap();
+    post_seal_follow_up(&fx, reviewer, &sealed_event);
     assert!(
         sealed(
             &crate::events::list(&fx.project),
@@ -686,7 +720,7 @@ fn committed_follow_up_keeps_old_reviewer_seal_void() {
     lane(&fx, 1);
     let review = prepared(&fx);
     let reviewer = review.reviewer.as_deref().unwrap();
-    let candidate = git(&fx.repo, &["rev-parse", &review.candidate_branch]);
+    let candidate = candidate(&fx, &review);
     seal_verdict(
         &fx,
         &review,
@@ -701,30 +735,7 @@ fn committed_follow_up_keeps_old_reviewer_seal_void() {
             .unwrap()
             .clone();
     let checkout = thread::load(&fx.project, reviewer).unwrap().worktree_path;
-    let report = thread::artifact(
-        &fx.project,
-        &sealed_event.payload.done.as_ref().unwrap().artifact,
-    )
-    .unwrap();
-    let path = Path::new(&checkout).join(&sealed_event.payload.done.as_ref().unwrap().report_path);
-    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-    std::fs::write(&path, report).unwrap();
-    std::fs::write(
-        fx.repo.join(".git/info/exclude"),
-        ".worktrees/\n.herdr-project/\n.reports/\n",
-    )
-    .unwrap();
-    thread::update(&fx.project, reviewer, |lane| {
-        lane.review_after = sealed_event.id.clone();
-        lane.follow_ups.push(thread::FollowUp {
-            attempt: 1,
-            state: thread::FollowUpState::Delivered,
-            after_seal: sealed_event.id.clone(),
-            delivered_at: "2026-09-18T00:00:00Z".into(),
-            ..Default::default()
-        })
-    })
-    .unwrap();
+    let path = post_seal_follow_up(&fx, reviewer, &sealed_event);
     std::fs::write(&path, "changed report").unwrap();
     crate::ticker::restore_unchanged_seal(
         &fx.world.ctx(),
@@ -1009,7 +1020,7 @@ fn hand_started_reviewer_role_lands_as_an_ordinary_member() {
         .iter()
         .all(|lane| lane.id != reviewer)
     );
-    let candidate = git(&fx.repo, &["rev-parse", &review.candidate_branch]);
+    let candidate = candidate(&fx, &review);
     seal_verdict(
         &fx,
         &review,
@@ -1046,7 +1057,7 @@ fn whole_pile_lands_pushes_closes_and_prunes_once() {
             .count(),
         1
     );
-    let candidate = git(&fx.repo, &["rev-parse", &review.candidate_branch]);
+    let candidate = candidate(&fx, &review);
     for sha in [a, b] {
         assert!(
             Git::new(fx.world.ctx().runner, &fx.repo)
@@ -1155,12 +1166,8 @@ fn whole_pile_lands_pushes_closes_and_prunes_once() {
     let calls = fx.world.runner.calls.borrow().len();
     advance(&fx.world.ctx(), &fx.project, &mut review).unwrap();
     assert_eq!(fx.world.runner.calls.borrow().len(), calls);
-    assert!(
-        Git::new(fx.world.ctx().runner, &fx.repo)
-            .branch_head(&review.candidate_branch)
-            .unwrap()
-            .is_none()
-    );
+    assert!(review.candidate_branch.is_empty());
+    assert!(git(&fx.repo, &["branch", "--list", "review/*"]).is_empty());
 }
 
 #[test]
@@ -1228,7 +1235,7 @@ fn exclusion_requires_candidate_without_that_lane_and_new_seal_for_next_pile() {
     let (_, a) = lane(&fx, 1);
     let (excluded_lane, _) = lane(&fx, 2);
     let mut review = prepared(&fx);
-    let candidate = git(&fx.repo, &["rev-parse", &review.candidate_branch]);
+    let candidate = candidate(&fx, &review);
     let without = BTreeMap::from([(excluded_lane.clone(), "Needs a follow-up".into())]);
     seal_verdict(
         &fx,
@@ -1316,7 +1323,7 @@ fn merits_reject_needs_follow_ups_and_cancel_releases_unchanged_members() {
     lane(&fx, 1);
     let mut review = prepared(&fx);
     let base = review.base.clone();
-    let candidate = git(&fx.repo, &["rev-parse", &review.candidate_branch]);
+    let candidate = candidate(&fx, &review);
     seal_verdict(
         &fx,
         &review,
@@ -1396,18 +1403,9 @@ fn persisted_landing_without_remote_completes_on_ticker_pass() {
     let fx = configured();
     lane(&fx, 1);
     let mut review = prepared(&fx);
-    let candidate = git(&fx.repo, &["rev-parse", &review.candidate_branch]);
+    let candidate = candidate(&fx, &review);
     review.push_remote = Some(String::new());
-    review.verdict = Some(Verdict {
-        verdict: "MERGE".into(),
-        review: review.id.clone(),
-        candidate: candidate.clone(),
-        without: BTreeMap::new(),
-        gates: vec![],
-        gates_note: String::new(),
-        evidence_only: false,
-    });
-    review.phase = Phase::Landing;
+    landing_verdict(&mut review, &candidate);
     save(&fx.project, &review).unwrap();
     fx.world.runner.calls.borrow_mut().clear();
     tick(&fx.world.ctx(), &fx.project).unwrap();
@@ -1434,18 +1432,9 @@ fn large_landing_shares_every_ticker_pass_with_other_projects_due_work() {
         lane(&fx, n);
     }
     let mut review = prepared(&fx);
-    let candidate = git(&fx.repo, &["rev-parse", &review.candidate_branch]);
+    let candidate = candidate(&fx, &review);
     review.push_remote = Some(String::new());
-    review.verdict = Some(Verdict {
-        verdict: "MERGE".into(),
-        review: review.id.clone(),
-        candidate: candidate.clone(),
-        without: BTreeMap::new(),
-        gates: vec![],
-        gates_note: String::new(),
-        evidence_only: false,
-    });
-    review.phase = Phase::Landing;
+    landing_verdict(&mut review, &candidate);
     save(&fx.project, &review).unwrap();
 
     let other = fx.world.project("other", "b.sock");
@@ -1529,12 +1518,8 @@ fn large_landing_shares_every_ticker_pass_with_other_projects_due_work() {
     assert_eq!(previous, 59); // members plus the reviewer
     assert!(passes > 1);
     assert_eq!(git(&fx.repo, &["rev-parse", "main"]), candidate);
-    assert!(
-        Git::new(ctx.runner, &fx.repo)
-            .branch_head(&review.candidate_branch)
-            .unwrap()
-            .is_none()
-    );
+    assert!(review.candidate_branch.is_empty());
+    assert!(git(&fx.repo, &["branch", "--list", "review/*"]).is_empty());
 }
 
 #[test]
@@ -1600,7 +1585,7 @@ fn landing_verifies_the_push_destination_not_the_box_reviewers_clone() {
                     })
                     .unwrap();
                 }
-                let candidate = git(&fx.repo, &["rev-parse", &review.candidate_branch]);
+                let candidate = candidate(&fx, &review);
                 git(
                     &fx.repo,
                     &[
@@ -1627,16 +1612,7 @@ fn landing_verifies_the_push_destination_not_the_box_reviewers_clone() {
                 review.push_remote = Some(remote.into());
                 review.push = recorded_push;
                 review.install_required = true;
-                review.phase = Phase::Landing;
-                review.verdict = Some(Verdict {
-                    verdict: "MERGE".into(),
-                    review: review.id.clone(),
-                    evidence_only: false,
-                    candidate: candidate.clone(),
-                    without: BTreeMap::new(),
-                    gates: vec![],
-                    gates_note: String::new(),
-                });
+                landing_verdict(&mut review, &candidate);
                 save(&fx.project, &review).unwrap();
                 fx.world.runner.calls.borrow_mut().clear();
                 let error = land_with_install(&fx.world.ctx(), &fx.project, &mut review, || {
@@ -1697,7 +1673,7 @@ fn successful_push_without_remote_candidate_does_not_mark_publication_done() {
     let fx = configured();
     lane(&fx, 1);
     let mut review = prepared(&fx);
-    let candidate = git(&fx.repo, &["rev-parse", &review.candidate_branch]);
+    let candidate = candidate(&fx, &review);
     let published = fx.world.home.path().join("published.git");
     git(
         &fx.repo,
@@ -1710,16 +1686,7 @@ fn successful_push_without_remote_candidate_does_not_mark_publication_done() {
         ],
     );
     review.push_remote = Some(published.to_string_lossy().into_owned());
-    review.verdict = Some(Verdict {
-        evidence_only: false,
-        verdict: "MERGE".into(),
-        review: review.id.clone(),
-        candidate,
-        without: BTreeMap::new(),
-        gates: vec![],
-        gates_note: String::new(),
-    });
-    review.phase = Phase::Landing;
+    landing_verdict(&mut review, &candidate);
     let runner = crate::runner::fake::FakeRunner::new();
     runner.on_fn(
         |cmd| cmd.program == "git" && cmd.args.iter().any(|arg| arg == "push"),
@@ -1748,19 +1715,10 @@ fn configured_remote_failure_is_not_treated_as_local_only() {
     let fx = configured();
     lane(&fx, 1);
     let mut review = prepared(&fx);
-    let candidate = git(&fx.repo, &["rev-parse", &review.candidate_branch]);
+    let candidate = candidate(&fx, &review);
     let remote = fx.world.home.path().join("missing-remote.git");
     review.push_remote = Some(remote.to_string_lossy().into_owned());
-    review.verdict = Some(Verdict {
-        evidence_only: false,
-        verdict: "MERGE".into(),
-        review: review.id.clone(),
-        candidate,
-        without: BTreeMap::new(),
-        gates: vec![],
-        gates_note: String::new(),
-    });
-    review.phase = Phase::Landing;
+    landing_verdict(&mut review, &candidate);
     fx.world.runner.calls.borrow_mut().clear();
     let error = land_with_install(&fx.world.ctx(), &fx.project, &mut review, || {
         Ok(String::new())
@@ -1785,7 +1743,7 @@ fn landing_recovers_ref_before_marker_and_install_failure_without_early_task_don
     let (id, _) = lane(&fx, 1);
     let task = job(&fx, &id);
     let mut review = prepared(&fx);
-    let candidate = git(&fx.repo, &["rev-parse", &review.candidate_branch]);
+    let candidate = candidate(&fx, &review);
     seal_verdict(
         &fx,
         &review,
@@ -1795,16 +1753,7 @@ fn landing_recovers_ref_before_marker_and_install_failure_without_early_task_don
         vec![],
         1,
     );
-    review.verdict = Some(Verdict {
-        verdict: "MERGE".into(),
-        review: review.id.clone(),
-        candidate: candidate.clone(),
-        without: BTreeMap::new(),
-        gates: vec![],
-        gates_note: String::new(),
-        evidence_only: false,
-    });
-    review.phase = Phase::Landing;
+    landing_verdict(&mut review, &candidate);
     review.install_required = true;
     save(&fx.project, &review).unwrap();
     // Crash after git accepted the FF but before fast_forward was recorded.
@@ -1890,17 +1839,8 @@ fn landing_completes_while_a_merged_member_owes_cleanup() {
         .unwrap();
     fx.seal_done(&id, 1, 2, &sha, "[large](large.bin)\n");
     let mut review = prepared(&fx);
-    let candidate = git(&fx.repo, &["rev-parse", &review.candidate_branch]);
-    review.verdict = Some(Verdict {
-        verdict: "MERGE".into(),
-        review: review.id.clone(),
-        candidate,
-        without: BTreeMap::new(),
-        gates: vec![],
-        gates_note: String::new(),
-        evidence_only: false,
-    });
-    review.phase = Phase::Landing;
+    let candidate = candidate(&fx, &review);
+    landing_verdict(&mut review, &candidate);
     save(&fx.project, &review).unwrap();
     land_with_install(&fx.world.ctx(), &fx.project, &mut review, || {
         Ok(String::new())
@@ -1919,7 +1859,7 @@ fn moved_tip_refreshes_same_reviewer_once_then_releases_for_fresh_review() {
     lane(&fx, 1);
     let mut review = prepared(&fx);
     let reviewer = review.reviewer.clone();
-    let candidate = git(&fx.repo, &["rev-parse", &review.candidate_branch]);
+    let candidate = candidate(&fx, &review);
     let tip = commit_file(&fx.repo, "other.txt", "other", "integration moved");
     seal_verdict(
         &fx,
@@ -1954,6 +1894,19 @@ fn moved_tip_refreshes_same_reviewer_once_then_releases_for_fresh_review() {
         vec![],
         2,
     );
+    let event = crate::events::latest_done_event(&crate::events::list(&fx.project), &lane.id, 1)
+        .unwrap()
+        .clone();
+    post_seal_follow_up(&fx, &lane.id, &event);
+    advance(&fx.world.ctx(), &fx.project, &mut review).unwrap();
+    assert_eq!(review.checked_event, event.id);
+    assert_ne!(review.verdict_event, event.id);
+    assert_eq!(review.phase, Phase::Reviewing);
+    thread::update(&fx.project, &lane.id, |t| {
+        t.review_after.clear();
+        t.follow_ups[0].state = thread::FollowUpState::Closed;
+    })
+    .unwrap();
     commit_file(&fx.repo, "again.txt", "again", "integration moved twice");
     save(&fx.project, &review).unwrap();
     advance(&fx.world.ctx(), &fx.project, &mut review).unwrap();
@@ -2292,7 +2245,7 @@ fn required_criterion_rows_missing_partial_or_empty_cannot_merge_despite_passing
         |cmd| cmd.program == "sh",
         |cmd| crate::runner::Runner::run(&crate::runner::RealRunner, cmd),
     );
-    let candidate = git(&fx.repo, &["rev-parse", &review.candidate_branch]);
+    let candidate = candidate(&fx, &review);
     let partial = criterion_reason(&id, &review.members[0].event, &task.acceptance[0], false);
     let empty = criterion_reason(&id, &review.members[0].event, &task.acceptance[0], true).replace(
         "immutable report artifact and inspected source coverage",
@@ -2356,7 +2309,7 @@ fn landing_retry_cannot_use_declared_exits_or_missing_logs_as_execution_proof() 
         command: "printf proof".into(),
         ..Default::default()
     }];
-    let candidate = git(&fx.repo, &["rev-parse", &review.candidate_branch]);
+    let candidate = candidate(&fx, &review);
     seal_verdict(
         &fx,
         &review,
@@ -2374,16 +2327,7 @@ fn landing_retry_cannot_use_declared_exits_or_missing_logs_as_execution_proof() 
     let event = sealed(&events, &reviewer).unwrap();
     // Simulate an old cached landing verdict whose only proof was exit=0.
     review.verdict_event = event.id.clone();
-    review.verdict = Some(Verdict {
-        evidence_only: false,
-        verdict: "MERGE".into(),
-        review: review.id.clone(),
-        candidate: candidate.clone(),
-        without: BTreeMap::new(),
-        gates: vec![],
-        gates_note: String::new(),
-    });
-    review.phase = Phase::Landing;
+    landing_verdict(&mut review, &candidate);
     assert!(
         land_with_install(&fx.world.ctx(), &fx.project, &mut review, || Ok(
             String::new()
@@ -2466,7 +2410,7 @@ fn incomplete_capture_with_exit_zero_is_not_a_passing_receipt() {
         command: "checker".into(),
         ..Default::default()
     }];
-    let candidate = git(&fx.repo, &["rev-parse", &review.candidate_branch]);
+    let candidate = candidate(&fx, &review);
     let mut ctx = fx.world.ctx();
     ctx.runner = &Incomplete;
     let git = Git::new(ctx.runner, &review.repo);
@@ -2492,7 +2436,7 @@ fn passing_receipt_records_environment_candidate_and_full_logs_and_invalidates_o
         ..Default::default()
     };
     review.gates = vec![gate.clone()];
-    let candidate = git(&fx.repo, &["rev-parse", &review.candidate_branch]);
+    let candidate = candidate(&fx, &review);
     let mut ctx = fx.world.ctx();
     ctx.runner = &crate::runner::RealRunner;
     let git = Git::new(ctx.runner, &review.repo);
@@ -2544,7 +2488,7 @@ fn gate_free_and_allowlist_exclusions_are_visible_not_silently_broadened() {
     let fx = configured();
     lane(&fx, 1);
     let mut review = prepared(&fx);
-    let candidate = git(&fx.repo, &["rev-parse", &review.candidate_branch]);
+    let candidate = candidate(&fx, &review);
     let git = Git::new(&fx.world.runner, &review.repo);
     review.gates = vec![project::Gate {
         command: "never run".into(),
@@ -2587,7 +2531,7 @@ fn checker_timeout_and_spawn_errors_are_unknown_not_pass_or_work_failure() {
         command: "checker".into(),
         ..Default::default()
     }];
-    let candidate = git(&fx.repo, &["rev-parse", &review.candidate_branch]);
+    let candidate = candidate(&fx, &review);
     let git = Git::new(&fx.world.runner, &review.repo);
     let failure =
         observed_gates(&fx.world.ctx(), &fx.project, &review, &candidate, &git).unwrap_err();
@@ -2619,7 +2563,7 @@ fn receipt_capture_keeps_full_large_logs_instead_of_treating_clipping_as_pass() 
         command: "head -c 2097152 /dev/zero".into(),
         ..Default::default()
     }];
-    let candidate = git(&fx.repo, &["rev-parse", &review.candidate_branch]);
+    let candidate = candidate(&fx, &review);
     let mut ctx = fx.world.ctx();
     ctx.runner = &crate::runner::RealRunner;
     let git = Git::new(ctx.runner, &review.repo);
