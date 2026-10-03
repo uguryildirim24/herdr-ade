@@ -1,6 +1,5 @@
 //! Adopting an already-running local agent pane into a project.
 
-use std::path::Path;
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
@@ -48,7 +47,23 @@ pub(crate) fn adoptable_agent(ctx: &Ctx, herdr: &Herdr, socket: &str, pane: &str
             bail!("pane {pane} is already thread {} of `{slug}`", t.id);
         }
     }
+    require_non_git_cwd(ctx, &agent.cwd)?;
     Ok(agent)
+}
+
+fn require_non_git_cwd(ctx: &Ctx, cwd: &str) -> Result<()> {
+    let out = ctx
+        .runner
+        .run(&Cmd::new("git", Duration::from_secs(5)).args([
+            "-C",
+            cwd,
+            "rev-parse",
+            "--show-toplevel",
+        ]))?;
+    if out.success() {
+        bail!("Git-backed adoption is not supported; start a lane with `thread start` instead");
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, Default)]
@@ -84,41 +99,18 @@ pub(crate) fn adopt(
     let record = project
         .coordinator()
         .with_context(|| format!("`{slug}` has never been opened; run `open {slug}` first"))?;
-    ticker::start(ctx)?;
     let herdr = Herdr::new(ctx.env.herdr_bin(), &record.socket, ctx.runner);
     let agent = adoptable_agent(ctx, &herdr, &record.socket, pane)?;
+    ticker::start(ctx)?;
     // Adoption records the process already running; it never selects a model.
     let spec = crate::contracts::RoleSpec {
         kind: agent.agent.clone(),
         ..Default::default()
     };
 
-    // The pane's repository and branch, when it is in one.
-    let git = |args: &[&str]| -> Option<String> {
-        let out = ctx
-            .runner
-            .run(
-                &Cmd::new("git", Duration::from_secs(5))
-                    .args(["-C", &agent.cwd])
-                    .args(args.iter().copied()),
-            )
-            .ok()?;
-        out.success()
-            .then(|| out.stdout.trim().to_string())
-            .filter(|s| !s.is_empty())
-    };
-    let repo = git(&["rev-parse", "--show-toplevel"]).unwrap_or_default();
-    let branch = git(&["rev-parse", "--abbrev-ref", "HEAD"])
-        .filter(|b| b != "HEAD")
-        .unwrap_or_default();
-    let origin = git(&["remote", "get-url", "origin"]).unwrap_or_default();
-
     let created = thread::allocate(&project, |t| {
         t.title = title.trim().to_string();
         t.kind = Kind::Adopted;
-        t.repo = repo;
-        t.branch = branch;
-        t.origin = origin;
         t.agent = agent.agent.clone();
         // Not started by the binary: whatever name herdr reports, possibly empty.
         t.agent_name = agent.name.clone();
@@ -153,47 +145,29 @@ pub(crate) fn adopt(
             )?;
         }
         let prefix = crate::coordinator::current_prefix(&ctx.root)?;
-        if created.repo.is_empty() {
-            // An adopted process cannot have its cwd replaced, but all of its
-            // durable work lives in the same project-owned git folder as a
-            // newly started no-repository thread. `done` stages this folder.
-            let folder = thread::threads_dir_for_write(&project)?.join(&id);
-            let with_dir = Thread {
-                worktree_path: folder.to_string_lossy().into_owned(),
-                thread_dir: folder.to_string_lossy().into_owned(),
-                ..created.clone()
-            };
-            let brief = thread::with_lane_skill(
-                &prefix,
-                &thread::brief_for(&project, &with_dir, &task, false)?,
-            );
-            let (folder, hash, base) =
-                threads::prepare_managed_git_folder(ctx.runner, &folder, &brief)?;
-            let folder = folder.to_string_lossy().into_owned();
-            thread::update(&project, &id, |t| {
-                t.worktree_path = folder.clone();
-                t.thread_dir = folder;
-                t.branch = "main".into();
-                t.base = base;
-                t.launch.brief_hash = hash;
-            })?;
-        } else {
-            // An adopted process already in a code repository keeps its
-            // per-thread report directory out of that repository.
-            let dir = thread::thread_dir(&agent.cwd, slug, &id);
-            let with_dir = Thread {
-                thread_dir: dir.clone(),
-                ..created.clone()
-            };
-            let brief = thread::with_lane_skill(
-                &prefix,
-                &thread::brief_for(&project, &with_dir, &task, false)?,
-            );
-            std::fs::create_dir_all(&dir).with_context(|| format!("could not create {dir}"))?;
-            threads::exclude_from_git(ctx.runner, &agent.cwd)?;
-            project::write_atomic(&Path::new(&dir).join("brief.md"), brief.as_bytes())?;
-            thread::update(&project, &id, |t| t.thread_dir = dir)?;
-        }
+        // An adopted process cannot have its cwd replaced, but all of its
+        // durable work lives in the same project-owned git folder as a
+        // newly started no-repository thread. `done` stages this folder.
+        let folder = thread::threads_dir_for_write(&project)?.join(&id);
+        let with_dir = Thread {
+            worktree_path: folder.to_string_lossy().into_owned(),
+            thread_dir: folder.to_string_lossy().into_owned(),
+            ..created.clone()
+        };
+        let brief = thread::with_lane_skill(
+            &prefix,
+            &thread::brief_for(&project, &with_dir, &task, false)?,
+        );
+        let (folder, hash, base) =
+            threads::prepare_managed_git_folder(ctx.runner, &folder, &brief)?;
+        let folder = folder.to_string_lossy().into_owned();
+        thread::update(&project, &id, |t| {
+            t.worktree_path = folder.clone();
+            t.thread_dir = folder;
+            t.branch = "main".into();
+            t.base = base;
+            t.launch.brief_hash = hash;
+        })?;
         Ok(())
     })();
     if let Err(error) = briefed {
@@ -301,35 +275,10 @@ pub(crate) fn adopt_workspace(ctx: &Ctx, args: &AdoptWorkspace) -> Result<()> {
         bail!("`{slug}` already exists in {}", ctx.root.display());
     }
 
-    // repo = the workspace's directory when that is a git repository.
-    let cwd = if args.workspace_cwd.is_empty() {
-        agent.cwd.clone()
-    } else {
-        args.workspace_cwd.clone()
-    };
-    let is_repo = ctx
-        .runner
-        .run(&Cmd::new("git", Duration::from_secs(5)).args([
-            "-C",
-            &cwd,
-            "rev-parse",
-            "--show-toplevel",
-        ]))
-        .ok()
-        .filter(|o| o.success())
-        .map(|o| o.stdout.trim().to_string())
-        .filter(|s| !s.is_empty());
-    let repos = is_repo
-        .map(|path| {
-            vec![project::Repo {
-                path,
-                machine: None,
-                ..project::Repo::default()
-            }]
-        })
-        .unwrap_or_default();
-
-    let project = project::create(&ctx.root, &args.name, &args.goal, repos)?;
+    if !args.workspace_cwd.is_empty() && args.workspace_cwd != agent.cwd {
+        require_non_git_cwd(ctx, &args.workspace_cwd)?;
+    }
+    let project = project::create(&ctx.root, &args.name, &args.goal, vec![])?;
     println!("created `{}` at {}", project.slug, project.dir().display());
     coordinator::open(
         ctx,
@@ -366,6 +315,7 @@ mod tests {
     use crate::runner::Runner;
     use crate::runner::fake::ok;
     use crate::scenarios::{World, agent_json};
+    use std::path::Path;
 
     fn lane() -> AdeAdopt {
         AdeAdopt::default()
@@ -504,6 +454,34 @@ mod tests {
         };
         assert!(adopt_workspace(&world.ctx(), &args).is_err());
         assert!(!world.root.join("from-workspace").exists());
+    }
+
+    #[test]
+    fn git_cwd_cannot_be_adopted_or_create_a_project() {
+        let (world, project, cwd) = world_with_agent("idle", "my-agent");
+        crate::runner::RealRunner
+            .run(&Cmd::new("git", Duration::from_secs(5)).args(["-C", &cwd, "init"]))
+            .unwrap();
+        let error = adopt(&world.ctx(), "demo", "w5:p1", "Code", None, lane()).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("Git-backed adoption is not supported")
+        );
+        assert!(thread::list(&project).is_empty());
+        let args = AdoptWorkspace {
+            name: "From Workspace".into(),
+            goal: String::new(),
+            pane: "w5:p1".into(),
+            workspace_cwd: cwd,
+            session: SessionFlags {
+                session: None,
+                socket: Some(world.home.path().join("a.sock")),
+            },
+        };
+        assert!(adopt_workspace(&world.ctx(), &args).is_err());
+        assert!(!world.root.join("from-workspace").exists());
+        assert_eq!(world.runner.count("agent prompt"), 0);
     }
 
     #[test]

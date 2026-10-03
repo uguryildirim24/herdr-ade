@@ -1,6 +1,6 @@
 //! pause, resume, archive, unarchive and delete.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -227,16 +227,93 @@ fn other_projects_using_path(others: &[OtherProjectOwnership], path: &Path) -> V
         .collect()
 }
 
-fn trash(ctx: &Ctx, path: &Path, what: &str) -> Result<()> {
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Trash {
+    Mac,
+    Gio,
+    Put,
+}
+
+impl Trash {
+    fn probe_script(platform: &str) -> Result<&'static str> {
+        match platform {
+            "macos" => Ok("test -x /usr/bin/trash && printf /usr/bin/trash"),
+            "linux" => Ok(
+                "if command -v gio >/dev/null 2>&1; then printf gio; elif command -v trash-put >/dev/null 2>&1; then printf trash-put; else exit 1; fi",
+            ),
+            _ => bail!("system trash is not supported on {platform}"),
+        }
+    }
+
+    fn from_probe(out: &crate::runner::Output) -> Result<Self> {
+        if out.success() {
+            match out.stdout.trim() {
+                "/usr/bin/trash" => return Ok(Self::Mac),
+                "gio" => return Ok(Self::Gio),
+                "trash-put" => return Ok(Self::Put),
+                _ => {}
+            }
+        }
+        bail!(
+            "system trash is unavailable: macOS needs /usr/bin/trash; Linux needs gio or trash-put; nothing was deleted"
+        )
+    }
+
+    fn local(ctx: &Ctx) -> Result<Self> {
+        let script = Self::probe_script(std::env::consts::OS)?;
+        let out = ctx
+            .runner
+            .run(&Cmd::new("sh", Duration::from_secs(5)).args(["-c", script]))?;
+        Self::from_probe(&out)
+    }
+
+    fn remote(ctx: &Ctx, machine: &str) -> Result<Self> {
+        let profile =
+            remote::machine_profile(ctx.runner, &ctx.env.herdr_bin(), &ctx.config_dir, machine)?;
+        let script = format!(
+            "case \"$(uname -s)\" in Darwin) {} ;; Linux) {} ;; *) exit 1 ;; esac",
+            Self::probe_script("macos")?,
+            Self::probe_script("linux")?,
+        );
+        let out = remote::ssh(
+            ctx.runner,
+            &profile.target,
+            &script,
+            None,
+            Duration::from_secs(10),
+        )?;
+        Self::from_probe(&out).map_err(|error| anyhow::anyhow!("on {machine}: {error}"))
+    }
+
+    fn program(self) -> &'static str {
+        match self {
+            Self::Mac => "/usr/bin/trash",
+            Self::Gio => "gio",
+            Self::Put => "trash-put",
+        }
+    }
+
+    fn args(self) -> &'static [&'static str] {
+        match self {
+            Self::Mac => &[],
+            Self::Gio => &["trash", "--"],
+            Self::Put => &["--"],
+        }
+    }
+}
+
+fn trash(ctx: &Ctx, tool: Trash, path: &Path, what: &str) -> Result<()> {
     if !path.exists() {
         return Ok(());
     }
-    let out = ctx
-        .runner
-        .run(&Cmd::new("/usr/bin/trash", Duration::from_secs(60)).arg(path.to_string_lossy()))?;
+    let out = ctx.runner.run(
+        &Cmd::new(tool.program(), Duration::from_secs(60))
+            .args(tool.args().iter().copied())
+            .arg(path.to_string_lossy()),
+    )?;
     if !out.success() {
         bail!(
-            "could not move {} to the macOS Trash: {}",
+            "could not move {} to the system trash: {}",
             path.display(),
             out.error_text()
         );
@@ -262,7 +339,7 @@ fn old_copy_for_slug(name: &str, slug: &str) -> bool {
             .all(|(index, byte)| matches!(index, 8 | 15) || byte.is_ascii_digit())
 }
 
-fn clean_old_trash(ctx: &Ctx, slug: &str) -> Result<()> {
+fn clean_old_trash(ctx: &Ctx, tool: Trash, slug: &str) -> Result<()> {
     let holding = ctx.root.join(".trash");
     let entries = match std::fs::read_dir(&holding) {
         Ok(entries) => entries,
@@ -278,7 +355,7 @@ fn clean_old_trash(ctx: &Ctx, slug: &str) -> Result<()> {
             .to_str()
             .is_some_and(|name| old_copy_for_slug(name, slug))
         {
-            trash(ctx, &entry.path(), "old copy of this project")?;
+            trash(ctx, tool, &entry.path(), "old copy of this project")?;
         } else {
             kept = true;
             println!(
@@ -293,7 +370,7 @@ fn clean_old_trash(ctx: &Ctx, slug: &str) -> Result<()> {
             holding.display()
         );
     } else {
-        trash(ctx, &holding, "empty old trash holding folder")?;
+        trash(ctx, tool, &holding, "empty old trash holding folder")?;
     }
     Ok(())
 }
@@ -399,13 +476,18 @@ fn prune_local_worktrees(ctx: &Ctx, repo: &str) -> Result<()> {
     Ok(())
 }
 
-fn remote_remove(ctx: &Ctx, machine: &str, path: &str, what: &str) -> Result<()> {
+fn remote_remove(ctx: &Ctx, tool: Trash, machine: &str, path: &str, what: &str) -> Result<()> {
     if !Path::new(path).is_absolute() || path == "/" {
         bail!("refusing to remove unsafe box path `{path}`");
     }
     let profile =
         remote::machine_profile(ctx.runner, &ctx.env.herdr_bin(), &ctx.config_dir, machine)?;
-    let script = format!("rm -rf -- {}", remote::quote(path));
+    let quoted = remote::quote(path);
+    let script = format!(
+        "if [ -e {quoted} ] || [ -L {quoted} ]; then {} {} {quoted}; fi",
+        tool.program(),
+        tool.args().join(" "),
+    );
     let out = remote::ssh(
         ctx.runner,
         &profile.target,
@@ -489,7 +571,7 @@ fn close_tab(herdr: &Herdr<'_>, tab: &str, label: &str) -> Result<()> {
 }
 
 /// Permanently removes a project and everything attributable only to it.
-/// Local files go through macOS Trash; `archive` is the reversible operation.
+/// Files go through the platform trash; `archive` keeps the project records.
 pub(crate) fn delete(ctx: &Ctx, slug: &str, delete_github: bool, preview: bool) -> Result<()> {
     let project = Project::load(&ctx.root, slug)?;
     let (settings, _) = project.read_project_md()?;
@@ -534,6 +616,49 @@ pub(crate) fn delete(ctx: &Ctx, slug: &str, delete_github: bool, preview: bool) 
             }
         );
         return Ok(());
+    }
+
+    let owned_repos: Vec<_> = settings
+        .repos
+        .iter()
+        .filter_map(|repo| {
+            let users = other_projects_using_repo(&others, repo);
+            if users.is_empty() {
+                Some(repo.clone())
+            } else {
+                println!(
+                    "kept shared repo {} (also listed by {})",
+                    repo.path,
+                    users.join(", ")
+                );
+                None
+            }
+        })
+        .collect();
+
+    // Check every affected machine before recording intent, closing panes,
+    // deleting GitHub repositories or moving any file.
+    let local_trash = Trash::local(ctx)?;
+    let mut remote_machines = BTreeSet::new();
+    for repo in &owned_repos {
+        if repo.box_path.is_some() {
+            remote_machines.extend(machines_for_repo(ctx, repo, &threads)?);
+        }
+    }
+    for lane in &threads {
+        if lane.is_remote()
+            && !lane.worktree_path.is_empty()
+            && other_projects_using_path(&others, Path::new(&lane.worktree_path)).is_empty()
+            && !owned_repos
+                .iter()
+                .any(|repo| Path::new(&lane.worktree_path).starts_with(&repo.path))
+        {
+            remote_machines.insert(lane.machine_route().to_string());
+        }
+    }
+    let mut remote_trash = BTreeMap::new();
+    for machine in remote_machines {
+        remote_trash.insert(machine.clone(), Trash::remote(ctx, &machine)?);
     }
 
     let intent_path = project.state_dir().join("delete.toml");
@@ -625,20 +750,6 @@ pub(crate) fn delete(ctx: &Ctx, slug: &str, delete_github: bool, preview: bool) 
         println!("cancelled review: {review}");
     }
 
-    let mut owned_repos = Vec::new();
-    for repo in &settings.repos {
-        let users = other_projects_using_repo(&others, repo);
-        if users.is_empty() {
-            owned_repos.push(repo.clone());
-        } else {
-            println!(
-                "kept shared repo {} (also listed by {})",
-                repo.path,
-                users.join(", ")
-            );
-        }
-    }
-
     // A shared checkout stays, but this project's worktrees do not.
     for record in &threads {
         if record.worktree_path.is_empty() {
@@ -663,6 +774,7 @@ pub(crate) fn delete(ctx: &Ctx, slug: &str, delete_github: bool, preview: bool) 
         if record.is_remote() {
             remote_remove(
                 ctx,
+                remote_trash[record.machine_route()],
                 record.machine_route(),
                 &record.worktree_path,
                 "project worktree",
@@ -675,7 +787,7 @@ pub(crate) fn delete(ctx: &Ctx, slug: &str, delete_github: bool, preview: bool) 
                 prune_remote_worktrees(ctx, record.machine_route(), box_repo)?;
             }
         } else {
-            trash(ctx, path, "project worktree")?;
+            trash(ctx, local_trash, path, "project worktree")?;
             prune_local_worktrees(ctx, &record.repo)?;
         }
     }
@@ -755,13 +867,20 @@ pub(crate) fn delete(ctx: &Ctx, slug: &str, delete_github: bool, preview: bool) 
     for repo in &owned_repos {
         trash(
             ctx,
+            local_trash,
             Path::new(&repo.path),
             "project repo (including worktrees)",
         )?;
         if let Some(box_path) = &repo.box_path {
             for machine in machines_for_repo(ctx, repo, &threads)? {
                 if removed_box_repos.insert((machine.clone(), box_path.clone())) {
-                    remote_remove(ctx, &machine, box_path, "box repo (including worktrees)")?;
+                    remote_remove(
+                        ctx,
+                        remote_trash[&machine],
+                        &machine,
+                        box_path,
+                        "box repo (including worktrees)",
+                    )?;
                 }
             }
         }
@@ -802,7 +921,7 @@ pub(crate) fn delete(ctx: &Ctx, slug: &str, delete_github: bool, preview: bool) 
         if let Ok(entries) = std::fs::read_dir(base) {
             for entry in entries.flatten() {
                 if exact_names.contains(entry.file_name().to_string_lossy().as_ref()) {
-                    trash(ctx, &entry.path(), "agent session logs")?;
+                    trash(ctx, local_trash, &entry.path(), "agent session logs")?;
                 }
             }
         }
@@ -813,14 +932,14 @@ pub(crate) fn delete(ctx: &Ctx, slug: &str, delete_github: bool, preview: bool) 
     // holding folder goes only when no retained copy still needs it. Do this
     // before the project record: a cleanup failure must leave the deletion
     // intent available for retry.
-    clean_old_trash(ctx, slug)?;
+    clean_old_trash(ctx, local_trash, slug)?;
 
     {
         // No project writer can land after this point. The trash command moves
         // the directory atomically on macOS, while the open lock inode remains
         // valid until this scope ends.
         let _lock = project.lock()?;
-        trash(ctx, &project.dir(), "project record")?;
+        trash(ctx, local_trash, &project.dir(), "project record")?;
     }
     Ok(())
 }
@@ -830,6 +949,138 @@ mod tests {
     use super::*;
     use crate::runner::fake::ok;
     use crate::scenarios::World;
+
+    fn system_trash() -> &'static str {
+        if cfg!(target_os = "macos") {
+            "/usr/bin/trash"
+        } else {
+            "gio"
+        }
+    }
+
+    fn trash_calls(world: &World) -> usize {
+        world
+            .runner
+            .calls
+            .borrow()
+            .iter()
+            .filter(|call| call.program == system_trash())
+            .count()
+    }
+
+    fn mock_trash(world: &World) {
+        let script = Trash::probe_script(std::env::consts::OS).unwrap();
+        world.runner.on_fn(
+            move |cmd| cmd.program == "sh" && cmd.args == ["-c", script],
+            |_| Ok(ok(system_trash())),
+        );
+        world
+            .runner
+            .on_fn(|cmd| cmd.program == system_trash(), |_| Ok(ok("")));
+    }
+
+    #[test]
+    fn platform_trash_selection_and_missing_tool() {
+        use crate::runner::{RealRunner, Runner};
+        let dir = tempfile::tempdir().unwrap();
+        let script = Trash::probe_script("linux").unwrap();
+        let probe = || {
+            RealRunner
+                .run(
+                    &Cmd::new("/bin/sh", Duration::from_secs(5))
+                        .args(["-c", script])
+                        .env("PATH", dir.path().to_string_lossy()),
+                )
+                .unwrap()
+        };
+        assert!(Trash::from_probe(&probe()).is_err());
+        for (name, expected) in [("trash-put", Trash::Put), ("gio", Trash::Gio)] {
+            let path = dir.path().join(name);
+            std::fs::write(&path, "#!/bin/sh\nexit 0\n").unwrap();
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+            }
+            assert_eq!(Trash::from_probe(&probe()).unwrap(), expected);
+        }
+        assert_eq!(
+            Trash::probe_script("macos").unwrap(),
+            "test -x /usr/bin/trash && printf /usr/bin/trash"
+        );
+        assert_eq!(
+            Trash::from_probe(&ok("/usr/bin/trash")).unwrap(),
+            Trash::Mac
+        );
+    }
+
+    #[test]
+    fn missing_trash_refuses_before_any_effect() {
+        let world = World::new();
+        let project = world.project("demo", "a.sock");
+        world.runner.on_fn(
+            |cmd| cmd.program == "sh",
+            |_| Ok(crate::runner::fake::fail(1, "")),
+        );
+        let error = delete(&world.ctx(), "demo", true, false).unwrap_err();
+        assert!(error.to_string().contains("system trash is unavailable"));
+        assert!(!project.state_dir().join("delete.toml").exists());
+        assert!(project.project_md().exists());
+        assert_eq!(world.runner.count("workspace close"), 0);
+        assert_eq!(world.runner.count("gh repo delete"), 0);
+        assert_eq!(trash_calls(&world), 0);
+    }
+
+    #[test]
+    fn remote_trash_is_checked_before_effects_and_never_uses_rm() {
+        for available in [false, true] {
+            let world = World::new();
+            let project = world.project("demo", "a.sock");
+            world.thread(&project, world.home.path(), |t| {
+                t.machine = "box".into();
+                t.worktree_path = "/home/agent/projects/lane".into();
+            });
+            mock_trash(&world);
+            world.runner.on("machine list", ok("[]"));
+            world.runner.on_fn(
+                |cmd| cmd.program == "ssh",
+                move |cmd| {
+                    if cmd.display().contains("uname -s") {
+                        Ok(if available {
+                            ok("gio")
+                        } else {
+                            crate::runner::fake::fail(1, "")
+                        })
+                    } else {
+                        Ok(ok(""))
+                    }
+                },
+            );
+            let result = delete(&world.ctx(), "demo", false, false);
+            if available {
+                result.unwrap();
+                assert!(world.runner.calls.borrow().iter().any(|cmd| {
+                    cmd.program == "ssh"
+                        && cmd.display().contains("gio trash --")
+                        && cmd.display().contains("/home/agent/projects/lane")
+                }));
+            } else {
+                let error = result.unwrap_err();
+                assert!(error.to_string().contains("on box"), "{error:#}");
+                assert!(!project.state_dir().join("delete.toml").exists());
+                assert_eq!(world.runner.count("workspace close"), 0);
+                assert_eq!(trash_calls(&world), 0);
+            }
+            assert!(
+                !world
+                    .runner
+                    .calls
+                    .borrow()
+                    .iter()
+                    .any(|cmd| cmd.display().contains("rm -rf"))
+            );
+        }
+    }
 
     #[test]
     fn delete_stops_everything_and_uses_the_system_trash() {
@@ -845,13 +1096,13 @@ mod tests {
             world.coordinator_pane(&project),
             crate::scenarios::pane_json("w2", "w2:t1", "w2:p1", &thread.cwd)
         );
-        world.runner.on("/usr/bin/trash", ok(""));
+        mock_trash(&world);
 
         delete(&world.ctx(), "demo", false, false).unwrap();
 
         assert_eq!(world.runner.count("workspace close w1"), 1);
         assert!(world.runner.count("tab close") + world.runner.count("workspace close w2") >= 1);
-        assert_eq!(world.runner.count("/usr/bin/trash"), 1);
+        assert_eq!(trash_calls(&world), 1);
         assert_eq!(world.runner.count("gh repo delete"), 0);
     }
 
@@ -864,7 +1115,7 @@ mod tests {
 
         assert!(project.project_md().is_file());
         assert!(!project.state_dir().join("delete.toml").exists());
-        assert_eq!(world.runner.count("/usr/bin/trash"), 0);
+        assert_eq!(trash_calls(&world), 0);
         assert_eq!(world.runner.count("workspace close"), 0);
     }
 
@@ -895,13 +1146,13 @@ mod tests {
             }],
         )
         .unwrap();
-        world.runner.on("/usr/bin/trash", ok(""));
+        mock_trash(&world);
 
         delete(&world.ctx(), &first.slug, false, false).unwrap();
 
         let calls = world.runner.calls.borrow();
         assert!(!calls.iter().any(|call| {
-            call.program == "/usr/bin/trash"
+            call.program == system_trash()
                 && call
                     .args
                     .iter()
@@ -925,10 +1176,10 @@ mod tests {
             }],
         )
         .unwrap();
-        world.runner.on("/usr/bin/trash", ok(""));
+        mock_trash(&world);
 
         assert!(delete(&world.ctx(), "demo", false, false).is_err());
-        assert_eq!(world.runner.count("/usr/bin/trash"), 0);
+        assert_eq!(trash_calls(&world), 0);
         assert!(!project.state_dir().join("delete.toml").exists());
     }
 
@@ -962,13 +1213,13 @@ mod tests {
             }],
         )
         .unwrap();
-        world.runner.on("/usr/bin/trash", ok(""));
+        mock_trash(&world);
 
         delete(&world.ctx(), "first", true, false).unwrap();
 
         assert_eq!(world.runner.count("gh repo delete"), 0);
         assert!(world.runner.calls.borrow().iter().any(|call| {
-            call.program == "/usr/bin/trash"
+            call.program == system_trash()
                 && call
                     .args
                     .iter()
@@ -1002,7 +1253,7 @@ mod tests {
             },
         );
         world.runner.on("gh repo delete", ok(""));
-        world.runner.on("/usr/bin/trash", ok(""));
+        mock_trash(&world);
 
         delete(&world.ctx(), "demo", true, false).unwrap();
 
@@ -1071,7 +1322,7 @@ mod tests {
                     crate::runner::fake::fail(2, "no origin")
                 },
             );
-            world.runner.on("/usr/bin/trash", ok(""));
+            mock_trash(&world);
 
             delete(&world.ctx(), "first", true, false).unwrap();
 
@@ -1109,7 +1360,7 @@ mod tests {
         }
         crate::project::create(&world.root, "demo", "", repos).unwrap();
         world.runner.on("gh repo delete acme/delete --yes", ok(""));
-        world.runner.on("/usr/bin/trash", ok(""));
+        mock_trash(&world);
 
         delete(&world.ctx(), "demo", true, false).unwrap();
 
@@ -1127,20 +1378,20 @@ mod tests {
         let other = holding.join("demo-other-20260901T000000Z");
         std::fs::create_dir_all(&own).unwrap();
         std::fs::create_dir_all(&other).unwrap();
-        world.runner.on("/usr/bin/trash", ok(""));
+        mock_trash(&world);
 
         delete(&world.ctx(), "demo", false, false).unwrap();
 
         let calls = world.runner.calls.borrow();
         assert!(calls.iter().any(|call| {
-            call.program == "/usr/bin/trash"
+            call.program == system_trash()
                 && call
                     .args
                     .iter()
                     .any(|arg| arg == &own.display().to_string())
         }));
         assert!(!calls.iter().any(|call| {
-            call.program == "/usr/bin/trash"
+            call.program == system_trash()
                 && call.args.iter().any(|arg| {
                     arg == &other.display().to_string() || arg == &holding.display().to_string()
                 })
@@ -1195,7 +1446,7 @@ mod tests {
         std::fs::create_dir_all(&claude_session).unwrap();
 
         world.runner.on("gh repo delete acme/demo --yes", ok(""));
-        world.runner.on("/usr/bin/trash", ok(""));
+        mock_trash(&world);
 
         delete(&world.ctx(), "demo", true, false).unwrap();
 
@@ -1203,7 +1454,7 @@ mod tests {
         let calls = world.runner.calls.borrow();
         for path in [repo, pi_session, claude_session] {
             assert!(calls.iter().any(|call| {
-                call.program == "/usr/bin/trash"
+                call.program == system_trash()
                     && call
                         .args
                         .iter()
