@@ -16,6 +16,8 @@ use crate::project::{Repo, Settings};
 use crate::remote;
 use crate::runner::Cmd;
 
+pub(crate) mod check;
+
 /// The plugin build's tool path, exactly as the coordinator uses it by hand.
 pub(crate) const DEVELOPER_DIR: &str = "/Library/Developer/CommandLineTools";
 
@@ -249,6 +251,7 @@ pub(crate) struct InstallOutcome {
     pub(crate) tasks: Vec<TaskInstallProof>,
     pub(crate) coordinator_hooks: Vec<String>,
     pub(crate) warnings: Vec<String>,
+    pub(crate) checks: check::InstallCheck,
 }
 
 impl InstallOutcome {
@@ -310,7 +313,12 @@ impl InstallOutcome {
         if self.live_handoff_required {
             message.push_str("the running server keeps its image; live handoff pending\n");
         }
+        message.push_str(&format!("{}\n", self.checks.result));
         message
+    }
+
+    pub(crate) fn summary(&self) -> &str {
+        &self.checks.result
     }
 
     pub(crate) fn warnings(&self) -> String {
@@ -471,6 +479,114 @@ fn local_install(ctx: &Ctx, repo: &str, bin: &str, commit: &str, source_clean: b
         let _ = std::fs::remove_file(install_record(&dir, bin));
     }
     Ok(())
+}
+
+/// Hard links retain the exact previous images and install stamps while the
+/// installer atomically replaces their public paths.
+struct PreviousBinaries {
+    dir: PathBuf,
+    saved: Vec<(PathBuf, Option<PathBuf>)>,
+}
+
+impl PreviousBinaries {
+    fn new(home: &Path) -> Result<Self> {
+        let dir = home
+            .join(".local/bin")
+            .join(format!(".harness-previous-{}", std::process::id()));
+        std::fs::create_dir_all(dir.parent().context("binary folder missing")?)?;
+        std::fs::create_dir(&dir)?;
+        Ok(Self {
+            dir,
+            saved: Vec::new(),
+        })
+    }
+
+    fn remember(&mut self, home: &Path, bin: &str) -> Result<()> {
+        let dir = home.join(".local/bin");
+        for path in [dir.join(bin), install_record(&dir, bin)] {
+            let backup = self
+                .dir
+                .join(path.file_name().context("binary name missing")?);
+            let saved = if path.exists() {
+                std::fs::hard_link(&path, &backup)?;
+                Some(backup)
+            } else {
+                None
+            };
+            self.saved.push((path, saved));
+        }
+        Ok(())
+    }
+
+    fn changed(&self, home: &Path, bin: &str) -> Result<bool> {
+        let target = home.join(".local/bin").join(bin);
+        match self.saved.iter().find(|(path, _)| path == &target) {
+            Some((_, Some(backup))) => Ok(std::fs::read(backup)? != std::fs::read(target)?),
+            Some((_, None)) => Ok(target.exists()),
+            None => Ok(false),
+        }
+    }
+
+    fn restore(&self) -> Result<()> {
+        for (path, saved) in &self.saved {
+            if let Some(saved) = saved {
+                std::fs::rename(saved, path)?;
+            } else if path.exists() {
+                std::fs::remove_file(path)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn discard(self) -> Result<()> {
+        std::fs::remove_dir_all(self.dir)?;
+        Ok(())
+    }
+}
+
+fn installed_snapshot(ctx: &Ctx) -> Result<Vec<check::ProjectCheck>> {
+    let bin = ctx.env.home.join(".local/bin/herdr-ade");
+    let output = ctx
+        .runner
+        .run(&Cmd::new(bin.to_string_lossy(), INSTALL_TIMEOUT).args([
+            "--root",
+            &ctx.root.to_string_lossy(),
+            "install-check",
+        ]))?;
+    if !output.success() {
+        bail!("installed binary could not load records");
+    }
+    serde_json::from_str(&output.stdout).context("installed binary did not return install counts")
+}
+
+fn rollback<T>(
+    ctx: &Ctx,
+    previous: PreviousBinaries,
+    checks: &mut check::InstallCheck,
+    reason: &str,
+) -> Result<T> {
+    checks.result = format!("{reason}; rollback on mac pending, boxes untouched");
+    checks.record(&ctx.config_dir)?;
+    previous.restore()?;
+    let bin = ctx.env.home.join(".local/bin/herdr-ade");
+    if ctx.detached_ticker && bin.exists() {
+        let output = ctx.runner.run(
+            &Cmd::new(bin.to_string_lossy(), INSTALL_TIMEOUT)
+                .env("HERDR_ADE_INSTALL_TICKER", "1")
+                .args(["--root", &ctx.root.to_string_lossy(), "ticker", "start"]),
+        )?;
+        if !output.success() {
+            checks.result = format!(
+                "{reason}; binaries restored on mac, ticker restart failed, boxes untouched"
+            );
+            checks.record(&ctx.config_dir)?;
+            bail!("{}", checks.result);
+        }
+    }
+    previous.discard()?;
+    checks.result = format!("{reason}; rolled back on mac, boxes untouched");
+    checks.record(&ctx.config_dir)?;
+    bail!("{}", checks.result)
 }
 
 /// Stage the whole mod, then publish it in one filesystem operation. Mac's
@@ -1280,48 +1396,90 @@ fn install_for(ctx: &Ctx, current: Option<(&str, &str)>) -> Result<InstallOutcom
     let mut kinds = Vec::new();
     let mut installed = Vec::new();
     let mut builds = Vec::new();
-    for repo in &repos {
-        let kind = kind(&repo.path)?;
-        fork |= kind == Kind::Fork;
-        let commit = repo_head(ctx, &repo.path)?;
-        let clean_before = repo_clean(ctx, &repo.path)?;
-        local_build(ctx, &repo.path, kind, clean_before)?;
-        let after_build = repo_head(ctx, &repo.path)?;
-        let source_clean = clean_before && repo_clean(ctx, &repo.path)?;
-        if after_build != commit {
-            bail!(
-                "harness_build_changed: {} moved from {commit} to {after_build} while it was building",
-                repo.path
+    let mut checks = check::InstallCheck {
+        before: check::snapshot(&ctx.root),
+        after: Vec::new(),
+        result: "install pending".into(),
+    };
+    checks.record(&ctx.config_dir)?;
+    let mut previous = PreviousBinaries::new(&ctx.env.home)?;
+    let local_result = (|| -> Result<()> {
+        for repo in &repos {
+            let kind = kind(&repo.path)?;
+            fork |= kind == Kind::Fork;
+            let commit = repo_head(ctx, &repo.path)?;
+            let clean_before = repo_clean(ctx, &repo.path)?;
+            local_build(ctx, &repo.path, kind, clean_before)?;
+            let after_build = repo_head(ctx, &repo.path)?;
+            let source_clean = clean_before && repo_clean(ctx, &repo.path)?;
+            if after_build != commit {
+                bail!(
+                    "harness_build_changed: {} moved from {commit} to {after_build} while it was building",
+                    repo.path
+                );
+            }
+            for bin in kind.binaries() {
+                previous.remember(&ctx.env.home, bin)?;
+                local_install(ctx, &repo.path, bin, &commit, source_clean)?;
+            }
+            builds.push(InstalledBuild {
+                repo: repo.path.clone(),
+                machine: "local".into(),
+                head: commit.clone(),
+            });
+            let mut binaries = Vec::new();
+            for bin in kind.binaries() {
+                binaries.push(installed_version(ctx, bin)?);
+            }
+            kinds.push(kind);
+            installed.push(InstalledRepo {
+                path: repo.path.clone(),
+                kind: kind.name().into(),
+                binaries,
+                commit,
+                boxes: Vec::new(),
+            });
+        }
+        Ok(())
+    })();
+    if let Err(error) = local_result {
+        return rollback(
+            ctx,
+            previous,
+            &mut checks,
+            &format!("install failed on mac: {error:#}"),
+        );
+    }
+    match installed_snapshot(ctx) {
+        Ok(after) => checks.after = after,
+        Err(_) => {
+            return rollback(
+                ctx,
+                previous,
+                &mut checks,
+                "REGRESSION: installed binary could not check records",
             );
         }
-        for bin in kind.binaries() {
-            local_install(ctx, &repo.path, bin, &commit, source_clean)?;
-        }
-        #[cfg(target_os = "macos")]
-        if kind == Kind::Plugin {
+    }
+    if let Some(reason) = check::regression(&checks.before, &checks.after) {
+        return rollback(ctx, previous, &mut checks, &reason);
+    }
+    let rundown_changed = previous.changed(&ctx.env.home, "herdr-rundown")?;
+    previous.discard()?;
+    checks.result = format!("installed on mac; {}", checks.summary());
+    checks.record(&ctx.config_dir)?;
+    #[cfg(target_os = "macos")]
+    for (repo, kind) in repos.iter().zip(&kinds) {
+        if *kind == Kind::Plugin {
             install_coordinator_handoff(&ctx.env.home, Path::new(&repo.path))?;
         }
-        builds.push(InstalledBuild {
-            repo: repo.path.clone(),
-            machine: "local".into(),
-            head: commit.clone(),
-        });
-        let mut binaries = Vec::new();
-        for bin in kind.binaries() {
-            binaries.push(installed_version(ctx, bin)?);
-        }
-        kinds.push(kind);
-        installed.push(InstalledRepo {
-            path: repo.path.clone(),
-            kind: kind.name().into(),
-            binaries,
-            commit,
-            boxes: Vec::new(),
-        });
+    }
+    if rundown_changed {
+        crate::rundown::reopen_existing(ctx)?;
     }
     if kinds.contains(&Kind::Plugin) {
         refresh_local_guard(ctx)?;
-        if cfg!(target_os = "macos") {
+        if cfg!(target_os = "macos") && ctx.detached_ticker {
             install_ticker_agent(ctx)?;
         }
     }
@@ -1475,6 +1633,18 @@ fn install_for(ctx: &Ctx, current: Option<(&str, &str)>) -> Result<InstallOutcom
         }
     }
     let tasks = record_task_proofs(ctx, &builds, &processes)?;
+    let mut machines = vec!["mac".to_string()];
+    machines.extend(
+        boxes
+            .iter()
+            .filter(|result| result.errors.is_empty())
+            .map(|result| result.machine.clone()),
+    );
+    checks.result = format!("installed on {}; {}", machines.join(", "), checks.summary());
+    if boxes.iter().any(|result| !result.errors.is_empty()) {
+        checks.result.push_str("; boxes pending");
+    }
+    checks.record(&ctx.config_dir)?;
     Ok(InstallOutcome {
         repositories: installed,
         boxes,
@@ -1483,6 +1653,7 @@ fn install_for(ctx: &Ctx, current: Option<(&str, &str)>) -> Result<InstallOutcom
         tasks,
         coordinator_hooks,
         warnings,
+        checks,
     })
 }
 
@@ -1594,6 +1765,11 @@ mod tests {
             tasks: vec![],
             coordinator_hooks: vec![],
             warnings: vec![],
+            checks: check::InstallCheck {
+                before: vec![],
+                after: vec![],
+                result: String::new(),
+            },
         }
         .message();
         assert!(message.contains(&format!(
@@ -1918,6 +2094,200 @@ mod tests {
     }
 
     #[test]
+    fn installed_image_checks_counts_and_rolls_back_before_any_box_command() {
+        for (done, total, records_load, regresses) in [
+            (0, 1, true, true),
+            (1, 1, false, true),
+            (2, 3, true, false),
+            (1, 2, true, false),
+        ] {
+            let home = tempfile::tempdir().unwrap();
+            let root = home.path().join("root");
+            let project =
+                crate::project::create(&root, "demo", "private project text", vec![]).unwrap();
+            let task = crate::task::Task {
+                id: "job-0001".into(),
+                title: "historical task".into(),
+                authority: vec!["request:historical".into()],
+                acceptance: vec!["done".into()],
+                installed: vec![crate::task::Evidence {
+                    at: String::new(),
+                    command: "historical install".into(),
+                    acceptance: vec![],
+                    machine: None,
+                    build: None,
+                }],
+                ..Default::default()
+            };
+            let tasks = project.record_dir_for_write("tasks").unwrap();
+            std::fs::write(tasks.join("job-0001.toml"), toml::to_string(&task).unwrap()).unwrap();
+            let plan = crate::contracts::Plan {
+                steps: vec![crate::contracts::PlanStep {
+                    id: "s-1".into(),
+                    tasks: vec![task.id],
+                    ..Default::default()
+                }],
+                ..Default::default()
+            };
+            std::fs::write(
+                crate::plan::plan_path(&project),
+                toml::to_string(&plan).unwrap(),
+            )
+            .unwrap();
+            assert_eq!(crate::plan::counts(&project).unwrap(), (1, 1));
+            let config_dir = home.path().join("config");
+            std::fs::create_dir(&config_dir).unwrap();
+            let repo = home.path().join("plugin");
+            std::fs::create_dir_all(repo.join("target/release")).unwrap();
+            std::fs::write(repo.join("Cargo.toml"), "[package]\nname = 'herdr-ade'\n").unwrap();
+            std::fs::write(
+                config_dir.join("config.toml"),
+                format!("[harness]\nrepos = [{{path = '{}' }}]\n", repo.display()),
+            )
+            .unwrap();
+            #[cfg(target_os = "macos")]
+            {
+                let source = Path::new(env!("CARGO_MANIFEST_DIR")).join("mods/coordinator-handoff");
+                fn copy_dir(from: &Path, to: &Path) {
+                    std::fs::create_dir_all(to).unwrap();
+                    for entry in std::fs::read_dir(from).unwrap() {
+                        let entry = entry.unwrap();
+                        if entry.file_type().unwrap().is_dir() {
+                            copy_dir(&entry.path(), &to.join(entry.file_name()));
+                        } else {
+                            std::fs::copy(entry.path(), to.join(entry.file_name())).unwrap();
+                        }
+                    }
+                }
+                copy_dir(&source, &repo.join("mods/coordinator-handoff"));
+            }
+            let installed_dir = home.path().join(".local/bin");
+            std::fs::create_dir_all(&installed_dir).unwrap();
+            for bin in Kind::Plugin.binaries() {
+                write_version_binary(
+                    &installed_dir.join(bin),
+                    &format!("{bin} 0.1.0+old1234.1"),
+                    "old image",
+                );
+                record_installed_commit(&installed_dir, bin, "old1234").unwrap();
+                write_version_binary(
+                    &repo.join("target/release").join(bin),
+                    &format!("{bin} {}", crate::VERSION),
+                    "new image",
+                );
+            }
+            // Keep Rundown unchanged: this test is about the checked installer,
+            // not Herdr's pane API.
+            std::fs::copy(
+                installed_dir.join("herdr-rundown"),
+                repo.join("target/release/herdr-rundown"),
+            )
+            .unwrap();
+            let after = vec![check::ProjectCheck {
+                project: "demo".into(),
+                done,
+                total,
+                records_load,
+            }];
+            let json = serde_json::to_string(&after).unwrap();
+            let source = repo.join("target/release/herdr-ade");
+            std::fs::write(&source, format!("#!/bin/sh\nif [ \"$1\" = --version ]; then echo 'herdr-ade {}'; else printf '%s\\n' '{}'; fi\n", crate::VERSION, json)).unwrap();
+            let before_image = std::fs::read(installed_dir.join("herdr-ade")).unwrap();
+            let runner = FakeRunner::new();
+            runner.on("rev-parse HEAD", ok("new1234"));
+            runner.on("status --porcelain", ok(""));
+            runner.on("cargo build", ok(""));
+            runner.on("touch build.rs", ok(""));
+            runner.on("refresh-guard", ok(""));
+            runner.on_fn(
+                |cmd| {
+                    cmd.program == "cp"
+                        || cmd.program == "mv"
+                        || cmd.args == ["--version"]
+                        || cmd.display().contains("install-check")
+                        || cmd.display().contains("ticker start")
+                },
+                |cmd| {
+                    let output = RealRunner.run(cmd)?;
+                    if cmd.display().contains("ticker start") {
+                        assert!(
+                            output.stdout.contains("old1234"),
+                            "rollback started the wrong image"
+                        );
+                        assert!(
+                            cmd.env
+                                .contains(&("HERDR_ADE_INSTALL_TICKER".into(), "1".into()))
+                        );
+                    }
+                    Ok(output)
+                },
+            );
+            let env = crate::paths::Env::for_test(home.path(), &[]);
+            let ctx = Ctx {
+                env: &env,
+                root,
+                config_dir,
+                runner: &runner,
+                detached_ticker: regresses,
+            };
+            // Existing proof gate still observes the actual ticker lock holder.
+            let mut holder = std::fs::File::options()
+                .create(true)
+                .truncate(false)
+                .write(true)
+                .open(crate::ticker::lock_path(&ctx.root))
+                .unwrap();
+            holder.lock().unwrap();
+            use std::io::Write;
+            write!(
+                holder,
+                "{{\"pid\":4321,\"version\":\"{}\"}}",
+                crate::VERSION
+            )
+            .unwrap();
+            let result = install(&ctx);
+            assert_eq!(result.is_err(), regresses, "{result:?}");
+            let record: serde_json::Value =
+                crate::project::read_json(&ctx.config_dir.join("harness-install.json")).unwrap();
+            assert_eq!(record["before"][0]["done"], 1);
+            assert_eq!(record["after"][0]["done"], done, "{result:?}; {record}");
+            assert!(!record.to_string().contains("private project text"));
+            if regresses {
+                assert!(
+                    result
+                        .unwrap_err()
+                        .to_string()
+                        .contains("rolled back on mac, boxes untouched")
+                );
+                for bin in Kind::Plugin.binaries() {
+                    assert_eq!(
+                        std::fs::read_to_string(install_record(&installed_dir, bin)).unwrap(),
+                        "old1234\n"
+                    );
+                }
+                assert_eq!(
+                    std::fs::read(installed_dir.join("herdr-ade")).unwrap(),
+                    before_image
+                );
+                assert_eq!(runner.count("ssh"), 0);
+                assert_eq!(runner.count("machine list"), 0);
+                assert_eq!(runner.count("ticker start"), 1);
+            } else {
+                assert!(result.unwrap().summary().contains("records load"));
+                assert_ne!(
+                    std::fs::read(installed_dir.join("herdr-ade")).unwrap(),
+                    before_image
+                );
+            }
+            assert!(
+                !installed_dir
+                    .join(format!(".harness-previous-{}", std::process::id()))
+                    .exists()
+            );
+        }
+    }
+
+    #[test]
     fn install_visits_both_declared_boxes_even_when_first_build_fails() {
         // Separate installs must not reuse a lock briefly inherited by a
         // concurrently forked child from another test.
@@ -1946,6 +2316,7 @@ mod tests {
             let env = crate::paths::Env::for_test(root.path(), &[]);
             let runner = FakeRunner::new();
             runner.on("machine list --json", ok("[]"));
+            runner.on("install-check", ok("[]"));
             runner.on_fn(
                 |cmd| cmd.program == "git" && cmd.display().contains("rev-parse HEAD"),
                 |_| Ok(ok("abc123\n")),

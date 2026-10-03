@@ -1029,6 +1029,7 @@ mod tests {
                     fast_forward: true,
                     push: true,
                     install: true,
+                    install_result: String::new(),
                     close: true,
                     prune: true,
                     attention: String::new(),

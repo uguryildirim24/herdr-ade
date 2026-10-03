@@ -83,6 +83,8 @@ pub(crate) struct Review {
     pub fast_forward: bool,
     pub push: bool,
     pub install: bool,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub install_result: String,
     pub close: bool,
     pub prune: bool,
     pub attention: String,
@@ -118,13 +120,16 @@ impl Review {
         };
         let install = if !self.install_required {
             "install not required"
+        } else if !self.install_result.is_empty() {
+            &self.install_result
         } else if self.install {
             "install completed"
         } else {
             "install pending"
         };
-        let continuation = if matches!(self.phase, Phase::Landing | Phase::Cancelling)
-            || (!self.phase.closed() && self.attention.is_empty())
+        let continuation = if !self.install_result.starts_with("REGRESSION")
+            && (matches!(self.phase, Phase::Landing | Phase::Cancelling)
+                || (!self.phase.closed() && self.attention.is_empty()))
         {
             "; continues automatically"
         } else {
@@ -784,6 +789,7 @@ fn start_locked(ctx: &Ctx, project: &Project, row: project::Repo) -> Result<Opti
         fast_forward: false,
         push: false,
         install: false,
+        install_result: String::new(),
         close: false,
         prune: false,
         attention: String::new(),
@@ -991,6 +997,9 @@ fn defer_members(project: &Project, review: &Review) -> Result<()> {
     Ok(())
 }
 fn advance(ctx: &Ctx, project: &Project, review: &mut Review) -> Result<()> {
+    if review.install_result.starts_with("REGRESSION") && !review.attention.is_empty() {
+        return Ok(());
+    }
     if review.phase == Phase::Cancelling {
         let reason = review.attention.clone();
         return cancel_record(ctx, project, review, &reason);
@@ -1299,7 +1308,7 @@ fn land(ctx: &Ctx, project: &Project, review: &mut Review) -> Result<()> {
                 installed.warnings.join("; ")
             );
         }
-        Ok(())
+        Ok(installed.summary().to_string())
     })
 }
 
@@ -1307,7 +1316,7 @@ fn land_with_install(
     ctx: &Ctx,
     project: &Project,
     review: &mut Review,
-    install: impl FnOnce() -> Result<()>,
+    install: impl FnOnce() -> Result<String>,
 ) -> Result<()> {
     let git = Git::new(ctx.runner, &review.repo);
     let candidate = review
@@ -1418,7 +1427,21 @@ fn land_with_install(
     }
     if !review.install {
         if review.install_required {
-            install()?;
+            match install() {
+                Ok(summary) => review.install_result = summary,
+                Err(error) => {
+                    if error.to_string().starts_with("REGRESSION") {
+                        review.install_result = error.to_string();
+                        review.attention = error.to_string();
+                        queue_notice(
+                            review,
+                            format!("REVIEW {}: {}", review.id, review.landing_summary()),
+                        );
+                        save(project, review)?;
+                    }
+                    return Err(error);
+                }
+            }
         }
         review.install = true;
         save(project, review)?;
@@ -1565,6 +1588,10 @@ pub(crate) fn retry(ctx: &Ctx, slug: &str, repo: Option<&str>) -> Result<Option<
         ));
     };
     if record.fast_forward || matches!(record.phase, Phase::Landing | Phase::Cancelling) {
+        if record.install_result.starts_with("REGRESSION") {
+            record.attention.clear();
+            save(&home, &record)?;
+        }
         advance(ctx, &home, &mut record)?;
         return Ok(Some(record));
     }

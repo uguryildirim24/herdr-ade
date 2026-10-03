@@ -1422,9 +1422,11 @@ fn configured_remote_failure_is_not_treated_as_local_only() {
     });
     review.phase = Phase::Landing;
     fx.world.runner.calls.borrow_mut().clear();
-    let error = land_with_install(&fx.world.ctx(), &fx.project, &mut review, || Ok(()))
-        .unwrap_err()
-        .to_string();
+    let error = land_with_install(&fx.world.ctx(), &fx.project, &mut review, || {
+        Ok(String::new())
+    })
+    .unwrap_err()
+    .to_string();
     assert!(
         error.starts_with(&format!(
             "`git ls-remote {} refs/heads/main` failed: ",
@@ -1474,15 +1476,29 @@ fn landing_recovers_ref_before_marker_and_install_failure_without_early_task_don
     assert!(review.fast_forward);
     assert!(
         land_with_install(&fx.world.ctx(), &fx.project, &mut review, || bail!(
-            "install interrupted"
+            "REGRESSION demo: done 31→29; rolled back on mac, boxes untouched"
         ))
         .is_err()
     );
     assert!(review.fast_forward && review.push && !review.install && !review.close);
     assert_eq!(
         review.landing_summary(),
-        "merged; no remote configured; install pending; continues automatically"
+        "merged; no remote configured; REGRESSION demo: done 31→29; rolled back on mac, boxes untouched"
     );
+    let notice = &review.notices.last().unwrap().line;
+    assert!(notice.contains(&review.landing_summary()));
+    assert_eq!(notice.matches("REGRESSION").count(), 1);
+    fx.world.runner.calls.borrow_mut().clear();
+    advance(&fx.world.ctx(), &fx.project, &mut review).unwrap();
+    assert_eq!(
+        fx.world.runner.calls.borrow().len(),
+        0,
+        "a regressed build must not reinstall each ticker pass"
+    );
+    let mut old_value = toml::Value::try_from(&review).unwrap();
+    old_value.as_table_mut().unwrap().remove("install_result");
+    let historical: Review = toml::from_str(&toml::to_string(&old_value).unwrap()).unwrap();
+    assert!(historical.install_result.is_empty());
     assert_eq!(
         crate::task::view(&fx.project, task.clone()).state,
         crate::task::State::Merged
@@ -1494,11 +1510,14 @@ fn landing_recovers_ref_before_marker_and_install_failure_without_early_task_don
         )
     );
     let mut restored = load(&fx.project, &review.id).unwrap();
-    land_with_install(&fx.world.ctx(), &fx.project, &mut restored, || Ok(())).unwrap();
+    land_with_install(&fx.world.ctx(), &fx.project, &mut restored, || {
+        Ok("installed on mac, oci, a2; plan counts unchanged; records load".into())
+    })
+    .unwrap();
     assert_eq!(restored.phase, Phase::Complete);
     assert_eq!(
         restored.landing_summary(),
-        "merged; no remote configured; install completed"
+        "merged; no remote configured; installed on mac, oci, a2; plan counts unchanged; records load"
     );
     assert_eq!(
         crate::task::view(&fx.project, task).state,
@@ -1535,7 +1554,10 @@ fn landing_completes_while_a_merged_member_owes_cleanup() {
     });
     review.phase = Phase::Landing;
     save(&fx.project, &review).unwrap();
-    land_with_install(&fx.world.ctx(), &fx.project, &mut review, || Ok(())).unwrap();
+    land_with_install(&fx.world.ctx(), &fx.project, &mut review, || {
+        Ok(String::new())
+    })
+    .unwrap();
     assert_eq!(review.phase, Phase::Complete);
     let lane = thread::load(&fx.project, &id).unwrap();
     assert_eq!(lane.status, Status::Resolved);

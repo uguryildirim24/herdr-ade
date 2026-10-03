@@ -5475,6 +5475,7 @@ mod tests {
             fast_forward: false,
             push: false,
             install: false,
+            install_result: String::new(),
             close: false,
             prune: false,
             attention: String::new(),

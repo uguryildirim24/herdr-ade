@@ -521,6 +521,16 @@ impl Project {
         write_json(&path, &state)
     }
 
+    /// Installation probes read structured state, not PROJECT.md's content.
+    pub(crate) fn records_load(&self) -> bool {
+        fn loads<T: serde::de::DeserializeOwned>(path: PathBuf) -> bool {
+            !path.exists() || read_json::<T>(&path).is_some()
+        }
+        loads::<ProjectState>(self.record_file("project.json"))
+            && loads::<Coordinator>(self.record_file("coordinator.json"))
+            && loads::<crate::steps::State>(self.record_file("ticker.json"))
+    }
+
     pub(crate) fn coordinator(&self) -> Option<Coordinator> {
         read_json(&self.state_dir().join("coordinator.json"))
     }
