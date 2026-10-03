@@ -83,6 +83,9 @@ pub(crate) enum RetirementAuthority {
 pub(crate) struct RetirementRequest {
     pub authority: RetirementAuthority,
     pub retained_tip: String,
+    /// Deliverables were preserved before checkout deletion. Tail retries can
+    /// finish without reading sources that the driver has already removed.
+    pub preserved: bool,
     pub skip_copy: bool,
     pub discard_uncopied: bool,
     pub keep_pane: bool,
@@ -253,11 +256,14 @@ pub(crate) struct Thread {
 impl Thread {
     /// Explicit commands can change their choices, but never drop a durable
     /// retained-removal pin. Automatic retries resume the request unchanged.
-    pub(crate) fn retirement_request(&self, request: RetirementRequest) -> RetirementRequest {
-        self.retirement
-            .clone()
-            .filter(|r| r.authority == RetirementAuthority::Retained)
-            .unwrap_or(request)
+    pub(crate) fn retirement_request(&self, mut request: RetirementRequest) -> RetirementRequest {
+        if let Some(saved) = &self.retirement {
+            if saved.authority == RetirementAuthority::Retained {
+                return saved.clone();
+            }
+            request.preserved = saved.preserved;
+        }
+        request
     }
 
     pub(crate) fn is_remote(&self) -> bool {

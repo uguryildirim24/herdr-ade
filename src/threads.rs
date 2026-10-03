@@ -2554,6 +2554,9 @@ pub fn resolve(ctx: &Ctx, slug: &str, id: &str, args: &ResolveArgs) -> Result<Re
         let reopened = thread::update(&project, id, |t| {
             t.status = Status::Open;
             t.resolved_reason.clear();
+            t.cleanup_pending = false;
+            t.cleanup_reason.clear();
+            t.retirement = None;
         })?;
         refresh_plan(ctx, &project);
         return Ok(ResolveOutcome {
@@ -2615,9 +2618,6 @@ fn retire(
 ) -> Result<ResolveOutcome> {
     let record = before.clone();
     let id = record.id.as_str();
-    if durable {
-        begin_retirement(project, &record, &request, reason)?;
-    }
     let attempted = (|| -> Result<ResolveOutcome> {
         if request.authority == RetirementAuthority::Resolve {
             let events = crate::events::for_thread(project, id);
@@ -2633,12 +2633,22 @@ fn retire(
         if request.authority != RetirementAuthority::Retained {
             crate::review::require_resolvable(project, id)?;
         }
+        // Authorization must precede the terminal transition: marking a lane
+        // resolved closes its follow-ups, which must not authorize a retry.
+        if durable {
+            begin_retirement(project, &record, &request, reason)?;
+        }
         let removable = removable_folder(project, &record);
         let already_removed = removable && !worktree_exists(ctx, project, &record)?;
 
-        // Every path that resolves a thread performs a final copy first.
+        // After deletion, resume from the saved preservation receipt rather
+        // than trying to read links from the now-absent checkout.
+        let preservation_complete =
+            request.preserved && (already_removed || record.worktree_path.is_empty());
         let mut removal_refusal = None;
-        let (mut final_copy, mut copy_notes) = if request.skip_copy {
+        let (mut final_copy, mut copy_notes) = if preservation_complete && !request.skip_copy {
+            ("complete".to_string(), Vec::new())
+        } else if request.skip_copy {
             ("skipped".to_string(), Vec::new())
         } else {
             let copied = final_copy(ctx, project, &record);
@@ -2668,16 +2678,17 @@ fn retire(
         // Even an explicit copy override cannot delete linked files that were not
         // preserved. The sealed report is still available when --skip-copy is set.
         let preserved = thread::load(project, id)?;
-        let preservation_pending =
-            if let Err(error) = preserve_report_links(ctx, project, &preserved) {
-                let detail = format!("linked_files_not_kept: {error:#}");
-                copy_notes.push(detail.clone());
-                final_copy = "partial".into();
-                removal_refusal = Some(detail);
-                true
-            } else {
-                false
-            };
+        let preservation_pending = if !preservation_complete
+            && let Err(error) = preserve_report_links(ctx, project, &preserved)
+        {
+            let detail = format!("linked_files_not_kept: {error:#}");
+            copy_notes.push(detail.clone());
+            final_copy = "partial".into();
+            removal_refusal = Some(detail);
+            true
+        } else {
+            false
+        };
 
         if removable && !already_removed {
             if request.keep_pane && removal_refusal.is_none() {
@@ -2730,6 +2741,7 @@ fn retire(
                 )?;
             }
         }
+        request.preserved = !preservation_pending && removal_refusal.is_none();
         let resolved = begin_retirement(project, &record, &request, reason)?;
         if let Ok(Some(view)) = views.for_thread(ctx, project, &resolved) {
             clear_thread_tokens(&view.herdr, &resolved);
@@ -7861,6 +7873,109 @@ mod tests {
                     "resolved"
                 }
             );
+            if authority == "automatic" {
+                failing.set(true);
+                assert!(resolve(&ctx, "demo", &lane.id, &ResolveArgs::default()).is_err());
+                assert!(thread::load(&project, &lane.id).unwrap().cleanup_pending);
+                resolve(
+                    &ctx,
+                    "demo",
+                    &lane.id,
+                    &ResolveArgs {
+                        reopen: true,
+                        ..Default::default()
+                    },
+                )
+                .unwrap();
+                retry_pending_cleanup(&ctx, &project).unwrap();
+                let reopened = thread::load(&project, &lane.id).unwrap();
+                assert_eq!(reopened.status, Status::Open);
+                assert!(!reopened.cleanup_pending);
+                assert!(reopened.retirement.is_none());
+            }
+        }
+    }
+
+    #[test]
+    fn retirement_retries_after_linked_sources_and_checkout_are_removed() {
+        let (fx, lane) = repo_link_fixture(false);
+        let root = Path::new(&lane.thread_dir);
+        std::fs::write(root.join("plot.txt"), "kept plot").unwrap();
+        seal_linked_report(&fx.project, &lane, "[Plot](plot.txt)\n");
+        struct TailFailure<'a> {
+            runner: &'a dyn Runner,
+            fail: std::cell::Cell<bool>,
+            id: String,
+        }
+        impl Runner for TailFailure<'_> {
+            fn run(&self, cmd: &Cmd) -> Result<crate::runner::Output> {
+                use crate::runner::fake::{fail, ok};
+                if cmd.display().contains("session list --json") {
+                    return Ok(ok(&format!(
+                        r#"{{"sessions":[{{"name":"scratch-{}","running":false,"socket_path":"/scratch.sock"}}]}}"#,
+                        self.id
+                    )));
+                }
+                if self.fail.get() && cmd.display().contains("session delete") {
+                    return Ok(fail(1, "busy"));
+                }
+                self.runner.run(cmd)
+            }
+        }
+        let runner = TailFailure {
+            runner: &fx.world.runner,
+            fail: std::cell::Cell::new(true),
+            id: lane.id.clone(),
+        };
+        let mut ctx = fx.world.ctx();
+        ctx.runner = &runner;
+        let error = remove_kept_worktree(&ctx, "demo", &lane.id).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("could not delete scratch session")
+        );
+        assert!(!root.exists());
+        let pending = thread::load(&fx.project, &lane.id).unwrap();
+        assert!(pending.cleanup_pending);
+        assert!(pending.retirement.as_ref().unwrap().preserved);
+        assert!(pending.worktree_path.is_empty());
+        runner.fail.set(false);
+        retry_pending_cleanup(&ctx, &fx.project).unwrap();
+        let saved = thread::load(&fx.project, &lane.id).unwrap();
+        assert!(!saved.cleanup_pending, "{}", saved.cleanup_reason);
+        let plot = thread::sha256_hex(b"kept plot");
+        assert_eq!(
+            std::fs::read(crate::events::artifact_path(&fx.project, &plot)).unwrap(),
+            b"kept plot"
+        );
+        let report =
+            std::fs::read_to_string(thread::final_report_path(&fx.project, &saved).unwrap())
+                .unwrap();
+        assert_eq!(report, format!("[Plot]({plot})\n"));
+    }
+
+    #[test]
+    fn automatic_retirement_cannot_close_a_follow_up_to_authorize_its_retry() {
+        let fx = crate::testkit::fixture();
+        let (id, _) = fx.lane(1);
+        thread::update(&fx.project, &id, |lane| {
+            lane.follow_ups.push(FollowUp {
+                attempt: 1,
+                text: "Finish the correction".into(),
+                state: FollowUpState::Queued,
+                ..Default::default()
+            });
+        })
+        .unwrap();
+        for _ in 0..2 {
+            let outcome = resolve_automatically(&fx.world.ctx(), &fx.project, &id, "finished");
+            assert!(outcome.copy_notes[0].contains("follow_up_pending"));
+            let saved = thread::load(&fx.project, &id).unwrap();
+            assert_eq!(saved.status, Status::Open);
+            assert_eq!(saved.follow_ups[0].state, FollowUpState::Queued);
+            assert!(!saved.cleanup_pending);
+            assert!(Path::new(&saved.worktree_path).exists());
         }
     }
 
