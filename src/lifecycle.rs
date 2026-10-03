@@ -56,6 +56,7 @@ fn alive_panes(project: &Project, view: &SessionView) -> Vec<(String, String, St
 
 pub(crate) fn set_status(ctx: &Ctx, slug: &str, status: Status) -> Result<()> {
     let project = Project::load(&ctx.root, slug)?;
+    let _binding = project.coordinator_lock()?;
     let current = project.status();
     match (current, status) {
         (Status::Archived, Status::Paused) => bail!("`{slug}` is archived; `unarchive` it first"),
@@ -64,6 +65,15 @@ pub(crate) fn set_status(ctx: &Ctx, slug: &str, status: Status) -> Result<()> {
         | (_, Status::Paused)
         | (Status::Paused, Status::Active)
         | (Status::Active, Status::Active) => {}
+    }
+    if status != Status::Archived {
+        let path = deletion_path(&ctx.root, slug);
+        if path.exists() {
+            let intent: DeleteIntent = toml::from_str(&std::fs::read_to_string(path)?)?;
+            if intent.started && !intent.finished() {
+                bail!("`{slug}` is being deleted; finish the persisted deletion first");
+            }
+        }
     }
     project.set_status(status)?;
     println!("`{slug}` is now {status}");
@@ -109,6 +119,50 @@ struct DeleteIntent {
     worktrees: Vec<String>,
     #[serde(default)]
     completed: BTreeSet<String>,
+    #[serde(default)]
+    steps: Option<Vec<DeleteStep>>,
+    #[serde(default)]
+    topology: String,
+    #[serde(default)]
+    started: bool,
+}
+
+impl DeleteIntent {
+    fn finished(&self) -> bool {
+        self.steps.as_ref().is_some_and(|steps| {
+            !steps.is_empty() && (0..steps.len()).all(|i| self.completed.contains(&i.to_string()))
+        })
+    }
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(tag = "action", rename_all = "snake_case")]
+enum DeleteStep {
+    Workspace {
+        socket: String,
+        machine: String,
+        id: String,
+    },
+    Tab {
+        socket: String,
+        machine: String,
+        id: String,
+    },
+    Trash {
+        path: String,
+        machine: String,
+        identity: String,
+        what: String,
+    },
+    Prune {
+        repo: String,
+        machine: String,
+        identity: String,
+    },
+    Github {
+        name: String,
+        identity: String,
+    },
 }
 
 struct OtherProjectOwnership {
@@ -116,6 +170,7 @@ struct OtherProjectOwnership {
     repos: Vec<Repo>,
     threads: Vec<thread::Thread>,
     paths: BTreeSet<PathBuf>,
+    coordinator: Option<crate::project::Coordinator>,
 }
 
 fn same_path(a: &str, b: &str) -> bool {
@@ -170,7 +225,18 @@ fn owned_paths(project: &Project, threads: &[thread::Thread]) -> BTreeSet<PathBu
 
 fn other_ownership(ctx: &Ctx, slug: &str) -> Result<Vec<OtherProjectOwnership>> {
     let mut owners = Vec::new();
-    for other_slug in crate::project::list_slugs(&ctx.root) {
+    let (slugs, errors) = crate::project::list_slugs_with_errors(&ctx.root);
+    if !errors.is_empty() {
+        bail!(
+            "cannot prove ownership: {}",
+            errors
+                .iter()
+                .map(|e| format!("{e:#}"))
+                .collect::<Vec<_>>()
+                .join("; ")
+        );
+    }
+    for other_slug in slugs {
         if other_slug == slug {
             continue;
         }
@@ -182,6 +248,7 @@ fn other_ownership(ctx: &Ctx, slug: &str) -> Result<Vec<OtherProjectOwnership>> 
             repos: settings.repos,
             paths: owned_paths(&project, &threads),
             threads,
+            coordinator: readable_coordinator(&project)?,
         });
     }
     Ok(owners)
@@ -214,14 +281,16 @@ fn other_projects_using_path(others: &[OtherProjectOwnership], path: &Path) -> V
     others
         .iter()
         .filter(|owner| {
-            owner
-                .repos
+            owner.repos.iter().any(|repo| {
+                paths_overlap(&repo.path, &path)
+                    || repo
+                        .box_path
+                        .as_deref()
+                        .is_some_and(|p| paths_overlap(p, &path))
+            }) || owner
+                .paths
                 .iter()
-                .any(|repo| paths_overlap(&repo.path, &path))
-                || owner
-                    .paths
-                    .iter()
-                    .any(|candidate| paths_overlap(&candidate.to_string_lossy(), &path))
+                .any(|candidate| paths_overlap(&candidate.to_string_lossy(), &path))
         })
         .map(|owner| owner.slug.clone())
         .collect()
@@ -303,7 +372,7 @@ impl Trash {
 }
 
 fn trash(ctx: &Ctx, tool: Trash, path: &Path, what: &str) -> Result<()> {
-    if !path.exists() {
+    if std::fs::symlink_metadata(path).is_err_and(|e| e.kind() == std::io::ErrorKind::NotFound) {
         return Ok(());
     }
     let out = ctx.runner.run(
@@ -339,42 +408,6 @@ fn old_copy_for_slug(name: &str, slug: &str) -> bool {
             .all(|(index, byte)| matches!(index, 8 | 15) || byte.is_ascii_digit())
 }
 
-fn clean_old_trash(ctx: &Ctx, tool: Trash, slug: &str) -> Result<()> {
-    let holding = ctx.root.join(".trash");
-    let entries = match std::fs::read_dir(&holding) {
-        Ok(entries) => entries,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-        Err(error) => return Err(error.into()),
-    };
-    let mut entries: Vec<_> = entries.collect::<std::io::Result<_>>()?;
-    entries.sort_by_key(std::fs::DirEntry::file_name);
-    let mut kept = false;
-    for entry in entries {
-        let name = entry.file_name();
-        if name
-            .to_str()
-            .is_some_and(|name| old_copy_for_slug(name, slug))
-        {
-            trash(ctx, tool, &entry.path(), "old copy of this project")?;
-        } else {
-            kept = true;
-            println!(
-                "kept another project's old copy: {}",
-                entry.path().display()
-            );
-        }
-    }
-    if kept {
-        println!(
-            "kept old trash holding folder because it still contains other project copies: {}",
-            holding.display()
-        );
-    } else {
-        trash(ctx, tool, &holding, "empty old trash holding folder")?;
-    }
-    Ok(())
-}
-
 fn github_name(url: &str) -> Option<String> {
     let url = url.trim();
     let rest = url
@@ -394,15 +427,19 @@ fn github_name(url: &str) -> Option<String> {
     Some(format!("{owner}/{repo}"))
 }
 
-fn checkout_github_name(ctx: &Ctx, path: &str) -> Result<String> {
+fn checkout_origin(ctx: &Ctx, path: &str) -> Result<String> {
     let out = ctx.runner.run(
         &Cmd::new("git", Duration::from_secs(40)).args(["-C", path, "remote", "get-url", "origin"]),
     )?;
     if !out.success() {
         bail!("could not resolve origin: {}", out.error_text());
     }
-    github_name(&out.stdout)
-        .ok_or_else(|| anyhow::anyhow!("origin is not a GitHub repo: {}", out.stdout.trim()))
+    Ok(out.stdout.trim().to_string())
+}
+
+fn checkout_github_name(ctx: &Ctx, path: &str) -> Result<String> {
+    let origin = checkout_origin(ctx, path)?;
+    github_name(&origin).ok_or_else(|| anyhow::anyhow!("origin is not a GitHub repo: {origin}"))
 }
 
 fn github_names(repos: &[Repo], threads: &[thread::Thread]) -> BTreeSet<String> {
@@ -570,376 +607,745 @@ fn close_tab(herdr: &Herdr<'_>, tab: &str, label: &str) -> Result<()> {
     Ok(())
 }
 
-/// Permanently removes a project and everything attributable only to it.
-/// Files go through the platform trash; `archive` keeps the project records.
-pub(crate) fn delete(ctx: &Ctx, slug: &str, delete_github: bool, preview: bool) -> Result<()> {
-    let project = Project::load(&ctx.root, slug)?;
-    let (settings, _) = project.read_project_md()?;
-    let threads = readable_threads(&project)?;
-    let others = other_ownership(ctx, slug)?;
-    let coordinator = project.coordinator();
+fn readable_coordinator(project: &Project) -> Result<Option<crate::project::Coordinator>> {
+    match std::fs::read(project.record_file("coordinator.json")) {
+        Ok(bytes) => Ok(Some(serde_json::from_slice(&bytes)?)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e.into()),
+    }
+}
 
-    let record_users = other_projects_using_path(&others, &project.dir());
-    if !record_users.is_empty() {
-        bail!(
-            "cannot delete `{slug}` because its project record overlaps resources owned by {}",
-            record_users.join(", ")
+// Only resource bindings, not progress/status, qualify the snapshot. A new
+// lane or rebound terminal cannot silently become part of an earlier preview.
+fn topology(ctx: &Ctx, project: &Project, threads: &[thread::Thread]) -> Result<String> {
+    let coordinator = readable_coordinator(project)?.map(|c| {
+        (
+            crate::ticker::socket_inode(Path::new(&c.socket)),
+            c.socket,
+            c.workspace_id,
+            c.tab_id,
+            c.pane_id,
+            c.generation,
+        )
+    });
+    let mut targets = BTreeMap::new();
+    for t in threads.iter().filter(|t| t.is_remote()) {
+        targets.insert(
+            t.machine_route(),
+            remote::machine_profile(
+                ctx.runner,
+                &ctx.env.herdr_bin(),
+                &ctx.config_dir,
+                t.machine_route(),
+            )?
+            .target,
         );
     }
+    let lanes: Vec<_> = threads
+        .iter()
+        .map(|t| {
+            (
+                &t.id,
+                t.kind,
+                t.machine_route(),
+                &t.workspace_id,
+                &t.tab_id,
+                &t.pane_id,
+                &t.repo,
+                &t.worktree_path,
+                &t.cwd,
+                &t.origin,
+            )
+        })
+        .collect();
+    Ok(thread::sha256_hex(&serde_json::to_vec(&(
+        coordinator,
+        lanes,
+        targets,
+    ))?))
+}
 
-    let project_paths: Vec<_> = owned_paths(&project, &threads).into_iter().collect();
+fn file_identity(ctx: &Ctx, machine: &str, path: &str) -> Result<Option<String>> {
+    if machine.is_empty() {
+        match std::fs::symlink_metadata(path) {
+            #[cfg(unix)]
+            Ok(metadata) => {
+                use std::os::unix::fs::MetadataExt;
+                Ok(Some(format!("{}:{}", metadata.dev(), metadata.ino())))
+            }
+            #[cfg(not(unix))]
+            Ok(_) => bail!("deletion identity is unsupported on this platform"),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(e.into()),
+        }
+    } else {
+        if !Path::new(path).is_absolute() || path == "/" {
+            bail!("refusing unsafe box path `{path}`");
+        }
+        let profile =
+            remote::machine_profile(ctx.runner, &ctx.env.herdr_bin(), &ctx.config_dir, machine)?;
+        let path = remote::quote(path);
+        let script = format!(
+            "if [ -e {path} ] || [ -L {path} ]; then case \"$(uname -s)\" in Darwin) stat -f '%d:%i' {path} ;; Linux) stat -c '%d:%i' -- {path} ;; *) exit 1 ;; esac; else printf missing; fi"
+        );
+        let out = remote::ssh(
+            ctx.runner,
+            &profile.target,
+            &script,
+            None,
+            Duration::from_secs(10),
+        )?;
+        let identity = out.stdout.trim();
+        if !out.success() || identity.is_empty() {
+            bail!(
+                "cannot prove file identity on {machine}: {}",
+                out.error_text()
+            );
+        }
+        Ok((identity != "missing").then(|| format!("{}:{identity}", profile.target)))
+    }
+}
 
-    if preview {
-        println!("Archive keeps `{slug}` and its files available for unarchive.");
-        println!("Delete removes these explicitly recorded resources:");
-        println!("  project record: {}", project.dir().display());
-        for repo in &settings.repos {
-            let shared = other_projects_using_repo(&others, repo);
-            if shared.is_empty() {
-                println!("  owned repo: {}", repo.path);
-                if let Some(box_path) = &repo.box_path {
-                    println!("  owned box repo: {box_path}");
+fn github_identity(ctx: &Ctx, name: &str) -> Result<String> {
+    let out = ctx
+        .runner
+        .run(&Cmd::new("gh", Duration::from_secs(40)).args([
+            "api",
+            &format!("repos/{name}"),
+            "--jq",
+            ".node_id",
+        ]))?;
+    if !out.success() || out.stdout.trim().is_empty() || out.stdout.trim() == "null" {
+        bail!(
+            "cannot prove GitHub identity for {name}: {}",
+            out.error_text()
+        );
+    }
+    Ok(out.stdout.trim().to_string())
+}
+
+fn recorded_github(others: &[OtherProjectOwnership]) -> BTreeSet<String> {
+    others
+        .iter()
+        .flat_map(|o| {
+            github_names(&o.repos, &o.threads)
+                .into_iter()
+                .chain(o.threads.iter().filter_map(|t| github_name(&t.origin)))
+        })
+        .collect()
+}
+
+fn other_github(ctx: &Ctx, others: &[OtherProjectOwnership]) -> Result<BTreeSet<String>> {
+    let mut names = recorded_github(others);
+    for repo in others.iter().flat_map(|o| &o.repos) {
+        // Origin and publish URL can name different repositories. A successful
+        // non-GitHub origin is evidence; an unreadable origin is not.
+        if let Some(name) = github_name(&checkout_origin(ctx, &repo.path)?) {
+            names.insert(name);
+        }
+    }
+    Ok(names)
+}
+
+fn terminal_users(
+    others: &[OtherProjectOwnership],
+    socket: &str,
+    machine: &str,
+    id: &str,
+    workspace: bool,
+) -> Vec<String> {
+    others
+        .iter()
+        .filter(|owner| {
+            if owner
+                .coordinator
+                .as_ref()
+                .is_some_and(|c| c.socket != socket)
+            {
+                return false;
+            }
+            (machine.is_empty()
+                && owner.coordinator.as_ref().is_some_and(|c| {
+                    if workspace {
+                        c.workspace_id == id
+                    } else {
+                        c.tab_id == id
+                    }
+                }))
+                || owner.threads.iter().any(|t| {
+                    t.machine_route() == machine
+                        && if workspace {
+                            t.workspace_id == id
+                        } else {
+                            t.tab_id == id
+                        }
+                })
+        })
+        .map(|owner| owner.slug.clone())
+        .collect()
+}
+
+fn add_trash(
+    ctx: &Ctx,
+    steps: &mut Vec<DeleteStep>,
+    path: &Path,
+    machine: &str,
+    what: &str,
+) -> Result<()> {
+    let path = path.to_string_lossy().into_owned();
+    if let Some(identity) = file_identity(ctx, machine, &path)?
+        && !steps.iter().any(|step| matches!(step, DeleteStep::Trash { path: p, machine: m, .. } if p == &path && m == machine))
+    {
+        steps.push(DeleteStep::Trash { path, machine: machine.into(), identity, what: what.into() });
+    }
+    Ok(())
+}
+
+fn build_plan(ctx: &Ctx, project: &Project, github: bool) -> Result<DeleteIntent> {
+    let (settings, _) = project.read_project_md()?;
+    let threads = readable_threads(project)?;
+    let others = other_ownership(ctx, &project.slug)?;
+    if !other_projects_using_path(&others, &project.dir()).is_empty() {
+        bail!(
+            "cannot delete `{}`: another project owns resources inside its record",
+            project.slug
+        );
+    }
+    let owned: Vec<_> = settings
+        .repos
+        .iter()
+        .filter(|repo| {
+            let mut users = other_projects_using_repo(&others, repo);
+            users.extend(other_projects_using_path(&others, Path::new(&repo.path)));
+            if let Some(path) = &repo.box_path {
+                users.extend(other_projects_using_path(&others, Path::new(path)));
+            }
+            users.sort();
+            users.dedup();
+            if !users.is_empty() {
+                println!("kept shared repo {} ({})", repo.path, users.join(", "));
+            }
+            users.is_empty()
+        })
+        .cloned()
+        .collect();
+    let mut steps = Vec::new();
+    if let Some(c) = readable_coordinator(project)? {
+        let mut workspaces = BTreeSet::new();
+        let mut tabs: BTreeSet<(String, String)> = BTreeSet::new();
+        if !c.workspace_id.is_empty() {
+            workspaces.insert((String::new(), c.workspace_id.clone()));
+        }
+        for t in &threads {
+            if t.kind == thread::Kind::Adopted {
+                if !t.tab_id.is_empty() {
+                    tabs.insert((t.machine_route().into(), t.tab_id.clone()));
                 }
-            } else {
-                println!("  kept shared repo: {} ({})", repo.path, shared.join(", "));
+            } else if !t.workspace_id.is_empty() {
+                workspaces.insert((t.machine_route().into(), t.workspace_id.clone()));
             }
         }
-        for lane in &threads {
-            println!("  lane: {}", lane.id);
+        // A workspace containing adopted/shared work stays; close only this
+        // project's exclusive tabs in it, including the coordinator's tab.
+        workspaces.retain(|(machine, id)| {
+            let shared = !terminal_users(&others, &c.socket, machine, id, true).is_empty()
+                || threads.iter().any(|t| {
+                    t.kind == thread::Kind::Adopted
+                        && t.workspace_id == *id
+                        && t.machine_route() == machine
+                });
+            if shared {
+                if machine.is_empty() && c.workspace_id == *id && !c.tab_id.is_empty() {
+                    tabs.insert((machine.clone(), c.tab_id.clone()));
+                }
+                for t in &threads {
+                    if t.workspace_id == *id && t.machine_route() == machine && !t.tab_id.is_empty()
+                    {
+                        tabs.insert((machine.clone(), t.tab_id.clone()));
+                    }
+                }
+            }
+            !shared
+        });
+        for (machine, id) in tabs {
+            if terminal_users(&others, &c.socket, &machine, &id, false).is_empty() {
+                steps.push(DeleteStep::Tab {
+                    socket: c.socket.clone(),
+                    machine,
+                    id,
+                });
+            }
+        }
+        for (machine, id) in workspaces {
+            if terminal_users(&others, &c.socket, &machine, &id, true).is_empty()
+                && !threads.iter().any(|t| {
+                    t.kind == thread::Kind::Adopted
+                        && t.workspace_id == id
+                        && t.machine_route() == machine
+                })
+            {
+                steps.push(DeleteStep::Workspace {
+                    socket: c.socket.clone(),
+                    machine,
+                    id,
+                });
+            }
+        }
+    } else if threads
+        .iter()
+        .any(|t| !t.workspace_id.is_empty() || !t.tab_id.is_empty() || !t.pane_id.is_empty())
+    {
+        bail!("cannot stop the project's lanes because it has no coordinator session record");
+    }
+    for t in &threads {
+        if t.worktree_path.is_empty() || t.kind == thread::Kind::Adopted {
+            continue;
+        }
+        let machine = if t.is_remote() { t.machine_route() } else { "" };
+        let path = Path::new(&t.worktree_path);
+        let covered = owned.iter().any(|r| {
+            if machine.is_empty() {
+                path.starts_with(&r.path)
+            } else {
+                r.box_path.as_ref().is_some_and(|p| path.starts_with(p))
+            }
+        });
+        if covered || !other_projects_using_path(&others, path).is_empty() {
+            continue;
+        }
+        add_trash(ctx, &mut steps, path, machine, "project worktree")?;
+        let repo = if machine.is_empty() {
+            Some(t.repo.as_str())
+        } else {
+            path.parent().and_then(Path::parent).and_then(Path::to_str)
+        };
+        if let Some(repo) = repo
+            && let Some(identity) = file_identity(ctx, machine, repo)?
+        {
+            steps.push(DeleteStep::Prune {
+                repo: repo.into(),
+                machine: machine.into(),
+                identity,
+            });
+        }
+    }
+    if github {
+        let mut names = github_names(&owned, &threads);
+        if names.is_empty() {
+            for repo in &owned {
+                match checkout_github_name(ctx, &repo.path) {
+                    Ok(name) => {
+                        names.insert(name);
+                    }
+                    Err(e) => println!("kept GitHub repo for {}: {e:#}", repo.path),
+                }
+            }
+        }
+        let recorded = recorded_github(&others);
+        let candidates: BTreeSet<_> = names.difference(&recorded).cloned().collect();
+        // No origin reads are needed if recorded ownership already excludes
+        // every GitHub effect. Otherwise every ownership read must succeed.
+        let shared = if candidates.is_empty() {
+            recorded
+        } else {
+            other_github(ctx, &others)?
+        };
+        for name in candidates.difference(&shared) {
+            steps.push(DeleteStep::Github {
+                name: name.clone(),
+                identity: github_identity(ctx, name)?,
+            });
+        }
+    }
+    for repo in &owned {
+        // Never remove the record (and its completion journal) before the last step.
+        if Path::new(&project.dir()).starts_with(&repo.path) {
+            bail!("repo overlaps project record: {}", repo.path);
+        }
+        add_trash(
+            ctx,
+            &mut steps,
+            Path::new(&repo.path),
+            "",
+            "project repo (including worktrees)",
+        )?;
+        if let Some(path) = &repo.box_path {
+            for machine in machines_for_repo(ctx, repo, &threads)? {
+                add_trash(
+                    ctx,
+                    &mut steps,
+                    Path::new(path),
+                    &machine,
+                    "box repo (including worktrees)",
+                )?;
+            }
+        }
+    }
+    let paths = owned_paths(project, &threads);
+    for (base, naming) in [
+        (
+            ctx.root.join("pi/agent/sessions"),
+            pi_session_name as fn(&Path) -> String,
+        ),
+        (
+            ctx.env.home.join(".claude/projects"),
+            claude_session_name as fn(&Path) -> String,
+        ),
+    ] {
+        let shared: BTreeSet<_> = others
+            .iter()
+            .flat_map(|o| o.paths.iter().map(|p| naming(p)))
+            .collect();
+        for name in paths
+            .iter()
+            .map(|p| naming(p))
+            .collect::<BTreeSet<_>>()
+            .difference(&shared)
+        {
+            add_trash(ctx, &mut steps, &base.join(name), "", "agent session logs")?;
+        }
+    }
+    let holding = ctx.root.join(".trash");
+    match std::fs::read_dir(&holding) {
+        Ok(entries) => {
+            let mut entries = entries.collect::<std::io::Result<Vec<_>>>()?;
+            entries.sort_by_key(std::fs::DirEntry::file_name);
+            for entry in entries {
+                if entry
+                    .file_name()
+                    .to_str()
+                    .is_some_and(|n| old_copy_for_slug(n, &project.slug))
+                {
+                    add_trash(
+                        ctx,
+                        &mut steps,
+                        &entry.path(),
+                        "",
+                        "old copy of this project",
+                    )?;
+                }
+            }
+            // The holding directory is not a finite target: a later copy could
+            // belong to another project. Leave the empty container, not its data.
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e.into()),
+    }
+    for step in &steps {
+        if let DeleteStep::Trash { path, machine, .. } = step
+            && machine.is_empty()
+        {
+            if project.dir().starts_with(path) {
+                bail!("planned target would remove the project record before completion: {path}");
+            }
+            if deletion_path(&ctx.root, &project.slug).starts_with(path) {
+                bail!("planned target would remove the deletion journal: {path}");
+            }
+        }
+    }
+    add_trash(ctx, &mut steps, &project.dir(), "", "project record")?;
+    Ok(DeleteIntent {
+        slug: project.slug.clone(),
+        github,
+        created: crate::project::now(),
+        repos: settings
+            .repos
+            .iter()
+            .flat_map(|r| std::iter::once(r.path.clone()).chain(r.box_path.clone()))
+            .collect(),
+        worktrees: threads.iter().map(|t| t.worktree_path.clone()).collect(),
+        completed: BTreeSet::new(),
+        steps: Some(steps),
+        topology: topology(ctx, project, &threads)?,
+        started: false,
+    })
+}
+
+fn check_step(ctx: &Ctx, project: &Project, plan: &DeleteIntent, step: &DeleteStep) -> Result<()> {
+    let others = other_ownership(ctx, &project.slug)?;
+    let users = match step {
+        DeleteStep::Workspace {
+            socket,
+            machine,
+            id,
+        } => terminal_users(&others, socket, machine, id, true),
+        DeleteStep::Tab {
+            socket,
+            machine,
+            id,
+        } => terminal_users(&others, socket, machine, id, false),
+        DeleteStep::Github { name, identity } => {
+            if github_identity(ctx, name)? != *identity {
+                bail!("GitHub identity changed: {name}");
+            }
+            if other_github(ctx, &others)?.contains(name) {
+                vec!["another project".into()]
+            } else {
+                Vec::new()
+            }
+        }
+        DeleteStep::Trash {
+            path,
+            machine,
+            identity,
+            what,
+        } => {
+            if let Some(current) = file_identity(ctx, machine, path)?
+                && current != *identity
+            {
+                bail!("file identity changed: {path}");
+            }
+            let mut users = other_projects_using_path(&others, Path::new(path));
+            if what == "agent session logs" {
+                for owner in &others {
+                    if owner.paths.iter().any(|p| {
+                        Path::new(path).file_name().is_some_and(|name| {
+                            name == pi_session_name(p).as_str()
+                                || name == claude_session_name(p).as_str()
+                        })
+                    }) {
+                        users.push(owner.slug.clone());
+                    }
+                }
+            }
+            // Additions to our settings are not covered by an old parent target.
+            for repo in project.read_project_md()?.0.repos {
+                for candidate in std::iter::once(&repo.path).chain(repo.box_path.as_ref()) {
+                    if !plan.repos.contains(candidate) && paths_overlap(candidate, path) {
+                        bail!("new repo overlaps planned deletion: {candidate}");
+                    }
+                }
+            }
+            users
+        }
+        DeleteStep::Prune {
+            repo,
+            machine,
+            identity,
+        } => {
+            if let Some(current) = file_identity(ctx, machine, repo)?
+                && current != *identity
+            {
+                bail!("kept repo identity changed: {repo}");
+            }
+            Vec::new()
+        }
+    };
+    if !users.is_empty() {
+        bail!(
+            "planned resource is now owned by {}: {step:?}",
+            users.join(", ")
+        );
+    }
+    Ok(())
+}
+
+fn deletion_path(root: &Path, slug: &str) -> PathBuf {
+    root.join(".deletions").join(format!("{slug}.toml"))
+}
+
+fn save_plan(path: &Path, plan: &DeleteIntent) -> Result<()> {
+    crate::project::write_atomic(path, toml::to_string(plan)?.as_bytes())
+}
+
+/// Preview freezes exactly the steps execution will use. Execution keeps both
+/// lifecycle locks through the effects, and archives before the first effect:
+/// allocations serialize with deletion and a failed delete cannot restart work.
+pub(crate) fn delete(ctx: &Ctx, slug: &str, delete_github: bool, preview: bool) -> Result<()> {
+    crate::project::validate_slug(slug)?;
+    let path = deletion_path(&ctx.root, slug);
+    std::fs::create_dir_all(path.parent().expect("journal directory"))?;
+    let _journal = crate::project::lock_file(&path.with_extension("lock"))?;
+    let mut saved = match std::fs::read_to_string(&path) {
+        Ok(text) => Some(toml::from_str::<DeleteIntent>(&text)?),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+        Err(e) => return Err(e.into()),
+    };
+    if let Some(plan) = &saved {
+        let steps = plan.steps.as_ref().ok_or_else(|| anyhow::anyhow!("historical deletion intent has no identity-qualified execution plan; nothing was deleted"))?;
+        if plan.slug != slug
+            || !matches!(steps.last(), Some(DeleteStep::Trash { path: p, machine, what, .. }) if p == &ctx.root.join(slug).to_string_lossy() && machine.is_empty() && what == "project record")
+            || plan.completed.iter().any(|key| {
+                key.parse::<usize>().is_err()
+                    || key.parse::<usize>().is_ok_and(|i| i >= steps.len())
+            })
+        {
+            bail!("invalid deletion plan for `{slug}`; nothing was deleted");
+        }
+        let new_incarnation = plan.finished()
+            && match steps.last() {
+                Some(DeleteStep::Trash {
+                    path: p, identity, ..
+                }) => file_identity(ctx, "", p)?.is_some_and(|current| current != *identity),
+                _ => false,
+            };
+        if plan.github != delete_github && !new_incarnation && !(preview && !plan.started) {
+            bail!(
+                "delete is already planned for `{}` with GitHub deletion {}; retry with the same choice",
+                plan.slug,
+                plan.github
+            );
+        }
+    }
+    // The journal is outside the record, so even the final move has a durable
+    // completion. If the process died between that move and its receipt, absence
+    // proves the record is gone; no destructive command needs repeating.
+    if let Some(plan) = saved.as_mut()
+        && plan.started
+        && let Some(steps) = &plan.steps
+        && let Some(DeleteStep::Trash {
+            path: record, what, ..
+        }) = steps.last()
+        && what == "project record"
+        && record == &ctx.root.join(slug).to_string_lossy()
+        && (0..steps.len() - 1).all(|i| plan.completed.contains(&i.to_string()))
+        && file_identity(ctx, "", record)?.is_none()
+    {
+        plan.completed.insert((steps.len() - 1).to_string());
+        save_plan(&path, plan)?;
+        return Ok(());
+    }
+    let project = Project::load(&ctx.root, slug)?;
+    let _binding = project.coordinator_lock()?;
+    let _records = project.lock()?;
+    // Historical records still deserialize, but their unqualified intent cannot
+    // be upgraded using today's resource lists: that would execute a stale plan.
+    let legacy = project.record_file("delete.toml");
+    if legacy.exists() {
+        let _: DeleteIntent = toml::from_str(&std::fs::read_to_string(legacy)?)?;
+        bail!(
+            "historical deletion intent has no identity-qualified execution plan; nothing was deleted"
+        );
+    }
+    let mut plan = match saved {
+        // A fresh preview may replace an unstarted snapshot. Once effects have
+        // begun, even preview must render the frozen plan, never expand it.
+        Some(plan) if preview && !plan.started => build_plan(ctx, &project, delete_github)?,
+        Some(plan) if plan.finished() => match plan.steps.as_ref().and_then(|steps| steps.last()) {
+            Some(DeleteStep::Trash {
+                path: record,
+                identity,
+                what,
+                ..
+            }) if what == "project record"
+                && file_identity(ctx, "", record)?.as_ref() != Some(identity) =>
+            {
+                build_plan(ctx, &project, delete_github)?
+            }
+            _ => plan,
+        },
+        Some(plan) => plan,
+        None => build_plan(ctx, &project, delete_github)?,
+    };
+    let steps = plan.steps.as_ref().ok_or_else(|| anyhow::anyhow!("historical deletion intent has no identity-qualified execution plan; nothing was deleted"))?;
+    if preview {
+        save_plan(&path, &plan)?;
+        println!("Archive keeps `{slug}` and its files available for unarchive.");
+        println!("Persisted deletion plan: {}", path.display());
+        for (i, step) in steps.iter().enumerate() {
+            println!(
+                "  {}: {step:?}{}",
+                i + 1,
+                if plan.completed.contains(&i.to_string()) {
+                    " (completed)"
+                } else {
+                    ""
+                }
+            );
         }
         println!(
             "  GitHub: {}",
-            if delete_github {
-                "delete project-owned repositories"
+            if plan.github {
+                "delete only listed repositories"
             } else {
                 "keep repositories"
             }
         );
         return Ok(());
     }
-
-    let owned_repos: Vec<_> = settings
-        .repos
-        .iter()
-        .filter_map(|repo| {
-            let users = other_projects_using_repo(&others, repo);
-            if users.is_empty() {
-                Some(repo.clone())
-            } else {
-                println!(
-                    "kept shared repo {} (also listed by {})",
-                    repo.path,
-                    users.join(", ")
-                );
-                None
-            }
-        })
-        .collect();
-
-    // Check every affected machine before recording intent, closing panes,
-    // deleting GitHub repositories or moving any file.
+    if topology(ctx, &project, &readable_threads(&project)?)? != plan.topology {
+        bail!("project resource bindings changed since preview; refusing stale deletion plan");
+    }
+    // Preflight all remaining targets and trash tools before closing anything.
     let local_trash = Trash::local(ctx)?;
-    let mut remote_machines = BTreeSet::new();
-    for repo in &owned_repos {
-        if repo.box_path.is_some() {
-            remote_machines.extend(machines_for_repo(ctx, repo, &threads)?);
-        }
-    }
-    for lane in &threads {
-        if lane.is_remote()
-            && !lane.worktree_path.is_empty()
-            && other_projects_using_path(&others, Path::new(&lane.worktree_path)).is_empty()
-            && !owned_repos
-                .iter()
-                .any(|repo| Path::new(&lane.worktree_path).starts_with(&repo.path))
-        {
-            remote_machines.insert(lane.machine_route().to_string());
-        }
-    }
     let mut remote_trash = BTreeMap::new();
-    for machine in remote_machines {
-        remote_trash.insert(machine.clone(), Trash::remote(ctx, &machine)?);
-    }
-
-    let intent_path = project.state_dir().join("delete.toml");
-    let mut delete_intent = if intent_path.is_file() {
-        let text = std::fs::read_to_string(&intent_path)?;
-        let intent: DeleteIntent = toml::from_str(&text)?;
-        if intent.github != delete_github {
-            bail!(
-                "delete is already in progress with GitHub deletion {}; retry with the same choice",
-                if intent.github { "on" } else { "off" }
-            );
-        }
-        intent
-    } else {
-        let intent = DeleteIntent {
-            slug: slug.to_string(),
-            github: delete_github,
-            created: crate::project::now(),
-            repos: settings
-                .repos
-                .iter()
-                .map(|repo| repo.path.clone())
-                .collect(),
-            worktrees: threads
-                .iter()
-                .filter(|thread| !thread.worktree_path.is_empty())
-                .map(|thread| thread.worktree_path.clone())
-                .collect(),
-            completed: BTreeSet::new(),
-        };
-        crate::project::write_atomic(&intent_path, toml::to_string(&intent)?.as_bytes())?;
-        println!("recorded deletion plan: {}", intent_path.display());
-        intent
-    };
-
-    let open_reviews: Vec<_> = crate::review::list(&project)?
-        .into_iter()
-        .filter(|record| !record.phase.closed())
-        .map(|record| record.id)
-        .collect();
-
-    if coordinator.is_none()
-        && threads.iter().any(|thread| {
-            !thread.workspace_id.is_empty()
-                || !thread.tab_id.is_empty()
-                || !thread.pane_id.is_empty()
-        })
-    {
-        bail!("cannot stop the project's lanes because it has no coordinator session record");
-    }
-    if let Some(record) = &coordinator {
-        let herdr = Herdr::new(ctx.env.herdr_bin(), &record.socket, ctx.runner);
-        let mut workspaces = BTreeSet::new();
-        let mut tabs = BTreeSet::new();
-        if !record.workspace_id.is_empty() {
-            workspaces.insert((String::new(), record.workspace_id.clone()));
-        }
-        for lane in &threads {
-            let machine = lane.machine_route().to_string();
-            if lane.kind == thread::Kind::Adopted {
-                if !lane.tab_id.is_empty() {
-                    tabs.insert((machine, lane.tab_id.clone()));
-                }
-            } else if !lane.workspace_id.is_empty() {
-                workspaces.insert((machine, lane.workspace_id.clone()));
-            }
-        }
-        for (machine, tab) in tabs {
-            let label = if machine.is_empty() {
-                String::new()
-            } else {
-                format!(" on {machine}")
-            };
-            close_tab(&herdr.on_machine(&machine), &tab, &label)?;
-        }
-        for (machine, workspace) in workspaces {
-            let label = if machine.is_empty() {
-                String::new()
-            } else {
-                format!(" on {machine}")
-            };
-            close_workspace(&herdr.on_machine(&machine), &workspace, &label)?;
-        }
-    }
-    for record in &threads {
-        println!("stopped lane: {}", record.id);
-    }
-    for review in open_reviews {
-        println!("cancelled review: {review}");
-    }
-
-    // A shared checkout stays, but this project's worktrees do not.
-    for record in &threads {
-        if record.worktree_path.is_empty() {
+    for (i, step) in steps.iter().enumerate() {
+        if plan.completed.contains(&i.to_string()) {
             continue;
         }
-        let path = Path::new(&record.worktree_path);
-        let covered_by_owned_repo = owned_repos
-            .iter()
-            .any(|repo| path.starts_with(Path::new(&repo.path)));
-        if covered_by_owned_repo {
+        check_step(ctx, &project, &plan, step)?;
+        if let DeleteStep::Trash { machine, .. } = step
+            && !machine.is_empty()
+            && !remote_trash.contains_key(machine)
+        {
+            remote_trash.insert(machine.clone(), Trash::remote(ctx, machine)?);
+        }
+    }
+    plan.started = true;
+    save_plan(&path, &plan)?;
+    crate::project::write_json(
+        &project.record_file("project.json"),
+        &serde_json::json!({"status": "archived"}),
+    )?;
+    for i in 0..plan.steps.as_ref().expect("checked").len() {
+        let key = i.to_string();
+        if plan.completed.contains(&key) {
             continue;
         }
-        let users = other_projects_using_path(&others, path);
-        if !users.is_empty() {
-            println!(
-                "kept shared project worktree {} (also owned by {})",
-                path.display(),
-                users.join(", ")
-            );
-            continue;
-        }
-        if record.is_remote() {
-            remote_remove(
-                ctx,
-                remote_trash[record.machine_route()],
-                record.machine_route(),
-                &record.worktree_path,
-                "project worktree",
-            )?;
-            if let Some(box_repo) = Path::new(&record.worktree_path)
-                .parent()
-                .and_then(Path::parent)
-                .and_then(Path::to_str)
-            {
-                prune_remote_worktrees(ctx, record.machine_route(), box_repo)?;
-            }
-        } else {
-            trash(ctx, local_trash, path, "project worktree")?;
-            prune_local_worktrees(ctx, &record.repo)?;
-        }
-    }
-
-    let mut github_candidates = github_names(&owned_repos, &threads);
-    if delete_github && github_candidates.is_empty() {
-        // Historical rows may not record a publish URL. Resolve only origin,
-        // never gh's default remote (which may instead be upstream).
-        for repo in &owned_repos {
-            match checkout_github_name(ctx, &repo.path) {
-                Ok(name) => {
-                    github_candidates.insert(name);
-                }
-                Err(error) => {
-                    println!("kept GitHub repo for {}: {error:#}", repo.path);
+        let step = &plan.steps.as_ref().expect("checked")[i];
+        check_step(ctx, &project, &plan, step)?;
+        match step {
+            DeleteStep::Workspace {
+                socket,
+                machine,
+                id,
+            } => close_workspace(
+                &Herdr::new(ctx.env.herdr_bin(), socket, ctx.runner).on_machine(machine),
+                id,
+                machine,
+            )?,
+            DeleteStep::Tab {
+                socket,
+                machine,
+                id,
+            } => close_tab(
+                &Herdr::new(ctx.env.herdr_bin(), socket, ctx.runner).on_machine(machine),
+                id,
+                machine,
+            )?,
+            DeleteStep::Trash {
+                path,
+                machine,
+                what,
+                ..
+            } => {
+                if machine.is_empty() {
+                    trash(ctx, local_trash, Path::new(path), what)?;
+                } else {
+                    remote_remove(ctx, remote_trash[machine], machine, path, what)?;
                 }
             }
-        }
-    }
-    let mut other_github: BTreeSet<_> = others
-        .iter()
-        .flat_map(|owner| github_names(&owner.repos, &owner.threads))
-        .collect();
-    if delete_github {
-        for owner in &others {
-            other_github.extend(
-                owner
-                    .threads
-                    .iter()
-                    .filter_map(|record| github_name(&record.origin)),
-            );
-            other_github.extend(
-                owner
-                    .repos
-                    .iter()
-                    .filter_map(|repo| checkout_github_name(ctx, &repo.path).ok()),
-            );
-        }
-    }
-    let github: BTreeSet<_> = github_candidates
-        .difference(&other_github)
-        .cloned()
-        .collect();
-    for name in github_candidates.intersection(&other_github) {
-        println!("kept shared GitHub repo: {name}");
-    }
-    if delete_github {
-        for name in &github {
-            let completed = format!("github:{name}");
-            if delete_intent.completed.contains(&completed) {
-                println!("already removed GitHub repo: {name}");
-                continue;
+            DeleteStep::Prune { repo, machine, .. } => {
+                if file_identity(ctx, machine, repo)?.is_some() {
+                    if machine.is_empty() {
+                        prune_local_worktrees(ctx, repo)?;
+                    } else {
+                        prune_remote_worktrees(ctx, machine, repo)?;
+                    }
+                }
             }
-            println!("removing GitHub repo: {name}");
-            let out = ctx.runner.run(
-                &Cmd::new("gh", Duration::from_secs(60)).args(["repo", "delete", name, "--yes"]),
-            )?;
-            if !out.success() {
-                bail!("could not delete GitHub repo {name}: {}", out.error_text());
-            }
-            delete_intent.completed.insert(completed);
-            crate::project::write_atomic(
-                &intent_path,
-                toml::to_string(&delete_intent)?.as_bytes(),
-            )?;
-            println!("removed GitHub repo: {name}");
-        }
-    } else if github.is_empty() {
-        println!("GitHub repositories remain; pass --github to remove project-owned copies.");
-    } else {
-        for name in &github {
-            println!("kept GitHub repo: {name} (pass --github to remove it)");
-        }
-    }
-
-    let mut removed_box_repos = BTreeSet::new();
-    for repo in &owned_repos {
-        trash(
-            ctx,
-            local_trash,
-            Path::new(&repo.path),
-            "project repo (including worktrees)",
-        )?;
-        if let Some(box_path) = &repo.box_path {
-            for machine in machines_for_repo(ctx, repo, &threads)? {
-                if removed_box_repos.insert((machine.clone(), box_path.clone())) {
-                    remote_remove(
-                        ctx,
-                        remote_trash[&machine],
-                        &machine,
-                        box_path,
-                        "box repo (including worktrees)",
-                    )?;
+            DeleteStep::Github { name, .. } => {
+                let out = ctx.runner.run(
+                    &Cmd::new("gh", Duration::from_secs(60))
+                        .args(["repo", "delete", name, "--yes"]),
+                )?;
+                if !out.success() {
+                    bail!("could not delete GitHub repo {name}: {}", out.error_text());
                 }
             }
         }
-    }
-
-    let session_cwds: BTreeSet<PathBuf> = project_paths.into_iter().collect();
-    let pi_names: BTreeSet<String> = session_cwds
-        .iter()
-        .map(|path| pi_session_name(path))
-        .collect();
-    let claude_names: BTreeSet<String> = session_cwds
-        .iter()
-        .map(|path| claude_session_name(path))
-        .collect();
-    let other_pi_names: BTreeSet<String> = others
-        .iter()
-        .flat_map(|owner| owner.paths.iter().map(|path| pi_session_name(path)))
-        .collect();
-    let other_claude_names: BTreeSet<String> = others
-        .iter()
-        .flat_map(|owner| owner.paths.iter().map(|path| claude_session_name(path)))
-        .collect();
-    for (base, exact_names, shared_names) in [
-        (ctx.root.join("pi/agent/sessions"), pi_names, other_pi_names),
-        (
-            ctx.env.home.join(".claude/projects"),
-            claude_names,
-            other_claude_names,
-        ),
-    ] {
-        for shared in exact_names.intersection(&shared_names) {
-            println!(
-                "kept shared agent session logs: {}",
-                base.join(shared).display()
-            );
-        }
-        let exact_names: BTreeSet<_> = exact_names.difference(&shared_names).cloned().collect();
-        if let Ok(entries) = std::fs::read_dir(base) {
-            for entry in entries.flatten() {
-                if exact_names.contains(entry.file_name().to_string_lossy().as_ref()) {
-                    trash(ctx, local_trash, &entry.path(), "agent session logs")?;
-                }
-            }
-        }
-    }
-
-    // Older versions parked deleted projects here. Remove this slug's copies,
-    // but keep and name every other project's retained copy; the redundant
-    // holding folder goes only when no retained copy still needs it. Do this
-    // before the project record: a cleanup failure must leave the deletion
-    // intent available for retry.
-    clean_old_trash(ctx, local_trash, slug)?;
-
-    {
-        // No project writer can land after this point. The trash command moves
-        // the directory atomically on macOS, while the open lock inode remains
-        // valid until this scope ends.
-        let _lock = project.lock()?;
-        trash(ctx, local_trash, &project.dir(), "project record")?;
+        plan.completed.insert(key);
+        save_plan(&path, &plan)?;
     }
     Ok(())
 }
@@ -977,6 +1383,7 @@ mod tests {
         world
             .runner
             .on_fn(|cmd| cmd.program == system_trash(), |_| Ok(ok("")));
+        world.runner.on("gh api", ok("fixture-node-id"));
     }
 
     #[test]
@@ -1024,7 +1431,8 @@ mod tests {
         );
         let error = delete(&world.ctx(), "demo", true, false).unwrap_err();
         assert!(error.to_string().contains("system trash is unavailable"));
-        assert!(!project.state_dir().join("delete.toml").exists());
+        assert!(!deletion_path(&world.root, &project.slug).exists());
+        assert_eq!(project.status(), Status::Active);
         assert!(project.project_md().exists());
         assert_eq!(world.runner.count("workspace close"), 0);
         assert_eq!(world.runner.count("gh repo delete"), 0);
@@ -1045,7 +1453,9 @@ mod tests {
             world.runner.on_fn(
                 |cmd| cmd.program == "ssh",
                 move |cmd| {
-                    if cmd.display().contains("uname -s") {
+                    if cmd.display().contains("stat -c") {
+                        Ok(ok("1:42"))
+                    } else if cmd.display().contains("uname -s") {
                         Ok(if available {
                             ok("gio")
                         } else {
@@ -1067,7 +1477,8 @@ mod tests {
             } else {
                 let error = result.unwrap_err();
                 assert!(error.to_string().contains("on box"), "{error:#}");
-                assert!(!project.state_dir().join("delete.toml").exists());
+                assert!(!deletion_path(&world.root, &project.slug).exists());
+                assert_eq!(project.status(), Status::Active);
                 assert_eq!(world.runner.count("workspace close"), 0);
                 assert_eq!(trash_calls(&world), 0);
             }
@@ -1107,14 +1518,14 @@ mod tests {
     }
 
     #[test]
-    fn delete_preview_changes_nothing() {
+    fn delete_preview_persists_the_plan_without_destructive_effects() {
         let world = World::new();
         let project = world.project("demo", "a.sock");
 
         delete(&world.ctx(), "demo", false, true).unwrap();
 
         assert!(project.project_md().is_file());
-        assert!(!project.state_dir().join("delete.toml").exists());
+        assert!(deletion_path(&world.root, &project.slug).exists());
         assert_eq!(trash_calls(&world), 0);
         assert_eq!(world.runner.count("workspace close"), 0);
     }
@@ -1180,7 +1591,7 @@ mod tests {
 
         assert!(delete(&world.ctx(), "demo", false, false).is_err());
         assert_eq!(trash_calls(&world), 0);
-        assert!(!project.state_dir().join("delete.toml").exists());
+        assert!(!deletion_path(&world.root, &project.slug).exists());
     }
 
     #[test]
@@ -1260,16 +1671,22 @@ mod tests {
         assert_eq!(world.runner.count("remote get-url origin"), 1);
         assert_eq!(world.runner.count("gh repo delete"), 1);
         let calls = world.runner.calls.borrow();
-        let deletion = calls.iter().find(|cmd| cmd.program == "gh").unwrap();
+        let deletion = calls
+            .iter()
+            .find(|cmd| cmd.program == "gh" && cmd.args.first().is_some_and(|a| a == "repo"))
+            .unwrap();
         assert_eq!(deletion.args, ["repo", "delete", "acme/demo", "--yes"]);
         let intent: DeleteIntent = toml::from_str(
-            &std::fs::read_to_string(project.state_dir().join("delete.toml")).unwrap(),
+            &std::fs::read_to_string(deletion_path(&world.root, &project.slug)).unwrap(),
         )
         .unwrap();
-        assert_eq!(
-            intent.completed,
-            BTreeSet::from(["github:acme/demo".into()])
-        );
+        let steps = intent.steps.as_ref().unwrap();
+        let github = steps
+            .iter()
+            .position(|s| matches!(s, DeleteStep::Github { name, .. } if name == "acme/demo"))
+            .unwrap();
+        assert!(intent.completed.contains(&github.to_string()));
+        assert_eq!(intent.completed.len(), steps.len());
     }
 
     #[test]
@@ -1413,6 +1830,698 @@ mod tests {
             })
             .unwrap();
         assert!(old_copy < project_record);
+    }
+
+    fn persisted(world: &World, slug: &str) -> DeleteIntent {
+        toml::from_str(&std::fs::read_to_string(deletion_path(&world.root, slug)).unwrap()).unwrap()
+    }
+
+    fn trashed(world: &World, path: &Path) -> usize {
+        world
+            .runner
+            .calls
+            .borrow()
+            .iter()
+            .filter(|cmd| {
+                cmd.program == system_trash()
+                    && cmd.args.last() == Some(&path.to_string_lossy().into_owned())
+            })
+            .count()
+    }
+
+    #[test]
+    fn preview_and_execution_use_identical_steps_and_leave_later_additions() {
+        let world = World::new();
+        let project = world.project("demo", "a.sock");
+        let repo = world.home.path().join("old-repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        world.add_repo(&project, repo.to_str().unwrap());
+        delete(&world.ctx(), "demo", false, true).unwrap();
+        let preview = persisted(&world, "demo");
+        let later = world.home.path().join("later-repo");
+        let later_copy = world.root.join(".trash/demo-20260902T000000Z");
+        let later_logs = world
+            .root
+            .join("pi/agent/sessions")
+            .join(pi_session_name(&project.dir()));
+        for path in [&later, &later_copy, &later_logs] {
+            std::fs::create_dir_all(path).unwrap();
+        }
+        world.add_repo(&project, later.to_str().unwrap());
+        mock_trash(&world);
+        delete(&world.ctx(), "demo", false, false).unwrap();
+        let executed = persisted(&world, "demo");
+        assert_eq!(
+            serde_json::to_value(&preview.steps).unwrap(),
+            serde_json::to_value(&executed.steps).unwrap()
+        );
+        assert_eq!(preview.created, executed.created);
+        assert_eq!(trashed(&world, &repo), 1);
+        for path in [&later, &later_copy, &later_logs] {
+            assert_eq!(trashed(&world, path), 0);
+        }
+        assert_eq!(executed.completed.len(), executed.steps.unwrap().len());
+        assert_eq!(world.runner.count("gh repo delete"), 0);
+    }
+
+    #[test]
+    fn new_nested_repo_refuses_the_old_parent_target() {
+        let world = World::new();
+        let project = world.project("demo", "a.sock");
+        let repo = world.home.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        world.add_repo(&project, repo.to_str().unwrap());
+        delete(&world.ctx(), "demo", false, true).unwrap();
+        world.add_repo(&project, repo.join("new-nested").to_str().unwrap());
+        mock_trash(&world);
+        let error = delete(&world.ctx(), "demo", false, false).unwrap_err();
+        assert!(error.to_string().contains("new repo overlaps"));
+        assert_eq!(trash_calls(&world), 0);
+        assert_eq!(world.runner.count("workspace close"), 0);
+    }
+
+    #[test]
+    fn newly_shared_target_is_refused_before_execution() {
+        let world = World::new();
+        let project = world.project("demo", "a.sock");
+        let repo = world.home.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        world.add_repo(&project, repo.to_str().unwrap());
+        delete(&world.ctx(), "demo", false, true).unwrap();
+        crate::project::create(
+            &world.root,
+            "second",
+            "",
+            vec![Repo {
+                path: repo.display().to_string(),
+                ..Repo::default()
+            }],
+        )
+        .unwrap();
+        mock_trash(&world);
+        assert!(
+            delete(&world.ctx(), "demo", false, false)
+                .unwrap_err()
+                .to_string()
+                .contains("now owned")
+        );
+        assert_eq!(trash_calls(&world), 0);
+        assert_eq!(world.runner.count("workspace close"), 0);
+    }
+
+    #[test]
+    fn ownership_is_reloaded_after_every_effect_and_failed_delete_stays_archived() {
+        let mut world = World::new();
+        world.runner = crate::runner::fake::FakeRunner::new();
+        let project = world.project("demo", "a.sock");
+        let repo = world.home.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        world.add_repo(&project, repo.to_str().unwrap());
+        let root = world.root.clone();
+        world.runner.on_fn(
+            |cmd| cmd.display().contains("workspace close"),
+            move |_| {
+                crate::project::create(
+                    &root,
+                    "second",
+                    "",
+                    vec![Repo {
+                        path: repo.display().to_string(),
+                        ..Repo::default()
+                    }],
+                )?;
+                Ok(ok(r#"{"result":{}}"#))
+            },
+        );
+        mock_trash(&world);
+        assert!(
+            delete(&world.ctx(), "demo", false, false)
+                .unwrap_err()
+                .to_string()
+                .contains("now owned")
+        );
+        assert_eq!(trash_calls(&world), 0);
+        assert_eq!(project.status(), Status::Archived);
+        assert!(persisted(&world, "demo").completed.contains("0"));
+        assert!(
+            set_status(&world.ctx(), "demo", Status::Active)
+                .unwrap_err()
+                .to_string()
+                .contains("being deleted")
+        );
+    }
+
+    #[test]
+    fn resume_skips_completed_workspace_github_and_trash_steps() {
+        use std::cell::Cell;
+        use std::rc::Rc;
+        let mut world = World::new();
+        world.runner = crate::runner::fake::FakeRunner::new();
+        world.runner.on("workspace close", ok(r#"{"result":{}}"#));
+        let project = world.project("demo", "a.sock");
+        let first = world.home.path().join("first");
+        let second = world.home.path().join("second");
+        for path in [&first, &second] {
+            std::fs::create_dir_all(path).unwrap();
+            world.add_repo(&project, path.to_str().unwrap());
+        }
+        let gone = Rc::new(Cell::new(false));
+        let flag = gone.clone();
+        world.runner.on_fn(
+            |cmd| cmd.display().contains("remote get-url origin"),
+            move |_| {
+                assert!(!flag.get(), "must not rebuild persisted GitHub targets");
+                Ok(ok("https://github.com/acme/demo.git"))
+            },
+        );
+        let flag = gone.clone();
+        world.runner.on_fn(
+            |cmd| cmd.program == "gh" && cmd.args.first().is_some_and(|a| a == "api"),
+            move |_| {
+                assert!(!flag.get(), "must skip finished GitHub identity reads");
+                Ok(ok("fixture-node-id"))
+            },
+        );
+        world.runner.on("gh repo delete", ok(""));
+        let crash = Rc::new(Cell::new(true));
+        let flag = crash.clone();
+        let target = second.to_string_lossy().into_owned();
+        world.runner.on_fn(
+            move |cmd| cmd.program == system_trash() && cmd.args.last() == Some(&target),
+            move |_| {
+                if flag.replace(false) {
+                    anyhow::bail!("fixture crash");
+                }
+                Ok(ok(""))
+            },
+        );
+        mock_trash(&world);
+        assert!(
+            delete(&world.ctx(), "demo", true, false)
+                .unwrap_err()
+                .to_string()
+                .contains("fixture crash")
+        );
+        let interrupted = persisted(&world, "demo");
+        assert!(interrupted.started);
+        assert_eq!(project.status(), Status::Archived);
+        assert_eq!(trashed(&world, &first), 1);
+        // If execution rebuilt GitHub candidates it would now fail. Finished
+        // GitHub steps must not even need to re-resolve their deleted identity.
+        gone.set(true);
+        delete(&world.ctx(), "demo", true, false).unwrap();
+        assert_eq!(world.runner.count("workspace close"), 1);
+        assert_eq!(world.runner.count("gh repo delete"), 1);
+        assert_eq!(trashed(&world, &first), 1);
+        assert_eq!(trashed(&world, &second), 2); // failed attempt, then success
+        let resumed = persisted(&world, "demo");
+        assert_eq!(resumed.completed.len(), resumed.steps.unwrap().len());
+    }
+
+    #[test]
+    fn replaced_file_and_github_identities_are_refused() {
+        use std::cell::Cell;
+        use std::rc::Rc;
+        for github in [false, true] {
+            let world = World::new();
+            let repo = world.home.path().join("repo");
+            std::fs::create_dir_all(&repo).unwrap();
+            crate::project::create(
+                &world.root,
+                "demo",
+                "",
+                vec![Repo {
+                    path: repo.display().to_string(),
+                    publish_url: Some("https://github.com/acme/demo.git".into()),
+                    ..Repo::default()
+                }],
+            )
+            .unwrap();
+            let changed = Rc::new(Cell::new(false));
+            let flag = changed.clone();
+            world.runner.on_fn(
+                |cmd| cmd.program == "gh" && cmd.args.first().is_some_and(|a| a == "api"),
+                move |_| {
+                    Ok(ok(if flag.get() {
+                        "replacement-node"
+                    } else {
+                        "fixture-node-id"
+                    }))
+                },
+            );
+            mock_trash(&world);
+            delete(&world.ctx(), "demo", github, true).unwrap();
+            if github {
+                changed.set(true);
+            } else {
+                std::fs::rename(&repo, world.home.path().join("original-repo")).unwrap();
+                std::fs::create_dir_all(&repo).unwrap();
+            }
+            assert!(
+                delete(&world.ctx(), "demo", github, false)
+                    .unwrap_err()
+                    .to_string()
+                    .contains("identity changed")
+            );
+            assert_eq!(trash_calls(&world), 0);
+            assert_eq!(world.runner.count("gh repo delete"), 0);
+        }
+    }
+
+    #[test]
+    fn changed_remote_identity_is_refused() {
+        use std::cell::Cell;
+        use std::rc::Rc;
+        let world = World::new();
+        let project = world.project("demo", "a.sock");
+        world.thread(&project, world.home.path(), |t| {
+            t.machine = "box".into();
+            t.worktree_path = "/home/agent/lane".into();
+        });
+        let changed = Rc::new(Cell::new(false));
+        let flag = changed.clone();
+        world.runner.on("machine list", ok("[]"));
+        world.runner.on_fn(
+            |cmd| cmd.program == "ssh",
+            move |cmd| {
+                Ok(ok(if cmd.display().contains("stat -c") {
+                    if flag.get() { "1:99" } else { "1:42" }
+                } else {
+                    "gio"
+                }))
+            },
+        );
+        delete(&world.ctx(), "demo", false, true).unwrap();
+        changed.set(true);
+        mock_trash(&world);
+        assert!(
+            delete(&world.ctx(), "demo", false, false)
+                .unwrap_err()
+                .to_string()
+                .contains("identity changed")
+        );
+        assert_eq!(world.runner.count("workspace close"), 0);
+        assert!(
+            !world
+                .runner
+                .calls
+                .borrow()
+                .iter()
+                .any(|c| c.program == "ssh" && c.display().contains("gio trash"))
+        );
+    }
+
+    #[test]
+    fn github_choice_is_frozen_and_new_lane_bindings_refuse_stale_plan() {
+        let world = World::new();
+        let project = world.project("demo", "a.sock");
+        delete(&world.ctx(), "demo", false, true).unwrap();
+        assert!(
+            delete(&world.ctx(), "demo", true, false)
+                .unwrap_err()
+                .to_string()
+                .contains("same choice")
+        );
+        world.thread(&project, world.home.path(), |t| {
+            t.worktree_path.clear();
+        });
+        mock_trash(&world);
+        assert!(
+            delete(&world.ctx(), "demo", false, false)
+                .unwrap_err()
+                .to_string()
+                .contains("stale deletion plan")
+        );
+        assert_eq!(world.runner.count("workspace close"), 0);
+        assert_eq!(trash_calls(&world), 0);
+    }
+
+    #[test]
+    fn adopted_and_shared_workspaces_keep_other_tabs_and_adopted_files() {
+        let world = World::new();
+        let project = world.project("demo", "a.sock");
+        let adopted = world.home.path().join("adopted");
+        std::fs::create_dir_all(&adopted).unwrap();
+        world.thread(&project, &adopted, |t| {
+            t.kind = thread::Kind::Adopted;
+            t.workspace_id = "w1".into();
+            t.tab_id = "w1:t2".into();
+        });
+        let other = world.project("second", "a.sock");
+        other
+            .update_coordinator(|c| {
+                c.tab_id = "w1:t3".into();
+                c.pane_id = "w1:p3".into();
+            })
+            .unwrap();
+        mock_trash(&world);
+        delete(&world.ctx(), "demo", false, false).unwrap();
+        assert_eq!(world.runner.count("workspace close"), 0);
+        assert_eq!(world.runner.count("tab close w1:t1"), 1);
+        assert_eq!(world.runner.count("tab close w1:t2"), 1);
+        assert_eq!(world.runner.count("tab close w1:t3"), 0);
+        assert_eq!(trashed(&world, &adopted), 0);
+    }
+
+    #[test]
+    fn ownership_reads_fail_closed_including_discovery_and_terminal_records() {
+        for source in ["project", "thread", "coordinator", "discovery"] {
+            let world = World::new();
+            world.project("demo", "a.sock");
+            let other = world.project("second", "b.sock");
+            match source {
+                "project" => std::fs::write(other.project_md(), "broken").unwrap(),
+                "thread" => {
+                    std::fs::create_dir_all(other.record_dir("threads")).unwrap();
+                    std::fs::write(other.record_dir("threads").join("t-0001.toml"), "broken")
+                        .unwrap();
+                }
+                "coordinator" => {
+                    std::fs::write(other.record_file("coordinator.json"), "broken").unwrap()
+                }
+                _ => {
+                    std::fs::create_dir_all(world.root.join("broken/PROJECT.md")).unwrap();
+                }
+            }
+            mock_trash(&world);
+            assert!(
+                delete(&world.ctx(), "demo", false, false).is_err(),
+                "{source}"
+            );
+            assert_eq!(trash_calls(&world), 0, "{source}");
+            assert_eq!(world.runner.count("workspace close"), 0, "{source}");
+        }
+    }
+
+    #[test]
+    fn final_record_completion_survives_its_move_and_record_writers_serialize() {
+        let mut world = World::new();
+        world.runner = crate::runner::fake::FakeRunner::new();
+        world.runner.on("workspace close", ok(r#"{"result":{}}"#));
+        let project = world.project("demo", "a.sock");
+        let record = project.dir();
+        let locks = [
+            project.record_file("lock"),
+            project.record_file("coordinator.lock"),
+        ];
+        world.runner.on_fn(
+            |cmd| cmd.program == system_trash(),
+            move |_| {
+                for path in &locks {
+                    let file = std::fs::File::options().write(true).open(path)?;
+                    assert!(file.try_lock().is_err());
+                }
+                std::fs::remove_dir_all(&record)?; // exclusively this temp fixture
+                Ok(ok(""))
+            },
+        );
+        mock_trash(&world);
+        delete(&world.ctx(), "demo", false, false).unwrap();
+        assert!(!project.dir().exists());
+        let mut plan = persisted(&world, "demo");
+        let last = (plan.steps.as_ref().unwrap().len() - 1).to_string();
+        assert!(plan.completed.contains(&last));
+        plan.completed.remove(&last); // simulate crash before final receipt
+        save_plan(&deletion_path(&world.root, "demo"), &plan).unwrap();
+        delete(&world.ctx(), "demo", false, false).unwrap();
+        assert!(persisted(&world, "demo").completed.contains(&last));
+        assert_eq!(trash_calls(&world), 1);
+        assert_eq!(world.runner.count("workspace close"), 1);
+        assert!(project.lock().is_err());
+    }
+
+    #[test]
+    fn github_ownership_is_rechecked_and_unreadable_origins_fail_closed() {
+        for source in ["publish", "origin", "unreadable"] {
+            let world = World::new();
+            let repo = world.home.path().join("repo");
+            std::fs::create_dir_all(&repo).unwrap();
+            crate::project::create(
+                &world.root,
+                "demo",
+                "",
+                vec![Repo {
+                    path: repo.display().to_string(),
+                    publish_url: Some("https://github.com/acme/demo.git".into()),
+                    ..Repo::default()
+                }],
+            )
+            .unwrap();
+            mock_trash(&world);
+            delete(&world.ctx(), "demo", true, true).unwrap();
+            let other = world.home.path().join("other");
+            std::fs::create_dir_all(&other).unwrap();
+            crate::project::create(
+                &world.root,
+                "second",
+                "",
+                vec![Repo {
+                    path: other.display().to_string(),
+                    publish_url: Some(
+                        if source == "publish" {
+                            "https://github.com/acme/demo.git"
+                        } else {
+                            "https://github.com/acme/different.git"
+                        }
+                        .into(),
+                    ),
+                    ..Repo::default()
+                }],
+            )
+            .unwrap();
+            world.runner.on(
+                "remote get-url origin",
+                if source == "unreadable" {
+                    crate::runner::fake::fail(1, "unreadable")
+                } else {
+                    ok("https://github.com/acme/demo.git")
+                },
+            );
+            assert!(
+                delete(&world.ctx(), "demo", true, false).is_err(),
+                "{source}"
+            );
+            assert_eq!(world.runner.count("gh repo delete"), 0, "{source}");
+            assert_eq!(trash_calls(&world), 0, "{source}");
+        }
+    }
+
+    #[test]
+    fn completed_journal_does_not_bind_a_new_project_with_the_same_slug() {
+        let world = World::new();
+        let project = world.project("demo", "a.sock");
+        mock_trash(&world);
+        delete(&world.ctx(), "demo", false, false).unwrap();
+        let original = persisted(&world, "demo");
+        // A Trash move retains the old inode; the new record must earn its own
+        // preview and GitHub choice rather than inheriting old completions.
+        std::fs::rename(project.dir(), world.home.path().join("trashed-record")).unwrap();
+        crate::project::create(&world.root, "demo", "", vec![]).unwrap();
+        delete(&world.ctx(), "demo", true, true).unwrap();
+        let new = persisted(&world, "demo");
+        assert!(new.github);
+        assert!(!new.started);
+        assert!(new.completed.is_empty());
+        assert_ne!(
+            serde_json::to_value(original.steps.unwrap().last()).unwrap(),
+            serde_json::to_value(new.steps.unwrap().last()).unwrap()
+        );
+    }
+
+    #[test]
+    fn another_preview_can_refresh_unstarted_bindings_but_not_started_steps() {
+        let world = World::new();
+        let project = world.project("demo", "a.sock");
+        delete(&world.ctx(), "demo", false, true).unwrap();
+        let before = persisted(&world, "demo");
+        world.thread(&project, world.home.path(), |t| {
+            t.worktree_path.clear();
+        });
+        delete(&world.ctx(), "demo", false, true).unwrap();
+        let mut refreshed = persisted(&world, "demo");
+        assert_ne!(before.topology, refreshed.topology);
+        assert!(refreshed.completed.is_empty());
+        refreshed.started = true;
+        save_plan(&deletion_path(&world.root, "demo"), &refreshed).unwrap();
+        let later = world.home.path().join("later-repo");
+        std::fs::create_dir_all(&later).unwrap();
+        world.add_repo(&project, later.to_str().unwrap());
+        delete(&world.ctx(), "demo", false, true).unwrap();
+        assert_eq!(
+            serde_json::to_value(persisted(&world, "demo").steps).unwrap(),
+            serde_json::to_value(refreshed.steps).unwrap()
+        );
+    }
+
+    #[test]
+    fn corrupted_completion_or_final_target_refuses_all_effects() {
+        for source in ["completion", "target"] {
+            let world = World::new();
+            world.project("demo", "a.sock");
+            delete(&world.ctx(), "demo", false, true).unwrap();
+            let mut plan = persisted(&world, "demo");
+            if source == "completion" {
+                plan.completed.insert("999".into());
+            } else if let DeleteStep::Trash { path, .. } =
+                plan.steps.as_mut().unwrap().last_mut().unwrap()
+            {
+                *path = world.home.path().display().to_string();
+            }
+            save_plan(&deletion_path(&world.root, "demo"), &plan).unwrap();
+            mock_trash(&world);
+            assert!(
+                delete(&world.ctx(), "demo", false, false)
+                    .unwrap_err()
+                    .to_string()
+                    .contains("invalid deletion plan")
+            );
+            assert_eq!(trash_calls(&world), 0);
+            assert_eq!(world.runner.count("workspace close"), 0);
+        }
+    }
+
+    #[test]
+    fn replaced_kept_repo_is_not_pruned_after_worktree_removal() {
+        let world = World::new();
+        let project = world.project("demo", "a.sock");
+        let repo = world.home.path().join("repo");
+        let lane = world.home.path().join("lane");
+        for path in [&repo, &lane] {
+            std::fs::create_dir_all(path).unwrap();
+        }
+        world.add_repo(&project, repo.to_str().unwrap());
+        crate::project::create(
+            &world.root,
+            "second",
+            "",
+            vec![Repo {
+                path: repo.display().to_string(),
+                ..Repo::default()
+            }],
+        )
+        .unwrap();
+        world.thread(&project, &lane, |t| {
+            t.repo = repo.display().to_string();
+        });
+        let target = lane.display().to_string();
+        let original = world.home.path().join("original-repo");
+        world.runner.on_fn(
+            move |cmd| cmd.program == system_trash() && cmd.args.last() == Some(&target),
+            move |_| {
+                std::fs::rename(&repo, &original)?;
+                std::fs::create_dir_all(&repo)?;
+                Ok(ok(""))
+            },
+        );
+        mock_trash(&world);
+        assert!(
+            delete(&world.ctx(), "demo", false, false)
+                .unwrap_err()
+                .to_string()
+                .contains("kept repo identity changed")
+        );
+        assert_eq!(trashed(&world, &lane), 1);
+        assert_eq!(world.runner.count("worktree prune"), 0);
+    }
+
+    #[test]
+    fn shared_session_name_collisions_are_kept_and_rechecked() {
+        for added_after_preview in [false, true] {
+            let world = World::new();
+            let project = world.project("demo", "a.sock");
+            let own_cwd = world.home.path().join("lane-a-b");
+            let other_cwd = world.home.path().join("lane-a/b");
+            for path in [&own_cwd, &other_cwd] {
+                std::fs::create_dir_all(path).unwrap();
+            }
+            world.thread(&project, &own_cwd, |_| {});
+            let logs = world
+                .root
+                .join("pi/agent/sessions")
+                .join(pi_session_name(&own_cwd));
+            assert_eq!(pi_session_name(&own_cwd), pi_session_name(&other_cwd));
+            std::fs::create_dir_all(&logs).unwrap();
+            let add_other = || {
+                let other = world.project("second", "b.sock");
+                world.thread(&other, &other_cwd, |_| {});
+            };
+            if !added_after_preview {
+                add_other();
+            }
+            delete(&world.ctx(), "demo", false, true).unwrap();
+            if added_after_preview {
+                add_other();
+            }
+            mock_trash(&world);
+            let result = delete(&world.ctx(), "demo", false, false);
+            if added_after_preview {
+                assert!(result.unwrap_err().to_string().contains("now owned"));
+                assert_eq!(trash_calls(&world), 0);
+            } else {
+                result.unwrap();
+            }
+            assert_eq!(trashed(&world, &logs), 0);
+        }
+    }
+
+    #[test]
+    fn repo_used_only_as_another_projects_cwd_is_kept_in_preview() {
+        let world = World::new();
+        let project = world.project("demo", "a.sock");
+        let repo = world.home.path().join("repo");
+        let other_cwd = repo.join("other-lane");
+        std::fs::create_dir_all(&other_cwd).unwrap();
+        world.add_repo(&project, repo.to_str().unwrap());
+        let other = world.project("second", "b.sock");
+        world.thread(&other, &other_cwd, |t| {
+            t.repo.clear();
+            t.worktree_path.clear();
+        });
+        delete(&world.ctx(), "demo", false, true).unwrap();
+        assert!(!persisted(&world, "demo").steps.unwrap().iter().any(
+            |s| matches!(s, DeleteStep::Trash { path, .. } if path == repo.to_str().unwrap())
+        ));
+        mock_trash(&world);
+        delete(&world.ctx(), "demo", false, false).unwrap();
+        assert_eq!(trashed(&world, &repo), 0);
+    }
+
+    #[test]
+    fn journal_cannot_be_inside_a_planned_trash_target() {
+        let world = World::new();
+        let project = world.project("demo", "a.sock");
+        let repo = world.root.join(".deletions");
+        std::fs::create_dir_all(&repo).unwrap();
+        world.add_repo(&project, repo.to_str().unwrap());
+        mock_trash(&world);
+        assert!(
+            delete(&world.ctx(), "demo", false, true)
+                .unwrap_err()
+                .to_string()
+                .contains("remove the deletion journal")
+        );
+        assert_eq!(trash_calls(&world), 0);
+        assert_eq!(world.runner.count("workspace close"), 0);
+    }
+
+    #[test]
+    fn historical_intent_loads_but_cannot_rebuild_a_stale_plan() {
+        let world = World::new();
+        let project = world.project("demo", "a.sock");
+        let text = "slug = 'demo'\ngithub = false\ncreated = 'then'\nrepos = []\nworktrees = []\n";
+        let historical: DeleteIntent = toml::from_str(text).unwrap();
+        assert!(historical.completed.is_empty());
+        assert!(historical.steps.is_none());
+        assert!(!historical.started);
+        std::fs::write(project.record_file("delete.toml"), text).unwrap();
+        mock_trash(&world);
+        assert!(
+            delete(&world.ctx(), "demo", false, false)
+                .unwrap_err()
+                .to_string()
+                .contains("historical deletion intent")
+        );
+        assert_eq!(trash_calls(&world), 0);
     }
 
     #[test]
