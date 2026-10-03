@@ -1116,6 +1116,39 @@ fn report_with_checks(
         let label = format!("project {slug}");
         if let Ok((settings, _)) = project.read_project_md() {
             for repo in &settings.repos {
+                if repo.machine.is_none()
+                    && repo
+                        .push_remote
+                        .as_deref()
+                        .is_none_or(|s| s.trim().is_empty())
+                    && repo
+                        .publish_url
+                        .as_deref()
+                        .is_none_or(|s| s.trim().is_empty())
+                    && let Ok(remotes) = crate::repo::Git::new(runner, &repo.path).run(&["remote"])
+                    && !remotes.trim().is_empty()
+                {
+                    let choices = remotes
+                        .lines()
+                        .map(|remote| format!("push_remote = {remote:?}"))
+                        .collect::<Vec<_>>();
+                    check(
+                        &mut out,
+                        None,
+                        &format!("{label} repo {}", repo.path),
+                        format!(
+                            "no push target; remotes: {}; add {} to this [[repos]] row in {}{}",
+                            remotes.lines().collect::<Vec<_>>().join(", "),
+                            choices.join(" or "),
+                            project.project_md().display(),
+                            if choices.len() > 1 {
+                                " (choose the integration destination)"
+                            } else {
+                                ""
+                            }
+                        ),
+                    );
+                }
                 if let Some(gates) = &repo.gates {
                     for gate in gates {
                         if gate.paths.as_ref().is_some_and(Vec::is_empty) {
@@ -2318,6 +2351,59 @@ recipe = "agy_gemini_flash"
 capability = "native-chat"
 recipe = "claude_fable_xhigh"
 "#;
+
+    #[test]
+    fn doctor_warns_for_a_path_only_repo_with_a_remote() {
+        let world = crate::scenarios::World::new();
+        let project = world.project("chainlm", "a.sock");
+        let (mut settings, body) = project.read_project_md().unwrap();
+        settings.repos.push(crate::project::Repo {
+            path: "/code/chainlm".into(),
+            ..Default::default()
+        });
+        std::fs::write(
+            project.project_md(),
+            format!("+++\n{}+++\n{body}", toml::to_string(&settings).unwrap()),
+        )
+        .unwrap();
+        world.runner.on("-C /code/chainlm remote", ok("origin\n"));
+        let config = world.home.path().join("cfg");
+        let (_, _, checks) = report_with_checks(
+            &world.env,
+            &world.root,
+            &config,
+            &SessionFlags::default(),
+            &world.runner,
+            None,
+        );
+        let warning = checks
+            .iter()
+            .find(|c| c.label == "project chainlm repo /code/chainlm")
+            .unwrap();
+        assert_eq!(warning.status, "warning");
+        assert!(warning.detail.contains("origin"));
+        assert!(warning.detail.contains("push_remote = \"origin\""));
+        assert!(
+            warning
+                .detail
+                .contains(&project.project_md().display().to_string())
+        );
+        settings.repos[0].push_remote = Some("origin".into());
+        std::fs::write(
+            project.project_md(),
+            format!("+++\n{}+++\n{body}", toml::to_string(&settings).unwrap()),
+        )
+        .unwrap();
+        let (_, _, checks) = report_with_checks(
+            &world.env,
+            &world.root,
+            &config,
+            &SessionFlags::default(),
+            &world.runner,
+            None,
+        );
+        assert!(!checks.iter().any(|c| c.label == warning.label));
+    }
 
     fn write_routing_config(config: &Path) {
         std::fs::create_dir_all(config).unwrap();

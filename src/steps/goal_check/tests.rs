@@ -195,12 +195,12 @@ fn unchanged_turn_reowes_diagnosis_once_then_escalates_and_empty_turn_is_bounded
     }
 }
 
-fn write_review(f: &Fx, phase: &str, merged: bool) {
+fn write_review(f: &Fx, phase: &str, merged: bool, installed: bool, attention: &str) {
     let review: crate::review::Review = serde_json::from_value(serde_json::json!({
         "id":"review-1", "repo":"", "integration":"", "base":"", "candidate_branch":"", "members":[], "gates":[], "selected_gates":[], "reviewer":null,
         "phase":phase, "verdict":null, "verdict_event":phase, "reviewer_after":"", "checked_event":"", "retry_attempt":null, "retry_generation":0,
-        "moved":0, "refresh_tip":null, "push_remote":null, "install_required":false, "fast_forward":merged, "push":false, "install":false,
-        "close":false, "prune":false, "attention":""
+        "moved":0, "refresh_tip":null, "push_remote":null, "install_required":true, "fast_forward":merged, "push":false, "install":installed,
+        "close":false, "prune":false, "attention":attention
     })).unwrap();
     std::fs::create_dir_all(crate::review::dir(&f.project)).unwrap();
     std::fs::write(
@@ -234,18 +234,72 @@ fn seal_landing_and_reject_each_owe_deduplicated_checks_across_restarts() {
         reconcile(&f.project, None, 20).unwrap();
         assert_eq!(load(&f.project), first);
     }
-    write_review(&f, "landing", true);
-    reconcile(&f.project, None, 30).unwrap();
+    for (phase, merged) in [("reviewing", false), ("landing", true)] {
+        write_review(&f, phase, merged, false, "");
+        reconcile(&f.project, None, 30).unwrap();
+        assert_eq!(
+            load(&f.project),
+            first,
+            "start and merge-before-install owe no review check"
+        );
+    }
+    write_review(&f, "landing", true, true, "");
+    reconcile(&f.project, None, 40).unwrap();
     let landed = load(&f.project);
     assert_eq!(landed.generation, first.generation + 1);
     assert!(landed.disposition.is_none());
-    reconcile(&f.project, None, 30).unwrap();
-    assert_eq!(load(&f.project), landed);
-    write_review(&f, "rejected", false);
-    reconcile(&f.project, None, 40).unwrap();
-    assert_eq!(load(&f.project).generation, landed.generation + 1);
-    reconcile(&f.project, None, 40).unwrap();
-    assert_eq!(load(&f.project).generation, landed.generation + 1);
+    write_review(&f, "complete", true, true, "");
+    reconcile(&f.project, None, 50).unwrap();
+    assert_eq!(
+        load(&f.project),
+        landed,
+        "close/cleanup owes no second check"
+    );
+}
+
+#[test]
+fn reject_and_landing_failure_each_owe_one_check_even_after_retry() {
+    for (phase, merged, attention) in [
+        ("rejected", false, ""),
+        ("landing", false, "merge failed; needs decision"),
+        ("landing", true, "install failed; needs decision"),
+    ] {
+        let f = fixture();
+        reconcile(&f.project, None, 10).unwrap();
+        record(
+            &f.project,
+            Disposition::Wait {
+                tasks: vec![],
+                party: "result".into(),
+                condition: "outcome".into(),
+            },
+            "await result",
+        )
+        .unwrap();
+        let first = load(&f.project).generation;
+        write_review(&f, phase, merged, false, attention);
+        reconcile(&f.project, None, 20).unwrap();
+        assert_eq!(load(&f.project).generation, first + 1);
+        record(
+            &f.project,
+            Disposition::Wait {
+                tasks: vec![],
+                party: "repair".into(),
+                condition: "fixed".into(),
+            },
+            "decision recorded",
+        )
+        .unwrap();
+        for (phase, merged, installed) in [
+            ("reviewing", false, false),
+            ("landing", true, true),
+            ("complete", true, true),
+        ] {
+            write_review(&f, phase, merged, installed, "");
+            reconcile(&f.project, None, 30).unwrap();
+            assert_eq!(load(&f.project).generation, first + 1);
+        }
+    }
 }
 
 #[test]

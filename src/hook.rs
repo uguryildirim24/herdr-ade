@@ -265,12 +265,7 @@ pub(crate) fn run(ctx: &Ctx, kind: &str, slug: &str, pane: &str, phase: &str) ->
         return Ok(());
     }
     if phase == "prompt" {
-        let text = prompt_text(&input).unwrap_or_default();
-        let request = if text.trim().is_empty() {
-            None
-        } else {
-            handle_prompt(&project, pane, text)?
-        };
+        let request = handle_prompt_input(&project, pane, &input)?;
         if let Some(request) = request {
             println!("request {request}");
         }
@@ -309,6 +304,25 @@ fn scope_binding(
 /// The submitted user text from a prompt-submit hook.
 fn prompt_text(input: &serde_json::Value) -> Option<&str> {
     input["prompt"].as_str()
+}
+
+fn handle_prompt_input(
+    project: &Project,
+    pane: &str,
+    input: &serde_json::Value,
+) -> Result<Option<String>> {
+    // Native provenance wins over text heuristics when the harness supplies it.
+    if ["source", "prompt_source"]
+        .iter()
+        .any(|field| matches!(input[*field].as_str(), Some("cron" | "scheduled")))
+    {
+        return Ok(None);
+    }
+    let text = prompt_text(input).unwrap_or_default();
+    if text.trim().is_empty() {
+        return Ok(None);
+    }
+    handle_prompt(project, pane, text)
 }
 
 /// Records a prompt typed into the coordinator pane and returns the request id
@@ -449,6 +463,61 @@ mod tests {
         assert_eq!(
             crate::prompt::request_text(&project, &request).as_deref(),
             Some("half")
+        );
+    }
+
+    #[test]
+    fn scheduled_prompts_record_no_request_and_reowe_no_goal_check() {
+        let fx = crate::testkit::fixture();
+        let project = &fx.project;
+        crate::steps::goal_check::reconcile(project, None, 10).unwrap();
+        crate::steps::goal_check::record(
+            project,
+            crate::steps::goal_check::Disposition::Wait {
+                tasks: vec![],
+                party: "result".into(),
+                condition: "new evidence".into(),
+            },
+            "await result",
+        )
+        .unwrap();
+        let before = crate::steps::goal_check::load(project);
+        for input in [
+            serde_json::json!({"source":"cron", "prompt":"Check in"}),
+            serde_json::json!({"prompt_source":"scheduled", "prompt":"Check in"}),
+            serde_json::json!({"prompt":"This is a scheduled trigger, not Rolf.\nCheck in"}),
+            serde_json::json!({"prompt":"Overnight self check-in (adeherdr coordinator, scheduled by itself).\nThis is a scheduled trigger, not Rolf.\nCheck in"}),
+        ] {
+            assert!(
+                handle_prompt_input(project, "w1:p1", &input)
+                    .unwrap()
+                    .is_none()
+            );
+            assert!(crate::prompt::latest_request_id(project).is_empty());
+            crate::steps::goal_check::reconcile(project, None, 20).unwrap();
+            assert_eq!(crate::steps::goal_check::load(project), before);
+        }
+        for text in [
+            "Build the dashboard",
+            "Please recognize the phrase This is a scheduled trigger, not Rolf. but keep my words.",
+            "The cron says:\nThis is a scheduled trigger, not Rolf.\nFix its intake.",
+        ] {
+            let request = handle_prompt_input(
+                project,
+                "w1:p1",
+                &serde_json::json!({"source":"human", "prompt":text}),
+            )
+            .unwrap()
+            .unwrap();
+            assert_eq!(
+                crate::prompt::request_text(project, &request).as_deref(),
+                Some(text)
+            );
+        }
+        crate::steps::goal_check::reconcile(project, None, 30).unwrap();
+        assert_eq!(
+            crate::steps::goal_check::load(project).generation,
+            before.generation + 1
         );
     }
 

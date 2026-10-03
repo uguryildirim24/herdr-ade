@@ -121,23 +121,20 @@ fn snapshot(project: &Project) -> Result<Snapshot> {
     let exhausted = plan
         .as_ref()
         .is_none_or(|p| p.steps.iter().all(|s| s.state == StepState::Done));
-    // Do not include delivery journals, context reads, or coordinator bindings:
-    // none is evidence of outcome progress. Keep merge/push/install distinct.
+    // Seals remain independent evidence. A review contributes only once its
+    // outcome is known, not at start or at each merge/push/install cursor.
+    // Keep already-owed review ids through retries/cleanup without a new field.
+    let owed = load(project).effects;
     let result_keys: Vec<_> = events.iter().map(|e| &e.id).collect();
     let review_keys: Vec<_> = reviews
         .iter()
-        .map(|r| {
-            (
-                &r.id,
-                &r.phase,
-                &r.verdict_event,
-                r.fast_forward,
-                r.push,
-                r.install,
-                r.close,
-                &r.attention,
-            )
+        .filter(|r| {
+            owed.contains(&r.id)
+                || r.phase == crate::review::Phase::Rejected
+                || (r.fast_forward && (!r.install_required || r.install))
+                || (r.phase == crate::review::Phase::Landing && !r.attention.is_empty())
         })
+        .map(|r| &r.id)
         .collect();
     let results = format!(
         "{:x}",
@@ -146,7 +143,7 @@ fn snapshot(project: &Project) -> Result<Snapshot> {
     let effects = result_keys
         .iter()
         .map(|id| (*id).clone())
-        .chain(reviews.iter().map(|r| r.id.clone()))
+        .chain(review_keys.iter().map(|id| (*id).clone()))
         .collect();
     let request = crate::prompt::latest_request_id(project);
     let source = format!(

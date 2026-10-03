@@ -6744,7 +6744,23 @@ mod tests {
         )
         .unwrap();
         nudge_pass(&f, &runner, std::slice::from_ref(&agent));
-        assert_eq!(runner.count("agent prompt"), 2);
+        assert_eq!(
+            runner.count("agent prompt"),
+            1,
+            "review start owes no check"
+        );
+        crate::prompt::record_test_request(
+            &f.project,
+            "q-independent",
+            "Do the independent work too",
+        )
+        .unwrap();
+        nudge_pass(&f, &runner, std::slice::from_ref(&agent));
+        assert_eq!(
+            runner.count("agent prompt"),
+            2,
+            "new human work still wakes during review"
+        );
         std::fs::remove_file(crate::review::path(&f.project, "review-1")).unwrap();
         // An unbound project does not start a coordinator or get a prompt.
         let unbound = project::create(&f.root, "unbound", "", vec![]).unwrap();
