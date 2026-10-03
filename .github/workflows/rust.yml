@@ -4,7 +4,10 @@ on: [push, pull_request]
 
 jobs:
   gates:
-    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -15,6 +18,13 @@ jobs:
       - run: cargo fmt --check
       - run: cargo test
       - run: cargo clippy --all-targets -- -D warnings
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+      - run: cargo build --bin herdr-ade
+      - run: node --test tests/pi_extension.test.mjs
+      - run: npm install --global @anthropic-ai/claude-code@2.1.287
+      - run: claude plugin test mods/coordinator-handoff
       - name: Check changed lines for whitespace errors
         env:
           EVENT: ${{ github.event_name }}

@@ -2420,6 +2420,7 @@ fn write_harness_config(world: &World, repos: &[(&str, &str)]) {
     )
     .unwrap();
     std::fs::write(dir.join("RULES.md"), "# Lane rules\n").unwrap();
+    world.runner.on("herdr-pi refresh-guard", ok(""));
 }
 
 #[test]
@@ -2483,6 +2484,16 @@ fn harness_install_runs_the_box_steps_only_when_buildbox_is_saved() {
         "one box build per repo plus lane settings, the pi guard, and the running-process check"
     );
     let calls = with_box.runner.calls.borrow();
+    let local_guard = calls
+        .iter()
+        .find(|call| {
+            call.program.ends_with("/.local/bin/herdr-pi") && call.args == ["refresh-guard"]
+        })
+        .unwrap();
+    assert!(local_guard.env.contains(&(
+        "HERDR_ADE_ROOT".into(),
+        with_box.ctx().root.display().to_string()
+    )));
     let scripts: Vec<String> = calls
         .iter()
         .filter(|c| c.program == "ssh")

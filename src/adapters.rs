@@ -283,6 +283,30 @@ mod tests {
     use super::*;
 
     #[test]
+    fn every_shipped_claude_recipe_disallows_agent() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("config.toml"),
+            "[routing]\ndefault = 'claude_fable_xhigh'\n",
+        )
+        .unwrap();
+        let config = crate::launch::parse_launch_config(dir.path()).unwrap();
+        let mut claude_rows = 0;
+        for (id, recipe) in &config.recipes {
+            if recipe.kind == "claude" {
+                claude_rows += 1;
+                let args = launch_args(&config.adapters["claude"], recipe);
+                assert!(
+                    args.windows(2)
+                        .any(|pair| pair == ["--disallowedTools", "Agent"]),
+                    "{id}: {args:?}"
+                );
+            }
+        }
+        assert_eq!(claude_rows, 2);
+    }
+
+    #[test]
     fn agy_starts_each_fresh_lane_as_a_new_project() {
         let row = builtin().remove("agy").unwrap();
         assert_eq!(

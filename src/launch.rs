@@ -507,13 +507,17 @@ fn resolve(ctx: &Ctx, project: &Project, input: &ResolveInput) -> Result<Launch>
     )?;
     Ok(Launch {
         kind: recipe.kind.clone(),
-        args: crate::adapters::launch_args(
-            config
-                .adapters
-                .get(&recipe.kind)
-                .context("adapter_unknown")?,
-            recipe,
-        ),
+        args: if config.adapters[&recipe.kind].doctor.readiness == "pi" {
+            crate::pi::launch::parse_args(&recipe.args)?.argv()
+        } else {
+            crate::adapters::launch_args(
+                config
+                    .adapters
+                    .get(&recipe.kind)
+                    .context("adapter_unknown")?,
+                recipe,
+            )
+        },
         env: recipe.env.clone(),
         ready_timeout_ms: if recipe.ready_timeout_ms == 0 {
             config.adapters[&recipe.kind].ready_timeout_ms

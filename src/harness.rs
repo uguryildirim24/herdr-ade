@@ -1166,6 +1166,22 @@ fn record_task_proofs(
     Ok(proofs)
 }
 
+fn refresh_local_guard(ctx: &Ctx) -> Result<()> {
+    let binary = ctx.env.home.join(".local/bin/herdr-pi");
+    let output = ctx.runner.run(
+        &Cmd::new(binary.display().to_string(), Duration::from_secs(30))
+            .arg("refresh-guard")
+            .env("HERDR_ADE_ROOT", ctx.root.display().to_string()),
+    )?;
+    if !output.success() {
+        bail!(
+            "harness_local_guard_failed: could not refresh the installed pi guard: {}",
+            output.error_text()
+        );
+    }
+    Ok(())
+}
+
 fn refresh_box_guard(ctx: &Ctx, target: &str, machine: &remote::MachineDeclaration) -> Result<()> {
     let command = format!(
         "HERDR_ADE_ROOT={} {} refresh-guard",
@@ -1304,9 +1320,7 @@ fn install_for(ctx: &Ctx, current: Option<(&str, &str)>) -> Result<InstallOutcom
         });
     }
     if kinds.contains(&Kind::Plugin) {
-        crate::pi::install::write_guard(&crate::pi::Layout {
-            root: ctx.root.join("pi"),
-        })?;
+        refresh_local_guard(ctx)?;
         if cfg!(target_os = "macos") {
             install_ticker_agent(ctx)?;
         }
@@ -2466,6 +2480,42 @@ mod tests {
             out.stdout
         );
         assert!(!out.stdout.contains("HERDR_ADE_BOX_TICKER_STALE="));
+    }
+
+    #[test]
+    fn old_installer_refreshes_guard_with_the_new_installed_image() {
+        let home = tempfile::tempdir().unwrap();
+        let env = crate::paths::Env::for_test(home.path(), &[]);
+        let ctx = Ctx {
+            env: &env,
+            root: home.path().join("selected root"),
+            config_dir: home.path().join("config"),
+            runner: &RealRunner,
+            detached_ticker: false,
+        };
+        let layout = crate::pi::Layout {
+            root: ctx.root.join("pi"),
+        };
+        crate::pi::install::write_guard(&layout).unwrap();
+        let old = std::fs::read_to_string(layout.guard()).unwrap();
+        let repo = home.path().join("repo");
+        let source = repo.join("target/release/herdr-pi");
+        std::fs::create_dir_all(source.parent().unwrap()).unwrap();
+        // A different executable image supplies its own extension, not this
+        // installer's compiled-in guard. No real install or shared root is used.
+        std::fs::write(&source, "#!/bin/sh\nif [ \"$1\" = --version ]; then echo 'herdr-pi 0.1.0+new1234.200'; exit; fi\n[ \"$1\" = refresh-guard ] || exit 2\nprintf '%s\\n' 'new image extension' > \"$HERDR_ADE_ROOT/pi/agent/extensions/herdr-pi-guard.ts\"\n").unwrap();
+        std::fs::set_permissions(&source, std::fs::Permissions::from_mode(0o755)).unwrap();
+        local_install(&ctx, repo.to_str().unwrap(), "herdr-pi", "new1234", false).unwrap();
+        refresh_local_guard(&ctx).unwrap();
+        let new = std::fs::read_to_string(layout.guard()).unwrap();
+        assert_eq!(new, "new image extension\n");
+        assert_ne!(new, old);
+        std::fs::write(
+            home.path().join(".local/bin/herdr-pi"),
+            "#!/bin/sh\nexit 1\n",
+        )
+        .unwrap();
+        assert!(refresh_local_guard(&ctx).is_err());
     }
 
     #[test]
