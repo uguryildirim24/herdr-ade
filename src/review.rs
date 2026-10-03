@@ -248,7 +248,7 @@ fn reviewer_ids(project: &Project) -> Result<std::collections::BTreeSet<String>>
     if rounds.exists() {
         for entry in std::fs::read_dir(rounds)? {
             let path = entry?.path();
-            if !path.extension().is_some_and(|ext| ext == "toml") {
+            if path.extension().is_none_or(|ext| ext != "toml") {
                 continue;
             }
             #[derive(Deserialize)]

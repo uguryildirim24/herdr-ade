@@ -448,7 +448,7 @@ pub(crate) fn list_checked(project: &Project) -> (Vec<Event>, bool) {
             readable = false;
             continue;
         };
-        if !entry.path().extension().is_some_and(|ext| ext == "toml") {
+        if entry.path().extension().is_none_or(|ext| ext != "toml") {
             continue;
         }
         let Some(id) = entry

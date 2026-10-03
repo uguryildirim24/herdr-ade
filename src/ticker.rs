@@ -28,7 +28,6 @@ const REPLACE_WAIT: Duration = Duration::from_millis(500);
 // took 123 seconds to finish the pass in the observed failed install; leave
 // enough room for that first replacement too.
 const INSTALL_REPLACE_WAIT: Duration = Duration::from_secs(180);
-const IDLE_EXIT: Duration = Duration::from_secs(300);
 const LOG_CAP: u64 = 1_000_000;
 
 pub(crate) fn lock_path(root: &Path) -> PathBuf {
@@ -205,18 +204,18 @@ fn ensure_free(
     Ok(())
 }
 
-/// Spawns the detached loop unless there is nothing to watch. It creates
-/// nothing when the root does not exist or contains no projects, so a linked
-/// plugin's `[[startup]]` is harmless in sessions that have no projects.
+/// Starts the detached loop, including before the first project is created.
+/// A successful spawn requires the child to publish its running lock.
 pub(crate) fn start(ctx: &Ctx) -> Result<()> {
     if std::env::var_os("HERDR_ADE_INSTALL_TICKER").is_some() {
         return start_for_install(ctx);
     }
-    // The installer replaces the ticker before releasing its lock. Commands
-    // may record pending work during that window; they must not compete with
-    // the replacement or refuse the work. After a failed install, the next
-    // ordinary start reaches start_inner and starts a free ticker as usual.
+    // The installer owns replacement while holding its lock. Never compete
+    // with it, or claim a running loop when its old holder has already left.
     if install_in_progress(ctx) {
+        if lock_state(&ctx.root) == LockState::Free {
+            bail!("ticker start deferred: installation in progress and no ticker is running");
+        }
         return Ok(());
     }
     if start_inner(ctx)? {
@@ -232,10 +231,6 @@ pub(crate) fn start(ctx: &Ctx) -> Result<()> {
 /// replace a ticker while installing. A stalled step leaves its stop request
 /// active, so the next start can launch the installed build.
 pub(crate) fn start_for_install(ctx: &Ctx) -> Result<()> {
-    if project::list_slugs(&ctx.root).is_empty() {
-        println!("HERDR_ADE_TICKER_NO_PROJECTS=1");
-        return Ok(());
-    }
     start_for_install_with_wait(ctx, INSTALL_REPLACE_WAIT)
 }
 
@@ -266,14 +261,20 @@ fn start_inner(ctx: &Ctx) -> Result<bool> {
 
 fn start_inner_with_wait(ctx: &Ctx, wait: Duration, install: bool) -> Result<bool> {
     let root = &ctx.root;
-    if !ctx.detached_ticker || project::list_slugs(root).is_empty() {
+    if !ctx.detached_ticker {
         return Ok(false);
     }
-    let state = lock_state(root);
-    // A newly acquired lock is published just after initialization. Do not
-    // mistake its as-yet-empty record for an old build and stop the winner.
-    if matches!(&state, LockState::Held(info) if info.pid == 0 || info.version.is_empty()) {
-        return Ok(false);
+    std::fs::create_dir_all(root)?;
+    let mut state = lock_state(root);
+    // Initialization has acquired the lock but has not published the image.
+    // Wait for evidence, without stopping this concurrent starter as stale.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while matches!(&state, LockState::Held(info) if info.pid == 0 || info.version.is_empty()) {
+        if Instant::now() >= deadline {
+            bail!("ticker startup not confirmed: lock holder has not published its running image");
+        }
+        std::thread::sleep(Duration::from_millis(25));
+        state = lock_state(root);
     }
     match decide_start(&state, crate::VERSION) {
         StartAction::Nothing => {
@@ -336,10 +337,39 @@ fn detached_command(root: &Path) -> Result<Command> {
 }
 
 fn spawn(root: &Path) -> Result<()> {
-    detached_command(root)?
-        .spawn()
-        .context("could not start the ticker")?;
-    Ok(())
+    let mut command = detached_command(root)?;
+    // Keep child initialization errors instead of discarding them with stdio.
+    command.stderr(
+        File::options()
+            .create(true)
+            .append(true)
+            .open(log_path(root))?,
+    );
+    spawn_and_confirm(command, root)
+}
+
+fn spawn_and_confirm(mut command: Command, root: &Path) -> Result<()> {
+    let mut child = command.spawn().context("could not start the ticker")?;
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        if matches!(lock_state(root), LockState::Held(info) if info.pid != 0 && crate::build::same_commit(&info.version, crate::VERSION))
+        {
+            return Ok(());
+        }
+        if let Some(status) = child.try_wait()? {
+            bail!(
+                "ticker startup failed: child exited {status} without a running ticker; see {}",
+                log_path(root).display()
+            );
+        }
+        if Instant::now() >= deadline {
+            bail!(
+                "ticker startup not confirmed: no running lock within 5 seconds; see {}",
+                log_path(root).display()
+            );
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    }
 }
 
 /// Ask the old ticker to leave, but never start a contender behind it. If an
@@ -514,12 +544,10 @@ fn mark_clean_exit(root: &Path, log: &Log) {
     }
 }
 
-/// The loop. Exits when another ticker holds the lock, when the stop file
-/// appears, or when no project has had a reachable session for five minutes.
+/// The loop stays available while sessions are absent, including on first setup.
+/// It exits only for a stop request or when another ticker holds the lock.
 pub(crate) fn run(ctx: &Ctx) -> Result<()> {
-    if project::list_slugs(&ctx.root).is_empty() {
-        return Ok(());
-    }
+    std::fs::create_dir_all(&ctx.root)?;
     // `ticker run` can also be invoked directly. Move the loop itself off the
     // caller's possibly disposable worktree, then give every external command
     // the same explicit projects root.
@@ -570,7 +598,6 @@ pub(crate) fn run(ctx: &Ctx) -> Result<()> {
     let log = Log {
         path: log_path(root),
     };
-    let mut last_reachable = Instant::now();
     let mut memory = Memory::new(ctx);
     let _records = crate::record_cache::Cache::new();
 
@@ -615,14 +642,10 @@ pub(crate) fn run(ctx: &Ctx) -> Result<()> {
         }
         !stop_path(root).exists()
     };
-    match tick_with_steps(ctx, &log, &mut memory, &mut step) {
-        None => {
-            log.line("stop file found; exiting");
-            mark_clean_exit(root, &log);
-            return Ok(());
-        }
-        Some(true) => last_reachable = Instant::now(),
-        Some(false) => {}
+    if tick_with_steps(ctx, &log, &mut memory, &mut step).is_none() {
+        log.line("stop file found; exiting");
+        mark_clean_exit(root, &log);
+        return Ok(());
     }
 
     loop {
@@ -640,19 +663,10 @@ pub(crate) fn run(ctx: &Ctx) -> Result<()> {
             }
             std::thread::sleep(Duration::from_millis(500));
         }
-        match tick_with_steps(ctx, &log, &mut memory, &mut step) {
-            None => {
-                log.line("stop file found; exiting");
-                mark_clean_exit(root, &log);
-                return Ok(());
-            }
-            Some(true) => last_reachable = Instant::now(),
-            Some(false) if last_reachable.elapsed() > IDLE_EXIT => {
-                log.line("no project has had a reachable session for five minutes; exiting");
-                mark_clean_exit(root, &log);
-                return Ok(());
-            }
-            Some(false) => {}
+        if tick_with_steps(ctx, &log, &mut memory, &mut step).is_none() {
+            log.line("stop file found; exiting");
+            mark_clean_exit(root, &log);
+            return Ok(());
         }
     }
 }
@@ -4830,6 +4844,21 @@ mod tests {
     }
 
     #[test]
+    fn successful_child_exit_without_a_ticker_is_a_startup_failure() {
+        let root = tempfile::tempdir().unwrap();
+        let error = spawn_and_confirm(
+            spawn_command(Path::new("/bin/true"), root.path()),
+            root.path(),
+        )
+        .unwrap_err();
+        assert!(
+            error.to_string().contains("without a running ticker"),
+            "{error}"
+        );
+        assert_eq!(lock_state(root.path()), LockState::Free);
+    }
+
+    #[test]
     fn a_detached_ticker_uses_the_projects_root_not_the_callers_folder() {
         let home = tempfile::tempdir().unwrap();
         let root = home.path().join("projects-root");
@@ -4985,7 +5014,8 @@ mod tests {
             runner: &runner,
             detached_ticker: true,
         };
-        start_for_install(&ctx).unwrap();
+        let error = start_for_install(&ctx).unwrap_err().to_string();
+        assert!(error.contains("has not published"), "{error}");
         assert!(!stop_path(&root).exists());
     }
 
@@ -5043,7 +5073,7 @@ mod tests {
             std::thread::sleep(Duration::from_millis(10));
         }
         assert_eq!(lock_state(&root), LockState::Free);
-        ensure(&ctx).unwrap();
+        ensure_free(&root, false, |_| Ok(())).unwrap();
         assert!(!stop_path(&root).exists());
     }
 
@@ -5249,14 +5279,17 @@ mod tests {
             drop(holder);
         });
         let start = Instant::now();
-        start_for_install(&ctx).unwrap();
+        // This unit-test executable cannot run `ticker run`; its failed exit
+        // must now be reported instead of mistaken for a successful spawn.
+        let error = start_for_install(&ctx).unwrap_err().to_string();
+        assert!(error.contains("ticker startup failed"), "{error}");
         assert!(start.elapsed() >= Duration::from_secs(5));
         release.join().unwrap();
         assert!(!stop_path(&root).exists());
     }
 
     #[test]
-    fn ordinary_starts_defer_to_install_without_refusing() {
+    fn explicit_start_reports_install_deferral_when_no_ticker_runs() {
         let home = tempfile::tempdir().unwrap();
         let root = home.path().join("root");
         project::create(&root, "demo", "", vec![]).unwrap();
@@ -5271,7 +5304,12 @@ mod tests {
             runner: &runner,
             detached_ticker: true,
         };
-        start(&ctx).unwrap();
+        assert!(
+            start(&ctx)
+                .unwrap_err()
+                .to_string()
+                .contains("installation in progress")
+        );
         ensure(&ctx).unwrap();
         assert!(!lock_path(&root).exists());
     }

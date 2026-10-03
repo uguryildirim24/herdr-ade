@@ -151,7 +151,6 @@ pub(crate) fn run_action(ctx: &Ctx, id: &str) -> Result<()> {
         }
         "doctor" => {
             let result = doctor::run(ctx, &SessionFlags::default())?;
-            print!("{}", result.message);
             let herdr = Herdr::new(ctx.env.herdr_bin(), socket(ctx)?, ctx.runner);
             let body = if result.healthy {
                 "All required checks passed. Details: herdr plugin log --plugin herdr-ade"
@@ -159,7 +158,7 @@ pub(crate) fn run_action(ctx: &Ctx, id: &str) -> Result<()> {
                 "Some checks FAILED. Details: herdr plugin log --plugin herdr-ade"
             };
             let _ = herdr.notification_show("herdr-ade doctor", body);
-            Ok(())
+            doctor::finish(ctx, &result)
         }
         other => bail!("unknown action `{other}`"),
     }
@@ -280,6 +279,26 @@ mod tests {
         vars.extend(extra.iter().map(|(k, v)| (*k, v.to_string())));
         let refs: Vec<(&str, &str)> = vars.iter().map(|(k, v)| (*k, v.as_str())).collect();
         Env::for_test(world.home.path(), &refs)
+    }
+
+    #[test]
+    fn doctor_action_returns_the_failed_checks_not_successful_invocation() {
+        let world = World::new();
+        let env = plugin_env(&world, &[]);
+        let ctx = Ctx {
+            env: &env,
+            ..world.ctx()
+        };
+        let error = run_action(&ctx, "doctor").unwrap_err();
+        assert!(crate::refusal::is(&error));
+        assert_eq!(error.to_string(), "some checks failed");
+        assert!(
+            crate::refusal::next(&error)
+                .unwrap()
+                .contains(" doctor --timings")
+        );
+        assert!(!crate::refusal::next(&error).unwrap().starts_with("ha "));
+        assert_eq!(world.runner.count("notification show"), 1);
     }
 
     #[test]

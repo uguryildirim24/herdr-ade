@@ -16,11 +16,11 @@
     <text x="200" y="191" text-anchor="middle" font-size="12.5" fill="#0a3069">"Ship the new billing</text>
     <text x="200" y="208" text-anchor="middle" font-size="12.5" fill="#0a3069">page this week."</text>
     <rect x="78" y="228" width="186" height="62" rx="10" fill="#f6f8fa" stroke="#d0d7de"/>
-    <text x="171" y="247" text-anchor="middle" font-size="12.5" fill="#24292f">"I suggest three threads:</text>
+    <text x="171" y="247" text-anchor="middle" font-size="12.5" fill="#24292f">"I started three lanes:</text>
     <text x="171" y="264" text-anchor="middle" font-size="12.5" fill="#24292f">API, page, and tests.</text>
-    <text x="171" y="281" text-anchor="middle" font-size="12.5" fill="#24292f">Start them?"</text>
+    <text x="171" y="281" text-anchor="middle" font-size="12.5" fill="#24292f">Next: pile review."</text>
     <rect x="198" y="300" width="90" height="30" rx="10" fill="#ddf4ff" stroke="#54aeff"/>
-    <text x="243" y="320" text-anchor="middle" font-size="12.5" fill="#0a3069">"Go ahead."</text>
+    <text x="243" y="320" text-anchor="middle" font-size="12.5" fill="#0a3069">"Thanks."</text>
     <text x="183" y="358" text-anchor="middle" font-size="13" fill="#57606a">It never does the work itself,</text>
     <text x="183" y="376" text-anchor="middle" font-size="13" fill="#57606a">so it is always free to answer.</text>
     <text x="183" y="407" text-anchor="middle" font-size="15" font-weight="600" fill="#24292f">1. Tell it what you want</text>
@@ -57,7 +57,7 @@
     <rect x="698" y="100" width="204" height="324" rx="12" fill="#ffffff" stroke="#d0d7de" stroke-width="2"/>
     <text x="716" y="134" font-size="12" font-weight="700" fill="#1a7f37" letter-spacing="0.4">READY FOR REVIEW</text>
     <rect x="716" y="144" width="168" height="30" rx="7" fill="#dafbe1" stroke="#4ac26b"/>
-    <text x="728" y="164" font-size="12.5" fill="#24292f">t-0001 · report + PR</text>
+    <text x="728" y="164" font-size="12.5" fill="#24292f">t-0001 · pile review</text>
     <text x="716" y="204" font-size="12" font-weight="700" fill="#9a6700" letter-spacing="0.4">WAITING ON YOU</text>
     <rect x="716" y="214" width="168" height="30" rx="7" fill="#fff8c5" stroke="#d4a72c"/>
     <text x="728" y="234" font-size="12.5" fill="#24292f">t-0003 · asks a question</text>

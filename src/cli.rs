@@ -1116,8 +1116,9 @@ pub fn run() -> Result<()> {
     let observed_project = observed_slug
         .as_deref()
         .and_then(|s| Project::load(&ctx.root, s).ok());
+    let prefix = coordinator::current_prefix(&ctx.root)?;
     let result = dispatch_with_start(ctx, cli.command, Some(cli_started));
-    record_command_outcome(observed_project.as_ref(), &result);
+    record_command_outcome(observed_project.as_ref(), &result, &prefix);
     if result.is_ok() {
         crate::output::finish_success()?;
     }
@@ -1125,11 +1126,14 @@ pub fn run() -> Result<()> {
 }
 
 /// Keep refusal and error outcomes distinct without filing a separate failure.
-fn record_command_outcome(project: Option<&Project>, result: &Result<()>) {
+fn record_command_outcome(project: Option<&Project>, result: &Result<()>, prefix: &str) {
     match result {
         Err(error) if crate::refusal::is(error) => {
             if let Some(next) = crate::refusal::next(error) {
-                crate::output::set_next(next);
+                let next = next
+                    .strip_prefix("ha ")
+                    .map_or_else(|| next.to_string(), |command| format!("{prefix} {command}"));
+                crate::output::set_next(&next);
             }
             crate::output::set_outcome("refused");
             crate::output::set_failure_class(None);
@@ -1839,23 +1843,7 @@ fn dispatch_with_start(
                 return Ok(());
             }
             let result = doctor::run_timed_from(&ctx, &session.into(), timings, cli_started)?;
-            crate::output::success(
-                Some(if result.healthy {
-                    "healthy"
-                } else {
-                    "unhealthy"
-                }),
-                &result,
-                &result.message,
-                "",
-            )?;
-            if !result.healthy {
-                return Err(crate::refusal::error(
-                    "some checks failed",
-                    "ha doctor --timings (inspect failed checks, fix them, then rerun)",
-                ));
-            }
-            Ok(())
+            doctor::finish(&ctx, &result)
         }
         command @ Command::Plan { .. } => run_project_commands(&ctx, command),
         Command::Review {

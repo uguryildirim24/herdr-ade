@@ -284,8 +284,8 @@ fn request_preview(text: &str) -> String {
     }
 }
 
-/// `<binary> --root <root>`: the fixed shape every printed command starts
-/// with, so allow-list patterns can match on it. Values with spaces are quoted.
+/// `<binary> --root <root>` for the resolved executable and project root.
+/// Values with spaces are shell-quoted.
 pub(crate) fn command_prefix(binary: &Path, root: &Path) -> String {
     format!(
         "{} --root {}",
@@ -295,10 +295,6 @@ pub(crate) fn command_prefix(binary: &Path, root: &Path) -> String {
 }
 
 pub(crate) fn current_prefix(root: &Path) -> Result<String> {
-    let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
-    if home.is_some_and(|home| root == home.join(".herdr-ade")) {
-        return Ok("ha".into());
-    }
     let binary = std::env::current_exe().context("could not find this binary's own path")?;
     Ok(command_prefix(&binary, root))
 }
@@ -645,16 +641,9 @@ pub(crate) fn open(ctx: &Ctx, slug: &str, options: &OpenOptions) -> Result<()> {
     // unsupported kind remains honestly unqualified and installs nothing.
     crate::hook::install(ctx, &project, &launch.kind, &record.pane_id)?;
 
-    match herdr.agent_start_opts(&crate::herdr::AgentStart {
-        name: &name,
-        kind: &launch.kind,
-        pane: &record.pane_id,
-        agent_args: &launch.args,
-        launch_bin: None,
-        parent: None,
-        ready_timeout_ms: launch.ready_timeout_ms,
-    }) {
+    match start_coordinator(&herdr, &name, &record.pane_id, &launch) {
         Ok(agent) => deliver_or_defer(&project, &herdr, &agent, &prompt)?,
+        Err(error) if error.code == "command_failed" => return Err(error.into()),
         Err(error) => println!(
             "the coordinator agent is not ready yet ({error}). If it shows a dialog, answer it in pane {}; the ticker sends the priming prompt once it is ready.",
             record.pane_id
@@ -671,6 +660,52 @@ pub(crate) fn open(ctx: &Ctx, slug: &str, options: &OpenOptions) -> Result<()> {
     );
     println!("Commands: {prefix}");
     Ok(())
+}
+
+/// Keep readiness waits short enough to inspect an already-visible shell failure.
+/// Other startup blocks remain pending for the existing ticker delivery path.
+fn start_coordinator(
+    herdr: &Herdr<'_>,
+    name: &str,
+    pane: &str,
+    launch: &crate::contracts::Launch,
+) -> std::result::Result<Agent, crate::herdr::HerdrError> {
+    let started = std::time::Instant::now();
+    let mut result = herdr.agent_start_opts(&crate::herdr::AgentStart {
+        name,
+        kind: &launch.kind,
+        pane,
+        agent_args: &launch.args,
+        launch_bin: None,
+        parent: None,
+        ready_timeout_ms: launch.ready_timeout_ms.min(1_000),
+    });
+    loop {
+        if result.is_ok() {
+            return result;
+        }
+        if let Ok(screen) = herdr.pane_read_text(pane, "screen")
+            && let Some(line) = screen.lines().find(|line| {
+                line.contains("command not found")
+                    || line.contains(": not found")
+                    || line.contains(": No such file or directory")
+                    || line.contains(": Permission denied")
+            })
+        {
+            return Err(crate::herdr::HerdrError {
+                code: "command_failed".into(),
+                message: format!("coordinator launch failed in pane {pane}: {}", line.trim()),
+            });
+        }
+        let error = result.as_ref().unwrap_err();
+        // An interactive block is not a timeout and still needs input in its pane.
+        if !matches!(error.code.as_str(), "timeout" | "agent_not_ready")
+            || started.elapsed().as_millis() >= u128::from(launch.ready_timeout_ms)
+        {
+            return result;
+        }
+        result = herdr.agent_wait_ready(pane, 1_000);
+    }
 }
 
 /// Renames a recorded workspace whose label is not the project's display name,
@@ -1168,6 +1203,61 @@ fn acknowledge_bootstrap(project: &Project) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn coordinator_start_surfaces_a_missing_command_without_the_ready_window() {
+        use crate::runner::fake::{FakeRunner, fail, ok};
+        let runner = FakeRunner::new();
+        runner.on(
+            "agent start",
+            fail(1, r#"{"error":{"code":"timeout","message":"not ready"}}"#),
+        );
+        runner.on("pane read", ok("bash: claude: command not found\n$ "));
+        let herdr = Herdr::new("herdr", "/test.sock", &runner);
+        let launch = crate::contracts::Launch {
+            kind: "claude".into(),
+            ready_timeout_ms: 300_000,
+            ..Default::default()
+        };
+        let error = start_coordinator(&herdr, "coordinator", "w1:p1", &launch).unwrap_err();
+        assert_eq!(error.code, "command_failed");
+        assert!(error.message.contains("claude: command not found"));
+        assert!(error.message.contains("w1:p1"));
+        assert_eq!(runner.count("agent wait"), 0);
+        assert!(
+            runner.calls.borrow()[0]
+                .args
+                .windows(2)
+                .any(|args| args == ["--timeout", "1000"])
+        );
+    }
+
+    #[test]
+    fn coordinator_start_retains_readiness_for_a_slow_successful_launch() {
+        use crate::runner::fake::{FakeRunner, fail, ok};
+        let runner = FakeRunner::new();
+        runner.on(
+            "agent start",
+            fail(1, r#"{"error":{"code":"timeout","message":"not ready"}}"#),
+        );
+        runner.on("pane read", ok("Starting Claude…"));
+        runner.on(
+            "agent wait",
+            ok(r#"{"result":{"agent":{"pane_id":"w1:p1","tab_id":"w1:t1","workspace_id":"w1","agent_status":"idle"}}}"#),
+        );
+        let herdr = Herdr::new("herdr", "/test.sock", &runner);
+        let launch = crate::contracts::Launch {
+            ready_timeout_ms: 300_000,
+            ..Default::default()
+        };
+        assert!(
+            start_coordinator(&herdr, "coordinator", "w1:p1", &launch)
+                .unwrap()
+                .ready()
+        );
+        assert_eq!(runner.count("agent start"), 1);
+        assert_eq!(runner.count("agent wait"), 1);
+    }
 
     #[test]
     fn provider_errors_only_match_the_terminal_line() {

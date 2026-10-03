@@ -94,7 +94,7 @@ impl<T: Clone> Records<T> {
                             continue;
                         }
                     };
-                    if !entry.path().extension().is_some_and(|ext| ext == "toml") {
+                    if entry.path().extension().is_none_or(|ext| ext != "toml") {
                         continue;
                     }
                     let Some(id) = entry
