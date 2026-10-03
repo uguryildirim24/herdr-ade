@@ -1515,7 +1515,9 @@ pub(crate) fn remote_attention(
         )
         .on_machine(lane.machine_route());
         // A missing agent alone is unknown; sealed attempts need no replacement.
-        if current.parked || crate::threads::attempt_sealed(project, &current) {
+        if !thread::can_check_gone(&current, now)
+            || crate::threads::attempt_sealed(project, &current)
+        {
             state.blocked.remove(&lane.id);
             state.missing.remove(&lane.id);
             state.missing_identity.remove(&lane.id);
@@ -1542,7 +1544,7 @@ pub(crate) fn remote_attention(
         let agent_dead = live.pane_exists
             && live.agent_state.is_none()
             && !agents.iter().any(|a| a.pane_id == lane.pane_id)
-            && lane.identity.process.is_some()
+            && thread::can_check_process_gone(&current, now)
             && remote
                 .pane_process_info(&lane.pane_id)
                 .is_ok_and(|info| info.agent_gone(&lane.pane_id));
@@ -1579,7 +1581,8 @@ pub(crate) fn remote_attention(
         if !matches!(
             current.status,
             thread::Status::Open | thread::Status::Starting
-        ) || current.attempt != lane.attempt
+        ) || !thread::can_check_gone(&current, now)
+            || current.attempt != lane.attempt
             || current.pane_id != lane.pane_id
             || current.tab_id != lane.tab_id
             || current.workspace_id != lane.workspace_id
@@ -2970,6 +2973,89 @@ mod tests {
         let progress = &manifest.progress[&("demo".into(), "t-1".into())];
         assert_eq!(progress.head, sha);
         assert_eq!(progress.screen, thread::sha256_hex(b"working"));
+    }
+
+    #[test]
+    fn recovered_box_attempt_ignores_old_identity_until_its_start_timeout() {
+        let world = crate::scenarios::World::new();
+        let project = world.project("demo", "a.sock");
+        let lane = thread::allocate(&project, |t| {
+            t.status = thread::Status::Starting;
+            t.machine = "buildbox".into();
+            t.machine_id = "abc".into();
+            t.attempt = 2;
+            t.workspace_id = "w9".into();
+            t.tab_id = "w9:t2".into();
+            t.pane_id = "w9:p2".into();
+            t.cwd = "/lane".into();
+            t.startup_wait_started = "2026-10-03T00:00:00Z".into();
+            t.launch.ready_timeout_ms = 60_000;
+            t.identity.workspace_id = "w9".into();
+            t.identity.tab_id = "w9:t1".into();
+            t.identity.pane_id = "w9:p1".into();
+            t.identity.process = Some(crate::contracts::ProcessIdentity {
+                pid: 42,
+                argv0: "pi".into(),
+            });
+            t.identity.agent_session = Some("saved-session".into());
+        })
+        .unwrap();
+        let pane = Pane {
+            workspace_id: lane.workspace_id.clone(),
+            tab_id: lane.tab_id.clone(),
+            pane_id: lane.pane_id.clone(),
+            cwd: lane.cwd.clone(),
+        };
+        world.runner.on("pane list", crate::runner::fake::ok(
+            r#"{"result":{"panes":[{"workspace_id":"w9","tab_id":"w9:t2","pane_id":"w9:p2","cwd":"/lane"}]}}"#,
+        ));
+        world.runner.on("pane process-info", crate::runner::fake::ok(
+            r#"{"result":{"process_info":{"pane_id":"w9:p2","foreground_processes":[{"pid":5,"name":"bash"}]}}}"#,
+        ));
+        let ctx = world.ctx();
+        let check = |now| {
+            assert!(
+                remote_attention(
+                    &ctx,
+                    &project,
+                    RemoteView {
+                        machine_id: "abc",
+                        threads: &[thread::load(&project, &lane.id).unwrap()],
+                        agents: &[],
+                        panes: std::slice::from_ref(&pane),
+                        boot_id: "boot-1",
+                        now,
+                    }
+                )
+                .is_empty()
+            );
+        };
+        for _ in 0..2 {
+            check(at("2026-10-03T00:00:59Z"));
+        }
+        let saved = thread::load(&project, &lane.id).unwrap();
+        assert_eq!(saved.status, thread::Status::Starting);
+        assert_eq!(saved.attempt, 2);
+        assert_eq!(
+            saved.identity.agent_session.as_deref(),
+            Some("saved-session")
+        );
+        assert!(
+            !events::remote_state(&project, "abc")
+                .missing
+                .contains_key(&lane.id)
+        );
+        assert_eq!(world.runner.count("pane process-info"), 0);
+        for _ in 0..2 {
+            check(at("2026-10-03T00:01:00Z"));
+        }
+        let failed = thread::load(&project, &lane.id).unwrap();
+        assert_eq!(failed.status, thread::Status::Failed);
+        assert_eq!(
+            failed.failure_class,
+            crate::contracts::FailureClass::ProcessGone
+        );
+        assert!(failed.start_notices.iter().any(|n| n.line.contains("GONE")));
     }
 
     #[test]

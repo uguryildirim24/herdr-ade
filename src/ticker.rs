@@ -1617,8 +1617,12 @@ fn thread_pass(
                     }
                 })?;
             } else if (state == "blocked" || (state.is_empty() && live.pane_exists))
-                && thread::seconds_since(&t.startup_wait_started, now).max(0) as u64 * 1000
-                    >= agent_start_timeout(&t.launch)
+                && !thread::in_start_window(t, now)
+                && !(state.is_empty()
+                    && !agents.iter().any(|a| a.pane_id == t.pane_id)
+                    && herdr
+                        .pane_process_info(&t.pane_id)
+                        .is_ok_and(|info| info.agent_gone(&t.pane_id)))
             {
                 let detail = if state == "blocked" {
                     "still blocked at the end of its ready window"
@@ -1769,7 +1773,7 @@ fn thread_pass(
                     match herdr.agent_prompt_wait_started(
                         &t.pane_id,
                         &thread::launch_prompt(prefix, slug, &current),
-                        agent_start_timeout(&current.launch)
+                        thread::agent_start_timeout(&current.launch)
                             .min(crate::herdr::AGENT_START_TIMEOUT.as_millis() as u64),
                     ) {
                         Ok(()) => {
@@ -1880,7 +1884,7 @@ fn thread_pass(
                 match herdr.agent_prompt_wait_started(
                     &current.pane_id,
                     &follow_up.text,
-                    agent_start_timeout(&current.launch)
+                    thread::agent_start_timeout(&current.launch)
                         .min(crate::herdr::AGENT_START_TIMEOUT.as_millis() as u64),
                 ) {
                     Ok(()) => {
@@ -2088,14 +2092,12 @@ fn thread_pass(
         // A missing pane or a previously identified agent back at a shell is
         // news. An omitted name while a process still runs remains unknown.
         let process_gone = !t.is_remote()
-            && (after.startup_wait_started.is_empty()
-                || thread::seconds_since(&after.startup_wait_started, now).max(0) as u64 * 1000
-                    >= agent_start_timeout(&after.launch))
+            && thread::can_check_gone(&after, now)
             && !threads::attempt_sealed(project, &after)
             && (!live.pane_exists
                 || (live.agent_state.is_none()
                     && !agents.iter().any(|a| a.pane_id == after.pane_id)
-                    && after.identity.process.is_some()
+                    && thread::can_check_process_gone(&after, now)
                     && herdr
                         .pane_process_info(&after.pane_id)
                         .is_ok_and(|info| info.agent_gone(&after.pane_id))));
@@ -2104,7 +2106,10 @@ fn thread_pass(
             // retry can place a tab after the pass took its snapshot. Absence
             // must be observed again after placement before closing anything.
             let current = thread::load(project, &t.id)?;
-            if current.status != thread::Status::Open
+            if !matches!(
+                current.status,
+                thread::Status::Open | thread::Status::Starting
+            ) || !thread::can_check_gone(&current, now)
                 || current.attempt != t.attempt
                 || current.pane_id != t.pane_id
                 || current.tab_id != t.tab_id
@@ -2200,14 +2205,6 @@ fn thread_pass(
 fn brief_delivery_timeout(launch: &crate::contracts::Launch) -> u64 {
     if launch.ready_timeout_ms == 0 {
         thread::STARTING_TIMEOUT_SECS as u64 * 1000
-    } else {
-        launch.ready_timeout_ms
-    }
-}
-
-fn agent_start_timeout(launch: &crate::contracts::Launch) -> u64 {
-    if launch.ready_timeout_ms == 0 {
-        crate::herdr::AGENT_START_TIMEOUT.as_millis() as u64
     } else {
         launch.ready_timeout_ms
     }
@@ -2341,7 +2338,10 @@ fn launch_pass(
             continue;
         }
         let live = thread::live_state(t, pass.agents, pass.panes, now);
-        if live.agent_state.is_some() || !live.pane_exists || !t.startup_wait_started.is_empty() {
+        if live.agent_state.is_some()
+            || !live.pane_exists
+            || (t.launch_attempts > 0 && !t.startup_wait_started.is_empty())
+        {
             continue;
         }
         if t.launch_attempts >= thread::MAX_LAUNCH_ATTEMPTS {
@@ -2444,7 +2444,7 @@ fn launch_pass(
                 || current.pane_id != t.pane_id
                 || current.status != thread::Status::Open
                 || !current.prompt_pending
-                || !current.startup_wait_started.is_empty()
+                || (current.launch_attempts > 0 && !current.startup_wait_started.is_empty())
             {
                 return Ok(());
             }
@@ -2453,7 +2453,9 @@ fn launch_pass(
                 current.error.clear();
             }
             current.trust_answered = false;
-            current.startup_wait_started = project::now();
+            if current.startup_wait_started.is_empty() {
+                current.startup_wait_started = project::now();
+            }
             claimed = true;
             Ok(())
         }) {
@@ -2499,7 +2501,7 @@ fn launch_pass(
             parent: parent.as_deref(),
             // `agent start` need not hold the ticker for the whole observation
             // window: subsequent passes watch the pane for the remaining time.
-            ready_timeout_ms: agent_start_timeout(&t.launch)
+            ready_timeout_ms: thread::agent_start_timeout(&t.launch)
                 .min(crate::herdr::AGENT_START_TIMEOUT.as_millis() as u64),
         })
         .collect();
@@ -4567,6 +4569,9 @@ mod tests {
             t.cwd = "/lane".into();
             t.agent_name = "hp-demo-t-0001".into();
             t.report_hash = "unsealed-draft".into();
+            t.identity.workspace_id = t.workspace_id.clone();
+            t.identity.tab_id = t.tab_id.clone();
+            t.identity.pane_id = t.pane_id.clone();
             t.identity.process = Some(crate::contracts::ProcessIdentity {
                 pid: 42,
                 argv0: "pi".into(),
@@ -4618,6 +4623,91 @@ mod tests {
                 .count(),
             1
         );
+    }
+
+    #[test]
+    fn recovered_local_attempt_ignores_old_identity_until_its_start_timeout() {
+        let world = crate::scenarios::World::new();
+        let project = world.project("demo", "a.sock");
+        let c = project.coordinator().unwrap();
+        *world.agents.borrow_mut() = format!(
+            "[{}]",
+            crate::scenarios::agent_json(
+                &c.workspace_id,
+                &c.tab_id,
+                &c.pane_id,
+                &c.cwd,
+                &c.agent_name,
+                "working",
+            )
+        );
+        let lane = thread::allocate(&project, |t| {
+            t.status = thread::Status::Starting;
+            t.attempt = 2;
+            t.workspace_id = "w2".into();
+            t.tab_id = "w2:t2".into();
+            t.pane_id = "w2:p2".into();
+            t.cwd = "/lane".into();
+            t.startup_wait_started = project::now();
+            t.launch.ready_timeout_ms = 60_000;
+            t.identity.workspace_id = "w2".into();
+            t.identity.tab_id = "w2:t1".into();
+            t.identity.pane_id = "w2:p1".into();
+            t.identity.process = Some(crate::contracts::ProcessIdentity {
+                pid: 42,
+                argv0: "pi".into(),
+            });
+            t.identity.agent_session = Some("saved-session".into());
+        })
+        .unwrap();
+        *world.panes.borrow_mut() = format!(
+            "[{},{}]",
+            world.coordinator_pane(&project),
+            crate::scenarios::pane_json("w2", "w2:t2", "w2:p2", "/lane")
+        );
+        world.runner.on("pane process-info", ok(r#"{"result":{"process_info":{"pane_id":"w2:p2","foreground_processes":[{"pid":5,"name":"bash"}]}}}"#));
+        let ctx = world.ctx();
+        let herdr = Herdr::new("herdr", &c.socket, &world.runner);
+        let check = || {
+            let pass = thread_pass(
+                &LaunchPass {
+                    ctx: &ctx,
+                    project: &project,
+                    herdr: &herdr,
+                    threads: &[thread::load(&project, &lane.id).unwrap()],
+                    agents: &herdr.agent_list().unwrap(),
+                    panes: &herdr.pane_list().unwrap(),
+                },
+                "ha",
+                None,
+                false,
+                None,
+            )
+            .unwrap();
+            assert!(pass.error.is_none(), "{:?}", pass.error);
+        };
+        check();
+        let saved = thread::load(&project, &lane.id).unwrap();
+        assert_eq!(saved.status, thread::Status::Starting);
+        assert_eq!(saved.attempt, 2);
+        assert_eq!(
+            saved.identity.agent_session.as_deref(),
+            Some("saved-session")
+        );
+        assert_eq!(world.runner.count("tab close"), 0);
+        assert_eq!(world.runner.count("workspace close"), 0);
+        thread::update(&project, &lane.id, |t| {
+            t.startup_wait_started = "2020-01-01T00:00:00Z".into();
+        })
+        .unwrap();
+        check();
+        let failed = thread::load(&project, &lane.id).unwrap();
+        assert_eq!(failed.status, thread::Status::Failed);
+        assert_eq!(
+            failed.failure_class,
+            crate::contracts::FailureClass::ProcessGone
+        );
+        assert!(world.runner.count("tab close") + world.runner.count("workspace close") > 0);
     }
 
     #[test]
@@ -5948,6 +6038,13 @@ mod tests {
             t.bootstrap = "acknowledged".into();
             t.launch.kind = "pi".into();
             t.launch.brief_hash = brief_hash.clone();
+            t.identity.workspace_id = t.workspace_id.clone();
+            t.identity.tab_id = t.tab_id.clone();
+            t.identity.pane_id = t.pane_id.clone();
+            t.identity.process = Some(crate::contracts::ProcessIdentity {
+                pid: 42,
+                argv0: "pi".into(),
+            });
             t.agent = "pi".into();
             if resuming {
                 t.identity.agent_session = Some("saved-session".into());
@@ -6045,9 +6142,72 @@ mod tests {
         assert!(!reopened.prompt_pending);
         assert_eq!(reopened.bootstrap == "resuming", resuming);
         assert_eq!(world.runner.count("agent start"), 0);
+        if remote {
+            for _ in 0..2 {
+                assert!(
+                    steps::remote_attention(
+                        &ctx,
+                        &project,
+                        steps::RemoteView {
+                            machine_id: reopened.machine_route(),
+                            threads: std::slice::from_ref(&reopened),
+                            agents: &[],
+                            panes: &[],
+                            boot_id: "boot-1",
+                            now: jiff::Timestamp::now(),
+                        }
+                    )
+                    .is_empty()
+                );
+            }
+            let pending = thread::load(&project, &lane.id).unwrap();
+            assert_eq!(pending.attempt, 2);
+            assert_eq!(
+                pending.launch.same_recipe_retries,
+                lane.launch.same_recipe_retries
+            );
+            assert!(
+                pending
+                    .start_notices
+                    .iter()
+                    .all(|n| !n.line.contains("GONE"))
+            );
+        }
         threads::place_recovery(&ctx, &project, &reopened).unwrap();
         let reopened =
             thread::update(&project, &lane.id, |t| t.error = "provider ready".into()).unwrap();
+        assert!(!reopened.startup_wait_started.is_empty());
+        if remote {
+            for _ in 0..2 {
+                assert!(
+                    steps::remote_attention(
+                        &ctx,
+                        &project,
+                        steps::RemoteView {
+                            machine_id: reopened.machine_route(),
+                            threads: std::slice::from_ref(&reopened),
+                            agents: &[],
+                            panes: std::slice::from_ref(&pane),
+                            boot_id: "boot-1",
+                            now: jiff::Timestamp::now(),
+                        }
+                    )
+                    .is_empty()
+                );
+            }
+            let placed = thread::load(&project, &lane.id).unwrap();
+            assert_eq!(placed.attempt, 2);
+            assert_eq!(
+                placed.launch.same_recipe_retries,
+                lane.launch.same_recipe_retries
+            );
+            assert!(
+                placed
+                    .start_notices
+                    .iter()
+                    .all(|n| !n.line.contains("GONE"))
+            );
+        }
         let herdr = Herdr::new("herdr", "", &world.runner).on_machine(reopened.machine_route());
         let mut errors = Vec::new();
         launch_pass(
