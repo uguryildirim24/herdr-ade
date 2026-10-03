@@ -1,7 +1,4 @@
-//! Crate-side seam for the pi library: the parts that need `crate::`.
-//!
-//! `src/pi/` itself never names `crate::` because it also compiles into the
-//! thin `herdr-pi` binary. This file is compiled only into `herdr-ade`.
+//! ADE launch readiness through the shared pi provider implementation.
 //!
 //! `thread start` and the ticker call [`check_with`] before a `kind = "pi"`
 //! launch; `doctor` prints [`doctor_rows_with`]. Both take the ADE root.
@@ -13,33 +10,8 @@ use std::path::Path;
 use anyhow::Result;
 
 use crate::pi::doctor::{self, CheckReport};
-use crate::pi::sh;
 use crate::pi::{Env, Layout};
-
-/// `crate::runner::Runner` as a `pi::sh::Runner`.
-pub(crate) struct Adapter<'a>(pub &'a dyn crate::runner::Runner);
-
-impl sh::Runner for Adapter<'_> {
-    fn run(&self, cmd: &sh::Cmd) -> Result<sh::Output> {
-        // Own group, like `sh::RealRunner`: a timeout on `zsh -lic` must
-        // reach its children.
-        let mut adapted = crate::runner::Cmd::new(cmd.program.clone(), cmd.timeout).own_group();
-        adapted = adapted.args(cmd.args.clone());
-        for (key, value) in &cmd.env {
-            adapted = adapted.env(key.clone(), value.clone());
-        }
-        for key in &cmd.env_remove {
-            adapted = adapted.env_remove(key.clone());
-        }
-        let output = self.0.run(&adapted)?;
-        Ok(sh::Output {
-            code: output.code,
-            stdout: output.stdout,
-            stderr: output.stderr,
-            timed_out: output.timed_out,
-        })
-    }
-}
+use crate::runner as sh;
 
 /// The pi folder under this ADE root (SPEC-ADE item 90): `herdr-ade --root`
 /// and the pi library agree on one place.
@@ -88,13 +60,7 @@ pub(crate) fn check_with(
 ) -> Result<CheckReport> {
     let env = Env::from_process()?;
     let rooted = crate::runner::CwdRunner::new(runner, root);
-    let report = doctor::check_report_model(
-        &env,
-        &layout(root),
-        &Adapter(&rooted),
-        provider,
-        Some(model),
-    );
+    let report = doctor::check_report_model(&env, &layout(root), &rooted, provider, Some(model));
     if report.ok {
         Ok(report)
     } else {
@@ -196,7 +162,7 @@ fn doctor_rows_parallel(
                 scope.spawn(move || {
                     let real = crate::runner::RealRunner;
                     let rooted = crate::runner::CwdRunner::new(&real, root);
-                    doctor::provider_row(&Adapter(&rooted), layout, provider, model)
+                    doctor::provider_row(&rooted, layout, provider, model)
                 })
             })
             .collect();
@@ -223,9 +189,9 @@ pub(crate) fn doctor_rows_with(
         .map(|(provider, model)| (provider.as_str(), model.as_str()))
         .collect();
     let rows = if runner.is_real() {
-        doctor_rows_parallel(&env, &layout(root), &Adapter(&rooted), &models, root)
+        doctor_rows_parallel(&env, &layout(root), &rooted, &models, root)
     } else {
-        doctor::doctor_rows_with_models(&env, &layout(root), &Adapter(&rooted), &models)
+        doctor::doctor_rows_with_models(&env, &layout(root), &rooted, &models)
     };
     let ok = doctor::healthy(&rows);
     Ok((rows, ok))

@@ -16,8 +16,7 @@ sha2 = "0.10"
 toml = "0.9"
 
 # The thin pi binary (SPEC-pi v2 §3): setup, login instructions, doctor and
-# check. It compiles `src/pi/` through a path attribute; the package keeps
-# one library-in-the-binary shape and no separate library target.
+# check. Both command binaries link the shared library.
 [[bin]]
 name = "herdr-pi"
 path = "src/bin/herdr-pi.rs"

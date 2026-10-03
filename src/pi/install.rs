@@ -8,7 +8,8 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 
-use super::{Layout, PI_PACKAGE, PI_VERSION, sh};
+use super::{Layout, PI_PACKAGE, PI_VERSION};
+use crate::runner as sh;
 
 /// The DeepSeek `contextWindow` merge (a second writer of the same
 /// `models.json`; it derives its models from the recipe rows).
@@ -64,7 +65,11 @@ pub(crate) fn install(runner: &dyn sh::Runner, layout: &Layout) -> Result<Instal
     std::fs::create_dir_all(layout.npm())
         .with_context(|| format!("could not create {}", layout.npm().display()))?;
     let args = npm_install_args(layout);
-    let output = runner.run(&sh::Cmd::new("npm", sh::SETUP).args(args.clone()))?;
+    let output = runner.run(
+        &sh::Cmd::new("npm", sh::SETUP)
+            .args(args.clone())
+            .own_group(),
+    )?;
     if !output.success() {
         bail!("npm install failed: {}", output.error_text());
     }
@@ -162,6 +167,7 @@ pub(crate) fn setup(
 
     let integration = runner.run(
         &sh::Cmd::new(env.herdr_bin(), Duration::from_secs(120))
+            .own_group()
             .args(["integration", "install", "pi"])
             .env("PI_CODING_AGENT_DIR", layout.agent().display().to_string()),
     )?;

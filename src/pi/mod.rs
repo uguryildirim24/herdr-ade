@@ -5,21 +5,20 @@
 //! doctor rows, and the guard extension that turns a provider failure
 //! into `blocked` / `WAITING` instead of a silent `done`.
 //!
-//! The module compiles into two targets: the `herdr-ade` binary and the thin
-//! `herdr-pi` binary (setup, login instructions, doctor, check). Both roots
-//! include the shared config reader; [`sh`] is the external-command seam.
+//! Both command binaries link this module once through the shared library.
 
-use std::collections::BTreeMap;
 use std::path::PathBuf;
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 
+pub(crate) use crate::paths::Env;
+
+pub(crate) mod cli;
 pub(crate) mod doctor;
 pub(crate) mod folder;
 pub(crate) mod install;
 pub(crate) mod launch;
 pub(crate) mod provider;
-pub(crate) mod sh;
 
 /// The pinned pi package. Never a caret range, never `npm install -g`
 /// (SPEC-pi v2 §1, §3.2).
@@ -30,61 +29,6 @@ pub(crate) const PI_VERSION: &str = "0.99.1";
 pub(crate) const MIN_NODE: (u32, u32, u32) = (22, 19, 0);
 /// The guard extension's file name (SPEC-pi v2 §3.9).
 const GUARD_FILE: &str = "herdr-pi-guard.ts";
-
-/// The process environment, read once, so resolution never depends on plugin
-/// variables that are not there.
-#[derive(Debug, Clone)]
-pub(crate) struct Env {
-    vars: BTreeMap<String, String>,
-    pub(crate) home: PathBuf,
-}
-
-impl Env {
-    pub(crate) fn from_process() -> Result<Self> {
-        let vars: BTreeMap<String, String> = std::env::vars().collect();
-        let home = vars
-            .get("HOME")
-            .filter(|h| !h.is_empty())
-            .map(PathBuf::from)
-            .context("HOME is not set")?;
-        Ok(Env { vars, home })
-    }
-
-    #[cfg(test)]
-    pub(crate) fn for_test(home: &std::path::Path, vars: &[(&str, &str)]) -> Self {
-        Env {
-            vars: vars
-                .iter()
-                .map(|(k, v)| (k.to_string(), v.to_string()))
-                .collect(),
-            home: home.to_path_buf(),
-        }
-    }
-
-    /// A variable's value; an empty value counts as unset.
-    pub(crate) fn var(&self, key: &str) -> Option<&str> {
-        self.vars
-            .get(key)
-            .map(String::as_str)
-            .filter(|v| !v.is_empty())
-    }
-
-    pub(crate) fn expand_tilde(&self, path: &str) -> PathBuf {
-        sh::expand_tilde(path, &self.home)
-    }
-
-    pub(crate) fn config_dir(&self) -> PathBuf {
-        let xdg = self
-            .var("XDG_CONFIG_HOME")
-            .map(|value| self.expand_tilde(value));
-        crate::config::dir(&self.home, xdg.as_deref())
-    }
-
-    /// The herdr binary: `HERDR_BIN_PATH` when set, else `herdr` on `PATH`.
-    pub(crate) fn herdr_bin(&self) -> String {
-        self.var("HERDR_BIN_PATH").unwrap_or("herdr").to_string()
-    }
-}
 
 /// Every path the pi library owns, all under one root
 /// (SPEC-pi v2 §3.1, §3.3).
@@ -174,26 +118,7 @@ impl Layout {
 /// `ha thread start` in a coordinator shell, the ticker and `herdr-pi` from a
 /// terminal check another, and every pi start would be refused.
 pub(crate) fn resolve_root(env: &Env) -> Result<PathBuf> {
-    let root = if let Some(dir) = env.var("HERDR_ADE_ROOT") {
-        env.expand_tilde(dir)
-    } else if let Some(root) = config_root(env)? {
-        env.expand_tilde(&root)
-    } else {
-        env.home.join(".herdr-ade")
-    };
-    let root =
-        std::path::absolute(&root).with_context(|| format!("bad path {}", root.display()))?;
-    Ok(root.join("pi"))
-}
-
-/// `root` from ADE's `config.toml`, when the file sets one.
-fn config_root(env: &Env) -> Result<Option<String>> {
-    let document = crate::config::Document::read(&env.config_dir())?;
-    Ok(document
-        .value("root")
-        .and_then(toml::Value::as_str)
-        .filter(|root| !root.is_empty())
-        .map(str::to_string))
+    Ok(crate::paths::resolve_root(None, env, &env.config_dir())?.join("pi"))
 }
 
 /// The one-time login per provider (SPEC-pi v2 §2). The plugin prints these

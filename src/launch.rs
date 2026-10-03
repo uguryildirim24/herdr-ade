@@ -76,6 +76,13 @@ pub fn doctor_config(config_dir: &Path) -> Result<DoctorConfig> {
 }
 
 pub fn parse_launch_config(config_dir: &Path) -> Result<LaunchConfig> {
+    let config = recipe_catalog(config_dir)?;
+    config.routing.validate(&config.recipes)?;
+    Ok(config)
+}
+
+/// Canonical declarations, also used during pi setup before routes are set.
+pub(crate) fn recipe_catalog(config_dir: &Path) -> Result<LaunchConfig> {
     let document = crate::config::Document::read(config_dir)?;
     let raw: RawConfig = document.decode()?;
     validate_doctor_config(&raw.doctor)?;
@@ -88,16 +95,14 @@ pub fn parse_launch_config(config_dir: &Path) -> Result<LaunchConfig> {
     let policy_hash = crate::thread::sha256_hex(
         serde_json::to_vec(&(&recipes, &adapters, &raw.dispatch, &raw.routing))?.as_slice(),
     );
-    let config = LaunchConfig {
+    Ok(LaunchConfig {
         recipes,
         adapters,
         dispatch: raw.dispatch,
         routing: raw.routing,
         doctor: raw.doctor,
         policy_hash,
-    };
-    config.routing.validate(&config.recipes)?;
-    Ok(config)
+    })
 }
 
 pub fn validate_config(config: &LaunchConfig, kinds: &BTreeSet<String>) -> Result<()> {
