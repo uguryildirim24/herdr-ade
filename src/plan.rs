@@ -550,6 +550,20 @@ fn find_step<'a>(plan: &'a mut Plan, id: &str) -> Result<&'a mut PlanStep> {
         .with_context(|| format!("plan_step_unknown: `{id}` is not a step of this plan"))
 }
 
+/// The same read-only projection as `show`, without exposing project prose.
+pub(crate) fn counts(project: &Project) -> Result<(usize, usize)> {
+    let Some(mut plan) = load(project)? else {
+        return Ok((0, 0));
+    };
+    project_states(project, &mut plan);
+    Ok((
+        all_steps(&plan)
+            .filter(|step| step.state == StepState::Done)
+            .count(),
+        all_steps(&plan).count(),
+    ))
+}
+
 /// `ha plan show [--json]`. Missing returns revision zero and `present:
 /// false`; a normal call reports a goal that drifted from `PROJECT.md`.
 pub(crate) fn show(ctx: &Ctx, slug: &str, json: bool) -> Result<String> {

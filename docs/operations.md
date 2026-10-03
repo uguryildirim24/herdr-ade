@@ -84,7 +84,7 @@ Every command accepts the global `--json` flag. It returns one record with an
 | `review <project> [--repo PATH]` | Start the ready pile now, enable automatic reviews project-wide, or display an existing review. |
 | `review retry <project> [--repo PATH]` | Replace a stuck or dead reviewer in its checkout, or resume a landed review's publication, install and cleanup. |
 | `review cancel <project> [--repo PATH]` | Cancel an unlanded review and return its lanes to the pile. |
-| `harness install` | Standalone repair: build every repository in `[harness]`, install it into `~/.local/bin`, then the same on the saved box. It rewrites every open coordinator's hook binding and names each one. |
+| `harness install` | Uses the landing's checked installer: record every project's plan counts and records-load, install the Mac, then check with the installed binary. A done-count drop or newly unreadable records restores the previous Mac binaries and ticker; boxes stay untouched. Only a passing Mac proceeds to the saved boxes and hook rebinding. Changed Rundown binaries reopen only proven single-pane ADE Rundown tabs. Prints the same install-result line as REVIEW; count-only evidence is in `harness-install.json` under the config folder. |
 | `pause`, `resume`, `archive`, `unarchive`, `delete [--preview] [--github]` | Project lifecycle. `delete` stops project-owned processes and sends owned local files to the macOS Trash; shared resources stay. GitHub deletion is explicit. |
 | `ticker start \| run \| stop \| status`, `doctor`, `skill` | Housekeeping. |
 

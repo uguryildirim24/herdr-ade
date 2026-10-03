@@ -16,6 +16,55 @@ fn hp(home: &Path, args: &[&str]) -> std::process::Output {
 }
 
 #[test]
+fn internal_install_check_reports_only_counts_and_readability_without_writes() {
+    let home = tempfile::tempdir().unwrap();
+    let root = home.path().join("root");
+    let project = root.join("demo");
+    let state = project.join(".state");
+    std::fs::create_dir_all(state.join("tasks")).unwrap();
+    // The check must not parse or emit PROJECT.md's content.
+    std::fs::write(
+        project.join("PROJECT.md"),
+        "private project content, not front matter",
+    )
+    .unwrap();
+    std::fs::write(state.join("project.json"), r#"{"status":"archived"}"#).unwrap();
+    std::fs::write(state.join("tasks/job-0001.toml"), "id = 'job-0001'\ntitle = 'private task title'\nauthority = ['request:historical']\nacceptance = ['done']\n[[installed]]\nat = 'then'\ncommand = 'historical install'\n").unwrap();
+    let plan = "schema = 1\n[[steps]]\nid = 's-1'\ntext = 'private step text'\ntasks = ['job-0001']\n[[steps.subtasks]]\nid = 's-2'\ntasks = ['job-0001']\n[[steps]]\nid = 's-3'\n";
+    std::fs::write(state.join("plan.toml"), plan).unwrap();
+    let check = || {
+        let output = hp(
+            home.path(),
+            &["--root", root.to_str().unwrap(), "install-check"],
+        );
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        serde_json::from_slice::<serde_json::Value>(&output.stdout).unwrap()
+    };
+    assert_eq!(
+        check(),
+        serde_json::json!([{"project":"demo","done":2,"total":3,"records_load":true}])
+    );
+    assert_eq!(
+        std::fs::read_to_string(state.join("plan.toml")).unwrap(),
+        plan
+    );
+    assert!(!root.join(".ticker.lock").exists());
+    assert!(!state.join("context-cursor.json").exists());
+    std::fs::write(state.join("coordinator.json"), r#"{"launch":123}"#).unwrap();
+    assert_eq!(check()[0]["records_load"], false);
+    std::fs::remove_file(state.join("coordinator.json")).unwrap();
+    std::fs::create_dir(state.join("reviews")).unwrap();
+    std::fs::write(state.join("reviews/review-1.toml"), "not valid TOML").unwrap();
+    assert_eq!(check()[0]["records_load"], false);
+    let help = hp(home.path(), &["--help"]);
+    assert!(!String::from_utf8_lossy(&help.stdout).contains("install-check"));
+}
+
+#[test]
 fn new_project_popup_lists_the_repository_like_the_cli_and_leaves_the_goal_for_chat() {
     for repository in [".", "/srv/app@box", ""] {
         let home = tempfile::tempdir().unwrap();

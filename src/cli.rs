@@ -47,6 +47,8 @@ impl From<SessionArgs> for SessionFlags {
 
 #[derive(Subcommand)]
 enum Command {
+    #[command(hide = true)]
+    InstallCheck,
     /// Create a project folder with its skeleton files
     New {
         name: String,
@@ -1099,6 +1101,11 @@ pub fn run() -> Result<()> {
         detached_ticker: true,
     };
 
+    // The installed image's read-only probe must not wake a ticker or render
+    // context. Its entire output is numbers and readability, not project text.
+    if matches!(cli.command, Command::InstallCheck) {
+        return install_check(&ctx);
+    }
     let (_awake, _) = crate::awake::enter(&ctx.root, false)?;
     let observed_slug = explicit_slug
         .or_else(|| {
@@ -1150,12 +1157,21 @@ fn record_command_outcome(project: Option<&Project>, result: &Result<()>) {
     }
 }
 
+fn install_check(ctx: &Ctx) -> Result<()> {
+    println!(
+        "{}",
+        serde_json::to_string(&crate::harness::check::snapshot(&ctx.root))?
+    );
+    Ok(())
+}
+
 fn dispatch_with_start(
     ctx: Ctx<'_>,
     command: Command,
     cli_started: Option<std::time::Instant>,
 ) -> Result<()> {
     match command {
+        Command::InstallCheck => install_check(&ctx),
         Command::New { name, goal, repos } => {
             let repos = repos
                 .iter()

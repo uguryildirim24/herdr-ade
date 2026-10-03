@@ -1608,6 +1608,7 @@ fn forty_minute_sleep_defers_dark_wakes_and_imports_seals_before_resuming_starts
         fast_forward: false,
         push: false,
         install: false,
+        install_result: String::new(),
         close: false,
         prune: false,
         attention: String::new(),
@@ -2431,6 +2432,7 @@ fn write_harness_config(world: &World, repos: &[(&str, &str)]) {
     .unwrap();
     std::fs::write(dir.join("RULES.md"), "# Lane rules\n").unwrap();
     world.runner.on("herdr-pi refresh-guard", ok(""));
+    world.runner.on("install-check", ok("[]"));
 }
 
 #[test]

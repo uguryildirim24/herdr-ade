@@ -17,11 +17,7 @@ pub(crate) fn ensure_tab(
     slug: &str,
     title: &str,
 ) -> Result<(), HerdrError> {
-    if herdr
-        .tab_list()?
-        .iter()
-        .any(|tab| tab.workspace_id == workspace && tab.label == LABEL)
-    {
+    if !owned_tabs(herdr, workspace)?.is_empty() {
         return Ok(());
     }
     let project = format!("HERDR_RUNDOWN_PROJECT={slug}");
@@ -58,6 +54,89 @@ pub(crate) fn ensure_tab(
     };
     herdr.tab_rename(tab, LABEL)?;
     println!("added the Rundown tab ({tab})");
+    Ok(())
+}
+
+/// Herdr's plugin focus reply is the existing API that proves a pane's
+/// plugin and entrypoint. Preserve focus; labels and executable names alone
+/// are not ownership evidence.
+fn owned_tabs(herdr: &Herdr, workspace: &str) -> Result<Vec<crate::herdr::Pane>, HerdrError> {
+    let tabs = herdr.tab_list()?;
+    if !tabs.iter().any(|tab| tab.workspace_id == workspace) {
+        return Ok(Vec::new());
+    }
+    let panes = herdr.pane_list()?;
+    let snapshot = herdr.call(&["api", "snapshot"], CALL_TIMEOUT)?;
+    let focused = snapshot["snapshot"]["focused_tab_id"].as_str();
+    let result = (|| {
+        let mut owned = Vec::new();
+        for tab in tabs.iter().filter(|tab| tab.workspace_id == workspace) {
+            let in_tab: Vec<_> = panes
+                .iter()
+                .filter(|pane| pane.tab_id == tab.tab_id)
+                .collect();
+            // A tab close kills every session in it, even non-plugin panes.
+            if in_tab.len() != 1 {
+                continue;
+            }
+            let pane = in_tab[0];
+            let reply = match herdr.call(&["plugin", "pane", "focus", &pane.pane_id], CALL_TIMEOUT)
+            {
+                Ok(reply) => reply,
+                Err(error) if error.code == "plugin_pane_not_found" => continue,
+                Err(error) => return Err(error),
+            };
+            let proof = &reply["plugin_pane"];
+            if proof["plugin_id"] == PLUGIN
+                && proof["entrypoint"] == ENTRYPOINT
+                && proof["pane"]["pane_id"] == pane.pane_id
+                && proof["pane"]["tab_id"] == tab.tab_id
+                && proof["pane"]["workspace_id"] == workspace
+            {
+                owned.push(pane.clone());
+            }
+        }
+        Ok(owned)
+    })();
+    if let Some(focused) = focused {
+        herdr.call(&["tab", "focus", focused], CALL_TIMEOUT)?;
+    }
+    result
+}
+
+/// Reopen only existing, proven single-pane Rundown tabs. Never add a tab to
+/// a workspace that did not have one, or close a tab that acquired a split.
+pub(crate) fn reopen_existing(ctx: &crate::paths::Ctx) -> anyhow::Result<()> {
+    for slug in crate::project::list_slugs(&ctx.root) {
+        let project = crate::project::Project::load(&ctx.root, &slug)?;
+        let Some(coordinator) = project.coordinator() else {
+            continue;
+        };
+        let herdr = Herdr::new(ctx.env.herdr_bin(), &coordinator.socket, ctx.runner);
+        let owned = owned_tabs(&herdr, &coordinator.workspace_id)?;
+        if owned.is_empty() {
+            continue;
+        }
+        let title = herdr.workspace_label(&coordinator.workspace_id)?;
+        let mut closed = false;
+        for old in owned {
+            let panes = herdr.pane_list()?;
+            let current: Vec<_> = panes
+                .iter()
+                .filter(|pane| pane.tab_id == old.tab_id)
+                .collect();
+            if current.len() == 1
+                && current[0].pane_id == old.pane_id
+                && current[0].workspace_id == old.workspace_id
+            {
+                herdr.tab_close(&old.tab_id)?;
+                closed = true;
+            }
+        }
+        if closed {
+            ensure_tab(&herdr, &coordinator.workspace_id, &ctx.root, &slug, &title)?;
+        }
+    }
     Ok(())
 }
 
@@ -112,6 +191,95 @@ mod tests {
             "--no-focus",
         ] {
             assert!(opened.args.iter().any(|arg| arg == argument));
+        }
+    }
+
+    #[test]
+    fn refresh_closes_only_the_single_pane_with_exact_plugin_provenance() {
+        for gained_split in [false, true] {
+            let home = tempfile::tempdir().unwrap();
+            let root = home.path().join("root");
+            let project = crate::project::create(&root, "demo", "", vec![]).unwrap();
+            project
+                .update_coordinator(|coordinator| {
+                    coordinator.socket = "scratch.sock".into();
+                    coordinator.workspace_id = "w1".into();
+                })
+                .unwrap();
+            let closed = std::rc::Rc::new(std::cell::Cell::new(false));
+            let runner = FakeRunner::new();
+            let flag = closed.clone();
+            runner.on_fn(|cmd| cmd.display().contains("tab list"), move |_| {
+                let mut tabs = serde_json::json!([
+                    {"tab_id":"w1:t1","workspace_id":"w1","label":"Rundown"},
+                    {"tab_id":"w1:t3","workspace_id":"w1","label":"Rundown"},
+                    {"tab_id":"w1:t4","workspace_id":"w1","label":"Rundown"},
+                    {"tab_id":"w2:t5","workspace_id":"w2","label":"Rundown"}
+                ]);
+                if !flag.get() { tabs.as_array_mut().unwrap().push(serde_json::json!({"tab_id":"w1:t2","workspace_id":"w1","label":"Renamed"})); }
+                Ok(ok(&serde_json::json!({"result":{"tabs":tabs}}).to_string()))
+            });
+            let flag = closed.clone();
+            let reads = std::cell::Cell::new(0);
+            runner.on_fn(|cmd| cmd.display().contains("pane list"), move |_| {
+                reads.set(reads.get() + 1);
+                let mut panes = serde_json::json!([
+                    {"pane_id":"w1:p1","tab_id":"w1:t1","workspace_id":"w1"},
+                    {"pane_id":"w1:p3","tab_id":"w1:t3","workspace_id":"w1"},
+                    {"pane_id":"w1:p4","tab_id":"w1:t3","workspace_id":"w1"},
+                    {"pane_id":"w1:p5","tab_id":"w1:t4","workspace_id":"w1"},
+                    {"pane_id":"w2:p1","tab_id":"w2:t5","workspace_id":"w2"}
+                ]);
+                if !flag.get() { panes.as_array_mut().unwrap().push(serde_json::json!({"pane_id":"w1:p2","tab_id":"w1:t2","workspace_id":"w1"})); }
+                if gained_split && reads.get() > 1 { panes.as_array_mut().unwrap().push(serde_json::json!({"pane_id":"w1:p6","tab_id":"w1:t2","workspace_id":"w1"})); }
+                Ok(ok(&serde_json::json!({"result":{"panes":panes}}).to_string()))
+            });
+            runner.on(
+                "api snapshot",
+                ok(r#"{"result":{"snapshot":{"focused_tab_id":"w1:t1"}}}"#),
+            );
+            runner.on(
+                "plugin pane focus w1:p1",
+                fail(
+                    1,
+                    r#"{"error":{"code":"plugin_pane_not_found","message":"not a plugin pane"}}"#,
+                ),
+            );
+            runner.on("plugin pane focus w1:p2", ok(r#"{"result":{"plugin_pane":{"plugin_id":"herdr-ade","entrypoint":"rundown","pane":{"pane_id":"w1:p2","tab_id":"w1:t2","workspace_id":"w1"}}}}"#));
+            runner.on("plugin pane focus w1:p5", ok(r#"{"result":{"plugin_pane":{"plugin_id":"other","entrypoint":"rundown","pane":{"pane_id":"w1:p5","tab_id":"w1:t4","workspace_id":"w1"}}}}"#));
+            runner.on("tab focus w1:t1", ok(r#"{"result":{}}"#));
+            let flag = closed.clone();
+            runner.on_fn(
+                |cmd| cmd.display().contains("tab close w1:t2"),
+                move |_| {
+                    flag.set(true);
+                    Ok(ok(r#"{"result":{}}"#))
+                },
+            );
+            runner.on(
+                "workspace get w1",
+                ok(r#"{"result":{"workspace":{"label":"Demo"}}}"#),
+            );
+            runner.on(
+                "plugin pane open",
+                ok(r#"{"result":{"plugin_pane":{"pane":{"tab_id":"w1:t6"}}}}"#),
+            );
+            runner.on("tab rename w1:t6 Rundown", ok(r#"{"result":{}}"#));
+            let env = crate::paths::Env::for_test(home.path(), &[]);
+            let ctx = crate::paths::Ctx {
+                env: &env,
+                root,
+                config_dir: home.path().join("cfg"),
+                runner: &runner,
+                detached_ticker: false,
+            };
+            reopen_existing(&ctx).unwrap();
+            assert_eq!(runner.count("tab close"), usize::from(!gained_split));
+            assert_eq!(runner.count("plugin pane open"), usize::from(!gained_split));
+            assert!(runner.count("tab focus w1:t1") > 0);
+            for untouched in ["w1:p3", "w1:p4", "w2:p1"] {
+                assert_eq!(runner.count(&format!("plugin pane focus {untouched}")), 0);
+            }
         }
     }
 
