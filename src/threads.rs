@@ -5189,6 +5189,13 @@ fn row(t: &Thread, view: Option<&SessionView>, now: jiff::Timestamp) -> Row {
             note: "pane parked until requested".into(),
         };
     }
+    if t.recovery_pending && t.provider_wait_started.is_empty() {
+        return Row {
+            thread: t.clone(),
+            group: recorded,
+            note: "starting (placement queued)".into(),
+        };
+    }
     // Placement was refused before a pane existed. Do not diagnose a missing
     // process for a start that has never launched, even with no live session.
     if t.launch_attempts == 0 && !t.provider_wait_started.is_empty() {
@@ -7947,6 +7954,49 @@ mod tests {
             assert_eq!(started.launch.recipe_id, "pi_opencode_deepseek");
             assert_eq!(started.machine, "buildbox");
             assert_eq!(started.machine_id, "buildbox-id");
+        }
+    }
+
+    #[test]
+    fn first_placement_reads_as_starting_not_an_unknown_retry() {
+        let world = crate::scenarios::World::new();
+        let project = world.project("demo", "a.sock");
+        for machine in ["", "box"] {
+            for attempt in [1, 2] {
+                let lane = Thread {
+                    id: "t-0771".into(),
+                    status: Status::Open,
+                    machine: machine.into(),
+                    attempt,
+                    recovery_pending: true,
+                    ..Default::default()
+                };
+                assert_eq!(
+                    thread::recorded_group(&lane, jiff::Timestamp::now()),
+                    Group::Working
+                );
+                assert_eq!(
+                    thread::group(&lane, &thread::Live::default(), jiff::Timestamp::now()),
+                    Group::Working
+                );
+                let shown = row(&lane, None, jiff::Timestamp::now());
+                assert!(shown.note.starts_with("starting"));
+                let view = crate::project_view::View::capture(
+                    &project,
+                    &project::Settings::default(),
+                    Some(vec![shown]),
+                    None,
+                );
+                let rendered = view.render(&[]);
+                assert!(rendered.contains("[Working]"), "{rendered}");
+                assert!(rendered.contains("starting"), "{rendered}");
+                assert!(!rendered.contains("[Unknown]"), "{rendered}");
+                assert_eq!(
+                    rendered.contains("automatic retry selected"),
+                    attempt > 1,
+                    "{rendered}"
+                );
+            }
         }
     }
 

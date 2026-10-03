@@ -89,12 +89,14 @@ fn installation_pending(thread: &crate::thread::Thread, reviews: &[crate::review
 }
 
 fn process_unknown(row: &Row) -> bool {
-    row.group == Group::Unknown
-        || row.note.contains("agent state unknown")
-        || row.note.contains("process not queried")
-        || row.note.contains("session unreachable")
-        || (row.thread.is_remote()
-            && (row.thread.last_observed.is_empty() || !row.thread.observation_error.is_empty()))
+    !row.thread.recovery_pending
+        && (row.group == Group::Unknown
+            || row.note.contains("agent state unknown")
+            || row.note.contains("process not queried")
+            || row.note.contains("session unreachable")
+            || (row.thread.is_remote()
+                && (row.thread.last_observed.is_empty()
+                    || !row.thread.observation_error.is_empty())))
 }
 
 /// Seal and process evidence stay separate. A missing pane never invalidates
@@ -290,14 +292,18 @@ impl View {
                 .into_iter()
                 .map(|thread| Row {
                     group: crate::thread::recorded_group(&thread, jiff::Timestamp::now()),
-                    note: format!(
-                        "recorded: {}; process not queried",
-                        if thread.last_state.is_empty() {
-                            "unknown"
-                        } else {
-                            &thread.last_state
-                        }
-                    ),
+                    note: if thread.recovery_pending {
+                        "starting (placement queued)".into()
+                    } else {
+                        format!(
+                            "recorded: {}; process not queried",
+                            if thread.last_state.is_empty() {
+                                "unknown"
+                            } else {
+                                &thread.last_state
+                            }
+                        )
+                    },
                     thread,
                 })
                 .collect()
@@ -427,7 +433,7 @@ impl View {
             if !t.error.is_empty() {
                 let _ = write!(detail, "\n  {}: {}", t.failure_class.plain(), t.error);
             }
-            if t.recovery_pending {
+            if t.recovery_pending && t.attempt > 1 {
                 detail.push_str("\n  automatic retry selected; wait for startup");
             } else if t.status == Status::Failed
                 && let Some(notice) = t
@@ -778,6 +784,7 @@ impl View {
             let provider = !t.provider_wait_started.is_empty();
             if row.group == Group::Working && reachable && !provider {
                 if t.status == Status::Starting
+                    || t.recovery_pending
                     || t.prompt_pending
                     || !t.startup_wait_started.is_empty()
                 {
