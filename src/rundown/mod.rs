@@ -282,6 +282,14 @@ mod tests {
                 ),
             );
             runner.on("plugin pane focus w1:p2", ok(r#"{"result":{"plugin_pane":{"plugin_id":"herdr-ade","entrypoint":"rundown","pane":{"pane_id":"w1:p2","tab_id":"w1:t2","workspace_id":"w1"}}}}"#));
+            runner.on("plugin pane focus w1:p3", ok(r#"{"result":{"plugin_pane":{"plugin_id":"other","entrypoint":"rundown","pane":{"pane_id":"w1:p3","tab_id":"w1:t3","workspace_id":"w1"}}}}"#));
+            runner.on(
+                "plugin pane focus w1:p4",
+                fail(
+                    1,
+                    r#"{"error":{"code":"plugin_pane_not_found","message":"not a plugin pane"}}"#,
+                ),
+            );
             runner.on("plugin pane focus w1:p5", ok(r#"{"result":{"plugin_pane":{"plugin_id":"other","entrypoint":"rundown","pane":{"pane_id":"w1:p5","tab_id":"w1:t4","workspace_id":"w1"}}}}"#));
             runner.on("tab focus w1:t1", ok(r#"{"result":{}}"#));
             let flag = closed.clone();
@@ -313,9 +321,14 @@ mod tests {
             assert_eq!(runner.count("tab close"), usize::from(!gained_split));
             assert_eq!(runner.count("plugin pane open"), usize::from(!gained_split));
             assert!(runner.count("tab focus w1:t1") > 0);
-            for untouched in ["w1:p3", "w1:p4", "w2:p1"] {
-                assert_eq!(runner.count(&format!("plugin pane focus {untouched}")), 0);
+            // Only the non-destructive ensure pass examines split tabs.
+            for split in ["w1:p3", "w1:p4"] {
+                assert_eq!(
+                    runner.count(&format!("plugin pane focus {split}")),
+                    usize::from(!gained_split)
+                );
             }
+            assert_eq!(runner.count("plugin pane focus w2:p1"), 0);
         }
     }
 
