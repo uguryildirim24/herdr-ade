@@ -8,7 +8,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::File;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use anyhow::{Context, Result, bail};
 
@@ -45,14 +45,7 @@ pub(crate) fn load(project: &Project) -> Result<Option<Plan>> {
 fn write(project: &Project, plan: &Plan) -> Result<()> {
     let text = toml::to_string(plan)?;
     let path = project.record_file("plan.toml");
-    write_atomic(&path, text.as_bytes())?;
-    sync_dir(project.state_dir().as_path())?;
-    Ok(())
-}
-
-fn sync_dir(dir: &Path) -> Result<()> {
-    File::open(dir)?.sync_all()?;
-    Ok(())
+    write_atomic(&path, text.as_bytes())
 }
 
 fn step_id_ok(id: &str) -> bool {

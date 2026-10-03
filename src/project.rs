@@ -95,21 +95,45 @@ pub(crate) fn display_name(name: &str, slug: &str) -> String {
     }
 }
 
-/// Writes through a temporary file in the same directory plus a rename. It never
-/// creates parent directories; each optional store creates its folder on first use.
+/// Writes complete bytes, syncs the file, renames it, then syncs its directory.
+/// Does not create parents: stores must persist newly created directories too.
+/// Callers retain their locks/revision guards. An error after rename means the
+/// complete new record is visible, but its persistence has not been acknowledged.
 pub(crate) fn write_atomic(path: &Path, contents: &[u8]) -> Result<()> {
+    write_atomic_with(path, contents, |io| io.run())
+}
+
+// Keep the real persistence sequence injectable without replacing its ordering.
+enum ReplaceIo<'a> {
+    Write(&'a mut File, &'a [u8]),
+    FileSync(&'a File),
+    Rename(&'a Path, &'a Path),
+    DirectorySync(&'a Path),
+}
+
+impl ReplaceIo<'_> {
+    fn run(self) -> std::io::Result<()> {
+        match self {
+            Self::Write(file, contents) => file.write_all(contents),
+            Self::FileSync(file) => file.sync_all(),
+            Self::Rename(from, to) => std::fs::rename(from, to),
+            Self::DirectorySync(dir) => File::open(dir)?.sync_all(),
+        }
+    }
+}
+
+fn write_atomic_with(
+    path: &Path,
+    contents: &[u8],
+    mut io: impl FnMut(ReplaceIo<'_>) -> std::io::Result<()>,
+) -> Result<()> {
     let dir = path.parent().context("path has no parent")?;
-    let name = path.file_name().context("path has no file name")?;
-    let tmp = dir.join(format!(
-        ".{}.{}.tmp",
-        name.to_string_lossy(),
-        std::process::id()
-    ));
+    let (tmp, mut file) = unique_temp(path)?;
     let result = (|| -> Result<()> {
-        let mut file = File::create(&tmp)?;
-        file.write_all(contents)?;
-        file.sync_all()?;
-        std::fs::rename(&tmp, path)?;
+        io(ReplaceIo::Write(&mut file, contents))?;
+        io(ReplaceIo::FileSync(&file))?;
+        io(ReplaceIo::Rename(&tmp, path))?;
+        io(ReplaceIo::DirectorySync(dir))?;
         Ok(())
     })();
     if result.is_err() {
@@ -118,29 +142,39 @@ pub(crate) fn write_atomic(path: &Path, contents: &[u8]) -> Result<()> {
     result.with_context(|| format!("could not write {}", path.display()))
 }
 
-/// Publish complete immutable bytes without ever exposing an empty final file.
-/// Exact replays are accepted; a different existing record is never overwritten.
-pub(crate) fn write_create_only(path: &Path, contents: &[u8]) -> Result<()> {
-    use std::sync::atomic::{AtomicU64, Ordering};
+/// Exclusively reserve a same-directory temp name, skipping crash leftovers.
+fn unique_temp(path: &Path) -> Result<(PathBuf, File)> {
+    use std::sync::atomic::AtomicU64;
     static SERIAL: AtomicU64 = AtomicU64::new(0);
+    unique_temp_with(path, &SERIAL)
+}
+
+fn unique_temp_with(path: &Path, serial: &std::sync::atomic::AtomicU64) -> Result<(PathBuf, File)> {
     let dir = path.parent().context("path has no parent")?;
     let name = path.file_name().context("path has no file name")?;
-    let (tmp, mut file) = loop {
+    loop {
         let tmp = dir.join(format!(
             ".{}.{}.{}.tmp",
             name.to_string_lossy(),
             std::process::id(),
-            SERIAL.fetch_add(1, Ordering::Relaxed)
+            serial.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
         ));
         match File::options().create_new(true).write(true).open(&tmp) {
-            Ok(file) => break (tmp, file),
+            Ok(file) => return Ok((tmp, file)),
             // A crash can leave a temp file and the OS can reuse its pid.
             Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
             Err(error) => {
                 return Err(error).with_context(|| format!("could not create {}", tmp.display()));
             }
         }
-    };
+    }
+}
+
+/// Publish complete immutable bytes without ever exposing an empty final file.
+/// Exact replays are accepted; a different existing record is never overwritten.
+pub(crate) fn write_create_only(path: &Path, contents: &[u8]) -> Result<()> {
+    let dir = path.parent().context("path has no parent")?;
+    let (tmp, mut file) = unique_temp(path)?;
     let result = (|| -> Result<()> {
         file.write_all(contents)?;
         file.sync_all()?;
@@ -899,6 +933,9 @@ pub(crate) fn create(root: &Path, name: &str, goal: &str, repos: Vec<Repo>) -> R
     refresh_page(&project)?;
     Ok(project)
 }
+
+#[cfg(test)]
+mod atomic_tests;
 
 #[cfg(test)]
 mod tests {
