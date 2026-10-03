@@ -72,6 +72,12 @@ fn common_refusals_show_next_in_text_and_json() {
         ),
     ];
     for (args, reason, next) in cases {
+        let next = format!(
+            "{} --root {} {}",
+            env!("CARGO_BIN_EXE_herdr-ade"),
+            root.display(),
+            next.strip_prefix("ha ").unwrap()
+        );
         let text = run(false, args);
         assert!(!text.status.success(), "{args:?}");
         let stderr = String::from_utf8_lossy(&text.stderr);
@@ -82,6 +88,6 @@ fn common_refusals_show_next_in_text_and_json() {
         let json = run(true, args);
         let record: serde_json::Value = serde_json::from_slice(&json.stdout).unwrap();
         assert_eq!(record["outcome"], "refused");
-        assert!(record["next"].as_str().unwrap().starts_with(next));
+        assert!(record["next"].as_str().unwrap().starts_with(&next));
     }
 }

@@ -1006,11 +1006,7 @@ fn box_process_script(
          pid=\n\
          n=0\n\
          while [ $n -lt {attempts} ]; do\n\
-           start_output=$(HERDR_ADE_INSTALL_TICKER=1 $bin --root \"$root\" ticker start) || start_output=\n\
-           if [ \"$start_output\" = 'HERDR_ADE_TICKER_NO_PROJECTS=1' ]; then\n\
-             printf 'HERDR_ADE_BOX_TICKER_NO_PROJECTS=1\\n'\n\
-             exit 0\n\
-           fi\n\
+           HERDR_ADE_INSTALL_TICKER=1 $bin --root \"$root\" ticker start || :\n\
            seen=\n\
            pid=\n\
            if [ -r \"$root/.ticker.lock\" ] && ! ( flock -n 9 ) 9<>\"$root/.ticker.lock\"; then\n\
@@ -1151,19 +1147,6 @@ fn box_process_proofs(
                 expected
             )),
         });
-    } else if out
-        .stdout
-        .lines()
-        .any(|line| line == "HERDR_ADE_BOX_TICKER_NO_PROJECTS=1")
-    {
-        proofs.push(ProcessProof {
-            machine: machine.id.clone(),
-            process: "ticker".into(),
-            pid: None,
-            build: None,
-            state: "not_needed".into(),
-            reason: Some("the box root has no projects; ticker is not started".into()),
-        });
     } else {
         proofs.push(ProcessProof {
             machine: machine.id.clone(),
@@ -1197,7 +1180,7 @@ fn require_running_tickers(processes: &[ProcessProof], expected: &[&str]) -> Res
         }
     }
     for proof in processes {
-        if proof.process == "ticker" && proof.state != "running" && proof.state != "not_needed" {
+        if proof.process == "ticker" && proof.state != "running" {
             bail!(
                 "harness_ticker_failed: {} ticker pid {:?}, build {:?}: {}",
                 proof.machine,
@@ -1237,7 +1220,7 @@ fn record_task_proofs(
     let processes_pass = !processes.is_empty()
         && processes
             .iter()
-            .all(|p| matches!(p.state.as_str(), "running" | "installed" | "not_needed"));
+            .all(|p| matches!(p.state.as_str(), "running" | "installed"));
     let mut proofs = Vec::new();
     for slug in crate::project::list_slugs(&ctx.root) {
         let project = crate::project::Project::load(&ctx.root, &slug)?;
@@ -1600,9 +1583,7 @@ fn install_for(ctx: &Ctx, current: Option<(&str, &str)>) -> Result<InstallOutcom
     if let Err(error) = require_running_tickers(&processes, &expected) {
         let box_ticker_pending = box_paths.iter().any(|machine| {
             !processes.iter().any(|proof| {
-                proof.machine == machine.id
-                    && proof.process == "ticker"
-                    && matches!(proof.state.as_str(), "running" | "not_needed")
+                proof.machine == machine.id && proof.process == "ticker" && proof.state == "running"
             })
         });
         warnings.push(format!(
@@ -1614,8 +1595,7 @@ fn install_for(ctx: &Ctx, current: Option<(&str, &str)>) -> Result<InstallOutcom
         for proof in processes.iter().filter(|proof| {
             proof.machine == machine.id
                 && (proof.process == "herdr-ade binary" && proof.state != "installed"
-                    || proof.process == "ticker"
-                        && !matches!(proof.state.as_str(), "running" | "not_needed")
+                    || proof.process == "ticker" && proof.state != "running"
                     || proof.process == "box binary and ticker" && proof.state != "running")
         }) {
             let error = format!(
@@ -2713,14 +2693,14 @@ mod tests {
     }
 
     #[test]
-    fn a_box_without_projects_needs_no_ticker_but_projects_need_one() {
+    fn a_box_without_projects_still_needs_a_running_ticker() {
         let root = tempfile::tempdir().unwrap();
         let env = crate::paths::Env::for_test(root.path(), &[]);
         let bin = root.path().join("herdr-ade");
         std::fs::write(
             &bin,
             format!(
-                "#!/bin/sh\nif [ \"$1\" = --version ]; then echo 'herdr-ade {}'; elif [ \"$HERDR_ADE_INSTALL_TICKER\" = 1 ] && [ ! -f \"$2/demo/PROJECT.md\" ]; then echo 'HERDR_ADE_TICKER_NO_PROJECTS=1'; fi\n",
+                "#!/bin/sh\nif [ \"$1\" = --version ]; then echo 'herdr-ade {}'; fi\n",
                 crate::VERSION
             ),
         )
@@ -2758,16 +2738,6 @@ mod tests {
         };
         let proofs = box_process_proofs(&ctx, &machine, crate::VERSION);
         assert_eq!(proofs[0].state, "installed");
-        assert_eq!(proofs[1].state, "not_needed");
-        assert_eq!(
-            proofs[1].reason.as_deref(),
-            Some("the box root has no projects; ticker is not started")
-        );
-        require_running_tickers(&proofs, &["buildbox"]).unwrap();
-
-        std::fs::create_dir(box_root.join("demo")).unwrap();
-        std::fs::write(box_root.join("demo/PROJECT.md"), "+++\n+++\n").unwrap();
-        let proofs = box_process_proofs(&ctx, &machine, crate::VERSION);
         assert_eq!(proofs[1].state, "unknown");
         assert!(require_running_tickers(&proofs, &["buildbox"]).is_err());
     }

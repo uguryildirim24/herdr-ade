@@ -1,4 +1,4 @@
-//! The pinned install (SPEC-pi v2 §3.2).
+//! Install the exact Pi package pin into ADE's own npm prefix.
 //!
 //! Exactly `@earendil-works/pi-coding-agent@0.99.1` into
 //! `<ADE root>/pi/npm`, never global, never `pi install`.
@@ -15,11 +15,10 @@ use crate::runner as sh;
 /// `models.json`; it derives its models from the recipe rows).
 use super::provider as deepseek;
 
-/// The guard extension, plugin-owned, beside the herdr state hook
-/// (SPEC-pi v2 §3.3, §3.7). Doctor compares the complete installed file.
+/// Plugin-owned guard beside the Herdr state hook. Doctor compares its bytes.
 const GUARD_TS: &str = include_str!("../../extensions/herdr-pi-guard.ts");
 
-/// The exact `npm install` argv (SPEC-pi v2 §3.2). `--save-exact` is the pin;
+/// The exact `npm install` argv. `--save-exact` is the pin;
 /// a caret range is refused by doctor.
 fn npm_install_args(layout: &Layout) -> Vec<String> {
     vec![
@@ -120,14 +119,14 @@ pub(crate) fn write_guard(layout: &Layout) -> Result<std::path::PathBuf> {
 }
 
 /// True when the installed guard is the exact extension compiled into this
-/// binary (SPEC-pi v2 §3.9). A marker alone cannot detect changed behavior.
+/// binary. A marker alone cannot detect changed behavior.
 pub(crate) fn guard_ok(layout: &Layout) -> bool {
     guard_source(layout).is_ok_and(|expected| {
         std::fs::read_to_string(layout.guard()).is_ok_and(|text| text == expected)
     })
 }
 
-/// The one line Rolf types after setup (SPEC-pi v2 §3.2). The wrapper itself
+/// The wrapper link command printed after setup. The wrapper itself
 /// is written by setup; the symlink is his to make.
 pub(crate) fn link_line(layout: &Layout, home: &std::path::Path) -> String {
     format!(

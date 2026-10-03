@@ -393,9 +393,14 @@ fn successful_commands_keep_human_text_and_return_one_machine_record() {
 }
 
 #[test]
-fn ticker_start_without_projects_creates_nothing() {
+fn ticker_start_before_the_first_project_confirms_a_running_loop() {
     let home = tempfile::tempdir().unwrap();
-    assert!(hp(home.path(), &["ticker", "start"]).status.success());
+    let start = hp(home.path(), &["ticker", "start"]);
+    assert!(
+        start.status.success(),
+        "{}",
+        String::from_utf8_lossy(&start.stderr)
+    );
     let install = Command::new(BIN)
         .env_clear()
         .env("HOME", home.path())
@@ -403,8 +408,40 @@ fn ticker_start_without_projects_creates_nothing() {
         .args(["ticker", "start"])
         .output()
         .unwrap();
-    assert!(install.status.success());
-    assert_eq!(install.stdout, b"HERDR_ADE_TICKER_NO_PROJECTS=1\n");
-    assert!(!home.path().join(".herdr-ade").exists());
+    let before = hp(home.path(), &["ticker", "status"]);
+    let created = hp(home.path(), &["new", "demo"]);
+    std::thread::sleep(std::time::Duration::from_millis(100));
+    let after = hp(home.path(), &["ticker", "status"]);
+    let stopped = hp(home.path(), &["ticker", "stop"]);
+    assert!(stopped.status.success());
+    assert!(
+        install.status.success(),
+        "{}",
+        String::from_utf8_lossy(&install.stderr)
+    );
+    assert!(created.status.success());
+    for status in [before, after] {
+        assert!(String::from_utf8_lossy(&status.stdout).contains("ticker: running"));
+    }
     assert!(!home.path().join(".config").exists());
+}
+
+#[test]
+fn default_root_next_commands_need_no_ha_alias() {
+    let home = tempfile::tempdir().unwrap();
+    let created = hp(home.path(), &["new", "demo"]);
+    let text = String::from_utf8_lossy(&created.stdout);
+    assert!(
+        text.contains(&format!(
+            "next: {BIN} --root {} open demo",
+            home.path().join(".herdr-ade").display()
+        )),
+        "{text}"
+    );
+    let doctor = hp(home.path(), &["--json", "doctor"]);
+    assert!(!doctor.status.success());
+    let result: serde_json::Value = serde_json::from_slice(&doctor.stdout).unwrap();
+    assert_eq!(result["data"]["healthy"], false);
+    assert!(result["next"].as_str().unwrap().starts_with(BIN));
+    assert!(!result["next"].as_str().unwrap().contains("ha doctor"));
 }

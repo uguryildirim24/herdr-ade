@@ -4,8 +4,8 @@ How Herdr ADE works, what it writes where, and how to run threads on other machi
 
 ## How it works
 
-- **The coordinator is an ordinary agent** in a Herdr pane that follows a skill (`herdr-ade skill` prints it). Plugin code does not route messages, plan work or decide anything.
-- **The binary does mechanics.** Starting or restarting a thread, copying reports, marking inbox items handled: each is one deterministic subcommand. It talks to Herdr through Herdr's CLI. The coordinator prompt hook also records Rolf's own messages.
+- **The coordinator is an ordinary agent** in a Herdr pane that follows a skill (`herdr-ade skill` prints it). It plans and routes work; the binary executes those decisions.
+- **The binary does mechanics.** Starting or restarting a thread, copying reports, marking inbox items handled: each is one deterministic subcommand. It talks to Herdr through Herdr's CLI. The coordinator prompt hook records your own messages as request authority.
 - **Files are the record, prompts are wake-ups.** Thread and review records own their state; `context` renders it directly at the start of every turn. The inbox holds only messages such as courier deliveries and machine notices. A missed prompt loses nothing.
 - **One ticker per projects root** checks every 15 seconds: thread state and groups, pending prompts, changed reports, pending cleanup. Remote machines are polled once a minute.
 - **Tools are found even under a bare `PATH`.** A Herdr server started outside a login shell gives its plugins a minimal `PATH`; the binary appends `/opt/homebrew/bin`, `/usr/local/bin`, `~/.local/bin` and `~/.cargo/bin` to its own, so the ticker finds `gh`, `rsync` and friends. `ticker status` and `doctor` show what resolved.
@@ -17,7 +17,7 @@ How Herdr ADE works, what it writes where, and how to run threads on other machi
 ~/.herdr-ade/<project>/
   PROJECT.md              editable settings; never replaced by the harness
   scratch/                the coordinator's temporary files
-  library/<id>/           files a thread produced for Rolf
+  library/<id>/           files a thread produced for you
   .state/
     page.md              generated current page (atomic replacement)
     notes/<id>.json       immutable facts and instructions with request ids and replacements
@@ -38,6 +38,12 @@ New notes, retirements, delivery entries, receipts and import markers publish co
 
 Content folders in this tree are created on their first write; a new project has only `PROJECT.md` and `.state/`. All binary-owned records live under `.state/`. A project-owned lane folder stays where its thread record says it is.
 
+## Safety and cleanup
+
+ADE is not a sandbox. Shipped recipes bypass agent permission prompts, and their declared bypass flags are required. Agents have the launching account's filesystem, network and credential access. Git worktrees isolate changes, not privileges. Trust repositories, briefs and selected providers before dispatch; do not copy provider credentials between machines. Missing process or publication evidence is not success. Seal, merge, push, install and delivery remain separate facts.
+
+Deletion verifies owned-resource scope and requires a platform trash tool on every affected machine before effects. Shared repositories stay; GitHub deletion requires explicit `--github`. Use `delete --preview` to inspect scope or `archive` for a reversible lifecycle change. Lane cleanup follows the checks below, not an agent permission dialog.
+
 Every ADE lane works from a plain git worktree at `<repo>/.worktrees/<thread-id>/`, opened as a tab in the coordinator workspace (not as a Herdr worktree workspace). `tab create` sets `HERDR_ADE_LAUNCH`. The lane is primed with “Run the shell command `<prefix> skill <role>`, then read `.herdr-project/<project>-<id>/brief.md` and do what it says.” The frozen brief is a content-addressed project artifact tied to the worktree's exact base commit and materialized only in that ignored runtime folder. The agent writes `report.md` there and creates `library/` only for real deliverables. `.worktrees/` is added to `info/exclude`. `done` seals the report once as `.state/artifacts/<hash>`; thread and task views find it from the thread record. Unmatched historical `.state/threads/<id>.md` reports remain readable. Resolving removes a finished worktree with `git worktree remove` without `--force`, after copying real deliverables. A remote lane's rebuildable Cargo folder is removed in the same operation. Uncommitted tracked or untracked changes refuse resolution. Ignored data keeps both the worktree and its build folder but does not stop resolution; the typed `ignored_data` reason names each folder and its size. The branch is pruned after a clean worktree is removed; a kept worktree keeps its branch.
 
 Ignored files are disposable only when their path is covered by the editable global setting below or by `disposable` on that repository's row in `PROJECT.md`. A harness repository row in `config.toml` may carry the same list. Repository lists are added to the global list only for their own repository. With no matching setting, every ignored file is treated as data. A one-part name matches that path component anywhere in the worktree; a path containing `/` matches from the worktree root. `*` matches within one path part (`runs/pytest-*` covers `runs/pytest-cancel` but not `runs/seed-1`). A nested Git checkout is always data, even inside a disposable folder.
@@ -54,9 +60,9 @@ disposable = ["target", ".target", "zig-out", ".zig-cache", "node_modules"]
 min_free_disk_gb = 12
 ```
 
-Settings remain in the hand-edited front matter of `PROJECT.md`. The harness never replaces this file, including on existing projects: historical bodies are left intact, not migrated into notes. The separate generated `.state/page.md` is rebuilt atomically from the records and shows the goal, what Rolf gets, running work and its waits, plan, each open task on one status-and-next-action line, current task notes, instructions and facts, recent completions. An edit during rendering remains saved; the next refresh updates the view. `task show` carries the task's full acceptance conditions and evidence. `PROJECT.md` settings: `name` (the Herdr workspace label; a slug-like name such as `herdr-ade` is stored and shown as `Herdr Ade`, plain title case, so write `GTM AI` yourself if you want capitals; an edited name renames the workspace on the next `open`), `goal`, `repos` (`path`, optional `machine`, `box_path`, `publish_url`, `disposable`, integration `branch`, allowed `push_remote`, repository `gates`). Each gate is `{ command = "...", paths = ["src/**", "tests/**"], env = { NAME = "value" } }`; optional `paths` selects the gate only when the reviewed diff changes a matching repository-relative file. Glob syntax: `*` and `?` within one path segment, `**` as a whole segment for zero or more directories (no character classes, negation or absolute paths). `doctor` flags globs that match no tracked file. Omit `paths` to always run; omitted `gates` means not configured while `gates = []` explicitly makes that repository gate-free. A project-wide `gates` key is removed. Projects have no thread-count limit. Kind and args come from `[recipes.<id>]` (`kind`, `provider`, `args`, `env`, `ready_timeout_ms`, `enabled`, `plain`). The ordered `[routing]` table selects a recipe by workflow or task product.
+Settings remain in the hand-edited front matter of `PROJECT.md`. The harness never replaces this file, including on existing projects: historical bodies are left intact, not migrated into notes. The separate generated `.state/page.md` is rebuilt atomically from the records and shows the goal, what you get, running work and its waits, plan, each open task on one status-and-next-action line, current task notes, instructions and facts, recent completions. An edit during rendering remains saved; the next refresh updates the view. `task show` carries the task's full acceptance conditions and evidence. `PROJECT.md` settings: `name` (the Herdr workspace label; a slug-like name such as `herdr-ade` is stored and shown as `Herdr Ade`, plain title case, so write `GTM AI` yourself if you want capitals; an edited name renames the workspace on the next `open`), `goal`, `repos` (`path`, optional `machine`, `box_path`, `publish_url`, `disposable`, integration `branch`, allowed `push_remote`, repository `gates`). Each gate is `{ command = "...", paths = ["src/**", "tests/**"], env = { NAME = "value" } }`; optional `paths` selects the gate only when the reviewed diff changes a matching repository-relative file. Glob syntax: `*` and `?` within one path segment, `**` as a whole segment for zero or more directories (no character classes, negation or absolute paths). `doctor` flags globs that match no tracked file. Omit `paths` to always run; omitted `gates` means not configured while `gates = []` explicitly makes that repository gate-free. A project-wide `gates` key is removed. Projects have no thread-count limit. Kind and args come from `[recipes.<id>]` (`kind`, `provider`, `args`, `env`, `ready_timeout_ms`, `enabled`, `plain`). The ordered `[routing]` table selects a recipe by workflow or task product.
 
-The title is the new lane's description. `thread start --job` takes the title and repository from the stable task; `--title` and `--repo` override real lane differences. A newly created task and `thread adopt` need an explicit title; adoption uses `--workflow` like start. The default workflow is `lane`. Adoption is only for agent panes outside Git repositories; use `thread start` for repository work. `--passive` on adopt sends no primer. Lane `parent` tokens nest panes under their current coordinator in herdr's sidebar (with `agent_parent_nesting` enabled). ADE requires `agent_parent_notify = false` in herdr's `[experimental]` config on every machine: the same token otherwise makes herdr push GONE/BLOCKED, bypassing ADE's durable notice outbox. Sealed lanes and deliberate cleanup do not produce GONE; a confirmed unsealed crash still does. Automated notices wait in a durable outbox for a 120-second idle batch (one line per notice), or go straight to a mid-turn coordinator. Rolf's input is never batched. A missing context receipt does not repeat a notice on the same coordinator binding.
+The title is the new lane's description. `thread start --job` takes the title and repository from the stable task; `--title` and `--repo` override real lane differences. A newly created task and `thread adopt` need an explicit title; adoption uses `--workflow` like start. The default workflow is `lane`. Adoption is only for agent panes outside Git repositories; use `thread start` for repository work. `--passive` on adopt sends no primer. Lane `parent` tokens nest panes under their current coordinator in herdr's sidebar (with `agent_parent_nesting` enabled). ADE requires `agent_parent_notify = false` in herdr's `[experimental]` config on every machine: the same token otherwise makes herdr push GONE/BLOCKED, bypassing ADE's durable notice outbox. Sealed lanes and deliberate cleanup do not produce GONE; a confirmed unsealed crash still does. Automated notices wait in a durable outbox for a 120-second idle batch (one line per notice), or go straight to a mid-turn coordinator. Your input is never batched. A missing context receipt does not repeat a notice on the same coordinator binding.
 
 `config.toml` also carries the harness repositories under `[harness] repos` (the same repository-row shape). Every project may start a lane or review a pile on a harness repository, listed in `PROJECT.md` or not; a repository that is neither listed nor a harness repository is refused. A harness repository row may declare `gates` with the same command, paths and environment fields as a project row. Pile reviews use the `[harness]` row's `gates` first, otherwise the reviewing project's listed row's `gates`. If both omit `gates`, the review refuses with `harness_gates_missing` and asks for gates on the repository's `[harness]` row in `config.toml`. An explicit `gates = []` is a declared gate-free policy. Non-harness repositories may still omit gates; their review record, verdict, context and landing line say "no gates declared". After a pile lands and pushes the integration ref, harness repositories use the installer: it builds and installs locally and on the saved box.
 
@@ -97,11 +103,11 @@ The project keeps a plan card. Reading it never changes a plan or resolves a lan
 
 - **The plan card** is `<project>/.state/plan.toml`, written under `<project>/.state/plan.lock` with a revision guard and an atomic rename. It holds the goal copied exactly from `PROJECT.md`, the authored outcome (`plan set <project> --does "<outcome>"`) and any number of ordered steps. Historical outcome fields still load. New bindings name stable tasks in each step, so one task may support several steps. A step's state is projected from those tasks. Historical thread bindings and task-side `plan_step` links still project from current lane/task records. Old round links are ignored. `plan sync` is the manual refresh.
 
-Coordinators ask Rolf in their chat, as a short choice between outcomes he can picture, only about spend, irreversible steps or steps that leave the machine. While waiting for his chat reply, they keep unrelated work moving; if nothing can proceed, they wait.
+Coordinators ask decisions in chat, as short choices between concrete outcomes, while keeping unrelated work moving.
 
-Every message Rolf sends the coordinator gets a request id from the prompt-submit hook and a record under `.state/requests/`. Historical request ids in the old talk journal remain readable; nothing writes that journal now. Automated harness prompts do not count as Rolf's requests; `context` shows new request ids. His chat answer supplies request-backed authority for work.
+Your coordinator messages get request ids from the prompt-submit hook under `.state/requests/`. Historical request ids in the old talk journal remain readable; nothing writes that journal now. Automated harness prompts are not requests. `context` shows the ids; tasks require that recorded authority even when started from the CLI.
 
-The idle-plan ticker sends one nudge, then stays quiet until the plan revision, lane set, Rolf's latest request changes, or a lane runs. Its text suggests only work that can proceed without his reply and explicitly allows waiting for his reply in chat. It does not infer chat-wait state or require a new flag or record.
+The idle-plan ticker sends one nudge, then stays quiet until the plan revision, lane set or latest request changes, or a lane runs. It suggests only work that can proceed without your reply and permits waiting in chat.
 
 The live ask workflow is removed: no creation or closure commands, notifications, publication retries or waiting widgets. Historical ask revisions, answers and withdrawals remain read-only on disk. Notes and tasks citing `ask:a-N@revision` still resolve a current, nonzero answer as authority. Old publication and counter files are left untouched but are no longer read or written. Rundown reads the shared project view: running, waiting and unplanned work, current reviews and holds, plus a `Needs you` line for pending personal input or login. Planned-step counts stay separate and unchanged; short panes prioritize unfinished work and show how many steps are hidden.
 
@@ -119,11 +125,11 @@ The harness merges the pile into a candidate off the integration tip. One review
 
 If the integration tip moves, the same reviewer gets one request to merge it and rerun gates. A second move cancels that review and starts a fresh pile. `review retry` replaces the reviewer while preserving its checkout; `review cancel` releases an unlanded pile. After fast-forward, recovery finishes publication and cleanup rather than cancelling landed work.
 
-Cutover is installed only after all old reviews in every project have finished. Existing round, checkpoint and hold records are left untouched and are not read or migrated. Historical task installation entries still show installed. Open historical seals with unknown changes are classified once when first considered for review; work already on the integration branch is recorded as merged. The coordinator removes obsolete `task_states` settings after install; the parser ignores them.
+Existing round, checkpoint and hold records remain untouched; the current pile workflow does not read or migrate them. Historical task installation entries still show installed. Open historical seals with unknown changes are classified once when first considered for review; work already on the integration branch is recorded as merged.
 
 ## Agent and machine adapters
 
-Agent behavior lives in `[adapters.<kind>]`. A complete row declares `binary`, `launch_flags`, `ready_timeout_ms`, `coordinator`, `capabilities`, required flags and effort names, a doctor readiness driver and argument template (`{args}` expands to the routed recipe), and its hook path, JSON shape, events and prompt event. A kind may coordinate only when its native hooks expose prompt submission, so text Rolf types into its pane cannot disappear. Shipped rows use the same declaration type. A new kind needs only this row unless its provider has a non-command readiness protocol.
+Agent behavior lives in `[adapters.<kind>]`. A complete row declares `binary`, `launch_flags`, `ready_timeout_ms`, `coordinator`, `capabilities`, required flags and effort names, a doctor readiness driver and argument template (`{args}` expands to the routed recipe), and its hook path, JSON shape, events and prompt event. A kind may coordinate only when its native hooks expose prompt submission, so your typed requests cannot disappear. Shipped rows use the same declaration type. A new kind needs only this row unless its provider has a non-command readiness protocol.
 
 No remote machine is declared by default. Copy the neutral example in [`assets/default-machines.toml`](../assets/default-machines.toml) into your own `config.toml` and set your paths. Existing complete machine rows in that config keep their values. Machine facts live in `[machines.<name>]`: `target`, `session`, `home`, `root`, `worktrees`, `build`, `path`, `ade_bin`, `pi_bin`, `kinds`, and `repos`. `kinds` is the list of adapter kinds the machine runs, such as `kinds = ["pi"]`; an empty list runs no agent jobs there. Omitting `kinds` leaves an existing user machine unrestricted, so every adapter kind may run there. Each repo row names `path`, `box_path`, and `publish_url`. Placement, doctor probes, lane environment, start lines, courier paths and cleanup resolve the selected machine row; another box does not add a code branch.
 
@@ -133,7 +139,7 @@ No remote machine is declared by default. Copy the neutral example in [`assets/d
 
 Routing and executable recipes live together in `~/.config/herdr-ade/config.toml`. Rules are checked in order; every field present on a rule must match. A brief-hash pin wins over the matched rule or default. Unknown keys, empty defaults, unknown or disabled recipe names, malformed pins and rules without a matcher are errors. `doctor` validates the table and flags an enabled recipe with neither a route nor a command. `context` prints one line per recipe with its plain use, capabilities and the rule or choice that reaches it; command syntax stays in the coordinator skill. Disabled recipes have no route.
 
-The coordinator uses routing by default. When Rolf names the coordinator recipe for a project, `open <project> --recipe <id> --basis request:<id>` starts it and stores that exact recipe and request for process relaunches; a request from another project is `request:<project>/<id>`. When routing's choice does not fit a lane, the coordinator can start it with any enabled `--recipe <id>`. The lane launch record keeps the recipe with routing rule `explicit`; its basis and request are empty.
+The coordinator uses routing by default. When you explicitly choose the coordinator recipe for a project, `open <project> --recipe <id> --basis request:<id>` starts it and stores that exact recipe and request for process relaunches; a request from another project is `request:<project>/<id>`. When routing's choice does not fit a lane, the coordinator can start it with any enabled `--recipe <id>`. The lane launch record keeps the recipe with routing rule `explicit`; its basis and request are empty.
 
 The starting table is:
 
@@ -162,35 +168,9 @@ recipe = "claude_fable_xhigh"
 # "SHA256-of-exact-task-file-bytes" = "recipe-id"
 ```
 
-A rule may override the global recovery policy with `retries = N`. `ha failed "<failure and evidence>"` reports failed work and retries that same recipe up to the bound. `--class provider --provider-kind <kind>` and `--class lost_connection` also use bounded same-recipe retries; `process_gone` restarts the attempt within the same bound; `unknown` waits for the coordinator. Exhausted recovery stays failed.
+A rule may override the global recovery policy with `retries = N`. `herdr-ade failed "<failure and evidence>"` reports failed work and retries that same recipe up to the bound. `--class provider --provider-kind <kind>` and `--class lost_connection` also use bounded same-recipe retries; `process_gone` restarts the attempt within the same bound; `unknown` waits for the coordinator. Exhausted recovery stays failed.
 
 Each launch record and dispatch journal row says `pin`, `default`, `explicit` or `rule[n]`, so the reason for selection stays inspectable. Coordinator rows also carry `recipe_basis` and `recipe_request`; lane rows leave them empty. Historical launch and dispatch records without those fields still load.
-
-## The allow-list for your coordinator
-
-The coordinator runs the binary every turn, so allow-list it in your agent **by subcommand, never the bare binary**. `context` prints the exact prefix (`Commands: <binary> --root <root>`); the patterns must start with it. For Claude Code, in the project folder's `.claude/settings.local.json`:
-
-```json
-{ "permissions": { "allow": [
-  "Bash(<binary> --root <root> skill:*)",
-  "Bash(<binary> --root <root> context:*)",
-  "Bash(<binary> --root <root> inbox done:*)",
-  "Bash(<binary> --root <root> list:*)",
-  "Bash(<binary> --root <root> overview:*)",
-  "Bash(<binary> --root <root> thread list:*)",
-  "Bash(<binary> --root <root> thread show:*)",
-  "Bash(<binary> --root <root> thread prompt:*)",
-  "Bash(<binary> --root <root> thread ack:*)",
-  "Bash(<binary> --root <root> thread retry:*)"
-] } }
-```
-
-These patterns also cover the here-document form the coordinator uses to pass text on standard input (checked with Claude Code 2.1). A root with spaces is printed shell-quoted; write the pattern for that quoted form.
-
-- **Allow `thread start`** if the coordinator should start work without asking your CLI permission.
-- **Never allow** `thread resolve` (with any flag), `thread adopt`, `delete`, `archive`, `pause`, `new`, `open` or `ticker stop`.
-
-For other agents the principle is the same: allow reading and steering, keep anything that starts, ends or deletes on a prompt.
 
 ## Inbox notifications
 
@@ -210,16 +190,16 @@ Save the machine with `herdr machine add --label <label> <ssh target>` (both mac
 
 A lane or review tries a remote machine by default when it has a repository, `[dispatch] machine = "buildbox"` in `~/.config/herdr-ade/config.toml`, a matching `[machines.buildbox]` declaration, and its recipe kind is allowed by that machine's `kinds` (or `kinds` is omitted). A recipe whose kind is excluded runs locally without a box sign-in check. The repository needs both `box_path` and `publish_url` in its `PROJECT.md`, `[harness]` or machine `repos` row. Without the dispatch key it stays local. `thread start --machine local` keeps one start on the Mac, and `--machine <label>` names a saved machine only when its declaration allows the recipe kind. When a default box start finds the kind excluded, the box held, unreachable, unready, or unable to place the repository, it runs on the Mac instead and says why; an explicit `--machine <label>` still fails.
 
-On a box, `ha done` publishes the lane's or reviewer's own branch to the recorded `publish_url` with a non-force push, verifies the published ref, and only then seals. A failed push refuses with the Git error; retry after resolving it. Mac `done` does not publish.
+On a box, `herdr-ade done` publishes the lane's or reviewer's own branch to the recorded `publish_url` with a non-force push, verifies the published ref, and only then seals. A failed push refuses with the Git error; retry after resolving it. Mac `done` does not publish.
 
-Coordinator compaction's `coordinator-handoff` mod forks only the session note, then passes it on stdin to `ha handoff <project> --note-file -`. The harness renders live records with the same page and action renderers as `context`, includes the latest 12 request files verbatim (oldest first, with ids), and limits finished/dropped history to ten one-line rows with `ha task list <project>` for the rest. Neither a snapshot nor a saved handoff consumes inbox items, deliveries, wake receipts or the context cursor.
+Coordinator compaction's `coordinator-handoff` mod forks only the session note, then passes it on stdin to the resolved ADE command prefix's `handoff <project> --note-file -`. The harness renders live records with the same page and action renderers as `context`, includes the latest 12 request files verbatim (oldest first, with ids), and limits finished/dropped history to ten one-line rows with `herdr-ade task list <project>` for the rest. Neither a snapshot nor a saved handoff consumes inbox items, deliveries, wake receipts or the context cursor.
 
-The 16,000-character budget includes the header, session note and cut notice. Whole sections are cut in this order: recent finished work, inbox, recipes, repositories, facts, task notes, plan. The notice names the cuts and points to `ha context <project> --peek --full`. Rolf's messages, standing instructions, open tasks and running work are never cut; goal, waits, action rows, reviews and the session note also stay intact. If protected content alone exceeds the budget, it is preserved with an explicit overflow notice. The mod retains its folder guard, subagent pass-through, precompute skip and 120-second fork deadline; exceptions, nonzero exits and empty stdout fall back to normal compaction.
+The 16,000-character budget includes the header, session note and cut notice. Whole sections are cut in this order: recent finished work, inbox, recipes, repositories, facts, task notes, plan. The notice names the cuts and points to `herdr-ade context <project> --peek --full`. Your messages, standing instructions, open tasks and running work are never cut; goal, waits, action rows, reviews and the session note also stay intact. If protected content alone exceeds the budget, it is preserved with an explicit overflow notice. The mod retains its folder guard, subagent pass-through, precompute skip and 120-second fork deadline; exceptions, nonzero exits and empty stdout fall back to normal compaction.
 
 When a coordinator binding changes, the ticker re-links verified live lanes under its new pane. A missing or mismatched process is not reparented. Use `thread retry` for a gone lane; there is no handoff document pair to maintain.
 
 - The worktree, the brief and the report live on the remote machine. The home ticker polls it once a minute and copies a changed report with `scp` and the thread's `library/` with `rsync -rt` (symbolic links are never followed or copied; a library over 50 MB is not copied and the thread's copy notes say so).
-- The box needs `herdr-ade` (`ade_bin`) for lane starts and `ha`, and `herdr-pi` (`pi_bin`) for pi `setup`, `login`, `doctor` and `check`; no pi verb runs through `herdr-ade`.
+- The box needs `herdr-ade` (`ade_bin`) for lane starts and seals, and `herdr-pi` (`pi_bin`) for pi `setup`, `login`, `doctor` and `check`; no pi verb runs through `herdr-ade`.
 - Every command the home machine runs on a box goes over SSH with the box machine's configured `path` in front, so it does not depend on login-shell `PATH` edits.
 - A machine that doesn't answer is left alone: no state is read, threads keep their last group, and it is skipped for about two minutes. After ten minutes you get one `outage` inbox item, and one more when it is back.
 - A blocked remote thread needs input, not necessarily approval. Inspect its current question on that machine: select the machine in Herdr's sidebar, or run `herdr --remote <ssh target>`.
@@ -227,11 +207,11 @@ When a coordinator binding changes, the ticker re-links verified live lanes unde
 
 ## Laptop-closed operation
 
-No plugin code is involved: install Herdr and this plugin on an always-on machine, keep the projects root there, open the project there, and attach from your laptop with `herdr --remote <ssh target>` (add `--session <name>` for a named session). The ticker runs on that machine. If Herdr asks whether to restart a remote server "that may not survive SSH connection loss", answering `n` keeps its panes. Checked on a Linux (aarch64) machine from a Mac.
+No plugin code is involved: install Herdr and this plugin on an always-on machine, keep the projects root there, open the project there, and attach from your laptop with `herdr --remote <ssh target>` (add `--session <name>` for a named session). The ticker runs on that machine. Checked on a Linux (aarch64) machine from a Mac.
 
 ## Development
 
-CI runs these gates on Linux and macOS:
+Rust 1.89 is the supported minimum (`Cargo.toml`). Check the Rust gates at that version with `cargo +1.89.0 …` as well as the installed toolchain. CI runs these gates on Linux and macOS:
 
 ```bash
 cargo fmt --check

@@ -15,14 +15,12 @@ serde_json = "1"
 sha2 = "0.10"
 toml = "0.9"
 
-# The thin pi binary (SPEC-pi v2 §3): setup, login instructions, doctor and
-# check. Both command binaries link the shared library.
+# Setup, login instructions, doctor and readiness share the library with ADE.
 [[bin]]
 name = "herdr-pi"
 path = "src/bin/herdr-pi.rs"
 
-# The Rundown tab (W132): one project's plan card as a plain to-do list, opened
-# by `ha open` as ADE's `rundown` pane. Compiles `src/rundown/view.rs`.
+# Project-bound plan and work view, opened as ADE's bundled Rundown pane.
 [[bin]]
 name = "herdr-rundown"
 path = "src/bin/herdr-rundown.rs"

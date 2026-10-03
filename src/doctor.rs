@@ -187,6 +187,30 @@ pub(crate) struct DoctorOutcome {
     pub(crate) message: String,
 }
 
+/// The terminal command and plugin action publish the same checks and exit status.
+pub(crate) fn finish(ctx: &Ctx, result: &DoctorOutcome) -> Result<()> {
+    crate::output::success(
+        Some(if result.healthy {
+            "healthy"
+        } else {
+            "unhealthy"
+        }),
+        result,
+        &result.message,
+        "",
+    )?;
+    if !result.healthy {
+        return Err(crate::refusal::error(
+            "some checks failed",
+            format!(
+                "{} doctor --timings (inspect failed checks, fix them, then rerun)",
+                crate::coordinator::current_prefix(&ctx.root)?
+            ),
+        ));
+    }
+    Ok(())
+}
+
 /// One agent runtime's existing doctor probe. Recipes identify the runtime by
 /// `kind`; placement never carries a separate allowlist of recipe ids.
 #[derive(Debug, Clone)]
@@ -937,7 +961,7 @@ fn report_with_checks(
             );
             if reachable {
                 let herdr = Herdr::new(&bin, &found.socket, runner);
-                check_workspace_leaks(&mut out, &mut check, root, "local", "this Mac", &herdr);
+                check_workspace_leaks(&mut out, &mut check, root, "local", "this machine", &herdr);
             }
         }
         Err(error) => check(&mut out, Some(false), "session", format!("{error:#}")),
@@ -1028,7 +1052,7 @@ fn report_with_checks(
                 if supervisor_loaded {
                     "loaded"
                 } else {
-                    "not loaded; run `ha harness install`"
+                    "not loaded; run the harness install command"
                 }
             ),
         );
@@ -1242,7 +1266,7 @@ fn report_with_checks(
                             &mut out,
                             Some(true),
                             &format!("machine {machine}"),
-                            "on this Mac".into(),
+                            "on this machine".into(),
                         ),
                         Ok(profile) => {
                             check(

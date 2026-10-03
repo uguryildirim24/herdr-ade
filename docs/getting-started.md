@@ -1,74 +1,104 @@
-# Getting started: open your first project
+# Getting started
 
-Install Herdr ADE, configure task routing, then open a project for its coordinator.
+This is the one setup path for macOS and Linux. **The repository is private:** you need GitHub access to `uguryildirim24/herdr-ade`. Anonymous clone and plugin install currently stop at GitHub authentication. Publication is an external release prerequisite, not an installer feature.
 
-## 1. Prerequisites
+## 1. Install prerequisites in order
 
-- macOS or Linux with [Herdr](https://herdr.dev) 0.9.1 or newer. Check both the client and running server with `herdr status`; restart a stale server after an update.
-- Rust 1.89 or newer, Cargo, a C compiler, and Git.
-- Access to `uguryildirim24/herdr-ade` and an agent CLI used by one of your configured recipes.
-- For project deletion on every affected machine: `/usr/bin/trash` on macOS; `gio` (used as `gio trash`) or `trash-put` on Linux. ADE checks these before any deletion effect and never falls back to permanent file removal.
-- Optional: `gh` for GitHub operations, and SSH plus `rsync` for lanes on another machine.
+1. Install [Herdr](https://herdr.dev) 0.9.1 or newer using its supported instructions. Run `herdr status` to check the client and running server. Apply server changes through Herdr's live handoff, not by stopping your running sessions.
+2. Install [Rust/Cargo](https://rustup.rs/) **1.89 or newer**, a C compiler (Xcode Command Line Tools on macOS, your distribution's compiler tools on Linux), and [Git](https://git-scm.com/downloads).
+3. Install [Node.js/npm](https://nodejs.org/en/download) (Node 24 is used by development CI). Confirm `node --version` and `npm --version` work in the shell Herdr starts.
+4. Install ADE and its pinned Pi runtime as described below. Pi lanes need their own provider logins. [Pi's instructions](https://github.com/earendil-works/pi/tree/main/packages/coding-agent#authentication) describe authentication; use ADE's `herdr-pi setup`, not a separate global Pi installation.
+5. Install the [Claude CLI](https://code.claude.com/docs/en/setup) and complete its supported login flow on this machine. Confirm `claude --version` works. The starting coordinator recipe uses Claude, even though the default work lane uses Pi.
 
-## 2. Install the plugin
+The full starting routing example also selects the Antigravity (`agy`) adapter for web research. Configure only recipes you have installed and signed into; disable unused recipes and remove their routing rules rather than expecting a missing CLI to work. The recipe catalogue is shown by `herdr-ade context <project>`.
+
+For deletion, each affected machine needs `/usr/bin/trash` on macOS, or `gio trash` or `trash-put` on Linux. ADE checks these before effects and never falls back to permanent deletion. `gh` is optional for GitHub operations; remote lanes additionally need SSH and `rsync`.
+
+## 2. Install ADE and set up Pi
+
+With repository access:
 
 ```bash
 herdr plugin install uguryildirim24/herdr-ade
 ```
 
-Herdr clones the repository, runs its locked release build, and registers ADE's actions, panes (including Rundown), and startup command.
+Herdr clones and runs the locked release build, then registers ADE's actions, bundled Rundown pane and ticker startup. For an unattended install, Herdr's existing `--yes` option accepts its install confirmation; it does not grant GitHub access.
 
-For terminal use, find the installed plugin's directory with `herdr plugin list`, then set `PLUGIN_ROOT` to that directory (replace the example path below):
+Find the plugin directory with `herdr plugin list`, substitute its actual path below, and make sure `~/.local/bin` is on your shell's `PATH`:
 
 ```bash
 PLUGIN_ROOT=/path/to/herdr-ade
 mkdir -p ~/.local/bin ~/.config/herdr-ade
 ln -s "$PLUGIN_ROOT/target/release/herdr-ade" ~/.local/bin/herdr-ade
 ln -s "$PLUGIN_ROOT/target/release/herdr-pi" ~/.local/bin/herdr-pi
-$EDITOR ~/.config/herdr-ade/config.toml
+export PATH="$HOME/.local/bin:$PATH"
 ```
 
-Add the starting routing table shown in [Task-based routing](operations.md#task-based-routing) to `config.toml`. The example selects `pi_codex_sol_high` by default, routes coordinator, spec, web-research and native-chat work with ordered rules, and allows one retry on the same recipe. Executable recipes and machine placement live in the same file. `herdr-ade context <project>` lists every recipe, what it is for, its capabilities and the exact command or rule that reaches it.
+Persist the PATH change in your shell configuration. No `ha` alias is required. Generated command prefixes include the resolved binary and project root.
 
-If you use pi recipes, run `herdr-pi setup`, complete each required login with `herdr-pi login`, then run `herdr-pi doctor`. If you want lanes on another machine, add a complete machine declaration to your config using the [neutral example](../assets/default-machines.toml); none is active by default. A login is local to that machine; do not copy its credential store to another machine. Run `herdr-ade doctor` after setting up the recipes you intend to use.
+Open `~/.config/herdr-ade/config.toml` with your editor (for example `nano` if `$EDITOR` is unset). Add the [starting routing table](operations.md#task-based-routing). Recipes, routing and machine placement share that file; the built-in recipes supply executable arguments. The example routes coordinator work to Claude and ordinary lanes to Pi.
 
-## 3. Create and open a project
+```bash
+herdr-pi setup
+```
 
-Use **Projects: new project** in Herdr with a name and repository (`PATH[@MACHINE]`), or run:
+Setup installs ADE's pinned npm package and integration, then prints the wrapper link command. **Run that printed `ln -s … ~/.local/bin/pi` command** so Herdr can launch `pi`. Then use:
+
+```bash
+herdr-pi login
+herdr-pi doctor
+```
+
+Follow the login instructions for each provider used by your enabled recipes. Logins belong to each machine: never copy credentials to a box. Complete the Claude installation/login from step 1 before opening the coordinator. See [the trust boundary](../README.md#trust-boundary): shipped recipes bypass permissions; ADE refuses recipes missing their required bypass flags.
+
+## 3. Create a project, plan and coordinator
+
+From inside Herdr, use **Projects: new project**, or run:
 
 ```bash
 herdr-ade new "Billing" --repo ~/dev/app
+herdr-ade plan set billing --does "A working billing page"
+herdr-ade plan step add billing "Build the page"
+herdr-ade plan step add billing "Review and ship"
 herdr-ade open billing
 ```
 
-The default project root is `~/.herdr-ade`. `new` creates the project record; `open` creates or focuses its Herdr workspace and coordinator. Use `open <project> --recipe <id> --basis request:<id>` when Rolf chooses a configured coordinator recipe for that project; process relaunches keep the recipe and request. The coordinator reads its skill and current digest before answering.
+The repository must already exist. `new` creates records under `~/.herdr-ade`; `open` creates or focuses the project workspace and coordinator. If using a named session, pass `--session <name>` to `open` and `doctor` consistently. A shell outside Herdr needs an explicit session or socket when discovery cannot select one.
 
-Edit the front matter of `PROJECT.md` for repositories and project settings. The harness never replaces this file. The current page is generated separately at `.state/page.md`; existing project bodies remain untouched and are not imported as notes. Add facts and standing instructions with `herdr-ade note add <project> "<text>" --kind memory|instruction --request <request-id> [--task <job>]` so each fact has one provenanced home and can be explicitly replaced. Recipe selection lives in the editable `[routing]` table in `config.toml`.
+**Rundown is included, not a separate plugin.** Opening the project ensures a project-bound Rundown tab; the ticker also maintains it for a recorded workspace. Do not launch a raw `herdr-rundown` pane: it needs the project environment supplied by ADE. Steps gain their done state from linked stable tasks, not from reading the plan.
+
+Herdr 0.9.1 was verified for project, plan and Rundown setup. Public Herdr without `agent start --parent` reports a compatibility warning and uses post-start parenting; sidebar nesting itself was not verified in the fresh-install run. ADE's parenting path requires `agent_parent_notify = false` in Herdr's `[experimental]` settings so Herdr does not bypass ADE's durable notices.
+
+Edit `PROJECT.md` front matter for repositories and project settings. ADE never replaces it; `.state/page.md` is the generated view. See [Operations](operations.md#where-things-live).
 
 ## 4. Start work
 
-Tell the coordinator what you want. It starts the lanes the work needs and tells you what it started. Each repository lane gets:
+Tell the signed-in coordinator your goal in its pane. The prompt-submit hook records a request id, and the coordinator uses it to create stable tasks and dispatch lanes. Every lane gets a pinned brief, its own branch/worktree and the applicable instructions.
 
-- a content-addressed brief in project state, tied to the exact starting commit and materialized only in the ignored runtime folder;
-- a branch and worktree under `<repo>/.worktrees/`;
-- a tab under the coordinator workspace; and
-- the project's instructions and bounded memory.
+Direct CLI dispatch does not bypass request authority. After a real coordinator conversation, find its recorded request in `herdr-ade context billing`, then use that actual id:
 
-A lane reports through its file under `.herdr-project/`. The harness copies reports to the project record and groups each lane by what needs attention. When a pile merges, the harness closes its member lanes and reviewers. Cancelling a review closes its reviewers but leaves member lanes available for a new pile. A report-only lane closes as soon as its unchanged commit and report arrive. A changed lane stays visible until its pile is reviewed. `thread resolve` remains available for an exceptional manual close.
+```bash
+herdr-ade task add billing --title "Build billing page" --request <recorded-request-id> --acceptance "The billing page works" --repo ~/dev/app
+herdr-ade thread start billing --job <returned-job-id> --task-file /path/to/brief.md
+```
 
-A finished lane's worktree is removed automatically after its commits land through a pile review, but only when it has no uncommitted changes or ignored data. Uncommitted changes refuse resolution. Ignored data resolves the lane but keeps the worktree with a reason naming its folders and sizes. List rebuildable ignored paths such as `target` and `node_modules` under global `[worktrees].disposable` in `config.toml`, or add `disposable` to one repository row in `PROJECT.md` (and to a harness repository row for harness-only output). Repository lists affect only that repository. `*` matches within one path part, so `runs/pytest-*` leaves other `runs/` output alone; with no matching list, all ignored files are kept. Nested worktrees are always kept. A kept worktree keeps its branch; cleanup prunes local and published branches after removing a finished worktree, without forcing worktree removal. Completed reviews prune their review branches.
+Without a signed-in coordinator and a captured request, you can create records and view the plan/Rundown, but cannot authorize tasks or lanes. Do not synthesize request state. Finished changed lanes go through one pile review; reports and cleanup follow the [operations reference](operations.md#safety-and-cleanup).
 
 ## Check your setup
 
 ```bash
 herdr-ade doctor
+herdr-ade ticker start
 herdr-ade ticker status
 ```
 
-- **The project session is unreachable:** run `open` inside Herdr or pass the right `--session` or `--socket`. Use `--rebind` only when the recorded session is gone.
-- **A lane failed, blocked, or got stuck:** inspect `thread show`, then use `thread retry --reason "<why>"`. It replaces the process; only automatic retries are bounded. Use `thread cancel` to stop it or `thread rebind` when its verified process is already live elsewhere.
-- **A provider is not ready:** use the provider's login flow on the same machine and rerun `doctor`.
-- **The coordinator needs its instructions again:** run `open <project> --reprime`.
-- **A worktree cannot be removed:** the final copy may be incomplete, Git may consider the worktree dirty, or ignored data may be present. Changes refuse resolution. Ignored data still lets the lane resolve and keeps its worktree; only configured rebuildable paths are discarded. Removal is not forced.
+Doctor prints the checks and exits nonzero for failures. Startup confirms a running ticker lock, even before the first project; it reports child initialization failures instead of claiming success. The ticker stays available when sessions are temporarily unreachable.
 
-See [Operations](operations.md) for records, routing, pile reviews, remote lanes, and the complete command surface.
+- **Missing CLI:** install the executable named in the pane's `command not found` error and check its PATH on that machine. `open` surfaces a visible shell launch failure instead of waiting out the readiness window. Fix it, then rerun `open`.
+- **Missing login:** use that CLI/provider's supported login on the same machine, then rerun `doctor`. A provider readiness failure is not fixed by creating another project.
+- **Missing/unreachable session:** run `open` in the right Herdr session or pass `--session`/`--socket`. `--rebind` is only for a recorded session whose socket is gone; it is not login recovery.
+- **Ticker absent:** run `ticker start`, then `ticker status`. Check `.ticker.log` under the projects root for a reported startup error. Merely invoking a plugin action is not evidence that a process stayed running.
+- **Lane failed or stuck:** inspect `thread show`, then `thread retry --reason "<why>"`, `thread cancel`, or `thread rebind` for an already-live verified process. These are not provider-login commands.
+- **Coordinator needs instructions again:** `open <project> --reprime`.
+
+See [Operations](operations.md) for safety, records, reviews, remote lanes and development gates.

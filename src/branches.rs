@@ -228,8 +228,7 @@ pub(crate) fn require_published_tip(
         let matches_tip = |actual: &String| {
             actual == &tip || (sealed && !record.base.is_empty() && actual == &record.base)
         };
-        if (latest_seal.is_some() && !sealed)
-            || (!sealed && remote.get(&record.branch) != Some(&tip))
+        if !sealed && (latest_seal.is_some() || remote.get(&record.branch) != Some(&tip))
             || remote
                 .get(&record.branch)
                 .is_some_and(|sha| !matches_tip(sha))
