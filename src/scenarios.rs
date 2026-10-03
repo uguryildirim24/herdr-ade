@@ -186,6 +186,7 @@ fn record_stored_report(project: &Project, thread_id: &str) {
     crate::events::seal_create_if_absent(
         project,
         &Event {
+            usage: None,
             id: format!("{thread_id}-{attempt}-done"),
             op: format!("{thread_id}-{attempt}-done"),
             thread: thread_id.into(),
@@ -1220,6 +1221,7 @@ fn linked_files_over_cap_or_missing_keep_the_worktree() {
         crate::events::seal_create_if_absent(
             &project,
             &Event {
+                usage: None,
                 id: "t-0001-1-done".into(),
                 op: "t-0001-1-done".into(),
                 thread: lane.id.clone(),
@@ -1283,6 +1285,7 @@ fn copy_overrides_do_not_discard_unsealed_or_unavailable_linked_reports() {
             crate::events::seal_create_if_absent(
                 &project,
                 &Event {
+                    usage: None,
                     id: "t-0001-1-done".into(),
                     op: "t-0001-1-done".into(),
                     thread: lane.id.clone(),
@@ -1354,6 +1357,7 @@ fn a_no_change_lane_closes_with_its_sealed_report_artifact() {
     std::fs::write(Path::new(&lane.thread_dir).join("report.md"), report).unwrap();
     let artifact = crate::events::store_artifact(&project, report.as_bytes()).unwrap();
     let event = Event {
+        usage: None,
         id: "t-0001-1-done".into(),
         op: "t-0001-1-done".into(),
         thread: lane.id.clone(),
@@ -1633,6 +1637,7 @@ fn forty_minute_sleep_defers_dark_wakes_and_imports_seals_before_resuming_starts
             coordinator_attempt: 1,
         },
         created: start.clone(),
+        usage: None,
         payload: EventPayload {
             done: Some(DonePayload {
                 has_changes: Some(false),
@@ -1936,6 +1941,7 @@ fn typed_provider_errors_reach_recovery_and_retry_the_same_recipe() {
         let event = crate::contracts::Event {
             id: event_id.clone(),
             op: event_id,
+            usage: None,
             thread: lane.id.clone(),
             attempt: 1,
             recipient: crate::contracts::Recipient::default(),
@@ -1989,6 +1995,7 @@ fn once_only_failure_waits_until_a_reasoned_coordinator_retry() {
     });
     std::fs::write(thread::task_path(&project, &lane.id), task).unwrap();
     let event = crate::contracts::Event {
+        usage: None,
         id: "process-gone-1".into(),
         op: "process-gone-1".into(),
         thread: lane.id.clone(),

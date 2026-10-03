@@ -68,6 +68,51 @@ fn new_project_popup_lists_the_repository_like_the_cli_and_leaves_the_goal_for_c
 }
 
 #[test]
+fn thread_show_puts_the_durable_report_and_usage_before_the_record() {
+    use sha2::Digest as _;
+    let home = tempfile::tempdir().unwrap();
+    assert!(hp(home.path(), &["new", "demo"]).status.success());
+    let project = home.path().join(".herdr-ade/demo");
+    let state = project.join(".state");
+    std::fs::create_dir_all(state.join("threads")).unwrap();
+    std::fs::write(
+        state.join("threads/t-0001.toml"),
+        "id = \"t-0001\"\nstatus = \"resolved\"\nattempt = 1\n",
+    )
+    .unwrap();
+    let show = || {
+        let output = hp(home.path(), &["thread", "show", "demo", "t-0001", "--json"]);
+        assert!(output.status.success(), "{output:?}");
+        let result: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        result["message"].as_str().unwrap().to_string()
+    };
+    assert!(show().starts_with("report: no report yet · usage unknown\ngroup = "));
+    std::fs::create_dir_all(state.join("events")).unwrap();
+    std::fs::create_dir_all(state.join("artifacts")).unwrap();
+    let report = b"Finished.\n";
+    let hash = format!("{:x}", sha2::Sha256::digest(report));
+    let path = state.join("artifacts").join(&hash);
+    std::fs::write(&path, report).unwrap();
+    let event = format!(
+        "id = \"t-0001-1-1\"\nop = \"t-0001-1-1\"\nthread = \"t-0001\"\nattempt = 1\ncreated = \"2026-10-03T00:00:00Z\"\n[recipient]\npane = \"w1:p1\"\ncoordinator_attempt = 1\n[payload.done]\nsha = \"abc\"\nreport_path = \"removed/report.md\"\nartifact = \"{hash}\"\n"
+    );
+    for (usage, summary) in [
+        ("", "usage unknown"),
+        (
+            "[usage]\ninput = 200000\noutput = 0\ncache_read = 4900000\ncache_write = 0\nreasoning = 0\ntotal = 5100000\n",
+            "5.1M tokens (4.9M cached)",
+        ),
+    ] {
+        std::fs::write(
+            state.join("events/t-0001-1-1.toml"),
+            format!("{event}{usage}"),
+        )
+        .unwrap();
+        assert!(show().starts_with(&format!("report: {} · {summary}\ngroup = ", path.display())));
+    }
+}
+
+#[test]
 fn help_and_version_are_successful_displays_even_with_json() {
     let home = tempfile::tempdir().unwrap();
     for args in [

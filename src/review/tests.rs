@@ -565,7 +565,7 @@ fn empty_commit_seals_as_no_change_without_starting_a_pile() {
     .unwrap();
     let staged = crate::ops::stage_done(&fx.project, &op.op, wt, fx.world.ctx().runner).unwrap();
     assert_eq!(staged.has_changes, Some(false));
-    let seal = crate::ops::seal(&fx.project, &op.op, |_| Ok(())).unwrap();
+    let seal = crate::ops::seal(&fx.project, &op.op, None, |_| Ok(())).unwrap();
     assert_eq!(seal.payload.done.unwrap().has_changes, Some(false));
     assert!(start(&fx.world.ctx(), "demo", None).unwrap().is_none());
     assert!(list(&fx.project).unwrap().is_empty());

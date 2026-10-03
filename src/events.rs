@@ -682,10 +682,11 @@ pub(crate) fn typed_line(project: &Project, event: &Event) -> Result<String> {
             waiting: None,
             failed: None,
         } => Ok(format!(
-            "DONE {} {} commit {}",
+            "DONE {} {} commit {} · {}",
             event.thread,
             std::path::absolute(artifact_path(project, &done.artifact))?.display(),
-            done.sha
+            done.sha,
+            crate::usage::summary(event.usage.as_ref())
         )),
         EventPayload {
             done: None,
@@ -779,6 +780,7 @@ mod tests {
                 coordinator_attempt: 1,
             },
             created: "2026-09-18T00:00:00Z".into(),
+            usage: None,
             payload: EventPayload {
                 done: Some(DonePayload {
                     has_changes: None,
@@ -793,6 +795,46 @@ mod tests {
             },
         };
         (root, project, event)
+    }
+
+    #[test]
+    fn historical_event_without_usage_loads_and_new_usage_is_one_optional_table() {
+        // Real adeherdr event t-0058-1-1, sealed before usage existed.
+        let old = r#"id = "t-0058-1-1"
+op = "t-0058-1-1"
+thread = "t-0058"
+attempt = 1
+created = "2026-09-19T22:53:42Z"
+[recipient]
+pane = "w1G:p1"
+coordinator_attempt = 1
+[payload.done]
+sha = "4f93bfb9d2f103186523577957852a5d1cc4d590"
+report_path = ".herdr-project/adeherdr-t-0058/report.md"
+artifact = "ff2346a2702021221a52567a733cc60301ac507dc2da3c6a0629e2c6ca58f75b"
+"#;
+        let event: Event = toml::from_str(old).unwrap();
+        assert!(event.usage.is_none());
+        let (_root, project, mut event) = fixture();
+        assert!(
+            !String::from_utf8(bytes(&event).unwrap())
+                .unwrap()
+                .contains("[usage]")
+        );
+        event.usage = Some(crate::usage::Usage {
+            input: 200000,
+            cache_read: 4900000,
+            total: 5100000,
+            ..Default::default()
+        });
+        let text = String::from_utf8(bytes(&event).unwrap()).unwrap();
+        assert_eq!(text.matches("[usage]").count(), 1);
+        assert_eq!(toml::from_str::<Event>(&text).unwrap(), event);
+        assert!(
+            typed_line(&project, &event)
+                .unwrap()
+                .ends_with(" · 5.1M tokens (4.9M cached)")
+        );
     }
 
     #[test]
@@ -893,6 +935,7 @@ mod tests {
                 coordinator_attempt: 1,
             },
             created: "2026-09-19T00:00:00Z".into(),
+            usage: None,
             payload: EventPayload {
                 done: Some(DonePayload {
                     has_changes: None,
@@ -932,7 +975,10 @@ mod tests {
         assert!(durable.is_absolute() && durable.is_file());
         assert_eq!(
             notice,
-            format!("DONE t-0001 {} commit abc", durable.display())
+            format!(
+                "DONE t-0001 {} commit abc · usage unknown",
+                durable.display()
+            )
         );
         assert!(!notice.contains(".reports/t-0001.md"));
 
