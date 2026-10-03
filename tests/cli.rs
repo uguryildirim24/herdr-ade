@@ -105,10 +105,13 @@ fn doctor_transport_runs_selected_probes_without_loading_policy_or_waking_state(
             "args":["-c", format!("echo run >> '{}'; printf 'original local failure' >&2; exit 1", marker.display())]}, 1000]],
         "models": [], "pi_ids": {}, "disk": null, "snapshot": null
     });
+    let build =
+        String::from_utf8(Command::new(BIN).arg("--version").output().unwrap().stdout).unwrap();
+    let input = serde_json::json!({"build": build.trim(), "request": {"Doctor": input}});
     let mut child = Command::new(BIN)
         .env_clear()
         .env("HOME", home.path())
-        .env("HERDR_ADE_DOCTOR_INPUT", "1")
+        .env("HERDR_ADE_BOX_INPUT", "1")
         .args(["--root", root.to_str().unwrap(), "doctor"])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -128,7 +131,9 @@ fn doctor_transport_runs_selected_probes_without_loading_policy_or_waking_state(
         String::from_utf8_lossy(&output.stderr)
     );
     let text = String::from_utf8(output.stdout).unwrap();
-    let report: serde_json::Value = serde_json::from_str(text.lines().last().unwrap()).unwrap();
+    let reply: serde_json::Value = serde_json::from_str(text.lines().last().unwrap()).unwrap();
+    assert_eq!(reply["status"], "Ready");
+    let report = &reply["result"];
     assert_eq!(report["rows"][0]["label"], "recipe selected-recipe");
     assert_eq!(report["rows"][0]["evidence"], "Unknown");
     assert!(

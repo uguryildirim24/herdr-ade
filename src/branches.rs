@@ -669,10 +669,22 @@ mod tests {
         fx.world
             .runner
             .on("machine list --json", crate::runner::fake::ok("[]"));
+        let root = fx.world.home.path().to_path_buf();
+        let env = crate::paths::Env::for_test(&root, &[]);
         fx.world.runner.on_fn(
             |cmd| cmd.program == "ssh",
-            |cmd| {
+            move |cmd| {
                 use crate::runner::Runner;
+                if cmd.display().contains("HERDR_ADE_BOX_INPUT") {
+                    let ctx = crate::paths::Ctx {
+                        env: &env,
+                        root: root.clone(),
+                        config_dir: root.join("cfg"),
+                        runner: &crate::runner::RealRunner,
+                        detached_ticker: false,
+                    };
+                    return crate::box_helper::tests::respond(&ctx, cmd.stdin.as_deref().unwrap());
+                }
                 crate::runner::RealRunner
                     .run(&Cmd::new("sh", cmd.timeout).args(["-c", cmd.args.last().unwrap()]))
             },

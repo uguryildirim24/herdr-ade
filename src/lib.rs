@@ -25,6 +25,7 @@ mod adapters;
 mod adopt;
 mod ask;
 mod awake;
+mod box_helper;
 mod branches;
 mod build;
 mod claude_trust;

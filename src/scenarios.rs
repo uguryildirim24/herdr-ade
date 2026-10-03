@@ -1044,10 +1044,15 @@ fn resolving_a_merged_box_lane_uses_the_box_clone_path() {
             let line = cmd.display();
             if line.contains("__HERDR_WORKTREE_PRESENT__") {
                 Ok(ok("__HERDR_WORKTREE_PRESENT__\n"))
-            } else if line.contains("__HERDR_DRAFT_PRESENT__") {
-                Ok(ok("__HERDR_DRAFT_ABSENT__\n"))
-            } else if line.contains("status --porcelain") {
-                Ok(ok("\0__HERDR_NESTED_WORKTREES__\0"))
+            } else if line.contains("HERDR_ADE_BOX_INPUT") {
+                let input: serde_json::Value = serde_json::from_str(cmd.stdin.as_deref().unwrap())?;
+                Ok(ok(&crate::box_helper::tests::ready(
+                    if input["request"].get("Missing").is_some() {
+                        serde_json::json!(true)
+                    } else {
+                        serde_json::to_value(crate::worktrees::Inspection::default())?
+                    },
+                )))
             } else {
                 Ok(ok(""))
             }
@@ -1137,14 +1142,16 @@ fn cancelling_other_ignored_data_keeps_a_box_worktree_but_removes_its_build() {
             let line = cmd.display();
             if line.contains("__HERDR_WORKTREE_PRESENT__") {
                 Ok(ok("__HERDR_WORKTREE_PRESENT__\n"))
-            } else if line.contains("status --porcelain --ignored --untracked-files=all") {
-                Ok(ok(
-                    "!! .reports/t-0001.md\0!! runs/raw.bin\0\0__HERDR_NESTED_WORKTREES__\0",
-                ))
-            } else if line.contains("du -sk") {
-                Ok(ok(
-                    "4096\t/home/agent/projects/herdr-ade/.worktrees/t-0001/runs\n",
-                ))
+            } else if line.contains("HERDR_ADE_BOX_INPUT") {
+                Ok(ok(&crate::box_helper::tests::ready(
+                    crate::worktrees::Inspection {
+                        dirty: Vec::new(),
+                        ignored_data: vec![crate::worktrees::DataPath {
+                            path: "runs".into(),
+                            bytes: 4096 * 1024,
+                        }],
+                    },
+                )))
             } else {
                 Ok(ok(""))
             }
@@ -1673,21 +1680,32 @@ fn forty_minute_sleep_defers_dark_wakes_and_imports_seals_before_resuming_starts
     };
     let bytes = crate::events::bytes(&event).unwrap();
     let hash = thread::sha256_hex(&bytes);
-    let manifest = format!(
-        "boot\tboot-1\nagents\t{{\"result\":{{\"agents\":[]}}}}\npanes\t{{\"result\":{{\"panes\":[]}}}}\n\
-         event\tdemo\tt-0001-1-1\t/box/events/t-0001-1-1.toml\t{hash}\t/box/artifacts/{artifact}\t{artifact}\n\
-         receipt\tdemo\tt-0001-1-1\t{hash}\t{artifact}\n"
-    );
+    let manifest = crate::box_helper::tests::ready(crate::steps::CourierManifest {
+        boot_id: "boot-1".into(),
+        agents: Some(Vec::new()),
+        panes: Some(Vec::new()),
+        envelopes: vec![crate::steps::BoxEnvelope {
+            slug: "demo".into(),
+            event: "t-0001-1-1".into(),
+            event_path: "/box/events/t-0001-1-1.toml".into(),
+            event_hash: hash.clone(),
+            artifact_path: format!("/box/artifacts/{artifact}"),
+            artifact_hash: artifact.clone(),
+        }],
+        receipts: vec![crate::steps::CompletionReceipt {
+            slug: "demo".into(),
+            event: "t-0001-1-1".into(),
+            event_hash: hash,
+            artifact_hash: artifact.clone(),
+        }],
+        ..Default::default()
+    });
     world.runner.on_fn(
         |cmd| cmd.program == "ssh",
         move |cmd| {
             Ok(if *flag.borrow() {
                 fail(255, "ssh: connect to host box: Operation timed out")
-            } else if cmd
-                .args
-                .last()
-                .is_some_and(|script| script.contains("HERDR_ADE_DOCTOR_INPUT"))
-            {
+            } else if crate::box_helper::tests::is_doctor(cmd) {
                 crate::testkit::diagnostic_output(cmd, 99_999_999, None)
             } else {
                 ok(&manifest)
@@ -1761,13 +1779,7 @@ fn forty_minute_sleep_defers_dark_wakes_and_imports_seals_before_resuming_starts
     let import = calls.iter().position(|cmd| cmd.program == "scp").unwrap();
     let ready = calls
         .iter()
-        .position(|cmd| {
-            cmd.program == "ssh"
-                && cmd
-                    .args
-                    .last()
-                    .is_some_and(|script| script.contains("HERDR_ADE_DOCTOR_INPUT"))
-        })
+        .position(|cmd| cmd.program == "ssh" && crate::box_helper::tests::is_doctor(cmd))
         .unwrap();
     assert!(
         import < ready,
@@ -1859,9 +1871,15 @@ fn a_successful_courier_clears_a_persisted_lost_connection_after_restart() {
         t.error = t.last_failure.clone();
     })
     .unwrap();
-    world
-        .runner
-        .on("ssh", ok("boot\tboot-1\nagents\t-\npanes\t-\n"));
+    world.runner.on(
+        "ssh",
+        ok(&crate::box_helper::tests::ready(
+            crate::steps::CourierManifest {
+                boot_id: "boot-1".into(),
+                ..Default::default()
+            },
+        )),
+    );
     let ctx = world.ctx();
     let mut fresh_memory = Memory::new(&ctx);
     fresh_memory.tick = 1;

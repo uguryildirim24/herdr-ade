@@ -282,7 +282,10 @@ pub fn start(ctx: &Ctx, slug: &str, args: StartArgs) -> Result<Thread> {
         listed,
     ) {
         Ok(placement) => (placement, None),
-        Err(error) if provider_readiness_error(&format!("{error:#}")) => {
+        Err(error)
+            if provider_readiness_error(&format!("{error:#}"))
+                || format!("{error:#}").contains("version_skew:") =>
+        {
             // Save an unplaced attempt on its requested machine. No pane or
             // worktree exists until a later readiness probe succeeds.
             let default = default_machine(role, &launch.machine, Some(&repo));
@@ -418,7 +421,7 @@ pub fn start(ctx: &Ctx, slug: &str, args: StartArgs) -> Result<Thread> {
         t.launch = launch.clone();
         if let Some(reason) = &provider_wait {
             t.provider_wait_started = project::now();
-            t.error = format!("waiting for provider: {reason}");
+            t.error = format!("waiting for placement: {reason}");
         }
     })?;
     let id = record.id.clone();
@@ -576,6 +579,9 @@ fn resolve_placement(
                 });
             }
             Err(missing) => {
+                if missing.contains("version_skew:") {
+                    bail!("{missing}");
+                }
                 if crate::remote::is_unreachable(&missing) {
                     bail!("{missing}");
                 }
@@ -3814,14 +3820,13 @@ fn linked_relative_path(
     bail!("linked path is not inside the worktree: {dest}")
 }
 
-fn linked_file_missing(ctx: &Ctx, record: &Thread, relative: &std::path::Path) -> Result<bool> {
-    let path = std::path::Path::new(&record.thread_dir).join(relative);
+fn linked_read<T: serde::de::DeserializeOwned>(
+    ctx: &Ctx,
+    record: &Thread,
+    request: crate::box_helper::Request,
+) -> Result<T> {
     if !record.is_remote() {
-        return match std::fs::symlink_metadata(&path) {
-            Ok(_) => Ok(false),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(true),
-            Err(error) => Err(error.into()),
-        };
+        return crate::box_helper::local(ctx, request);
     }
     let profile = remote::machine_profile(
         ctx.runner,
@@ -3829,37 +3834,30 @@ fn linked_file_missing(ctx: &Ctx, record: &Thread, relative: &std::path::Path) -
         &ctx.config_dir,
         record.machine_route(),
     )?;
-    let script = format!(
-        "if test -e {file} || test -L {file}; then printf 'present'; else printf 'missing'; fi",
-        file = remote::quote(&path.to_string_lossy())
-    );
-    let out = remote::ssh(
+    crate::box_helper::call(
         ctx.runner,
         &profile.target,
-        &script,
+        &remote::machine_declaration(&ctx.config_dir, &profile.label)?,
+        request,
+        Duration::from_secs(90),
         None,
-        std::time::Duration::from_secs(20),
-    )?;
-    if !out.success() {
-        bail!(
-            "could not inspect linked file {}: {}",
-            path.display(),
-            out.error_text()
-        );
-    }
-    match out.stdout.trim() {
-        "missing" => Ok(true),
-        "present" => Ok(false),
-        _ => bail!(
-            "linked file probe returned no presence answer: {}",
-            path.display()
-        ),
-    }
+    )
 }
 
-struct LinkedFiles {
-    directory: bool,
-    files: std::collections::BTreeMap<std::path::PathBuf, Vec<u8>>,
+fn linked_file_missing(ctx: &Ctx, record: &Thread, relative: &std::path::Path) -> Result<bool> {
+    linked_read(
+        ctx,
+        record,
+        crate::box_helper::Request::Missing {
+            root: record.thread_dir.clone().into(),
+            relative: relative.into(),
+        },
+    )
+}
+
+pub(crate) struct LinkedFiles {
+    pub(crate) directory: bool,
+    pub(crate) files: std::collections::BTreeMap<std::path::PathBuf, Vec<u8>>,
 }
 
 fn markdown_label(name: &str) -> String {
@@ -3880,155 +3878,49 @@ fn linked_bytes(ctx: &Ctx, record: &Thread, relative: &std::path::Path) -> Resul
     linked.files.remove(relative).context("linked file missing")
 }
 
-// The box walks and hashes the entire link in one probe. Payload requests
-// slice the concatenated files, so even thousands of small images need at
-// most 25 more round trips (200 MiB / 8 MiB), never one trip per file.
-const LINKED_BOX_SCRIPT: &str = r#"
-import os, sys, stat, json, hashlib, subprocess
-root = os.path.realpath(sys.argv[1])
-path = os.path.join(root, sys.argv[2])
-def checked(path):
-    info = os.lstat(path)
-    canonical = os.path.realpath(path)
-    if os.path.commonpath([root, canonical]) != root:
-        sys.exit(3)
-    part = path
-    while part != root:
-        if os.path.islink(part):
-            sys.exit(4)
-        parent = os.path.dirname(part)
-        if parent == part:
-            sys.exit(3)
-        part = parent
-    if not (stat.S_ISREG(info.st_mode) or stat.S_ISDIR(info.st_mode)):
-        sys.exit(4)
-    return info
-try:
-    os.stat(root)
-    directory = stat.S_ISDIR(checked(path).st_mode)
-    if len(sys.argv) == 4 and sys.argv[3] == 'repo':
-        if directory:
-            sys.exit(4)
-        name = os.path.relpath(path, root)
-        def git(*args):
-            return subprocess.run(['git', '-C', root, *args], check=True, stdout=subprocess.PIPE).stdout
-        spec = ':(literal)' + name
-        if not git('ls-files', '-z', '--', spec):
-            sys.exit(6)
-        if git('status', '--porcelain', '-z', '--untracked-files=all', '--', spec):
-            sys.exit(7)
-        sys.stdout.write(git('hash-object', '--no-filters', '--', path).decode())
-        sys.exit(0)
-    entries = []
-    pending = [path]
-    total = 0
-    while pending:
-        item = pending.pop()
-        info = checked(item)
-        if stat.S_ISDIR(info.st_mode):
-            with os.scandir(item) as children:
-                pending.extend(child.path for child in children)
-        else:
-            total += info.st_size
-            if total > 209715200:
-                sys.exit(5)
-            entries.append((os.path.relpath(item, root), info.st_size))
-    entries.sort()
-    if len(sys.argv) == 3:
-        manifest = []
-        for name, size in entries:
-            with open(os.path.join(root, name), 'rb') as source:
-                digest = hashlib.sha256()
-                while data := source.read(1048576):
-                    digest.update(data)
-                digest = digest.hexdigest()
-            manifest.append({'path': name, 'size': size, 'hash': digest})
-        print(json.dumps({'directory': directory, 'files': manifest}))
-    else:
-        offset = int(sys.argv[3])
-        remaining = 8388608
-        for name, size in entries:
-            if offset >= size:
-                offset -= size
-                continue
-            with open(os.path.join(root, name), 'rb') as source:
-                source.seek(offset)
-                data = source.read(min(size - offset, remaining))
-            sys.stdout.write(data.hex())
-            remaining -= len(data)
-            offset = 0
-            if remaining == 0:
-                break
-except FileNotFoundError:
-    sys.exit(2)
-"#;
-
-fn linked_probe_result(out: &crate::runner::Output, path: &std::path::Path) -> Result<()> {
-    if out.success() {
-        return Ok(());
+pub(crate) fn checked_link_path(root: &Path, path: &Path) -> Result<std::fs::Metadata> {
+    let relative = path
+        .strip_prefix(root)
+        .context("linked path is not inside the thread folder")?;
+    anyhow::ensure!(
+        relative
+            .components()
+            .all(|p| matches!(p, std::path::Component::Normal(_))),
+        "linked path is not inside the thread folder"
+    );
+    let info = std::fs::symlink_metadata(path)
+        .with_context(|| format!("linked path missing or unreadable: {}", path.display()))?;
+    for ancestor in path.ancestors().take_while(|p| *p != root) {
+        anyhow::ensure!(
+            !std::fs::symlink_metadata(ancestor)?
+                .file_type()
+                .is_symlink(),
+            "linked path is not a regular file or folder (symlink): {}",
+            ancestor.display()
+        );
     }
-    let reason = if out.timed_out {
-        "timed out".to_string()
-    } else {
-        match out.code {
-            Some(2) => "missing".into(),
-            Some(3) => "not inside the thread folder".into(),
-            Some(4) => "not a regular file or folder (symlinks are not kept)".into(),
-            Some(5) => "over cap (200 MiB)".into(),
-            _ => format!("probe failed: {}", out.error_text()),
-        }
-    };
-    bail!("linked path {reason}: {}; worktree kept", path.display());
+    anyhow::ensure!(
+        path.canonicalize()?.starts_with(root.canonicalize()?),
+        "linked path is not inside the thread folder: {}",
+        path.display()
+    );
+    Ok(info)
 }
 
-fn linked_files(ctx: &Ctx, record: &Thread, relative: &std::path::Path) -> Result<LinkedFiles> {
-    let root = std::path::Path::new(&record.thread_dir);
+// Both hosts use this walk; only the bounded, hashed transport differs.
+pub(crate) fn read_linked(
+    root: &Path,
+    relative: &Path,
+    offset: Option<u64>,
+) -> Result<LinkedFiles> {
     let path = root.join(relative);
-    if !record.is_remote() {
-        let canonical_root = root.canonicalize()?;
+    {
         let mut pending = vec![path.clone()];
         let mut paths = Vec::new();
         let mut total = 0_u64;
         let mut directory = false;
         while let Some(item) = pending.pop() {
-            let info = std::fs::symlink_metadata(&item).map_err(|error| {
-                if error.kind() == std::io::ErrorKind::NotFound {
-                    anyhow::anyhow!("linked path missing: {}", item.display())
-                } else {
-                    anyhow::anyhow!("could not inspect linked path {}: {error}", item.display())
-                }
-            })?;
-            let canonical = match std::fs::canonicalize(&item) {
-                Ok(canonical) => canonical,
-                Err(_) if info.file_type().is_symlink() => {
-                    bail!(
-                        "linked path is not a regular file or folder (symlink): {}",
-                        item.display()
-                    );
-                }
-                Err(error) => {
-                    return Err(error).with_context(|| {
-                        format!("could not resolve linked path {}", item.display())
-                    });
-                }
-            };
-            if !canonical.starts_with(&canonical_root) {
-                bail!(
-                    "linked path is not inside the thread folder: {}",
-                    item.display()
-                );
-            }
-            for ancestor in item.ancestors().take_while(|p| *p != root) {
-                if std::fs::symlink_metadata(ancestor)?
-                    .file_type()
-                    .is_symlink()
-                {
-                    bail!(
-                        "linked path is not a regular file or folder (symlink): {}",
-                        ancestor.display()
-                    );
-                }
-            }
+            let info = checked_link_path(root, &item)?;
             if info.is_dir() {
                 directory |= item == path;
                 for child in std::fs::read_dir(&item)? {
@@ -4041,7 +3933,7 @@ fn linked_files(ctx: &Ctx, record: &Thread, relative: &std::path::Path) -> Resul
                 if total > LINKED_FILES_CAP {
                     bail!("linked files over cap (200 MiB); worktree kept");
                 }
-                paths.push(item);
+                paths.push((item, info.len()));
             } else {
                 bail!(
                     "linked path is not a regular file or folder: {}",
@@ -4049,58 +3941,52 @@ fn linked_files(ctx: &Ctx, record: &Thread, relative: &std::path::Path) -> Resul
                 );
             }
         }
+        paths.sort();
         let mut files = std::collections::BTreeMap::new();
         let mut read_total = 0_u64;
-        for item in paths {
-            // Bound reads too, in case a file grows after inspection.
-            use std::io::Read;
+        let mut skip = offset.unwrap_or(0);
+        for (item, size) in paths {
+            // Chunking slices the same sorted inventory; no per-file SSH trip.
+            use std::io::{Read, Seek};
+            if offset.is_some() && skip >= size {
+                skip -= size;
+                continue;
+            }
+            checked_link_path(root, &item)?;
+            let mut source = std::fs::File::open(&item)?;
+            source.seek(std::io::SeekFrom::Start(skip))?;
+            let limit = if offset.is_some() {
+                (size - skip).min(crate::box_helper::CHUNK as u64 - read_total)
+            } else {
+                LINKED_FILES_CAP - read_total + 1
+            };
             let mut bytes = Vec::new();
-            std::fs::File::open(&item)?
-                .take(LINKED_FILES_CAP - read_total + 1)
-                .read_to_end(&mut bytes)?;
+            source.take(limit).read_to_end(&mut bytes)?;
+            skip = 0;
             read_total += bytes.len() as u64;
             if read_total > LINKED_FILES_CAP {
                 bail!("linked files over cap (200 MiB); worktree kept");
             }
             files.insert(item.strip_prefix(root)?.to_path_buf(), bytes);
+            if offset.is_some() && read_total == crate::box_helper::CHUNK as u64 {
+                break;
+            }
         }
-        return Ok(LinkedFiles { directory, files });
+        Ok(LinkedFiles { directory, files })
     }
-    #[derive(serde::Deserialize)]
-    struct Manifest {
-        directory: bool,
-        files: Vec<ManifestFile>,
+}
+
+fn linked_files(ctx: &Ctx, record: &Thread, relative: &Path) -> Result<LinkedFiles> {
+    if !record.is_remote() {
+        return read_linked(Path::new(&record.thread_dir), relative, None);
     }
-    #[derive(serde::Deserialize)]
-    struct ManifestFile {
-        path: std::path::PathBuf,
-        size: u64,
-        hash: String,
-    }
-    let profile = remote::machine_profile(
-        ctx.runner,
-        &ctx.env.herdr_bin(),
-        &ctx.config_dir,
-        record.machine_route(),
-    )?;
-    let script = format!(
-        "python3 -c {} {} {}",
-        remote::quote(LINKED_BOX_SCRIPT),
-        remote::quote(&record.thread_dir),
-        remote::quote(&relative.to_string_lossy())
-    );
-    let probe = |script: &str| -> Result<String> {
-        let out = remote::ssh(
-            ctx.runner,
-            &profile.target,
-            script,
-            None,
-            std::time::Duration::from_secs(90),
-        )?;
-        linked_probe_result(&out, &path)?;
-        Ok(out.stdout)
+    let path = Path::new(&record.thread_dir).join(relative);
+    let probe = |offset| crate::box_helper::Request::Linked {
+        root: record.thread_dir.clone().into(),
+        relative: relative.into(),
+        offset,
     };
-    let manifest: Manifest = serde_json::from_str(&probe(&script)?)?;
+    let manifest: crate::box_helper::Manifest = linked_read(ctx, record, probe(None))?;
     let mut total = 0_u64;
     for file in &manifest.files {
         if file
@@ -4122,21 +4008,15 @@ fn linked_files(ctx: &Ctx, record: &Thread, relative: &std::path::Path) -> Resul
         }
     }
     let mut bytes = Vec::new();
-    for offset in (0..total).step_by(8 * 1024 * 1024) {
-        let hex = probe(&format!("{script} {offset}"))?;
-        let hex = hex.trim();
-        if !hex.is_ascii() || hex.len() % 2 != 0 {
-            bail!("invalid linked file payload");
-        }
-        for i in (0..hex.len()).step_by(2) {
-            bytes.push(u8::from_str_radix(&hex[i..i + 2], 16)?);
-        }
-        if bytes.len() as u64 != (offset + 8 * 1024 * 1024).min(total) {
+    for offset in (0..total).step_by(crate::box_helper::CHUNK) {
+        let chunk: Vec<u8> = linked_read(ctx, record, probe(Some(offset)))?;
+        if chunk.len() as u64 != (total - offset).min(crate::box_helper::CHUNK as u64) {
             bail!(
                 "remote linked files changed during copy: {}",
                 path.display()
             );
         }
+        bytes.extend(chunk);
     }
     let mut files = std::collections::BTreeMap::new();
     let mut offset = 0;
@@ -4167,95 +4047,61 @@ fn repo_link_kept(
     relative: &std::path::Path,
     path: &std::path::Path,
 ) -> Result<()> {
-    let root = std::path::Path::new(&record.worktree_path);
+    let hash = linked_read(
+        ctx,
+        record,
+        crate::box_helper::Request::RepoLink {
+            root: record.worktree_path.clone().into(),
+            relative: relative.into(),
+        },
+    )?;
+    verify_repo_link_hash(ctx, project, record, relative, path, hash)
+}
+
+pub(crate) fn repo_link_hash(runner: &dyn Runner, root: &Path, relative: &Path) -> Result<String> {
+    let path = &root.join(relative);
     let spec = format!(":(literal){}", relative.to_string_lossy());
-    let hash = if record.is_remote() {
-        let profile = remote::machine_profile(
-            ctx.runner,
-            &ctx.env.herdr_bin(),
-            &ctx.config_dir,
-            record.machine_route(),
-        )?;
-        let script = format!(
-            "python3 -c {} {} {} repo",
-            remote::quote(LINKED_BOX_SCRIPT),
-            remote::quote(&record.worktree_path),
-            remote::quote(&path.to_string_lossy())
+    if !checked_link_path(root, path)?.is_file() {
+        bail!(
+            "linked path is not a regular repo file: {}; worktree kept",
+            path.display()
         );
-        let out = remote::ssh(
-            ctx.runner,
-            &profile.target,
-            &script,
-            None,
-            Duration::from_secs(90),
-        )?;
-        if !out.success() {
-            let reason = match out.code.filter(|_| !out.timed_out) {
-                Some(3) => "not inside the worktree",
-                Some(6) => "untracked repo file",
-                Some(7) => "uncommitted repo file",
-                _ => {
-                    linked_probe_result(&out, path)?;
-                    unreachable!()
-                }
-            };
-            bail!("linked path {reason}: {}; worktree kept", path.display());
-        }
-        out.stdout.trim().to_string()
-    } else {
-        let canonical_root = root.canonicalize()?;
-        let canonical = path
-            .canonicalize()
-            .with_context(|| format!("linked path missing: {}", path.display()))?;
-        if !canonical.starts_with(&canonical_root) {
-            bail!(
-                "linked path is not inside the worktree: {}; worktree kept",
-                path.display()
-            );
-        }
-        for ancestor in path.ancestors().take_while(|p| *p != root) {
-            if std::fs::symlink_metadata(ancestor)?
-                .file_type()
-                .is_symlink()
-            {
-                bail!(
-                    "linked path is not a regular file (symlink): {}; worktree kept",
-                    path.display()
-                );
-            }
-        }
-        if !std::fs::metadata(path)?.is_file() {
-            bail!(
-                "linked path is not a regular repo file: {}; worktree kept",
-                path.display()
-            );
-        }
-        let git =
-            crate::repo::Git::new(ctx.runner, &record.worktree_path).with_timeout(GIT_TIMEOUT);
-        if git.stdout(&["ls-files", "-z", "--", &spec])?.is_empty() {
-            bail!(
-                "linked path is an untracked repo file: {}; worktree kept",
-                path.display()
-            );
-        }
-        if !git
-            .stdout(&[
-                "status",
-                "--porcelain",
-                "-z",
-                "--untracked-files=all",
-                "--",
-                &spec,
-            ])?
-            .is_empty()
-        {
-            bail!(
-                "linked path is an uncommitted repo file: {}; worktree kept",
-                path.display()
-            );
-        }
-        git.run(&["hash-object", "--no-filters", "--", &path.to_string_lossy()])?
-    };
+    }
+    let git = crate::repo::Git::new(runner, root).with_timeout(GIT_TIMEOUT);
+    if git.stdout(&["ls-files", "-z", "--", &spec])?.is_empty() {
+        bail!(
+            "linked path is an untracked repo file: {}; worktree kept",
+            path.display()
+        );
+    }
+    if !git
+        .stdout(&[
+            "status",
+            "--porcelain",
+            "-z",
+            "--untracked-files=all",
+            "--",
+            &spec,
+        ])?
+        .is_empty()
+    {
+        bail!(
+            "linked path is an uncommitted repo file: {}; worktree kept",
+            path.display()
+        );
+    }
+    git.run(&["hash-object", "--no-filters", "--", &path.to_string_lossy()])
+}
+
+fn verify_repo_link_hash(
+    ctx: &Ctx,
+    project: &Project,
+    record: &Thread,
+    relative: &Path,
+    path: &Path,
+    hash: String,
+) -> Result<()> {
+    let spec = format!(":(literal){}", relative.to_string_lossy());
     // After placement `base` is the frozen start SHA, not a branch name.
     // Honor the configured integration branch even if another is checked out.
     let rows = project.read_project_md()?.0.repos;
@@ -4283,7 +4129,7 @@ fn repo_link_kept(
     if blob != format!("blob {hash}") {
         bail!(
             "linked repo file content is not committed on integration branch `{integration}`: {}; worktree kept",
-            relative.display()
+            path.display()
         );
     }
     Ok(())
@@ -4331,37 +4177,10 @@ fn preserve_report_links(ctx: &Ctx, project: &Project, record: &Thread) -> Resul
         .map(|done| &done.artifact);
     let Some(sealed) = sealed else {
         let text = if record.is_remote() {
-            let profile = remote::machine_profile(
-                ctx.runner,
-                &ctx.env.herdr_bin(),
-                &ctx.config_dir,
-                record.machine_route(),
-            )?;
-            let root = remote::quote(&record.thread_dir);
-            let draft = remote::quote(&format!("{}/report.md", record.thread_dir));
-            let script = format!(
-                "root=$(realpath -e -- {root}) || exit 2; test -r \"$root\" && test -x \"$root\" || exit 3; if test -e {draft} || test -L {draft}; then printf '__HERDR_DRAFT_PRESENT__\\n'; else printf '__HERDR_DRAFT_ABSENT__\\n'; fi"
-            );
-            let out = remote::ssh(
-                ctx.runner,
-                &profile.target,
-                &script,
-                None,
-                std::time::Duration::from_secs(20),
-            )?;
-            if !out.success() {
-                bail!(
-                    "could not inspect box report: {}; worktree kept",
-                    out.error_text()
-                );
+            if linked_file_missing(ctx, record, Path::new("report.md"))? {
+                return Ok(());
             }
-            match out.stdout.trim() {
-                "__HERDR_DRAFT_ABSENT__" => return Ok(()),
-                "__HERDR_DRAFT_PRESENT__" => {
-                    String::from_utf8(linked_bytes(ctx, record, Path::new("report.md"))?)?
-                }
-                _ => bail!("box report probe returned no presence answer; worktree kept"),
-            }
+            String::from_utf8(linked_bytes(ctx, record, Path::new("report.md"))?)?
         } else {
             let draft = Path::new(&record.thread_dir).join("report.md");
             match std::fs::read_to_string(&draft) {
@@ -4681,13 +4500,17 @@ pub(crate) fn inspect_worktree_for_removal(
         record.machine_route(),
     )?;
     let machine = remote::machine_declaration(&ctx.config_dir, &profile.label)?;
-    crate::worktrees::inspect_remote(
+    crate::box_helper::call(
         ctx.runner,
         &profile.target,
-        &machine.path,
-        &record.worktree_path,
-        &disposable,
-        report_artifact_stored,
+        &machine,
+        crate::box_helper::Request::Inspect {
+            path: record.worktree_path.clone(),
+            disposable,
+            report_stored: report_artifact_stored,
+        },
+        GIT_TIMEOUT,
+        None,
     )
 }
 
@@ -5188,6 +5011,16 @@ fn row(t: &Thread, view: Option<&SessionView>, now: jiff::Timestamp) -> Row {
     // Placement was refused before a pane existed. Do not diagnose a missing
     // process for a start that has never launched, even with no live session.
     if t.launch_attempts == 0 && !t.provider_wait_started.is_empty() {
+        if t.error.contains("version_skew:") {
+            return Row {
+                thread: t.clone(),
+                group: recorded,
+                note: format!(
+                    "{}; the start is queued and retries after the box install",
+                    t.error
+                ),
+            };
+        }
         let provider = crate::pi::launch::flag_value(&t.launch.args, "--provider")
             .unwrap_or_else(|| t.launch.kind.clone());
         let reason = if t.error.contains("readiness probe timed out") {
@@ -5386,20 +5219,20 @@ mod tests {
         world.runner.on("machine list --json", crate::runner::fake::ok(
             r#"[{"id":"buildbox-id","label":"buildbox","target":"buildbox-pi","session":"default","enabled":true}]"#,
         ));
-        // Execute only the linked-file script locally: SSH still goes through
-        // the fake runner, while the real probe protocol is exercised.
+        // SSH remains fake; the actual Rust endpoint and filesystem/Git mechanics run.
+        let env = crate::paths::Env::for_test(world.home.path(), &[]);
+        let root = world.home.path().to_path_buf();
         world.runner.on_fn(
-            |cmd| cmd.program == "ssh" && cmd.display().contains("manifest.append"),
-            |cmd| {
-                let output = std::process::Command::new("sh")
-                    .args(["-c", cmd.args.last().unwrap()])
-                    .output()?;
-                Ok(crate::runner::Output {
-                    code: output.status.code(),
-                    stdout: String::from_utf8(output.stdout)?,
-                    stderr: String::from_utf8(output.stderr)?,
-                    timed_out: false,
-                })
+            |cmd| cmd.program == "ssh" && cmd.display().contains("HERDR_ADE_BOX_INPUT"),
+            move |cmd| {
+                let ctx = Ctx {
+                    env: &env,
+                    root: root.clone(),
+                    config_dir: root.join("cfg"),
+                    runner: &crate::runner::RealRunner,
+                    detached_ticker: false,
+                };
+                crate::box_helper::tests::respond(&ctx, cmd.stdin.as_deref().unwrap())
             },
         );
     }
@@ -5662,6 +5495,40 @@ mod tests {
     }
 
     #[test]
+    fn typed_linked_transfer_refuses_changed_bytes_lengths_and_escaping_manifests() {
+        for defect in ["hash", "length", "escape", "cap"] {
+            let world = crate::scenarios::World::new();
+            world.runner.on_fn(|cmd| cmd.program == "ssh" && cmd.display().contains("HERDR_ADE_BOX_INPUT"), move |cmd| {
+                let input: serde_json::Value = serde_json::from_str(cmd.stdin.as_deref().unwrap())?;
+                let body = if input["request"]["Linked"]["offset"].is_null() {
+                    serde_json::json!({"directory":false,"files":[{"path":if defect == "escape" { "../outside" } else { "plot.bin" },"size":if defect == "cap" { LINKED_FILES_CAP + 1 } else { 3 },"hash":thread::sha256_hex(b"abc")}]})
+                } else { serde_json::json!(if defect == "length" { b"x".to_vec() } else { b"bad".to_vec() }) };
+                Ok(crate::runner::fake::ok(&crate::box_helper::tests::ready(body)))
+            });
+            linked_test_box(&world);
+            let record = Thread {
+                machine: "buildbox".into(),
+                thread_dir: "/box/lane".into(),
+                ..Default::default()
+            };
+            let error = linked_files(&world.ctx(), &record, Path::new("plot.bin"))
+                .err()
+                .unwrap()
+                .to_string();
+            assert!(
+                error.contains(match defect {
+                    "hash" => "changed during copy",
+                    "length" => "changed during copy",
+                    "escape" => "not inside",
+                    "cap" => "over cap",
+                    _ => unreachable!(),
+                }),
+                "{defect}: {error}"
+            );
+        }
+    }
+
+    #[test]
     fn linked_folders_complete_final_copy_on_mac_and_box() {
         for remote in [false, true] {
             let world = crate::scenarios::World::new();
@@ -5741,7 +5608,7 @@ mod tests {
             );
             assert!(rewritten.contains("#shots"));
             if remote {
-                assert_eq!(world.runner.count("manifest.append"), 4);
+                assert_eq!(world.runner.count("HERDR_ADE_BOX_INPUT"), 4);
             }
         }
     }
@@ -7294,7 +7161,7 @@ mod tests {
             |cmd| cmd.program == "ssh",
             |cmd| {
                 let script = cmd.args.last().cloned().unwrap_or_default();
-                if script.contains("HERDR_ADE_DOCTOR_INPUT") {
+                if crate::box_helper::tests::is_doctor(cmd) {
                     return Ok(crate::testkit::diagnostic_output(cmd, 99_999_999, None));
                 }
                 if script.contains("getconf _NPROCESSORS_ONLN") {
@@ -7714,7 +7581,7 @@ mod tests {
         let free = std::rc::Rc::new(std::cell::Cell::new(5_u64));
         let current = free.clone();
         fx.world.runner.on_fn(
-            |cmd| cmd.program == "ssh" && cmd.display().contains("HERDR_ADE_DOCTOR_INPUT"),
+            |cmd| cmd.program == "ssh" && crate::box_helper::tests::is_doctor(cmd),
             move |cmd| {
                 Ok(crate::testkit::diagnostic_output(
                     cmd,
@@ -8008,7 +7875,7 @@ mod tests {
         let ready = std::rc::Rc::new(std::cell::Cell::new(false));
         let state = ready.clone();
         fx.world.runner.on_fn(
-            |cmd| cmd.program == "ssh" && cmd.display().contains("HERDR_ADE_DOCTOR_INPUT"),
+            |cmd| cmd.program == "ssh" && crate::box_helper::tests::is_doctor(cmd),
             move |cmd| {
                 Ok(crate::testkit::diagnostic_output(
                     cmd,
@@ -8038,14 +7905,14 @@ mod tests {
             t.provider_wait_started = waiting.provider_wait_started.clone();
         })
         .unwrap();
-        let before = fx.world.runner.count("HERDR_ADE_DOCTOR_INPUT");
+        let before = fx.world.runner.count("HERDR_ADE_BOX_INPUT");
         crate::ticker::resume_provider_starts(
             &fx.world.ctx(),
             &fx.project,
             &mut std::collections::BTreeMap::new(),
             |error| panic!("{error:#}"),
         );
-        assert_eq!(fx.world.runner.count("HERDR_ADE_DOCTOR_INPUT") - before, 0);
+        assert_eq!(fx.world.runner.count("HERDR_ADE_BOX_INPUT") - before, 0);
         // The observation survives another pass, not merely its local map.
         thread::update(&fx.project, &other.id, |t| t.status = Status::Resolved).unwrap();
         ready.set(true);
@@ -8919,6 +8786,85 @@ mod tests {
         );
         assert_eq!(fx.world.runner.count("workspace create"), 0);
         assert_eq!(fx.world.runner.count("tab create"), 0);
+    }
+
+    #[test]
+    fn install_skew_records_job_intent_waits_without_expiry_then_places_same_attempt() {
+        for explicit in [false, true] {
+            let (fx, _) = box_fixture();
+            write_config(&fx, &lane_config());
+            let ready = std::rc::Rc::new(std::cell::Cell::new(false));
+            let installed = ready.clone();
+            fx.world.runner.on_fn(
+                |cmd| cmd.program == "ssh" && crate::box_helper::tests::is_doctor(cmd),
+                move |cmd| {
+                    Ok(if installed.get() {
+                        crate::testkit::diagnostic_output(cmd, 99_999_999, None)
+                    } else {
+                        crate::runner::fake::ok(r#"{"status":"Skew","build":"0.1.0+old.1"}"#)
+                    })
+                },
+            );
+            stub_box(&fx);
+            crate::prompt::record_test_request(
+                &fx.project,
+                "q-skew",
+                "Start on the box during install.",
+            )
+            .unwrap();
+            let job = crate::task::add(
+                &fx.project,
+                "Start on the box",
+                vec!["request:q-skew".into()],
+                vec!["The start survives install skew.".into()],
+                Some(fx.repo.to_string_lossy().into_owned()),
+                None,
+            )
+            .unwrap();
+            let mut args = start_args(
+                Some(fx.repo.to_string_lossy().into_owned()),
+                explicit.then(|| "buildbox".into()),
+            );
+            args.task_id = job.id.clone();
+            let waiting = start(&fx.world.ctx(), "demo", args).unwrap();
+            assert_eq!(waiting.machine, "buildbox");
+            assert_eq!(waiting.launch_attempts, 0);
+            assert!(waiting.pane_id.is_empty());
+            assert!(waiting.error.contains("build old") || waiting.error.contains("0.1.0+old.1"));
+            assert!(
+                crate::task::load(&fx.project, &job.id)
+                    .unwrap()
+                    .attempts
+                    .contains(&waiting.id)
+            );
+            thread::update(&fx.project, &waiting.id, |t| {
+                t.provider_wait_started = "2020-01-01T00:00:00Z".into()
+            })
+            .unwrap();
+            crate::ticker::resume_provider_starts(
+                &fx.world.ctx(),
+                &fx.project,
+                &mut BTreeMap::new(),
+                |error| panic!("{error:#}"),
+            );
+            let held = thread::load(&fx.project, &waiting.id).unwrap();
+            assert_eq!(held.status, Status::Starting);
+            assert_eq!(held.attempt, waiting.attempt);
+            assert_eq!(fx.world.runner.count("workspace create"), 0);
+            assert!(crate::events::list(&fx.project).is_empty());
+            ready.set(true);
+            crate::ticker::resume_provider_starts(
+                &fx.world.ctx(),
+                &fx.project,
+                &mut BTreeMap::new(),
+                |error| panic!("{error:#}"),
+            );
+            let placed = thread::load(&fx.project, &waiting.id).unwrap();
+            assert_eq!(placed.attempt, waiting.attempt);
+            assert!(placed.provider_wait_started.is_empty());
+            assert!(!placed.pane_id.is_empty());
+            assert_eq!(thread::list(&fx.project).len(), 1);
+        }
     }
 
     #[test]

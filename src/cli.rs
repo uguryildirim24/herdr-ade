@@ -1166,9 +1166,9 @@ pub fn run() -> Result<()> {
     // A diagnostic transport executes explicit probes only, never project
     // discovery or ticker wake-up on the target machine.
     if matches!(cli.command, Command::Doctor { .. })
-        && std::env::var_os("HERDR_ADE_DOCTOR_INPUT").is_some()
+        && std::env::var_os("HERDR_ADE_BOX_INPUT").is_some()
     {
-        return doctor::finish(&ctx, &doctor::run(&ctx, &Default::default())?);
+        return crate::box_helper::run(&ctx);
     }
     let (_awake, _) = crate::awake::enter(&ctx.root, false)?;
     let observed_slug = explicit_slug

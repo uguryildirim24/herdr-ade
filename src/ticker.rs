@@ -1380,6 +1380,16 @@ fn machine_passes_with_steps(
             memory.machine_views.insert(machine, Err(detail));
             continue;
         }
+        if let Err(error) = &outcome
+            && format!("{error:#}").contains("version_skew:")
+        {
+            let detail = format!("{error:#}");
+            clear_missing_box_panes(&entries, &machine, log);
+            clear_lost_connections(&entries, log);
+            record_failed_observation(&entries, &detail, log);
+            memory.machine_views.insert(machine, Err(detail));
+            continue;
+        }
         // A failed check (or a box server that could not supply both lists)
         // interrupts a consecutive pane-absence streak.
         if !outcome
@@ -1543,6 +1553,11 @@ pub(crate) fn resume_provider_starts(
             result.map_err(|error| format!("{error:#}"))
         });
         if let Err(error) = ready {
+            // Installation skew is deferred placement, not provider failure:
+            // no auth notice, expiry, or evidence of a dead lane.
+            if error.contains("version_skew:") {
+                continue;
+            }
             if crate::remote::is_unreachable(error) {
                 reachable = false;
                 continue;
@@ -4011,9 +4026,12 @@ mod tests {
                 "working",
             );
             let pane = pane_json(&lane.workspace_id, &lane.tab_id, &lane.pane_id, &lane.cwd);
-            let manifest = format!(
-                "boot\tboot-1\nagents\t{{\"result\":{{\"agents\":[{agent}]}}}}\npanes\t{{\"result\":{{\"panes\":[{pane}]}}}}\n"
-            );
+            let manifest = crate::box_helper::tests::ready(crate::steps::CourierManifest {
+                boot_id: "boot-1".into(),
+                agents: Some(serde_json::from_str(&format!("[{agent}]")).unwrap()),
+                panes: Some(serde_json::from_str(&format!("[{pane}]")).unwrap()),
+                ..Default::default()
+            });
             world
                 .runner
                 .on_fn(|cmd| cmd.program == "ssh", move |_| Ok(ok(&manifest)));
@@ -5229,14 +5247,22 @@ mod tests {
                 },
             );
             let pane = pane_json(&lane.workspace_id, &lane.tab_id, &lane.pane_id, &lane.cwd);
-            let receipt = if evidence == "bootstrap" {
-                format!("bootstrap\tdemo\t{}\tfrozen\t{}\n", lane.id, lane.pane_id)
-            } else {
-                String::new()
-            };
-            let manifest = format!(
-                "boot\tboot-1\nagents\t{{\"result\":{{\"agents\":[{agent}]}}}}\npanes\t{{\"result\":{{\"panes\":[{pane}]}}}}\n{receipt}"
-            );
+            let manifest = crate::box_helper::tests::ready(crate::steps::CourierManifest {
+                boot_id: "boot-1".into(),
+                agents: Some(serde_json::from_str(&format!("[{agent}]")).unwrap()),
+                panes: Some(serde_json::from_str(&format!("[{pane}]")).unwrap()),
+                bootstraps: if evidence == "bootstrap" {
+                    vec![crate::steps::BootstrapReceipt {
+                        slug: "demo".into(),
+                        thread: lane.id.clone(),
+                        brief_hash: "frozen".into(),
+                        pane: lane.pane_id.clone(),
+                    }]
+                } else {
+                    Vec::new()
+                },
+                ..Default::default()
+            });
             world
                 .runner
                 .on_fn(|cmd| cmd.program == "ssh", move |_| Ok(ok(&manifest)));
@@ -5343,12 +5369,26 @@ mod tests {
         };
         let bytes = toml::to_string(&event).unwrap().into_bytes();
         let hash = thread::sha256_hex(&bytes);
-        let manifest = format!(
-            "boot\tboot-1\nagents\t{{\"result\":{{\"agents\":[]}}}}\npanes\t{{\"result\":{{\"panes\":[]}}}}\n\
-             event\tdemo\t{0}\t/box/demo/.state/events/{0}.toml\t{hash}\t/box/demo/.state/artifacts/{artifact}\t{artifact}\n\
-             receipt\tdemo\t{0}\t{hash}\t{artifact}\n",
-            event.id
-        );
+        let manifest = crate::box_helper::tests::ready(crate::steps::CourierManifest {
+            boot_id: "boot-1".into(),
+            agents: Some(Vec::new()),
+            panes: Some(Vec::new()),
+            envelopes: vec![crate::steps::BoxEnvelope {
+                slug: "demo".into(),
+                event: event.id.clone(),
+                event_path: format!("/box/demo/.state/events/{}.toml", event.id),
+                event_hash: hash.clone(),
+                artifact_path: format!("/box/demo/.state/artifacts/{artifact}"),
+                artifact_hash: artifact.clone(),
+            }],
+            receipts: vec![crate::steps::CompletionReceipt {
+                slug: "demo".into(),
+                event: event.id.clone(),
+                event_hash: hash,
+                artifact_hash: artifact.clone(),
+            }],
+            ..Default::default()
+        });
         world.runner.on(
             "machine list --json",
             ok(r#"[{"id":"box","label":"box","target":"box","session":"default","enabled":true}]"#),
@@ -5378,6 +5418,53 @@ mod tests {
     }
 
     #[test]
+    fn courier_install_skew_is_unavailable_not_lane_death_or_a_link_outage() {
+        let world = crate::scenarios::World::new();
+        let project = world.project("demo", "a.sock");
+        let lane = world.thread(&project, &world.home.path().join("lane"), |t| {
+            t.machine = "box".into();
+            t.machine_id = "box".into();
+            t.status = thread::Status::Open;
+            t.launch_attempts = 1;
+        });
+        let mut state = crate::events::remote_state(&project, "box");
+        state.missing.insert(lane.id.clone(), 2);
+        crate::events::save_remote_state(&project, "box", &state).unwrap();
+        world.runner.on(
+            "machine list --json",
+            ok(r#"[{"id":"box","label":"box","target":"box","session":"default","enabled":true}]"#),
+        );
+        world
+            .runner
+            .on("ssh", ok(r#"{"status":"Skew","build":"0.1.0+old.1"}"#));
+        let ctx = world.ctx();
+        let mut memory = Memory::new(&ctx);
+        let log = Log {
+            path: world.home.path().join("ticker.log"),
+        };
+        for tick in 1..=12 {
+            memory.tick = tick;
+            machine_passes(&ctx, &[&project], &mut memory, &log);
+            assert!(
+                memory.machine_views["box"]
+                    .as_ref()
+                    .unwrap_err()
+                    .contains("version_skew:")
+            );
+            let held = thread::load(&project, &lane.id).unwrap();
+            assert_eq!(held.status, thread::Status::Open);
+            assert_eq!(held.attempt, lane.attempt);
+            assert!(
+                crate::events::remote_state(&project, "box")
+                    .missing
+                    .is_empty()
+            );
+            assert!(crate::events::list(&project).is_empty());
+            assert!(crate::inbox::unhandled(&project).is_empty());
+        }
+    }
+
+    #[test]
     fn every_project_on_a_box_gets_one_outage_and_recovery_notice() {
         use crate::scenarios::World;
         for detail in [
@@ -5401,11 +5488,20 @@ mod tests {
             let flag = down.clone();
             world.runner.on_fn(
                 |cmd| cmd.program == "ssh",
-                move |_| Ok(if flag.get() {
-                    fail(255, detail)
-                } else {
-                    ok("boot\tboot-1\nagents\t{\"result\":{\"agents\":[]}}\npanes\t{\"result\":{\"panes\":[]}}\n")
-                }),
+                move |_| {
+                    Ok(if flag.get() {
+                        fail(255, detail)
+                    } else {
+                        ok(&crate::box_helper::tests::ready(
+                            crate::steps::CourierManifest {
+                                boot_id: "boot-1".into(),
+                                agents: Some(Vec::new()),
+                                panes: Some(Vec::new()),
+                                ..Default::default()
+                            },
+                        ))
+                    })
+                },
             );
             world.runner.on(
                 "machine list --json",
@@ -8163,7 +8259,7 @@ mod tests {
             world.runner.on_fn(
                 |cmd| cmd.program == "ssh",
                 move |cmd| {
-                    Ok(if cmd.display().contains("HERDR_ADE_DOCTOR_INPUT") {
+                    Ok(if crate::box_helper::tests::is_doctor(cmd) {
                         crate::testkit::diagnostic_output(cmd, 99_999_999, None)
                     } else if cmd.display().contains("if test -f") {
                         if reply.get() == "unreachable" {

@@ -15,6 +15,7 @@ pub fn diagnostic_output(
 ) -> crate::runner::Output {
     use crate::pi::doctor::{FailureEvidence, Row};
     let input: serde_json::Value = serde_json::from_str(cmd.stdin.as_deref().unwrap()).unwrap();
+    let input = &input["request"]["Doctor"];
     let mut rows = Vec::new();
     if let Some(disk) = input["disk"].as_array() {
         let free = free_kb as f64 * 1024.0 / 1_000_000_000.0;
@@ -66,7 +67,9 @@ pub fn diagnostic_output(
             FailureEvidence::Unknown
         };
     }
-    ok(&serde_json::json!({"rows": rows, "snapshot": {"panes": null, "agents": null, "builds": null, "build_error": null}}).to_string())
+    ok(&crate::box_helper::tests::ready(
+        serde_json::json!({"rows": rows, "snapshot": {"panes": null, "agents": null, "builds": null, "build_error": null}}),
+    ))
 }
 
 pub struct Fx {
