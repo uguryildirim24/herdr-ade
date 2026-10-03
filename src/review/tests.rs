@@ -1469,7 +1469,16 @@ fn large_landing_shares_every_ticker_pass_with_other_projects_due_work() {
     );
     fx.world.runner.on_fn(
         |cmd| cmd.program == "ssh",
-        |_| Ok(ok("boot\tboot-1\nagents\t{\"result\":{\"agents\":[]}}\npanes\t{\"result\":{\"panes\":[]}}\n")),
+        |_| {
+            Ok(ok(&crate::box_helper::tests::ready(
+                crate::steps::CourierManifest {
+                    boot_id: "boot-1".into(),
+                    agents: Some(Vec::new()),
+                    panes: Some(Vec::new()),
+                    ..Default::default()
+                },
+            )))
+        },
     );
 
     let ctx = fx.world.ctx();

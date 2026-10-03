@@ -476,6 +476,7 @@ pub(crate) fn dependency_ready(
         &launch.kind,
         &launch.args,
         &launch.env,
+        crate::build::commit_version(crate::VERSION),
     ))?);
     let mut wait = load_dependency(&path)?;
     if wait.checked_at != 0
@@ -679,6 +680,41 @@ mod tests {
         .unwrap();
         assert_eq!(probes.load(Ordering::SeqCst), 3);
         assert_eq!((launch.work_retries, launch.same_recipe_retries), (2, 3));
+    }
+
+    #[test]
+    fn pre_install_readiness_does_not_mask_skew_or_cache_it_as_provider_failure() {
+        let root = tempfile::tempdir().unwrap();
+        let launch = crate::contracts::Launch {
+            kind: "pi".into(),
+            ..Default::default()
+        };
+        // The old build's successful cache has no build identity.
+        let path = dependency_path(root.path(), "oci", &launch);
+        let before = DependencyWait {
+            checked_at: jiff::Timestamp::now().as_second(),
+            ready: true,
+            ready_for: crate::thread::sha256_hex(
+                &serde_json::to_vec(&(&launch.kind, &launch.args, &launch.env)).unwrap(),
+            ),
+            ..Default::default()
+        };
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        crate::project::write_json(&path, &before).unwrap();
+        for _ in 0..2 {
+            let error = dependency_ready(root.path(), "oci", &launch, || {
+                bail!("version_skew: oci runs an older harness")
+            })
+            .unwrap_err();
+            assert!(error.to_string().contains("version_skew:"));
+        }
+        let held = load_dependency(&path).unwrap();
+        assert!(held.ready);
+        assert_eq!(held.ready_for, before.ready_for);
+        // Matching install immediately refreshes the shared cache.
+        dependency_ready(root.path(), "oci", &launch, || Ok(())).unwrap();
+        assert_ne!(load_dependency(&path).unwrap().ready_for, before.ready_for);
+        dependency_ready(root.path(), "oci", &launch, || panic!("already ready")).unwrap();
     }
 
     #[test]

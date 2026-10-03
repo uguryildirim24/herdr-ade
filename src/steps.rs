@@ -1054,6 +1054,12 @@ pub(crate) fn box_manifest(
     session: &str,
     taken: &[(String, String)],
 ) -> Result<CourierManifest> {
+    std::fs::read_dir(&ctx.root)
+        .with_context(|| format!("could not inspect courier root {}", ctx.root.display()))?;
+    let (slugs, errors) = project::list_slugs_with_errors(&ctx.root);
+    if let Some(error) = errors.into_iter().next() {
+        return Err(error);
+    }
     crate::ops::recover_box(ctx).context("box recovery failed")?;
     let bin = ctx.env.herdr_bin();
     let mut manifest = CourierManifest {
@@ -1066,7 +1072,7 @@ pub(crate) fn box_manifest(
         ..Default::default()
     };
     let taken: BTreeSet<_> = taken.iter().cloned().collect();
-    for slug in project::list_slugs(&ctx.root) {
+    for slug in slugs {
         let project = Project::load(&ctx.root, &slug)?;
         for (id, path) in box_records(&project.record_dir("events"), "toml")? {
             if taken.contains(&(slug.clone(), id.clone())) {
@@ -2742,6 +2748,24 @@ mod tests {
             manifest
         );
         assert!(serde_json::from_str::<CourierManifest>("nonsense").is_err());
+    }
+
+    #[test]
+    fn courier_missing_or_unreadable_root_is_not_an_empty_observation() {
+        let world = World::new();
+        let mut ctx = world.ctx();
+        ctx.root = world.home.path().join("absent");
+        assert!(box_manifest(&ctx, "default", &[]).is_err());
+        std::fs::write(&ctx.root, "not a directory").unwrap();
+        assert!(box_manifest(&ctx, "default", &[]).is_err());
+        std::fs::remove_file(&ctx.root).unwrap();
+        std::fs::create_dir(&ctx.root).unwrap();
+        assert!(
+            box_manifest(&ctx, "default", &[])
+                .unwrap()
+                .envelopes
+                .is_empty()
+        );
     }
 
     #[test]
