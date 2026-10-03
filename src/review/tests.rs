@@ -95,6 +95,7 @@ fn seal_verdict(
         verdict: word.into(),
         review: review.id.clone(),
         candidate: candidate.into(),
+        evidence_only: false,
         without,
         gates,
         gates_note: String::new(),
@@ -174,6 +175,183 @@ fn packet_carries_original_acceptance_and_durable_evidence_not_rewritten_intent(
     assert!(!packet.contains("Later rewritten intent"));
     thread::update(&fx.project, &id, |lane| lane.launch.brief_hash.clear()).unwrap();
     assert!(task(&fx.project, &review).contains("Original brief/acceptance: not established"));
+}
+
+#[test]
+fn retry_rebuilds_pre_contract_packet_and_delivers_it_to_a_parked_reviewer() {
+    for parked in [false, true] {
+        let fx = configured();
+        let (id, _) = lane(&fx, 1);
+        let member_task = job(&fx, &id);
+        let original = format!(
+            "# Original brief\nAcceptance: {}\n",
+            member_task.acceptance[0]
+        );
+        let member_hash = thread::store_artifact(&fx.project, original.as_bytes()).unwrap();
+        thread::update(&fx.project, &id, |t| {
+            t.launch.brief_hash = member_hash.clone()
+        })
+        .unwrap();
+        let mut review = prepared(&fx);
+        let reviewer = review.reviewer.clone().unwrap();
+        let old_packet = "Pre-contract pile: SHAs and reports only\n";
+        let old_hash = thread::store_artifact(&fx.project, old_packet.as_bytes()).unwrap();
+        project::write_atomic(
+            &thread::task_path_for_write(&fx.project, &reviewer).unwrap(),
+            old_packet.as_bytes(),
+        )
+        .unwrap();
+        thread::update(&fx.project, &reviewer, |t| {
+            t.launch.brief_hash = old_hash.clone();
+            t.parked = parked;
+        })
+        .unwrap();
+        let candidate = git(&fx.repo, &["rev-parse", &review.candidate_branch]);
+        fx.seal_done(&reviewer, 1, 1, &candidate, &format!(
+            "+++\nreview = {:?}\nverdict = \"MERGE\"\ncandidate = {candidate:?}\n+++\nOld review contract\n", review.id
+        ));
+        assert!(
+            advance(&fx.world.ctx(), &fx.project, &mut review)
+                .unwrap_err()
+                .to_string()
+                .contains("acceptance not established")
+        );
+        let retried = retry(&fx.world.ctx(), "demo", None).unwrap().unwrap();
+        assert_eq!(retried.phase, Phase::Reviewing);
+        assert!(retried.verdict.is_none());
+        let lane = thread::load(&fx.project, &reviewer).unwrap();
+        assert_ne!(lane.launch.brief_hash, old_hash);
+        let packet = std::fs::read_to_string(thread::task_path(&fx.project, &reviewer)).unwrap();
+        let brief =
+            String::from_utf8(thread::artifact(&fx.project, &lane.launch.brief_hash).unwrap())
+                .unwrap();
+        for text in [&original, "[[acceptance]]", &review.members[0].event] {
+            assert!(packet.contains(text));
+            assert!(brief.contains(text));
+            if parked {
+                assert!(
+                    lane.follow_ups
+                        .iter()
+                        .any(|follow_up| follow_up.text.contains(text))
+                );
+            }
+        }
+        assert_eq!(
+            thread::artifact(&fx.project, &old_hash).unwrap(),
+            old_packet.as_bytes()
+        );
+        assert_eq!(
+            thread::load(&fx.project, &id).unwrap().launch.brief_hash,
+            member_hash
+        );
+        assert!(
+            thread::load(&fx.project, &id)
+                .unwrap()
+                .review_after
+                .is_empty()
+        );
+        assert_eq!(git(&fx.repo, &["rev-parse", "main"]), review.base);
+    }
+}
+
+#[test]
+fn evidence_only_rejection_allows_retry_or_automatic_review_without_member_follow_ups() {
+    for explicit_retry in [false, true] {
+        let fx = configured();
+        let (id, _) = lane(&fx, 1);
+        let mut review = prepared(&fx);
+        let candidate = git(&fx.repo, &["rev-parse", &review.candidate_branch]);
+        // The reviewer can read neither the member's original brief nor its
+        // task record. This is not a verdict about the implementation.
+        std::fs::write(
+            fx.project
+                .record_dir_for_write("tasks")
+                .unwrap()
+                .join("job-unreadable.toml"),
+            "invalid = [",
+        )
+        .unwrap();
+        fx.seal_done(review.reviewer.as_deref().unwrap(), 1, 1, &candidate, &format!(
+            "+++\nreview = {:?}\nverdict = \"REJECT\"\ncandidate = {candidate:?}\nevidence_only = true\n+++\nIncomplete review evidence, not failed implementation\n", review.id
+        ));
+        advance(&fx.world.ctx(), &fx.project, &mut review).unwrap();
+        assert_eq!(review.phase, Phase::Rejected);
+        assert!(review.verdict.as_ref().unwrap().evidence_only);
+        let member = thread::load(&fx.project, &id).unwrap();
+        assert!(member.review_after.is_empty());
+        assert!(member.review_reason.is_empty());
+        assert_eq!(
+            pending(
+                &fx.project,
+                fx.repo.to_str().unwrap(),
+                &crate::events::list(&fx.project)
+            )
+            .len(),
+            1
+        );
+        assert_eq!(git(&fx.repo, &["rev-parse", "main"]), review.base);
+        // Recover a new allocation-before-binding intent without a live agent.
+        let next_reviewer = fx.thread("fresh reviewer");
+        thread::update(&fx.project, &next_reviewer, |t| {
+            t.role = "reviewer".into();
+            t.review_id = "review-2".into();
+            t.pane_id.clear();
+        })
+        .unwrap();
+        let fresh = if explicit_retry {
+            retry(&fx.world.ctx(), "demo", None).unwrap().unwrap()
+        } else {
+            tick(&fx.world.ctx(), &fx.project).unwrap();
+            load(&fx.project, "review-2").unwrap()
+        };
+        assert_eq!(fresh.phase, Phase::Reviewing);
+        assert_ne!(fresh.reviewer, review.reviewer);
+        assert_eq!(fresh.members[0].event, review.members[0].event);
+        assert!(task(&fx.project, &fresh).contains("[[acceptance]]"));
+        assert_eq!(
+            load(&fx.project, &review.id).unwrap().phase,
+            Phase::Rejected
+        );
+    }
+}
+
+#[test]
+fn evidence_only_cannot_be_used_for_merge_or_member_exclusions() {
+    let fx = configured();
+    lane(&fx, 1);
+    let review = prepared(&fx);
+    let candidate = git(&fx.repo, &["rev-parse", &review.candidate_branch]);
+    let git = Git::new(&fx.world.runner, fx.repo.to_str().unwrap());
+    for (n, word, without) in [
+        (1, "MERGE", String::new()),
+        (
+            2,
+            "REJECT",
+            format!(
+                "without = {{ {} = \"broken work\" }}\n",
+                review.members[0].thread
+            ),
+        ),
+    ] {
+        let reviewer = review.reviewer.as_deref().unwrap();
+        fx.seal_done(reviewer, 1, n, &candidate, &format!(
+            "+++\nreview = {:?}\nverdict = {word:?}\ncandidate = {candidate:?}\nevidence_only = true\n{without}+++\n", review.id
+        ));
+        let events = crate::events::checked(&fx.project).unwrap();
+        let lane = thread::load(&fx.project, reviewer).unwrap();
+        assert!(
+            verdict(
+                &fx.world.ctx(),
+                &fx.project,
+                &review,
+                sealed(&events, &lane).unwrap(),
+                &git
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("evidence_only requires")
+        );
+    }
 }
 
 #[test]
@@ -1137,7 +1315,7 @@ fn dead_reviewer_needs_coordinator_once_after_retries_end() {
 }
 
 #[test]
-fn reject_does_not_land_and_cancel_releases_unchanged_members() {
+fn merits_reject_needs_follow_ups_and_cancel_releases_unchanged_members() {
     let fx = configured();
     lane(&fx, 1);
     let mut review = prepared(&fx);
@@ -1164,6 +1342,40 @@ fn reject_does_not_land_and_cancel_releases_unchanged_members() {
             &crate::events::list(&fx.project)
         )
         .is_empty()
+    );
+
+    let member = &review.members[0];
+    let rejected = thread::load(&fx.project, &member.thread).unwrap();
+    assert_eq!(rejected.review_after, member.event);
+    assert_eq!(
+        rejected.review_reason,
+        "pile rejected; follow up before the next review"
+    );
+    assert!(retry(&fx.world.ctx(), "demo", None).is_err());
+    assert!(start(&fx.world.ctx(), "demo", None).unwrap().is_none());
+    // The unspecified historical verdict still loads and remains conservative.
+    assert!(
+        !load(&fx.project, &review.id)
+            .unwrap()
+            .verdict
+            .unwrap()
+            .evidence_only
+    );
+    fx.seal_done(
+        &member.thread,
+        1,
+        2,
+        &member.sha,
+        "follow-up fixed the implementation\n",
+    );
+    assert_eq!(
+        pending(
+            &fx.project,
+            fx.repo.to_str().unwrap(),
+            &crate::events::list(&fx.project)
+        )
+        .len(),
+        1
     );
 
     let fx = configured();
@@ -1197,6 +1409,7 @@ fn persisted_landing_without_remote_completes_on_ticker_pass() {
         without: BTreeMap::new(),
         gates: vec![],
         gates_note: String::new(),
+        evidence_only: false,
     });
     review.phase = Phase::Landing;
     save(&fx.project, &review).unwrap();
@@ -1234,6 +1447,7 @@ fn large_landing_shares_every_ticker_pass_with_other_projects_due_work() {
         without: BTreeMap::new(),
         gates: vec![],
         gates_note: String::new(),
+        evidence_only: false,
     });
     review.phase = Phase::Landing;
     save(&fx.project, &review).unwrap();
@@ -1421,6 +1635,7 @@ fn landing_verifies_the_push_destination_not_the_box_reviewers_clone() {
                 review.verdict = Some(Verdict {
                     verdict: "MERGE".into(),
                     review: review.id.clone(),
+                    evidence_only: false,
                     candidate: candidate.clone(),
                     without: BTreeMap::new(),
                     gates: vec![],
@@ -1500,6 +1715,7 @@ fn successful_push_without_remote_candidate_does_not_mark_publication_done() {
     );
     review.push_remote = Some(published.to_string_lossy().into_owned());
     review.verdict = Some(Verdict {
+        evidence_only: false,
         verdict: "MERGE".into(),
         review: review.id.clone(),
         candidate,
@@ -1540,6 +1756,7 @@ fn configured_remote_failure_is_not_treated_as_local_only() {
     let remote = fx.world.home.path().join("missing-remote.git");
     review.push_remote = Some(remote.to_string_lossy().into_owned());
     review.verdict = Some(Verdict {
+        evidence_only: false,
         verdict: "MERGE".into(),
         review: review.id.clone(),
         candidate,
@@ -1589,6 +1806,7 @@ fn landing_recovers_ref_before_marker_and_install_failure_without_early_task_don
         without: BTreeMap::new(),
         gates: vec![],
         gates_note: String::new(),
+        evidence_only: false,
     });
     review.phase = Phase::Landing;
     review.install_required = true;
@@ -1684,6 +1902,7 @@ fn landing_completes_while_a_merged_member_owes_cleanup() {
         without: BTreeMap::new(),
         gates: vec![],
         gates_note: String::new(),
+        evidence_only: false,
     });
     review.phase = Phase::Landing;
     save(&fx.project, &review).unwrap();
@@ -2160,6 +2379,7 @@ fn landing_retry_cannot_use_declared_exits_or_missing_logs_as_execution_proof() 
     // Simulate an old cached landing verdict whose only proof was exit=0.
     review.verdict_event = event.id.clone();
     review.verdict = Some(Verdict {
+        evidence_only: false,
         verdict: "MERGE".into(),
         review: review.id.clone(),
         candidate: candidate.clone(),
