@@ -675,15 +675,17 @@ pub(crate) fn states(project: &Project, event: &str) -> Result<Vec<DeliveryState
         .collect())
 }
 
-pub(crate) fn typed_line(event: &Event) -> Result<String> {
+pub(crate) fn typed_line(project: &Project, event: &Event) -> Result<String> {
     match &event.payload {
         EventPayload {
             done: Some(done),
             waiting: None,
             failed: None,
         } => Ok(format!(
-            "DONE {} {} {}",
-            event.thread, done.report_path, done.sha
+            "DONE {} {} commit {}",
+            event.thread,
+            std::path::absolute(artifact_path(project, &done.artifact))?.display(),
+            done.sha
         )),
         EventPayload {
             done: None,
@@ -925,6 +927,14 @@ mod tests {
             std::fs::read(artifact_path(&project, &hash)).unwrap(),
             report
         );
+        let notice = typed_line(&project, &imported).unwrap();
+        let durable = std::path::absolute(artifact_path(&project, &hash)).unwrap();
+        assert!(durable.is_absolute() && durable.is_file());
+        assert_eq!(
+            notice,
+            format!("DONE t-0001 {} commit abc", durable.display())
+        );
+        assert!(!notice.contains(".reports/t-0001.md"));
 
         // The exact replay is a no-op; changed bytes under the same id refuse.
         assert_eq!(

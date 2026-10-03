@@ -122,15 +122,19 @@ pub(crate) fn render(project: &Project, rows: &[Row]) -> String {
                 "-".to_string()
             };
             let _ = writeln!(out, "  {}  {}  [{}]  {}", t.id, t.title, row.note, place);
-            if group == Group::WaitingOnYou && !t.pane_id.is_empty() && row.note != "pane closed" {
-                if t.machine.is_empty() {
-                    let _ = writeln!(out, "          needs you in pane {}", t.pane_id);
-                } else {
-                    let _ = writeln!(
-                        out,
-                        "          needs you in pane {} on machine `{}`: select the machine in herdr's sidebar, or run `herdr --remote <ssh target>`",
-                        t.pane_id, t.machine
-                    );
+            if group == Group::WaitingOnYou {
+                if !t.error.is_empty() && !row.note.contains(&t.error) {
+                    let _ = writeln!(out, "          {}", t.error);
+                }
+                if t.recovery_pending {
+                    let _ = writeln!(out, "          automatic retry selected; wait for startup");
+                } else if let Some(notice) = t
+                    .start_notices
+                    .iter()
+                    .rev()
+                    .find(|n| n.line.contains(" — next: "))
+                {
+                    let _ = writeln!(out, "          {}", notice.line);
                 }
             }
         }
@@ -175,6 +179,38 @@ pub(crate) fn run(ctx: &Ctx, slug: Option<&str>, include_history: bool, wait: bo
 mod tests {
     use super::*;
     use crate::scenarios::World;
+
+    #[test]
+    fn attention_uses_failure_evidence_not_a_stored_pane_as_a_personal_request() {
+        let world = World::new();
+        let project = world.project("demo", "a.sock");
+        let lane = world.thread(&project, world.home.path(), |t| {
+            t.pane_id = "dead:pane".into();
+            t.error = "process disappeared".into();
+            t.start_notices.push(crate::steps::Notice {
+                line: format!(
+                    "GONE {} — next: {}",
+                    t.id,
+                    crate::threads::retry_command("demo", &t.id)
+                ),
+                submitted: false,
+            });
+        });
+        let rendered = render(
+            &project,
+            &[Row {
+                thread: lane,
+                group: Group::WaitingOnYou,
+                note: "process gone".into(),
+            }],
+        );
+        assert!(rendered.contains("Needs attention"), "{rendered}");
+        assert!(rendered.contains("process disappeared"), "{rendered}");
+        assert!(rendered.contains("ha thread retry demo"), "{rendered}");
+        assert!(!rendered.contains("dead:pane"), "{rendered}");
+        assert!(!rendered.contains("needs you"), "{rendered}");
+    }
+
     #[test]
     fn workspace_resolves_through_the_coordinator_or_a_thread_in_the_same_socket_only() {
         let world = World::new();

@@ -164,8 +164,6 @@ pub struct StartArgs {
     pub machine: Option<String>,
     pub base: Option<String>,
     pub task: String,
-    /// The birth sentence (SPEC-ADE D17 item 6).
-    pub plain: String,
     /// Internal flow/skill label; never a coordinator model-selection input.
     pub workflow: Option<String>,
     /// An exact recipe the coordinator chose for this one lane.
@@ -173,14 +171,6 @@ pub struct StartArgs {
     pub task_id: String,
     /// Internal reviewer identity; empty for every non-reviewer start.
     pub review_id: String,
-}
-
-/// Internal birth description: required, with no vocabulary or length gate.
-pub fn check_birth_plain(text: &str) -> Result<()> {
-    if text.trim().is_empty() {
-        bail!("plain_missing");
-    }
-    Ok(())
 }
 
 /// Creates the worktree or tab, the thread directory and the brief, then
@@ -227,7 +217,6 @@ fn start_with_ticker(
     ensure_ticker(ctx)?;
     let view = require_session(ctx, &project)?;
 
-    check_birth_plain(&args.plain)?;
     let role = args
         .workflow
         .as_deref()
@@ -391,7 +380,7 @@ fn start_with_ticker(
         t.base = args.base.clone().unwrap_or_default();
         t.role = role.to_string();
         t.review_id = args.review_id.clone();
-        t.plain = args.plain.trim().to_string();
+        t.plain = args.title.trim().to_string();
         t.attempt = 1;
         t.launch = launch.clone();
         if let Some(reason) = &provider_wait {
@@ -454,7 +443,8 @@ fn start_with_ticker(
                 return Err(error);
             }
             Err(error.context(format!(
-                "thread {id} failed to start; `thread retry {slug} {id} --reason <why>` retries"
+                "thread {id} failed to start — next: {}",
+                retry_command(slug, &id)
             )))
         }
     }
@@ -3231,6 +3221,14 @@ pub(crate) fn startup_screen(herdr: &Herdr<'_>, pane: &str) -> String {
     }
 }
 
+pub(crate) fn retry_command(slug: &str, id: &str) -> String {
+    format!(
+        "ha thread retry {} {} --reason \"<why replace this attempt>\"",
+        remote::quote(slug),
+        remote::quote(id)
+    )
+}
+
 /// Marks a start failed, removes its Working metadata, and closes everything
 /// the attempt opened. The failed state is durable even when cleanup itself
 /// reports an error, so no view can keep presenting the attempt as Working.
@@ -3303,28 +3301,34 @@ pub(crate) fn fail_start_checked(
             return Ok(());
         }
         matched = true;
-        if class == crate::contracts::FailureClass::ProcessGone
+        let next = if recovery.is_some() {
+            format!(
+                "automatic same-recipe retry selected for attempt {}; wait for startup",
+                t.attempt.max(1).saturating_add(1)
+            )
+        } else if class == crate::contracts::FailureClass::Unknown {
+            "wait for the coordinator to classify the missing failure evidence".into()
+        } else {
+            retry_command(&project.slug, id)
+        };
+        let gone = class == crate::contracts::FailureClass::ProcessGone
             && !t.parked
-            && !attempt_sealed(project, t)
-        {
+            && !attempt_sealed(project, t);
+        if gone || recovery.is_none() {
+            let reason = crate::steps::short_error(
+                &recovery_error.clone().unwrap_or_else(|| reason.to_string()),
+            );
+            let label = if gone {
+                format!("GONE {id} attempt {}", t.attempt.max(1))
+            } else {
+                format!("FAILED {id}")
+            };
             t.start_notices.push(crate::steps::Notice {
-                line: format!("GONE {id} attempt {}", t.attempt.max(1)),
+                line: format!("{label}: {reason} — next: {next}"),
                 submitted: false,
             });
         }
         t.status = Status::Failed;
-        if recovery.is_none() {
-            let reason = crate::steps::short_error(
-                &recovery_error.clone().unwrap_or_else(|| reason.to_string()),
-            );
-            t.start_notices.push(crate::steps::Notice {
-                line: format!(
-                    "FAILED {id}: {reason} — next: ha thread retry {} {id}",
-                    project.slug
-                ),
-                submitted: false,
-            });
-        }
         t.prompt_pending = false;
         t.startup_wait_started.clear();
         t.provider_wait_started.clear();
@@ -6604,16 +6608,6 @@ mod tests {
         assert_eq!(retried_lane.follow_ups[0].text, "Repair the conflict");
     }
 
-    #[test]
-    fn birth_sentence_keeps_structure_and_exact_technical_details() {
-        let err = check_birth_plain("").unwrap_err().to_string();
-        assert!(err.contains("plain_missing"), "{err}");
-        check_birth_plain("README, docs and skill files change src/plain.rs for t-0284.").unwrap();
-        check_birth_plain("The lane does the work.").unwrap();
-        let long = format!("{}.", vec!["README"; 26].join(" "));
-        check_birth_plain(&long).unwrap();
-    }
-
     struct GitReal<'a> {
         fake: &'a crate::runner::fake::FakeRunner,
     }
@@ -6700,7 +6694,6 @@ mod tests {
                 machine: None,
                 base: None,
                 task: "Repair the lane.".into(),
-                plain: "The lane repairs the project.".into(),
                 workflow: None,
                 recipe: None,
                 task_id: String::new(),
@@ -6813,7 +6806,6 @@ mod tests {
                 base: None,
                 // The CLI maps `--task-file` to this verbatim field.
                 task: lead_brief.into(),
-                plain: "The lane does the work.".into(),
                 workflow: None,
                 recipe: Some("chosen_claude".into()),
                 // The CLI maps `--job` to this stable task id.
@@ -7000,7 +6992,6 @@ mod tests {
             machine: None,
             base: None,
             task: "Do the thing.".into(),
-            plain: "The lane does the work.".into(),
             workflow: None,
             recipe: None,
             task_id: String::new(),
@@ -7187,7 +7178,6 @@ mod tests {
             machine,
             base: None,
             task: "Do the thing.".into(),
-            plain: "The lane does the work.".into(),
             workflow: None,
             recipe: None,
             task_id: String::new(),

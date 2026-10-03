@@ -1941,7 +1941,7 @@ fn thread_pass(
         } else {
             thread::group(&after, &live, now)
         };
-        // After startup, a sustained blocked state needs a human. Do not
+        // After startup, a sustained blocked state needs input. Do not
         // interact with the lane's pane: only the startup trust matcher can
         // answer its exact dialog. The group transition arms one alert per
         // blocked spell and a return to working re-arms the next one.
@@ -1952,7 +1952,7 @@ fn thread_pass(
             && t.last_group != group.token()
         {
             let notice = format!(
-                "BLOCKED {} awaits interactive approval in {}; no keys were sent. Answer it there or retry after resolving the permission.",
+                "BLOCKED {} needs input in {}; inspect the current question; no keys were sent.",
                 t.id, t.pane_id
             );
             let sent = if let Some(coordinator) = project.coordinator() {
@@ -4344,7 +4344,7 @@ mod tests {
                 .borrow()
                 .iter()
                 .any(|call| call.display().contains(&format!(
-                    "BLOCKED {} awaits interactive approval in w1:p2; no keys were sent",
+                    "BLOCKED {} needs input in w1:p2; inspect the current question; no keys were sent",
                     lane.id
                 )))
         );

@@ -177,9 +177,6 @@ enum Command {
         name: String,
         #[arg(long, default_value = "")]
         goal: String,
-        /// The adopted thread's birth sentence
-        #[arg(long)]
-        plain: Option<String>,
         /// The agent pane to adopt
         #[arg(long)]
         pane: String,
@@ -255,7 +252,7 @@ enum Command {
         #[arg(long, value_name = "PROJECT/THREAD")]
         remove_kept_worktree: Option<String>,
     },
-    /// Start or show the repository's pile review
+    /// Start the ready pile now; enable automatic reviews for this project; display an existing review
     #[command(
         args_conflicts_with_subcommands = true,
         subcommand_negates_reqs = true,
@@ -408,7 +405,7 @@ enum PlanStepCommand {
         after: Vec<String>,
         /// Why this step or link is removed
         #[arg(long)]
-        why: String,
+        reason: String,
         /// Expected plan revision; omitted uses the latest revision
         #[arg(long)]
         expect: Option<u64>,
@@ -542,10 +539,10 @@ fn run_project_commands(ctx: &Ctx, command: Command) -> Result<()> {
                     id,
                     tasks,
                     after,
-                    why,
+                    reason,
                     expect,
                 } => {
-                    let p = plan::step_unlink(ctx, &slug, &id, tasks, after, &why, expect)?;
+                    let p = plan::step_unlink(ctx, &slug, &id, tasks, after, &reason, expect)?;
                     crate::output::success(
                         None,
                         &serde_json::json!({
@@ -735,7 +732,7 @@ enum ThreadCommand {
         repo: Option<String>,
         #[arg(long, value_name = "LABEL|ID|local")]
         machine: Option<String>,
-        /// The integration branch the brief is committed on (default: the checked-out branch)
+        /// The integration branch to pin the code base to (default: the checked-out branch)
         #[arg(long, value_name = "BRANCH")]
         base: Option<String>,
         /// The task; `-` reads standard input
@@ -747,9 +744,6 @@ enum ThreadCommand {
         /// Exact configured recipe for this one lane (the coordinator's choice)
         #[arg(long, value_name = "ID")]
         recipe: Option<String>,
-        /// Birth sentence; defaults to the stable task's title
-        #[arg(long)]
-        plain: Option<String>,
         /// Existing stable task id. Ordinary lanes must name this or create one.
         #[arg(long, value_name = "TASK", conflicts_with = "requests")]
         job: Option<String>,
@@ -760,7 +754,7 @@ enum ThreadCommand {
         #[arg(long = "acceptance", requires = "requests")]
         acceptance: Vec<String>,
     },
-    /// Replace a failed, blocked, or stuck attempt through bounded routing
+    /// Replace a failed, blocked, or stuck attempt on the same recipe, even after automatic retries
     Retry {
         #[arg(value_name = "PROJECT")]
         slug: String,
@@ -823,11 +817,8 @@ enum ThreadCommand {
         /// Optional task; `-` reads standard input
         #[arg(long, value_name = "FILE")]
         task_file: Option<String>,
-        /// Birth sentence
-        #[arg(long)]
-        plain: Option<String>,
-        #[arg(long, value_name = "ROLE")]
-        role: Option<String>,
+        #[arg(long, value_name = "FLOW")]
+        workflow: Option<String>,
         /// Do not send a primer
         #[arg(long)]
         passive: bool,
@@ -954,8 +945,7 @@ fn start_details(
     existing: Option<&crate::task::Task>,
     title: Option<String>,
     repo: Option<String>,
-    plain: Option<String>,
-) -> Result<(String, Option<String>, String)> {
+) -> Result<(String, Option<String>)> {
     let title = title
         .or_else(|| existing.map(|task| task.title.clone()))
         .ok_or_else(|| {
@@ -963,12 +953,7 @@ fn start_details(
                 "task_title: --title is required when the lane does not name an existing --job", "ha thread start <project> --title \"<title>\" --request <request-id> --acceptance \"<condition>\" --task-file <file>")
         })?;
     let repo = repo.or_else(|| existing.and_then(|task| task.repo.clone()));
-    let plain = plain.unwrap_or_else(|| {
-        existing
-            .map(|task| task.title.clone())
-            .unwrap_or_else(|| title.clone())
-    });
-    Ok((title, repo, plain))
+    Ok((title, repo))
 }
 
 /// `-` is standard input; a relative path is relative to the caller's directory.
@@ -1067,7 +1052,15 @@ pub fn run() -> Result<()> {
     let wants_json = std::env::args_os().any(|arg| arg == "--json");
     let matches = match Cli::command().try_get_matches() {
         Ok(matches) => matches,
-        Err(error) if !wants_json => error.exit(),
+        Err(error)
+            if !wants_json
+                || matches!(
+                    error.kind(),
+                    clap::error::ErrorKind::DisplayHelp | clap::error::ErrorKind::DisplayVersion
+                ) =>
+        {
+            error.exit()
+        }
         Err(error) => {
             let (command, data) = partial_machine_result();
             crate::output::begin(true, command, "refused".into(), data);
@@ -1507,7 +1500,6 @@ fn dispatch_with_start(
                 task_file,
                 workflow,
                 recipe,
-                plain,
                 job,
                 requests,
                 acceptance,
@@ -1518,7 +1510,7 @@ fn dispatch_with_start(
                     .as_deref()
                     .map(|id| crate::task::load(&project, id))
                     .transpose()?;
-                let (title, repo, plain) = start_details(existing.as_ref(), title, repo, plain)?;
+                let (title, repo) = start_details(existing.as_ref(), title, repo)?;
                 let task_id = match job {
                     Some(id) => id,
                     None if workflow.as_deref() == Some("reviewer") => String::new(),
@@ -1562,7 +1554,6 @@ fn dispatch_with_start(
                         machine,
                         base,
                         task,
-                        plain,
                         workflow,
                         recipe,
                         task_id: task_id.clone(),
@@ -1716,8 +1707,7 @@ fn dispatch_with_start(
                 pane,
                 title,
                 task_file,
-                plain,
-                role,
+                workflow,
                 passive,
             } => {
                 let task = task_file.map(|file| read_text(&file)).transpose()?;
@@ -1727,11 +1717,7 @@ fn dispatch_with_start(
                     &pane,
                     &title,
                     task,
-                    adopt::AdeAdopt {
-                        plain: plain.unwrap_or_default(),
-                        role,
-                        passive,
-                    },
+                    adopt::AdeAdopt { workflow, passive },
                 )?;
                 crate::output::insert("id", thread.id.clone());
                 crate::output::insert("kind", serde_json::to_value(thread.kind)?);
@@ -1798,7 +1784,6 @@ fn dispatch_with_start(
         Command::AdoptWorkspace {
             name,
             goal,
-            plain,
             pane,
             workspace_cwd,
             session,
@@ -1807,7 +1792,6 @@ fn dispatch_with_start(
             &adopt::AdoptWorkspace {
                 name,
                 goal,
-                plain: plain.unwrap_or_default(),
                 pane,
                 workspace_cwd,
                 session: session.into(),
@@ -1872,6 +1856,7 @@ fn dispatch_with_start(
             repo,
             command,
         } => {
+            let opted_in = command.is_none();
             let record = match command {
                 Some(ReviewCommand::Cancel { slug, repo }) => {
                     crate::review::cancel(&ctx, &slug, repo.as_deref())?;
@@ -1890,14 +1875,21 @@ fn dispatch_with_start(
                 .as_ref()
                 .map(|r| {
                     format!(
-                        "{}: {:?} ({} lanes){}\n",
+                        "{}: {:?} ({} lanes) — {}{}\n",
                         r.id,
                         r.phase,
                         r.members.len(),
+                        r.landing_summary(),
                         r.gates_summary()
                     )
                 })
-                .unwrap_or_else(|| "no pile review running\n".into());
+                .unwrap_or_else(|| {
+                    if opted_in {
+                        "no ready pile; automatic reviews enabled for this project\n".into()
+                    } else {
+                        "no pile review running\n".into()
+                    }
+                });
             crate::output::success(
                 Some("review"),
                 &serde_json::json!({"review": record}),
@@ -1940,6 +1932,45 @@ fn dispatch_with_start(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn lane_description_is_the_title_and_flags_match_other_actions() {
+        let adopted = Cli::try_parse_from([
+            "ha",
+            "thread",
+            "adopt",
+            "demo",
+            "--pane",
+            "w1:p1",
+            "--title",
+            "Repair startup",
+            "--workflow",
+            "critic",
+        ])
+        .unwrap();
+        assert!(
+            matches!(adopted.command, Command::Thread { command: ThreadCommand::Adopt { workflow: Some(ref flow), .. } } if flow == "critic")
+        );
+        let unlinked = Cli::try_parse_from([
+            "ha", "plan", "step", "unlink", "demo", "s-1", "--task", "job-1", "--reason",
+            "Replaced",
+        ])
+        .unwrap();
+        assert!(
+            matches!(unlinked.command, Command::Plan { command: PlanCommand::Step { command: PlanStepCommand::Unlink { ref reason, .. } } } if reason == "Replaced")
+        );
+        for command in [
+            "ha thread start demo --task-file - --plain Extra",
+            "ha thread adopt demo --pane w1:p1 --title Repair --plain Extra",
+            "ha thread adopt demo --pane w1:p1 --title Repair --role critic",
+            "ha plan step unlink demo s-1 --task job-1 --why Replaced",
+        ] {
+            assert!(
+                Cli::try_parse_from(command.split_whitespace()).is_err(),
+                "{command}"
+            );
+        }
+    }
 
     #[test]
     fn failed_defaults_to_the_work_failed_class() {

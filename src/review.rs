@@ -95,6 +95,44 @@ pub(crate) struct Review {
 }
 
 impl Review {
+    fn command(&self, project: &Project, action: &str) -> String {
+        format!(
+            "ha review {action} {} --repo {}",
+            crate::remote::quote(&project.slug),
+            crate::remote::quote(&self.repo)
+        )
+    }
+
+    pub(crate) fn landing_summary(&self) -> String {
+        let merged = if self.fast_forward {
+            "merged"
+        } else {
+            "not merged"
+        };
+        let publication = if self.push_remote.as_deref().is_none_or(str::is_empty) {
+            "no remote configured"
+        } else if self.push {
+            "publication verified"
+        } else {
+            "publication pending"
+        };
+        let install = if !self.install_required {
+            "install not required"
+        } else if self.install {
+            "install completed"
+        } else {
+            "install pending"
+        };
+        let continuation = if matches!(self.phase, Phase::Landing | Phase::Cancelling)
+            || (!self.phase.closed() && self.attention.is_empty())
+        {
+            "; continues automatically"
+        } else {
+            ""
+        };
+        format!("{merged}; {publication}; {install}{continuation}")
+    }
+
     pub(crate) fn gates_summary(&self) -> String {
         if self.gates_note.is_empty() {
             String::new()
@@ -249,8 +287,9 @@ fn needs_coordinator(project: &Project, review: &mut Review, reason: &str) -> Re
     queue_notice(
         review,
         format!(
-            "REVIEW {} needs you: {attention} — next: ha review retry {}",
-            review.id, project.slug
+            "REVIEW {} needs attention: {attention} — next: {}",
+            review.id,
+            review.command(project, "retry")
         ),
     );
     save(project, review)
@@ -348,11 +387,15 @@ fn watch_no_verdict_state(
         && !review
             .notices
             .iter()
-            .any(|n| !n.submitted && n.line.contains("needs you"))
+            .any(|n| !n.submitted && n.line.contains("needs attention"))
     {
         let line = format!(
-            "REVIEW {} has no verdict since {} (reviewer {} {}); inspect the pane or run ha review retry {}. No merge was attempted.",
-            review.id, review.no_verdict_since, lane.id, state, project.slug
+            "REVIEW {} has no verdict since {} (reviewer {} {}); no merge attempted — next: {}",
+            review.id,
+            review.no_verdict_since,
+            lane.id,
+            state,
+            review.command(project, "retry")
         );
         queue_notice(review, line);
         save(project, review)?;
@@ -833,7 +876,10 @@ fn prepare(ctx: &Ctx, project: &Project, review: &mut Review) -> Result<()> {
             .filter(|t| t.review_id == review.id && t.status != Status::Resolved)
             .collect();
         if unbound.len() > 1 {
-            bail!("multiple reviewers for {}; cancel or retry", review.id);
+            return Err(crate::refusal::error(
+                format!("multiple reviewers for {}", review.id),
+                "wait for the coordinator to identify the valid reviewer; no replacement is safe yet",
+            ));
         }
         let reviewer = if let Some(t) = unbound.first() {
             t.clone()
@@ -847,7 +893,6 @@ fn prepare(ctx: &Ctx, project: &Project, review: &mut Review) -> Result<()> {
                     machine: None,
                     base: Some(review.candidate_branch.clone()),
                     task: task(project, review),
-                    plain: "Check the finished work together and land what is ready".into(),
                     workflow: Some("reviewer".into()),
                     recipe: None,
                     task_id: String::new(),
@@ -1037,7 +1082,10 @@ fn advance(ctx: &Ctx, project: &Project, review: &mut Review) -> Result<()> {
         )?;
         let events = crate::events::checked_for_thread(project, &reviewer.id)?;
         if reviewer.status == Status::Resolved && !reviewer.cancellation_reason.is_empty() {
-            bail!("reviewer was cancelled; use review retry or review cancel");
+            return Err(crate::refusal::error(
+                "reviewer was cancelled",
+                review.command(project, "retry"),
+            ));
         }
         if reviewer.status == Status::Failed && !reviewer.recovery_pending {
             needs_coordinator(
@@ -1298,10 +1346,10 @@ fn land_with_install(
             for member in &review.members {
                 let lane = thread::load(project, &member.thread)?;
                 if sealed(&events, &lane).map(|e| &e.id) != Some(&member.event) {
-                    bail!(
-                        "{} changed during review; cancel and start a fresh pile",
-                        member.thread
-                    );
+                    return Err(crate::refusal::error(
+                        format!("{} changed during review", member.thread),
+                        review.command(project, "cancel"),
+                    ));
                 }
             }
             if let Some(checkout) = git.checkout_of(&review.integration)? {
@@ -1433,21 +1481,13 @@ fn land_with_install(
         .map(|m| m.thread.as_str())
         .collect::<Vec<_>>()
         .join(", ");
-    let published = if review
-        .push_remote
-        .as_deref()
-        .is_some_and(|remote| !remote.is_empty())
-    {
-        ", pushed"
-    } else {
-        ""
-    };
     queue_notice(
         review,
         format!(
-            "REVIEW {} merged {members} ({}{published}){}",
+            "REVIEW {} merged {members} (commit {}; {}){}",
             review.id,
             &candidate[..candidate.len().min(7)],
+            review.landing_summary(),
             review.gates_summary()
         ),
     );
@@ -1469,7 +1509,10 @@ fn cancel_record(ctx: &Ctx, project: &Project, review: &mut Review, reason: &str
         }
     }
     if review.fast_forward {
-        bail!("review has landed; resume publication and cleanup instead");
+        return Err(crate::refusal::error(
+            "review has landed; resume publication, installation and cleanup",
+            review.command(project, "retry"),
+        ));
     }
     // Seal the cancellation before touching the reviewer. A crash after
     // stopping it must never accept its earlier MERGE seal on the next pass.
@@ -1512,7 +1555,14 @@ pub(crate) fn retry(ctx: &Ctx, slug: &str, repo: Option<&str>) -> Result<Option<
     let row = repository(ctx, &project, repo)?;
     let _lock = operation_lock(ctx, &row.path)?;
     let Some((home, mut record)) = active_for_repo(ctx, &row.path)? else {
-        bail!("no active pile review; start one with ha review {slug}");
+        return Err(crate::refusal::error(
+            "no active pile review",
+            format!(
+                "ha review {} --repo {}",
+                crate::remote::quote(slug),
+                crate::remote::quote(&row.path)
+            ),
+        ));
     };
     if record.fast_forward || matches!(record.phase, Phase::Landing | Phase::Cancelling) {
         advance(ctx, &home, &mut record)?;
@@ -1558,11 +1608,20 @@ pub(crate) fn require_follow_up(project: &Project, id: &str) -> Result<()> {
                 .any(|m| m.thread == id && !excluded(&record, id))
                 || record.phase == Phase::Landing && record.reviewer.as_deref() == Some(id))
         {
-            bail!(
-                "{} is in {}; cancel its review before requesting a follow-up",
-                id,
-                record.id
-            );
+            return Err(crate::refusal::error(
+                format!(
+                    "{id} is in {}; finish landing before a follow-up, or cancel an unlanded review",
+                    record.id
+                ),
+                record.command(
+                    project,
+                    if record.fast_forward || record.phase == Phase::Landing {
+                        "retry"
+                    } else {
+                        "cancel"
+                    },
+                ),
+            ));
         }
     }
     let lane = thread::load(project, id)?;
@@ -1581,7 +1640,10 @@ pub(crate) fn require_resolvable(project: &Project, id: &str) -> Result<()> {
             && (record.members.iter().any(|m| m.thread == id)
                 || record.reviewer.as_deref() == Some(id))
         {
-            bail!("{id} is in {}; cancel the review first", record.id);
+            return Err(crate::refusal::error(
+                format!("{id} is in {}; cancel the review first", record.id),
+                record.command(project, "cancel"),
+            ));
         }
     }
     Ok(())
@@ -1859,8 +1921,9 @@ pub(crate) fn tick(ctx: &Ctx, project: &Project) -> Result<()> {
             }
             if !enabled {
                 return Ok(Some(format!(
-                    "automatic review not enabled (next: ha review {})",
-                    project.slug
+                    "automatic review not enabled (next: ha review {} --repo {})",
+                    crate::remote::quote(&project.slug),
+                    crate::remote::quote(&repo)
                 )));
             }
             let mut blockers: Vec<String> = threads

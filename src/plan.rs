@@ -428,7 +428,7 @@ pub(crate) fn step_unlink(
     if tasks.is_empty() && after.is_empty() {
         return Err(crate::refusal::error(
             "plan_unlink: at least one --task or --after is required",
-            format!("ha plan step unlink {slug} {id} --after <step-id> --why <reason>"),
+            format!("ha plan step unlink {slug} {id} --after <step-id> --reason \"<reason>\""),
         ));
     }
     let (plan, (removed_tasks, removed_after, changed)) = with_plan(&project, expect, |plan| {
@@ -1356,7 +1356,6 @@ mod tests {
                 machine: None,
                 base: None,
                 task: "Build B".into(),
-                plain: "Build B".into(),
                 workflow: None,
                 recipe: None,
                 task_id: "job-0002".into(),
