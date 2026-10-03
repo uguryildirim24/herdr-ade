@@ -40,7 +40,7 @@ Content folders in this tree are created on their first write; a new project has
 
 ## Safety and cleanup
 
-ADE is not a sandbox. Shipped recipes bypass agent permission prompts, and their declared bypass flags are required. Agents have the launching account's filesystem, network and credential access. Git worktrees isolate changes, not privileges. Trust repositories, briefs and selected providers before dispatch; do not copy provider credentials between machines. Missing process or publication evidence is not success. Seal, merge, push, install and delivery remain separate facts.
+ADE is not a sandbox. The first-result guide's Pi recipes execute tools without per-command approval. Claude and agy require `--dangerously-skip-permissions`, and Cursor requires `--force`; removing a required flag makes a recipe invalid, not safely interactive. Agents have the launching account's filesystem, network and credential access. Git worktrees isolate changes, not privileges. Trust repositories, briefs and selected providers before dispatch; do not copy provider credentials between machines. Missing process or publication evidence is not success. Seal, merge, push, install and delivery remain separate facts.
 
 Deletion verifies owned-resource scope and requires a platform trash tool on every affected machine before effects. Shared repositories stay; GitHub deletion requires explicit `--github`. Use `delete --preview` to inspect scope or `archive` for a reversible lifecycle change. Lane cleanup follows the checks below, not an agent permission dialog.
 
@@ -95,7 +95,7 @@ Every command accepts the global `--json` flag. It returns one record with an
 | `pause`, `resume`, `archive`, `unarchive`, `delete [--preview] [--github]` | Project lifecycle. `delete` checks platform trash tools on every affected machine before effects, stops project-owned processes and sends owned files to the platform trash; shared resources stay. macOS uses `/usr/bin/trash`; Linux uses `gio trash` or `trash-put`. There is no permanent-file-deletion fallback. GitHub deletion is explicit. |
 | `ticker start \| run \| stop \| status`, `doctor`, `skill` | Housekeeping. |
 
-An early `agent_not_ready` startup block keeps the brief pending and shows as starting while the recipe's ready window remains open. Only a still-blocked agent at the end of that window fails with a visible-screen excerpt. Claude's default window is five minutes; recipes can set `ready_timeout_ms` explicitly. `thread retry` refuses a still-starting or working agent and shows its pane text. Groups, first match wins: Resolved; Working while starting; **Needs attention** (failed, a launch stuck for 60 seconds, a process gone with no report, or blocked for 30 seconds); **Unknown** for a box lane that has not been polled; **Working**; **Ready for review** (a report exists and you haven't acknowledged it); Idle. A report-only lane whose sealed commit equals its base closes after its final copy. A changed lane joins its repository pile. Coordinator retries are not limited by the automatic retry budget.
+An early `agent_not_ready` startup block keeps the brief pending and shows as starting while the recipe's ready window remains open. Only a still-blocked agent at the end of that window fails with a visible-screen excerpt. Claude's default window is five minutes; recipes can set `ready_timeout_ms` explicitly. ADE answers Claude's old and new trust dialogs only in a verified local managed worktree with its frozen brief and registered branch. For the new dialog it sends Down, verifies the visible Yes highlight, then Enter. Coordinator/project folders and remote or unverified folders are outside that automation. `thread retry` refuses a still-starting or working agent and shows its pane text. Groups, first match wins: Resolved; Working while starting; **Needs attention** (failed, a launch stuck for 60 seconds, a process gone with no report, or blocked for 30 seconds); **Unknown** for a box lane that has not been polled; **Working**; **Ready for review** (a report exists and you haven't acknowledged it); Idle. A report-only lane whose sealed commit equals its base closes after its final copy. A changed lane joins its repository pile. Coordinator retries are not limited by the automatic retry budget.
 
 ## Plans and questions
 
@@ -141,7 +141,7 @@ Routing and executable recipes live together in `~/.config/herdr-ade/config.toml
 
 The coordinator uses routing by default. When you explicitly choose the coordinator recipe for a project, `open <project> --recipe <id> --basis request:<id>` starts it and stores that exact recipe and request for process relaunches; a request from another project is `request:<project>/<id>`. When routing's choice does not fit a lane, the coordinator can start it with any enabled `--recipe <id>`. The lane launch record keeps the recipe with routing rule `explicit`; its basis and request are empty.
 
-The starting table is:
+The [first-result guide](getting-started.md) uses one Pi provider throughout. This optional multi-provider example requires Claude, Pi's selected provider and agy installed and logged in on their respective machines. Restore the corresponding complete rows from [`assets/default-recipes.toml`](../assets/default-recipes.toml) if the guide disabled them; replace its routing table, do not append a second one:
 
 ```toml
 [routing]
@@ -168,13 +168,21 @@ recipe = "claude_fable_xhigh"
 # "SHA256-of-exact-task-file-bytes" = "recipe-id"
 ```
 
-A rule may override the global recovery policy with `retries = N`. `herdr-ade failed "<failure and evidence>"` reports failed work and retries that same recipe up to the bound. `--class provider --provider-kind <kind>` and `--class lost_connection` also use bounded same-recipe retries; `process_gone` restarts the attempt within the same bound; `unknown` waits for the coordinator. Exhausted recovery stays failed.
+A rule may override global `retries = N`. `herdr-ade failed "<failure and evidence>"` seals failed work; automatic recovery retries the same recipe up to that bound, preserving the checkout. Provider, connection and process-loss failures never authorize a model switch. A lost connection needs reachable process evidence before replacement; unknown evidence waits for the coordinator. Exhaustion remains failed, but a coordinator can issue a reasoned `thread retry` beyond the automatic budget.
 
 Each launch record and dispatch journal row says `pin`, `default`, `explicit` or `rule[n]`, so the reason for selection stays inspectable. Coordinator rows also carry `recipe_basis` and `recipe_request`; lane rows leave them empty. Historical launch and dispatch records without those fields still load.
 
 ## Inbox notifications
 
-The ticker shows one Herdr notification for each set of new inbox items. The coordinator reads those items in its next context; the ticker never types an inbox prompt into its pane. A confirmed shell in the existing bound pane permits one accepted automatic restart with the saved recipe. Failed starts remain retryable after another process check; unknown processes and missing panes do not authorize a restart. A missing pane produces a notice to run `open`. Explicit prompt refusals remain retryable; ambiguous delivery waits for resolution instead of blindly repeating the prompt.
+The ticker notifies new inbox items; the next `context` reads them. It does not type an inbox prompt into the coordinator pane.
+
+- **Coordinator process lost:** a confirmed shell in the exact bound pane permits one accepted automatic restart with its saved recipe. A failed start is rechecked before retry; unknown process evidence does not authorize replacement. `open` focuses an already-live matching agent rather than duplicating it.
+- **Coordinator pane lost/closed:** intentional close stays closed; ambiguous absence gets a notice, not blind recreation. Run `herdr-ade open <project>` to resume. `--rebind` moves a binding only when the old session socket is gone; `--reprime` refreshes instructions, not authentication.
+- **Coordinator provider error:** recognized terminal Claude limit/API errors get one same-session retry at the displayed reset or, without one, after five minutes. Persistent refusal needs inspection/login; no new session or model is selected. This screen-based recovery is Claude-specific, not a promise for the Pi walkthrough or every adapter.
+- **Lane failed, waiting or stalled:** use the current notice and context action row. A confirmed gone/failed attempt can use `herdr-ade thread retry <project> <thread> --reason "<diagnosis>"`; WAITING/BLOCKED may need input, not approval. A stall notice names lack of output/commits, not confirmed death. Login must happen on the affected machine.
+- **Parked lane correction:** `herdr-ade thread prompt <project> <thread> --text-file <file>` reopens an open parked lane on the same branch/attempt; correction needs a fresh seal. Cancel an active unlanded review before prompting its member; resolved/merged work needs a new lane.
+
+Explicit prompt refusals remain retryable. Ambiguous delivery waits for evidence instead of repeating a possibly accepted prompt. For a stuck reviewer or interrupted landing use `herdr-ade review retry <project> --repo <path>`; after fast-forward, recovery finishes publication/install/cleanup rather than cancelling landed work.
 
 ## Brief delivery
 
