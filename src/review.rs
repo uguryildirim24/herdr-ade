@@ -814,6 +814,7 @@ fn task(project: &Project, review: &Review) -> String {
             member.sha,
             crate::events::artifact_path(project, &member.artifact).display()
         ));
+        out.push_str(&member_packet(project, member));
     }
     out.push_str("\nGate policy (select by all paths changed from the integration base, including your fixes):\n");
     out.push_str(
@@ -835,6 +836,50 @@ fn task(project: &Project, review: &Review) -> String {
     out.push_str(&format!("\nWrite a report with TOML front matter:\n+++\nreview = \"{}\"\nverdict = \"MERGE\" # or REJECT\ncandidate = \"<your exact HEAD>\"\ngates = [{{ command = \"<selected command>\", exit = 0 }}]\n# Optional: without = {{ t-0001 = \"one-line reason\" }}\n+++\n\nUse gates = [] if none are selected. If excluding lanes, rebuild from the integration base without those lanes before running gates; their commits must not remain ancestors of your candidate. Include gate output and findings. Commit repository changes if any, leave runtime deliverables untracked, then `ha done`. Output in another repository belongs in the report.\n", review.id));
     out
 }
+/// This text becomes part of the reviewer's own immutable launch brief. Never
+/// substitute today's task wording for the intent frozen at member launch.
+fn member_packet(project: &Project, member: &Member) -> String {
+    let mut out = format!(
+        "  Durable evidence: seal `{}` (attempt {}), report artifact `{}`.\n",
+        member.event, member.attempt, member.artifact
+    );
+    let brief = thread::load(project, &member.thread).and_then(|lane| {
+        let hash = &lane.launch.brief_hash;
+        let bytes = thread::artifact(project, hash)?;
+        Ok((hash.clone(), String::from_utf8(bytes)?))
+    });
+    match brief {
+        Ok((hash, text)) => out.push_str(&format!(
+            "\n### {}: original frozen brief and acceptance\nBrief artifact `{hash}`\n\n{text}\n\n### End original {} brief\n",
+            member.thread, member.thread
+        )),
+        Err(error) => out.push_str(&format!(
+            "  Original brief/acceptance: not established ({error}). Do not infer intent from the report.\n"
+        )),
+    }
+    let (tasks, errors) = crate::task::list_with_errors(project);
+    for task in tasks
+        .iter()
+        .filter(|task| task.attempts.contains(&member.thread))
+    {
+        out.push_str(&format!(
+            "  Task evidence record `{}`; requests: {}\n",
+            task.id,
+            task.authority.join(", ")
+        ));
+        for evidence in &task.installed {
+            out.push_str(&format!(
+                "  Installation (not acceptance): {} at {}; machine {:?}, build {:?}\n",
+                evidence.command, evidence.at, evidence.machine, evidence.build
+            ));
+        }
+    }
+    for error in errors {
+        out.push_str(&format!("  Task evidence: not established ({error}).\n"));
+    }
+    out
+}
+
 #[derive(Serialize)]
 struct GatePolicy {
     gates: Vec<project::Gate>,

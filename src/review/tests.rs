@@ -112,6 +112,46 @@ fn seal_verdict(
     );
 }
 #[test]
+fn packet_carries_original_acceptance_and_durable_evidence_not_rewritten_intent() {
+    let fx = configured();
+    let (id, _) = lane(&fx, 1);
+    let original = "# Original request\nRead every source.\nAcceptance: exhaustive coverage, preserve existing behavior.\n";
+    let hash = thread::store_artifact(&fx.project, original.as_bytes()).unwrap();
+    thread::update(&fx.project, &id, |lane| {
+        lane.launch.brief_hash = hash.clone()
+    })
+    .unwrap();
+    let mut record = job(&fx, &id);
+    record.acceptance = vec!["Later rewritten intent".into()];
+    record.installed.push(crate::task::Evidence {
+        at: "then".into(),
+        command: "ha harness install".into(),
+        acceptance: vec![],
+        machine: Some("oci".into()),
+        build: Some("build-sha".into()),
+    });
+    std::fs::write(
+        fx.project
+            .record_dir_for_write("tasks")
+            .unwrap()
+            .join(format!("{}.toml", record.id)),
+        toml::to_string(&record).unwrap(),
+    )
+    .unwrap();
+    let review = prepared(&fx);
+    let packet = task(&fx.project, &review);
+    assert!(packet.contains(original));
+    assert!(packet.contains(&hash));
+    assert!(packet.contains(&review.members[0].event));
+    assert!(packet.contains(&review.members[0].artifact));
+    assert!(packet.contains("Installation (not acceptance)"));
+    assert!(packet.contains("build-sha"));
+    assert!(!packet.contains("Later rewritten intent"));
+    thread::update(&fx.project, &id, |lane| lane.launch.brief_hash.clear()).unwrap();
+    assert!(task(&fx.project, &review).contains("Original brief/acceptance: not established"));
+}
+
+#[test]
 fn idle_reviewer_warns_once_and_a_new_verdict_lands() {
     let fx = configured();
     lane(&fx, 1);
