@@ -1,11 +1,10 @@
 //! Recoverable `done` and `waiting` operations (SPEC-ADE D5, item 32).
 
-use std::fs::{File, OpenOptions};
-use std::io::{Read as _, Write as _};
+use std::fs::File;
+use std::io::Read as _;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
-use sha2::{Digest, Sha256};
 
 use crate::contracts::{
     DonePayload, Event, EventPayload, Op, OpKind, OpState, Recipient, Requested, WaitingPayload,
@@ -14,6 +13,7 @@ use crate::events;
 use crate::paths::Ctx;
 use crate::project::{self, Project};
 use crate::runner::{Cmd, Runner};
+use crate::thread::sha256_hex;
 
 fn ops_dir(project: &Project) -> PathBuf {
     project.record_dir("ops")
@@ -92,7 +92,7 @@ pub(crate) fn reserve_done(project: &Project, r: Reservation<'_>, worktree: &Pat
         bail!("op_payload_invalid: reserve_done needs a done payload");
     };
     let report = stable_read(&resolve_report(worktree, report_path)?)?;
-    let hash = format!("{:x}", Sha256::digest(&report));
+    let hash = sha256_hex(&report);
     reserve_inner(project, r, Some(&hash))
 }
 
@@ -328,7 +328,7 @@ fn stage_done_inner(
     if op
         .report_hash
         .as_deref()
-        .is_some_and(|hash| hash != format!("{:x}", Sha256::digest(&first)))
+        .is_some_and(|hash| hash != sha256_hex(&first))
     {
         bail!("report_unstable: report changed after reservation");
     }
@@ -404,7 +404,7 @@ fn stage_done_inner(
         )?;
     }
     let has_changes = git.trees_differ(base, sha)?;
-    let artifact = write_artifact(project, &first)?;
+    let artifact = events::store_artifact(project, &first)?;
     advance_staged(
         project,
         id,
@@ -832,40 +832,6 @@ fn stable_read(path: &Path) -> Result<Vec<u8>> {
         bail!("report_unstable: {} changed during a read", path.display());
     }
     Ok(bytes)
-}
-
-fn write_artifact(project: &Project, bytes: &[u8]) -> Result<String> {
-    let hash = format!("{:x}", Sha256::digest(bytes));
-    let dir = project.state_dir().join("artifacts");
-    std::fs::create_dir_all(&dir)?;
-    let path = dir.join(&hash);
-    if path.exists() {
-        if std::fs::read(&path)? == bytes {
-            return Ok(hash);
-        }
-        bail!("artifact_conflict: {} has different bytes", path.display());
-    }
-    let tmp = dir.join(format!(".{hash}.{}.tmp", std::process::id()));
-    let result = (|| -> Result<()> {
-        let mut file = OpenOptions::new().write(true).create_new(true).open(&tmp)?;
-        file.write_all(bytes)?;
-        file.sync_all()?;
-        match std::fs::rename(&tmp, &path) {
-            Ok(()) => {}
-            Err(error) if path.exists() && std::fs::read(&path)? == bytes => {
-                let _ = std::fs::remove_file(&tmp);
-                let _ = error;
-            }
-            Err(error) => return Err(error.into()),
-        }
-        File::open(&dir)?.sync_all()?;
-        Ok(())
-    })();
-    if result.is_err() {
-        let _ = std::fs::remove_file(&tmp);
-    }
-    result?;
-    Ok(hash)
 }
 
 #[cfg(test)]

@@ -741,23 +741,7 @@ pub(crate) fn launch_prompt(prefix: &str, slug: &str, t: &Thread) -> String {
 
 // ---------------------------------------------------------------- briefs
 
-/// Stores immutable prose alongside the project's machine records. The hash
-/// is both its filename and the receipt carried by the thread record.
-pub(crate) fn store_artifact(project: &Project, bytes: &[u8]) -> Result<String> {
-    let hash = sha256_hex(bytes);
-    let dir = project.state_dir().join("artifacts");
-    std::fs::create_dir_all(&dir)?;
-    let path = dir.join(&hash);
-    match std::fs::read(&path) {
-        Ok(existing) if existing == bytes => {}
-        Ok(_) => bail!("artifact_conflict: {} has different bytes", path.display()),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            crate::project::write_atomic(&path, bytes)?;
-        }
-        Err(error) => return Err(error.into()),
-    }
-    Ok(hash)
-}
+pub(crate) use crate::events::store_artifact;
 
 pub(crate) fn artifact(project: &Project, hash: &str) -> Result<Vec<u8>> {
     let path = project.state_dir().join("artifacts").join(hash);
@@ -1460,10 +1444,7 @@ pub(crate) enum CopyOutcome {
 }
 
 pub(crate) fn sha256_hex(bytes: &[u8]) -> String {
-    Sha256::digest(bytes)
-        .iter()
-        .map(|b| format!("{b:02x}"))
-        .collect()
+    format!("{:x}", Sha256::digest(bytes))
 }
 
 fn is_real_dir(path: &Path) -> bool {
