@@ -467,6 +467,7 @@ impl AuthorityRef {
         }
         let rest = text.strip_prefix("ask:")?;
         let (id, revision) = rest.rsplit_once('@')?;
+        crate::ask::validate_ask_id(id).ok()?;
         Some(AuthorityRef::Ask {
             id: id.to_string(),
             revision: revision.parse().ok()?,

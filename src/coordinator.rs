@@ -1201,7 +1201,6 @@ pub(crate) fn context(ctx: &Ctx, slug: &str, peek: bool, full: bool) -> Result<(
     if !peek && owns_read {
         // An external read is a peek: it cannot consume the coordinator's delta.
         acknowledge_bootstrap(&project)?;
-        crate::project::write_json(&path, &delta.cursor)?;
         if coordinator.is_some() && delta.remaining == 0 {
             crate::steps::receipt(&project, wake_revision)?;
         }
@@ -1221,6 +1220,9 @@ pub(crate) fn context(ctx: &Ctx, slug: &str, peek: bool, full: bool) -> Result<(
                 }
             }
         }
+        // Receipts are idempotent: a crash replays the delivered rows until
+        // every receipt is durable. Only then may the cursor skip those rows.
+        crate::project::write_json(&path, &delta.cursor)?;
     }
     Ok(())
 }
