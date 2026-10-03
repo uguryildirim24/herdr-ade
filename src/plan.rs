@@ -1264,6 +1264,81 @@ mod tests {
     }
 
     #[test]
+    fn binding_shapes_pin_current_step_states() {
+        let fx = fixture();
+        let mut tasks = Vec::new();
+        for n in 1..=7 {
+            let id = format!("job-{n:04}");
+            write_task(&fx, &id);
+            tasks.push(crate::task::load(&fx.project, &id).unwrap());
+        }
+        // Explicit installed evidence needs neither a lane nor a seal.
+        tasks[0].installed.push(crate::task::Evidence {
+            at: project_goal(&fx.project), command: "historical install".into(),
+            acceptance: vec![], machine: None, build: None,
+        });
+        tasks[1] = tasks[0].clone();
+        tasks[1].id = "job-0002".into();
+        tasks[1].plan_step = Some("s-2".into());
+        tasks[2].dropped.push(crate::task::DropEvidence {
+            at: "2026-09-22T00:00:00Z".into(), reason: "not required".into(),
+        });
+        let historical = fx.thread("historical merged");
+        thread::update(&fx.project, &historical, |t| t.merged_sha = "old-sha".into()).unwrap();
+        let no_change = fx.thread("no change");
+        let seal = fx.seal_done(&no_change, 1, 1, "old-sha", "research");
+        thread::update(&fx.project, &no_change, |t| {
+            t.changes_seal = seal.clone(); t.has_changes = Some(false);
+        }).unwrap();
+        tasks[3].attempts = vec![no_change];
+        let critic = fx.thread("failed critic");
+        thread::update(&fx.project, &critic, |t| {
+            t.role = "critic".into(); t.merged_sha = "old-sha".into();
+        }).unwrap();
+        fx.seal_done(&critic, 1, 1, "old-sha", "+++\nverdict = \"FAIL\"\n+++\n");
+        tasks[4].attempts = vec![critic.clone()];
+        let awaiting_install = fx.thread("historical awaiting install");
+        thread::update(&fx.project, &awaiting_install, |t| {
+            t.merged_sha = "old-sha".into(); t.historical_install_required = true;
+        }).unwrap();
+        tasks[5].attempts = vec![awaiting_install];
+        for task in tasks {
+            std::fs::write(fx.project.state_dir().join("tasks").join(format!("{}.toml", task.id)), toml::to_string(&task).unwrap()).unwrap();
+        }
+        let step = |n: u32, tasks: &[&str], threads: Vec<String>| PlanStep {
+            id: format!("s-{n}"), tasks: tasks.iter().map(|id| (*id).into()).collect(),
+            threads, ..PlanStep::default()
+        };
+        let mut plan = Plan { schema: 1, steps: vec![
+            step(1, &["job-0001"], vec![]),
+            step(2, &[], vec![]),
+            step(3, &[], vec![historical]),
+            step(4, &["job-0003"], vec![]),
+            step(5, &["job-0004"], vec![]),
+            step(6, &["job-0005"], vec![]),
+            step(7, &["job-9999"], vec![]),
+            step(8, &["job-0001", "job-0003"], vec![]),
+            step(9, &["job-0006"], vec![]),
+            step(10, &["job-0007"], vec![]),
+            step(11, &[], vec!["t-9999".into()]),
+            step(12, &[], vec![]),
+            step(14, &["job-9999"], vec![]),
+            step(16, &[], vec![critic]),
+        ], ..Plan::default() };
+        plan.steps[11].subtasks = vec![step(13, &["job-0001"], vec![])];
+        plan.steps[12].subtasks = vec![step(15, &["job-0001"], vec![])];
+        write(&fx.project, &plan).unwrap();
+        let mut loaded = load(&fx.project).unwrap().unwrap();
+        project_states(&fx.project, &mut loaded);
+        use StepState::{Done, Left, Running};
+        assert_eq!(all_steps(&loaded).map(|s| s.state).collect::<Vec<_>>(), vec![
+            Done, Done, Done, Left, Done, Running, Left, Done, Running, Left,
+            Left, Done, Done, Running, Done, Running,
+        ]);
+        assert_eq!(all_steps(&loaded).filter(|s| s.state == Done).count(), 8);
+    }
+
+    #[test]
     fn authored_outcomes_replace_historical_prose_without_changing_steps() {
         let fx = fixture();
         let ctx = fx.world.ctx();
