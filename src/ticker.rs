@@ -1594,7 +1594,7 @@ fn thread_pass(
             .agent_state
             .as_deref()
             .is_some_and(crate::herdr::ready_state);
-        if !t.startup_wait_started.is_empty() {
+        if !t.startup_wait_started.is_empty() || (t.bootstrap == "resuming" && ready) {
             if state == "blocked" && !t.trust_answered {
                 // A refused trust check leaves the normal ready-window failure
                 // visible; only Claude itself may persist an accepted dialog.
@@ -5899,22 +5899,26 @@ mod tests {
 
     #[test]
     fn parked_local_pi_reopens_with_brief_then_ordered_follow_ups() {
-        parked_pi_reopens_with_brief_then_ordered_follow_ups(false, false);
+        parked_pi_reopens_with_brief_then_ordered_follow_ups(false, false, false);
     }
 
     #[test]
     fn parked_box_pi_reopens_with_brief_then_ordered_follow_ups() {
-        parked_pi_reopens_with_brief_then_ordered_follow_ups(true, false);
+        parked_pi_reopens_with_brief_then_ordered_follow_ups(true, false, false);
     }
 
     #[test]
     fn resumed_local_and_box_pi_deliver_the_reopening_follow_up_and_record_later_delivery() {
-        for remote in [false, true] {
-            parked_pi_reopens_with_brief_then_ordered_follow_ups(remote, true);
+        for (remote, late) in [(false, false), (true, false), (false, true)] {
+            parked_pi_reopens_with_brief_then_ordered_follow_ups(remote, true, late);
         }
     }
 
-    fn parked_pi_reopens_with_brief_then_ordered_follow_ups(remote: bool, resuming: bool) {
+    fn parked_pi_reopens_with_brief_then_ordered_follow_ups(
+        remote: bool,
+        resuming: bool,
+        late: bool,
+    ) {
         use crate::scenarios::World;
         let world = World::new();
         let project = world.project("demo", "a.sock");
@@ -6101,6 +6105,31 @@ mod tests {
             .unwrap();
             pass.error
         };
+        if late {
+            startup_failure(
+                &LaunchPass {
+                    ctx: &ctx,
+                    project: &project,
+                    herdr: &herdr,
+                    threads: &[],
+                    agents: &[],
+                    panes: std::slice::from_ref(&pane),
+                },
+                &thread::load(&project, &lane.id).unwrap(),
+                "agent state unknown at the end of its ready window",
+            )
+            .unwrap();
+            assert_eq!(
+                thread::load(&project, &lane.id).unwrap().status,
+                thread::Status::Failed
+            );
+            assert!(run_pass().is_none());
+            let recovered = thread::load(&project, &lane.id).unwrap();
+            assert_eq!(recovered.status, thread::Status::Open);
+            assert!(recovered.startup_wait_started.is_empty());
+            assert_eq!(recovered.bootstrap, "resuming");
+            assert_eq!(world.runner.count("agent prompt"), 0);
+        }
         if resuming {
             assert!(run_pass().is_none());
             assert_eq!(
