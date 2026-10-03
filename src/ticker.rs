@@ -7260,7 +7260,7 @@ mod tests {
         );
         let batch: serde_json::Value =
             project::read_json(&f.project.state_dir().join("notice-batch.json")).unwrap();
-        assert_eq!(batch["goals"], serde_json::json!([]));
+        assert_eq!(batch["entries"], serde_json::json!([]));
     }
 
     #[test]

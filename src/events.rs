@@ -663,10 +663,10 @@ pub(crate) fn append_delivery_locked(
     state: DeliveryState,
 ) -> Result<()> {
     project.record_dir_for_write("deliveries")?;
-    if state != DeliveryState::Submitted && states(project, event)?.contains(&state) {
+    let rows = delivery_lines(project, event)?;
+    if state != DeliveryState::Submitted && rows.iter().any(|line| line.state == state) {
         return Ok(());
     }
-    let rows = delivery_lines(project, event)?;
     let dir = deliveries_dir(project).join(event);
     std::fs::create_dir_all(&dir)?;
     let path = dir.join(format!("{:08}.json", rows.len() + 1));
@@ -1097,16 +1097,22 @@ artifact = "ff2346a2702021221a52567a733cc60301ac507dc2da3c6a0629e2c6ca58f75b"
             state: DeliveryState::Submitted,
         };
         let old = format!(
-            "{}\n{{\"event\":\"{}\",\"state\":",
+            "{{\"event\":\"{}\",\"state\":\"queued\"}}\n{}\n{{\"event\":\"{}\",\"state\":",
+            event.id,
             serde_json::to_string(&submitted).unwrap(),
             event.id
         );
         std::fs::write(&path, &old).unwrap();
+        append_delivery(&project, &event.id, DeliveryState::Queued).unwrap();
         append_delivery(&project, &event.id, DeliveryState::Acknowledged).unwrap();
         append_delivery(&project, &event.id, DeliveryState::Acknowledged).unwrap();
         assert_eq!(
             states(&project, &event.id).unwrap(),
-            vec![DeliveryState::Submitted, DeliveryState::Acknowledged]
+            vec![
+                DeliveryState::Queued,
+                DeliveryState::Submitted,
+                DeliveryState::Acknowledged
+            ]
         );
         assert_eq!(std::fs::read_to_string(&path).unwrap(), old);
         let bad = deliveries_dir(&project)

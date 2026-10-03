@@ -197,10 +197,10 @@ fn pending_hold_notice_survives_a_cleared_hold() {
     enable(&fx);
     lane(&fx, 1);
     let (working, _) = lane_unsealed(&fx, 2);
-    // No coordinator agent is available to accept the notice yet.
+    // The outbox accepts the notice even without a coordinator agent.
     tick(&fx.world.ctx(), &fx.project).unwrap();
     crate::steps::deliver_transition_notices(&fx.world.ctx(), &fx.project).unwrap();
-    assert!(!hold_notices(&fx.project).unwrap()[0].submitted);
+    assert!(hold_notices(&fx.project).unwrap()[0].submitted);
     fx.seal_waiting(&working, 1, 1, "need input");
     allocated_reviewer(&fx, "review-1");
     tick(&fx.world.ctx(), &fx.project).unwrap();
