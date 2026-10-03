@@ -262,6 +262,9 @@ pub(crate) struct Op {
     pub(crate) kind: OpKind,
     pub(crate) recipient: Recipient,
     pub(crate) helper_pid: u32,
+    /// Exact reserved placement; historical operations did not record it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) pane: Option<String>,
     pub(crate) requested: Requested,
     /// Fixed event id: equal to `op` (SPEC-ADE D5, item 32).
     pub(crate) event: String,

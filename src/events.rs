@@ -726,7 +726,11 @@ pub(crate) fn latest_event<'e>(
     events
         .iter()
         .filter(|e| e.thread == thread && e.attempt == attempt)
-        .max_by(|a, b| (&a.created, &a.id).cmp(&(&b.created, &b.id)))
+        .max_by(|a, b| {
+            a.created
+                .cmp(&b.created)
+                .then_with(|| crate::ops::submission_id_order(&a.id, &b.id))
+        })
 }
 
 /// The seal before a follow-up may be followed by a waiting event. Keep
@@ -739,7 +743,11 @@ pub(crate) fn latest_done_event<'e>(
     events
         .iter()
         .filter(|e| e.thread == thread && e.attempt == attempt && e.payload.done.is_some())
-        .max_by(|a, b| (&a.created, &a.id).cmp(&(&b.created, &b.id)))
+        .max_by(|a, b| {
+            a.created
+                .cmp(&b.created)
+                .then_with(|| crate::ops::submission_id_order(&a.id, &b.id))
+        })
 }
 
 pub(crate) fn checked(project: &Project) -> Result<Vec<Event>> {

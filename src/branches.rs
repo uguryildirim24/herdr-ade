@@ -215,11 +215,10 @@ pub(crate) fn require_published_tip(
         let remote = refs(ctx.runner, &record.repo, Some(&url))?;
         let local = refs(ctx.runner, &record.repo, None)?;
         let events = crate::events::list(project);
-        let latest_seal = events
-            .iter()
-            .filter(|event| event.thread == record.id)
-            .filter_map(|event| event.payload.done.as_ref())
-            .rfind(|done| done.published_ref.is_some());
+        let latest_seal =
+            crate::events::latest_done_event(&events, &record.id, record.attempt.max(1))
+                .and_then(|event| event.payload.done.as_ref())
+                .filter(|done| done.published_ref.is_some());
         let sealed = latest_seal.is_some_and(|done| {
             let reference = crate::ops::seal_ref(&record.branch, &done.sha);
             done.sha == tip
@@ -314,11 +313,10 @@ pub(crate) fn resolved_thread(ctx: &Ctx, project: &Project, record: &Thread) -> 
         None
     };
     let events = crate::events::list(project);
-    let last_box_seal = events
-        .iter()
-        .filter(|e| e.thread == record.id)
-        .filter_map(|e| e.payload.done.as_ref())
-        .rfind(|d| d.published_ref.is_some());
+    let last_box_seal =
+        crate::events::latest_done_event(&events, &record.id, record.attempt.max(1))
+            .and_then(|event| event.payload.done.as_ref())
+            .filter(|done| done.published_ref.is_some());
     let has_seal_refs = last_box_seal.is_some();
     let retained_tip = record
         .cleanup_reason

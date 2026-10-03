@@ -566,19 +566,26 @@ pub(crate) fn provision_card(
     let project_dir = project_dir.to_string_lossy();
     let project_md = format!("{project_dir}/PROJECT.md");
     let state_dir = format!("{project_dir}/.state");
-    let script = format!(
-        "set -e\n\
-         mkdir -p \"$(dirname {path})\"\n\
-         mkdir -p {state_dir}\n\
-         cat > {path}\n\
+    let write = format!(
+        "set -e\ncat > {path}\n\
          pm={pm}\n\
          if [ ! -f \"$pm\" ]; then\n\
            printf '+++\\nname = \"%s\"\\n+++\\n' {slug} > \"$pm\"\n\
          fi",
         path = quote(path),
-        state_dir = quote(&state_dir),
         pm = quote(&project_md),
         slug = quote(slug),
+    );
+    // Keep the same flock as Rust's project lock across exec, including on macOS.
+    let script = format!(
+        "set -e\nmkdir -p \"$(dirname {path})\" {state_dir}\n\
+         exec 9>{state_dir}/lock\nexec python3 -c {lock_exec} {write}",
+        path = quote(path),
+        state_dir = quote(&state_dir),
+        lock_exec = quote(
+            r#"import fcntl, os, sys; fcntl.flock(9, fcntl.LOCK_EX); os.set_inheritable(9, True); os.execvp("sh", ["sh", "-c", sys.argv[1]])"#
+        ),
+        write = quote(&write),
     );
     let out = ssh(runner, target, &script, Some(card), SSH_START_TIMEOUT)?;
     if !out.success() {
