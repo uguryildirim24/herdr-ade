@@ -4,6 +4,10 @@
 //! calls [`view`] so the project page, context and plans use the same
 //! projection.
 
+#[cfg(test)]
+#[path = "task/incident_tests.rs"]
+mod incident_tests;
+
 use std::collections::BTreeSet;
 use std::path::PathBuf;
 
@@ -94,6 +98,9 @@ pub(crate) struct Task {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) acceptance_review: Option<AcceptanceReview>,
     pub(crate) created: String,
+    /// Explicitly confirmed causes; never populated by retry or sealing.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) incidents: Vec<Incident>,
 }
 
 impl Default for Task {
@@ -114,6 +121,7 @@ impl Default for Task {
             installed: Vec::new(),
             acceptance_review: None,
             created: String::new(),
+            incidents: Vec::new(),
         }
     }
 }
@@ -147,6 +155,7 @@ pub(crate) struct View {
     pub(crate) next: String,
     pub(crate) failure_class: Option<FailureClass>,
     pub(crate) provider_kind: Option<String>,
+    pub(crate) repairs: Vec<RepairView>,
 }
 impl View {
     pub(crate) fn terminal_with_evidence(
@@ -536,6 +545,496 @@ pub(crate) fn link_attempt(project: &Project, id: &str, thread: &str) -> Result<
     Ok(task)
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub(crate) struct Incident {
+    pub(crate) cause: String,
+    pub(crate) boundary: String,
+    /// The original authorized recovery/spend/time limits, not a renewed budget.
+    pub(crate) limits: String,
+    pub(crate) confirmations: Vec<Confirmation>,
+    #[serde(default)]
+    pub(crate) installations: Vec<Evidence>,
+    #[serde(default)]
+    pub(crate) exercises: Vec<Exercise>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub(crate) struct Confirmation {
+    pub(crate) event: String,
+    pub(crate) at: String,
+    pub(crate) reason: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub(crate) struct Exercise {
+    pub(crate) event: String,
+    pub(crate) machine: String,
+    pub(crate) build: String,
+    pub(crate) evidence: String,
+}
+
+/// Only explicit coordinator judgments create associations. Retried transients
+/// stay in events and recovery; they never create work here.
+#[derive(Debug, clap::Args)]
+pub(crate) struct RepairArgs {
+    pub(crate) slug: String,
+    pub(crate) id: String,
+    #[command(subcommand)]
+    pub(crate) command: RepairCommand,
+}
+
+#[derive(Debug, clap::Subcommand)]
+pub(crate) enum RepairCommand {
+    /// Confirm that these failure/wait events share this diagnosed cause
+    Link {
+        #[arg(long)]
+        cause: String,
+        #[arg(long)]
+        boundary: String,
+        /// Required for the first link; retained unchanged on recurrence
+        #[arg(long)]
+        limits: Option<String>,
+        #[arg(long, required = true)]
+        event: Vec<String>,
+        #[arg(long)]
+        reason: String,
+    },
+    /// Record machine/build installation proof for an already reviewed repair
+    Install {
+        #[arg(long)]
+        cause: String,
+        #[arg(long)]
+        machine: String,
+        #[arg(long)]
+        build: String,
+        #[arg(long)]
+        at: String,
+        #[arg(long)]
+        evidence: String,
+    },
+    /// Judge a sealed successful exercise of the original failed boundary
+    Exercise {
+        #[arg(long)]
+        cause: String,
+        #[arg(long)]
+        boundary: String,
+        #[arg(long)]
+        machine: String,
+        #[arg(long)]
+        build: String,
+        #[arg(long)]
+        event: String,
+        #[arg(long)]
+        evidence: String,
+    },
+}
+
+fn nonempty(values: &[&str]) -> Result<()> {
+    if values.iter().any(|value| value.trim().is_empty()) {
+        bail!("repair_evidence: cause, boundary, limits and proof must be nonempty");
+    }
+    Ok(())
+}
+
+fn time(value: &str) -> Result<jiff::Timestamp> {
+    value
+        .parse()
+        .context("repair_evidence: expected a timestamp")
+}
+
+fn incident_mut<'a>(task: &'a mut Task, cause: &str) -> Result<&'a mut Incident> {
+    task.incidents
+        .iter_mut()
+        .find(|row| row.cause == cause)
+        .context("repair_cause: link the confirmed failure first")
+}
+
+/// This is an ordinary task mutation, never part of sealing or delivery.
+pub(crate) fn record_repair(project: &Project, id: &str, command: RepairCommand) -> Result<Task> {
+    let lock = project.lock()?;
+    let mut task = load(project, id)?;
+    let snapshot = EvidenceSnapshot::load(project);
+    match command {
+        RepairCommand::Link {
+            cause,
+            boundary,
+            limits,
+            event,
+            reason,
+        } => {
+            nonempty(&[&cause, &boundary, &reason])?;
+            let (tasks, errors) = list_with_errors(project);
+            if !errors.is_empty() {
+                bail!("repair_evidence: unreadable tasks; association unknown");
+            }
+            for other in tasks.iter().filter(|other| other.id != id) {
+                if other.incidents.iter().any(|row| row.cause == cause) {
+                    bail!(
+                        "repair_duplicate: cause `{cause}` already belongs to {}; retain its events and original limits there",
+                        other.id
+                    );
+                }
+                if other.incidents.iter().any(|row| {
+                    row.confirmations
+                        .iter()
+                        .any(|row| event.contains(&row.event))
+                }) {
+                    bail!("repair_duplicate: an event already belongs to {}", other.id);
+                }
+            }
+            if !snapshot.readable {
+                bail!("repair_evidence: unreadable events");
+            }
+            for id in &event {
+                let sealed = snapshot
+                    .events
+                    .iter()
+                    .find(|row| &row.id == id)
+                    .context("repair_event: failure event not found")?;
+                if crate::events::incident_text(sealed).is_none() {
+                    bail!("repair_event: {id} is not a single failure or dependency wait");
+                }
+                time(&sealed.created)?;
+                if task.incidents.iter().any(|row| {
+                    row.cause != cause && row.confirmations.iter().any(|row| &row.event == id)
+                }) {
+                    bail!("repair_duplicate: event {id} already has a confirmed cause");
+                }
+            }
+            if event.is_empty() {
+                bail!("repair_event: supply a failure event");
+            }
+            if !task.incidents.iter().any(|row| row.cause == cause) {
+                let limits = limits.as_deref().context(
+                    "repair_limits: preserve the original limits (use unknown when unavailable)",
+                )?;
+                nonempty(&[limits])?;
+                task.incidents.push(Incident {
+                    cause: cause.clone(),
+                    boundary: boundary.clone(),
+                    limits: limits.into(),
+                    confirmations: vec![],
+                    installations: vec![],
+                    exercises: vec![],
+                });
+            }
+            let incident = incident_mut(&mut task, &cause)?;
+            if incident.boundary != boundary
+                || limits.is_some_and(|limits| limits != incident.limits)
+            {
+                bail!("repair_limits: recurrence cannot change the original boundary or limits");
+            }
+            for event in event {
+                if !incident.confirmations.iter().any(|row| row.event == event) {
+                    incident.confirmations.push(Confirmation {
+                        event,
+                        at: project::now(),
+                        reason: reason.clone(),
+                    });
+                }
+            }
+        }
+        RepairCommand::Install {
+            cause,
+            machine,
+            build,
+            at,
+            evidence,
+        } => {
+            nonempty(&[&cause, &machine, &build, &evidence])?;
+            let installed_at = time(&at)?;
+            if installed_at > jiff::Timestamp::now() {
+                bail!("repair_install: installation is in the future");
+            }
+            require_accepted(project, &task, &snapshot)?;
+            let lane = crate::thread::load(
+                project,
+                task.attempts
+                    .last()
+                    .context("repair_install: no repair attempt")?,
+            )?;
+            let delivered = if let Some(review) = crate::review::lane_review(project, &lane)? {
+                let verdict = crate::events::load(project, &review.verdict_event)?;
+                if installed_at < time(&verdict.created)? {
+                    bail!("repair_install: installation predates review");
+                }
+                review.install_required
+                    && review.install
+                    && review
+                        .verdict
+                        .as_ref()
+                        .is_some_and(|verdict| verdict.candidate == build)
+            } else {
+                !lane.merged_sha.is_empty() && lane.installed_sha == build
+            };
+            let recorded = task.installed.iter().any(|row| {
+                row.machine.as_deref() == Some(&machine)
+                    && row.build.as_deref() == Some(&build)
+                    && time(&row.at).is_ok_and(|at| at == installed_at)
+            });
+            if !delivered && !recorded {
+                bail!("repair_install: no reviewed installed outcome for this build");
+            }
+            let incident = incident_mut(&mut task, &cause)?;
+            if !incident.installations.iter().any(|row| {
+                row.machine.as_deref() == Some(&machine)
+                    && row.build.as_deref() == Some(&build)
+                    && row.at == at
+            }) {
+                incident.installations.push(Evidence {
+                    at,
+                    command: evidence,
+                    acceptance: vec![],
+                    machine: Some(machine),
+                    build: Some(build),
+                });
+            }
+        }
+        RepairCommand::Exercise {
+            cause,
+            boundary,
+            machine,
+            build,
+            event,
+            evidence,
+        } => {
+            nonempty(&[&cause, &boundary, &machine, &build, &event, &evidence])?;
+            let sealed = snapshot
+                .events
+                .iter()
+                .find(|row| row.id == event)
+                .context("repair_exercise: event missing")?;
+            if !snapshot.readable
+                || sealed.payload.failed.is_some()
+                || sealed.payload.waiting.is_some()
+            {
+                bail!("repair_exercise: successful seal evidence unknown");
+            }
+            let done = sealed
+                .payload
+                .done
+                .as_ref()
+                .context("repair_exercise: not a successful seal")?;
+            crate::thread::artifact(project, &done.artifact)
+                .context("repair_exercise: successful report missing or corrupt")?;
+            let at = time(&sealed.created)?;
+            let incident = incident_mut(&mut task, &cause)?;
+            if incident.boundary != boundary {
+                bail!("repair_exercise: did not exercise the failed boundary");
+            }
+            if !incident.installations.iter().any(|row| {
+                row.machine.as_deref() == Some(&machine)
+                    && row.build.as_deref() == Some(&build)
+                    && time(&row.at).is_ok_and(|installed| installed < at)
+            }) {
+                bail!(
+                    "repair_exercise: success must follow installation on the same machine/build"
+                );
+            }
+            let exercise = Exercise {
+                event,
+                machine,
+                build,
+                evidence,
+            };
+            if !incident.exercises.contains(&exercise) {
+                incident.exercises.push(exercise);
+            }
+        }
+    }
+    write(project, &task)?;
+    drop(lock);
+    project::refresh_page(project)?;
+    Ok(task)
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub(crate) struct RepairView {
+    pub(crate) cause: String,
+    pub(crate) boundary: String,
+    pub(crate) limits: String,
+    pub(crate) outcome: String,
+    pub(crate) timeline: Vec<String>,
+    pub(crate) cost: crate::usage::Cost,
+    /// Recorded judgments only. No claim about unrecorded human effort.
+    pub(crate) interventions: usize,
+}
+
+fn repair_views(project: &Project, task: &Task, snapshot: &EvidenceSnapshot) -> Vec<RepairView> {
+    task.incidents
+        .iter()
+        .map(|incident| {
+            let mut timeline = Vec::new();
+            let mut cost_events = Vec::new();
+            let mut known = snapshot.readable
+                && (incident.installations.is_empty()
+                    || require_accepted(project, task, snapshot).is_ok());
+            let latest_install = incident
+                .installations
+                .iter()
+                .filter_map(|row| time(&row.at).ok().map(|at| (at, row)))
+                .max_by_key(|row| row.0);
+            let mut last_failure = None;
+            for confirmation in &incident.confirmations {
+                if let Some(event) = snapshot.events.iter().find(|event| {
+                    event.id == confirmation.event && crate::events::incident_text(event).is_some()
+                }) {
+                    cost_events.push(event);
+                    if let Ok(at) = time(&event.created) {
+                        last_failure =
+                            Some(last_failure.map_or(at, |last: jiff::Timestamp| last.max(at)));
+                        let recurrence = incident
+                            .installations
+                            .iter()
+                            .any(|row| time(&row.at).is_ok_and(|installed| at > installed));
+                        timeline.push(format!(
+                            "{} {} {}/attempt {}{}: {} (confirmed: {})",
+                            event.created,
+                            event.id,
+                            event.thread,
+                            event.attempt,
+                            if recurrence {
+                                " recurrence after install"
+                            } else {
+                                ""
+                            },
+                            crate::events::incident_text(event).unwrap_or("unknown"),
+                            confirmation.reason
+                        ));
+                        timeline.extend(
+                            crate::events::recovery_facts(project, &event.id)
+                                .into_iter()
+                                .map(|fact| format!("{} {} {fact}", event.created, event.id)),
+                        );
+                    } else {
+                        known = false;
+                    }
+                } else {
+                    known = false;
+                    timeline.push(format!("{} evidence unknown", confirmation.event));
+                }
+            }
+            for id in &task.attempts {
+                if let Ok(lane) = crate::thread::load(project, id) {
+                    cost_events.extend(snapshot.events.iter().filter(|event| event.thread == *id));
+                    match crate::review::lane_review(project, &lane) {
+                        Ok(Some(review)) => timeline.push(format!(
+                            "review {}: merged; install {}",
+                            review.id,
+                            if review.install_required && review.install {
+                                "recorded"
+                            } else {
+                                "not established"
+                            }
+                        )),
+                        Ok(None) if !lane.merged_sha.is_empty() => {
+                            timeline.push(format!("merged {}", lane.merged_sha))
+                        }
+                        Err(_) => {
+                            known = false;
+                            timeline.push("review evidence unknown".into());
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            for row in &incident.installations {
+                timeline.push(format!(
+                    "{} installed {} {}: {}",
+                    row.at,
+                    row.machine.as_deref().unwrap_or("unknown"),
+                    row.build.as_deref().unwrap_or("unknown"),
+                    row.command
+                ));
+            }
+            let mut last_success = None;
+            for exercise in &incident.exercises {
+                if let Some(event) = snapshot
+                    .events
+                    .iter()
+                    .find(|event| event.id == exercise.event)
+                {
+                    cost_events.push(event);
+                    let successful = event.payload.failed.is_none()
+                        && event.payload.waiting.is_none()
+                        && event.payload.done.as_ref().is_some_and(|done| {
+                            crate::thread::artifact(project, &done.artifact).is_ok()
+                        });
+                    if !successful {
+                        known = false;
+                    }
+                    if let Some((installed, installation)) = latest_install
+                        && installation.machine.as_deref() == Some(&exercise.machine)
+                        && installation.build.as_deref() == Some(&exercise.build)
+                        && successful
+                        && let Ok(at) = time(&event.created)
+                        && at > installed
+                    {
+                        last_success =
+                            Some(last_success.map_or(at, |last: jiff::Timestamp| last.max(at)));
+                    }
+                    timeline.push(format!(
+                        "{} {} exercised {} on {}/{}: {}",
+                        event.created,
+                        event.id,
+                        incident.boundary,
+                        exercise.machine,
+                        exercise.build,
+                        exercise.evidence
+                    ));
+                } else {
+                    known = false;
+                    timeline.push(format!("{} exercise evidence unknown", exercise.event));
+                }
+            }
+            timeline.sort();
+            let outcome = if !known {
+                "unknown"
+            } else if latest_install.is_some_and(|(installed, _)| {
+                last_failure.is_some_and(|failed| {
+                    failed > installed && last_success.is_none_or(|success| failed >= success)
+                })
+            }) {
+                "recurred after install"
+            } else if last_success.is_some() {
+                "effective at exercised boundary"
+            } else if latest_install.is_some() {
+                "installed; boundary unexercised"
+            } else {
+                "repair not established"
+            };
+            RepairView {
+                cause: incident.cause.clone(),
+                boundary: incident.boundary.clone(),
+                limits: incident.limits.clone(),
+                outcome: outcome.into(),
+                timeline,
+                cost: crate::usage::cost(&cost_events),
+                interventions: incident.confirmations.len()
+                    + incident.installations.len()
+                    + incident.exercises.len(),
+            }
+        })
+        .collect()
+}
+
+pub(crate) fn repair_summary(repair: &RepairView) -> String {
+    format!(
+        "{}: {} — boundary {}; original limits {}; {}; {} recorded judgments (other intervention cost unknown)\n{}",
+        repair.cause,
+        repair.outcome,
+        repair.boundary,
+        repair.limits,
+        repair.cost.summary(),
+        repair.interventions,
+        repair
+            .timeline
+            .iter()
+            .map(|row| format!("  {row}\n"))
+            .collect::<String>()
+    )
+}
+
 pub(crate) struct EvidenceSnapshot {
     events: Vec<crate::contracts::Event>,
     readable: bool,
@@ -565,12 +1064,14 @@ pub(crate) fn view_with_evidence(
     task: Task,
     evidence: &EvidenceSnapshot,
 ) -> View {
+    let repairs = repair_views(project, &task, evidence);
     let mut view = View {
         record: task,
         state: State::Open,
         next: "start an attempt".into(),
         failure_class: None,
         provider_kind: None,
+        repairs,
     };
     if !view.record.dropped.is_empty() {
         view.state = State::Dropped;
@@ -945,6 +1446,9 @@ pub(crate) fn render(_project: &Project, view: &View) -> String {
                 row.evidence
             ));
         }
+    }
+    for repair in &view.repairs {
+        text.push_str(&format!("  repair {}\n", repair_summary(repair)));
     }
     for note in &task.notes {
         text.push_str(&format!("  note {}: {}\n", note.at, note.text));

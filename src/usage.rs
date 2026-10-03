@@ -48,6 +48,67 @@ pub(crate) fn summary(usage: Option<&Usage>) -> String {
     )
 }
 
+/// Known seal counters, deduplicated by attempt. A retry can reuse a cumulative
+/// transcript: retain the largest snapshot per lane rather than adding it twice.
+/// This is a lower bound, not a bill; missing coverage and intervention cost stay unknown.
+#[derive(Debug, Clone, Serialize)]
+pub(crate) struct Cost {
+    pub(crate) known: Option<Usage>,
+    pub(crate) measured_attempts: usize,
+    pub(crate) unknown_attempts: usize,
+}
+
+pub(crate) fn cost(events: &[&crate::contracts::Event]) -> Cost {
+    let mut attempts = BTreeMap::new();
+    for event in events {
+        let key = (&event.thread, event.attempt);
+        let row = attempts.entry(key).or_insert(*event);
+        if (&event.created, &event.id) > (&row.created, &row.id) {
+            *row = event;
+        }
+    }
+    let mut lanes = BTreeMap::<&str, &Usage>::new();
+    let mut measured = 0;
+    let mut unknown = 0;
+    for event in attempts.values() {
+        if let Some(usage) = event.usage.as_ref().filter(|usage| usage.total > 0) {
+            let row = lanes.entry(&event.thread).or_insert(usage);
+            if usage.total > row.total {
+                *row = usage;
+            }
+            measured += 1;
+        } else {
+            unknown += 1;
+        }
+    }
+    let mut total = Usage::default();
+    for usage in lanes.values() {
+        if total.add(usage).is_err() {
+            return Cost {
+                known: None,
+                measured_attempts: 0,
+                unknown_attempts: attempts.len(),
+            };
+        }
+    }
+    Cost {
+        known: (measured > 0).then_some(total),
+        measured_attempts: measured,
+        unknown_attempts: unknown,
+    }
+}
+
+impl Cost {
+    pub(crate) fn summary(&self) -> String {
+        format!(
+            "{} reported lower bound (per-lane maximum; session overlap unknown); {} measured attempts, {} usage unknown",
+            summary(self.known.as_ref()),
+            self.measured_attempts,
+            self.unknown_attempts
+        )
+    }
+}
+
 fn short(tokens: u64) -> String {
     match tokens {
         0..1_000 => tokens.to_string(),
