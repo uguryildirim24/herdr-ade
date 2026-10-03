@@ -128,11 +128,12 @@ pub(crate) fn render(project: &Project, rows: &[Row]) -> String {
                 }
                 if t.recovery_pending {
                     let _ = writeln!(out, "          automatic retry selected; wait for startup");
-                } else if let Some(notice) = t
-                    .start_notices
-                    .iter()
-                    .rev()
-                    .find(|n| n.line.contains(" — next: "))
+                } else if t.status == thread::Status::Failed
+                    && let Some(notice) = t
+                        .start_notices
+                        .iter()
+                        .rev()
+                        .find(|n| n.line.contains(" — next: "))
                 {
                     let _ = writeln!(out, "          {}", notice.line);
                 }
@@ -186,6 +187,7 @@ mod tests {
         let project = world.project("demo", "a.sock");
         let lane = world.thread(&project, world.home.path(), |t| {
             t.pane_id = "dead:pane".into();
+            t.status = thread::Status::Failed;
             t.error = "process disappeared".into();
             t.start_notices.push(crate::steps::Notice {
                 line: format!(
@@ -199,7 +201,7 @@ mod tests {
         let rendered = render(
             &project,
             &[Row {
-                thread: lane,
+                thread: lane.clone(),
                 group: Group::WaitingOnYou,
                 note: "process gone".into(),
             }],
@@ -209,6 +211,23 @@ mod tests {
         assert!(rendered.contains("ha thread retry demo"), "{rendered}");
         assert!(!rendered.contains("dead:pane"), "{rendered}");
         assert!(!rendered.contains("needs you"), "{rendered}");
+
+        // Notices survive retries. A later live input wait must not reuse
+        // the failed attempt's replacement advice.
+        let mut retried = lane;
+        retried.status = thread::Status::Open;
+        retried.attempt += 1;
+        retried.error.clear();
+        let rendered = render(
+            &project,
+            &[Row {
+                thread: retried,
+                group: Group::WaitingOnYou,
+                note: "blocked".into(),
+            }],
+        );
+        assert!(rendered.contains("blocked"), "{rendered}");
+        assert!(!rendered.contains("ha thread retry"), "{rendered}");
     }
 
     #[test]

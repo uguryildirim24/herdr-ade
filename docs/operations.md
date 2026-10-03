@@ -221,7 +221,7 @@ When a coordinator binding changes, the ticker re-links verified live lanes unde
 - The box needs `herdr-ade` (`ade_bin`) for lane starts and `ha`, and `herdr-pi` (`pi_bin`) for pi `setup`, `login`, `doctor` and `check`; no pi verb runs through `herdr-ade`.
 - Every command the home machine runs on a box goes over SSH with the box machine's configured `path` in front, so it does not depend on login-shell `PATH` edits.
 - A machine that doesn't answer is left alone: no state is read, threads keep their last group, and it is skipped for about two minutes. After ten minutes you get one `outage` inbox item, and one more when it is back.
-- A blocked remote thread needs you in its pane on that machine: select the machine in Herdr's sidebar, or run `herdr --remote <ssh target>`.
+- A blocked remote thread needs input, not necessarily approval. Inspect its current question on that machine: select the machine in Herdr's sidebar, or run `herdr --remote <ssh target>`.
 - A start without `--repo` uses the project's sole listed repository. With no listed repository or several, it refuses until the repository is specified.
 
 ## Laptop-closed operation
