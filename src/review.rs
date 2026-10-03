@@ -50,6 +50,10 @@ pub(crate) struct Verdict {
     pub verdict: String,
     pub review: String,
     pub candidate: String,
+    /// Only a lack of review input, never a defect in the submitted work.
+    /// Unclassified historical rejections remain merits rejections.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub evidence_only: bool,
     #[serde(default)]
     pub without: BTreeMap<String, String>,
     /// Historical declarations remain readable, but are never mechanical proof.
@@ -836,7 +840,7 @@ fn task(project: &Project, review: &Review) -> String {
             gate.command, gate.env
         ));
     }
-    out.push_str(&format!("\nWrite a report with TOML front matter:\n+++\nreview = \"{}\"\nverdict = \"MERGE\" # or REJECT\ncandidate = \"<your exact HEAD>\"\n# Gate execution receipts are recorded by ADE, not declared here.\n# Optional: without = {{ t-0001 = \"one-line reason\" }}\n\n# Repeat for each included task's required criterion:\n[[acceptance]]\nthread = \"<member thread>\"\nevent = \"<member seal from the packet>\"\ncriterion = 1\ncondition = \"<exact original acceptance condition>\"\nestablished = true # false means not established; fix or exclude this member\nevidence = \"<durable artifact and behavior/journey references>\"\n+++\n\nIf excluding lanes, rebuild from the integration base without those lanes; their commits must not remain ancestors of your candidate. For every original required criterion, cite durable artifact/behavior evidence or say not established; gates alone do not prove semantics. Include findings and actual journey evidence. Commit repository changes if any, leave runtime deliverables untracked, then `ha done`. Output in another repository belongs in the report.\n", review.id));
+    out.push_str(&format!("\nWrite a report with TOML front matter:\n+++\nreview = \"{}\"\nverdict = \"MERGE\" # or REJECT\ncandidate = \"<your exact HEAD>\"\n# Gate execution receipts are recorded by ADE, not declared here.\n# Optional: without = {{ t-0001 = \"one-line reason\" }}\n# For REJECT solely because the review packet or member records are incomplete/unreadable:\n# evidence_only = true\n# Never use evidence_only for implementation defects, failed criteria, or mixed reasons.\n\n# Repeat for each included task's required criterion:\n[[acceptance]]\nthread = \"<member thread>\"\nevent = \"<member seal from the packet>\"\ncriterion = 1\ncondition = \"<exact original acceptance condition>\"\nestablished = true # false means not established; fix or exclude this member\nevidence = \"<durable artifact and behavior/journey references>\"\n+++\n\nIf excluding lanes, rebuild from the integration base without those lanes; their commits must not remain ancestors of your candidate. For every original required criterion, cite durable artifact/behavior evidence or say not established; gates alone do not prove semantics. Include findings and actual journey evidence. Commit repository changes if any, leave runtime deliverables untracked, then `ha done`. Output in another repository belongs in the report.\n", review.id));
     out
 }
 /// This text becomes part of the reviewer's own immutable launch brief. Never
@@ -1012,6 +1016,11 @@ fn verdict(
         {
             bail!("invalid excluded lane or reason: {lane}");
         }
+    }
+    if verdict.evidence_only && (verdict.verdict != "REJECT" || !verdict.without.is_empty()) {
+        bail!(
+            "evidence_only requires a whole-pile REJECT for missing review input, not exclusions or MERGE"
+        );
     }
     if verdict.verdict == "REJECT" {
         return Ok(verdict);
@@ -1426,6 +1435,9 @@ fn verify_gate_receipts(
 }
 
 fn defer_members(project: &Project, review: &Review) -> Result<()> {
+    if review.verdict.as_ref().is_some_and(|v| v.evidence_only) {
+        return Ok(());
+    }
     for member in &review.members {
         if review.phase == Phase::Rejected || excluded(review, &member.thread) {
             let reason = review
@@ -1456,8 +1468,9 @@ fn advance(ctx: &Ctx, project: &Project, review: &mut Review) -> Result<()> {
             .as_deref()
             .context("retry reviewer missing")?;
         let lane = thread::load(project, id)?;
+        let packet = std::fs::read_to_string(thread::task_path(project, id))?;
         let message = format!(
-            "Retry {} #{}: finish the same pile from integration base {} and seal a fresh verdict. Preserve the checkout's fixes and resolve any unfinished merge.",
+            "Retry {} #{}: finish the same pile from integration base {} and seal a fresh verdict. Preserve the checkout's fixes and resolve any unfinished merge. This rebuilt packet supersedes the earlier review instructions.\n\n{packet}",
             review.id, review.retry_generation, review.base
         );
         if lane.attempt.max(1) == attempt && !lane.follow_ups.iter().any(|f| f.text == message) {
@@ -1636,12 +1649,19 @@ fn advance(ctx: &Ctx, project: &Project, review: &mut Review) -> Result<()> {
             let reason = review
                 .verdict
                 .as_ref()
-                .map(|v| v.without.values().cloned().collect::<Vec<_>>().join("; "))
+                .map(|v| {
+                    if v.evidence_only {
+                        "review evidence incomplete; members remain eligible for a fresh review"
+                            .into()
+                    } else {
+                        v.without.values().cloned().collect::<Vec<_>>().join("; ")
+                    }
+                })
                 .filter(|s| !s.is_empty())
                 .unwrap_or_else(|| "reviewer rejected the pile".into());
             queue_notice(review, format!("REVIEW {} rejected: {reason}", review.id));
-            // Write barriers before closing the review so a crash cannot return
-            // unchanged rejected lanes to automatic review.
+            // Merits rejections need new member seals. Missing review input
+            // leaves the original seals eligible for a fresh packet/reviewer.
             defer_members(project, review)?;
             save(project, review)?;
             crate::threads::resolve_automatically(ctx, project, &reviewer.id, "review rejected");
@@ -2025,6 +2045,20 @@ pub(crate) fn retry(ctx: &Ctx, slug: &str, repo: Option<&str>) -> Result<Option<
     let row = repository(ctx, &project, repo)?;
     let _lock = operation_lock(ctx, &row.path)?;
     let Some((home, mut record)) = active_for_repo(ctx, &row.path)? else {
+        // A decided evidence-only review closed its reviewer, not its members.
+        // Start a new review under today's contract rather than reopen a
+        // resolved process or erase historical verdict evidence.
+        if list(&project)?
+            .into_iter()
+            .rev()
+            .find(|review| same_repo(&review.repo, &row.path))
+            .is_some_and(|review| {
+                review.phase == Phase::Rejected
+                    && review.verdict.as_ref().is_some_and(|v| v.evidence_only)
+            })
+        {
+            return start_locked(ctx, &project, row);
+        }
         return Err(crate::refusal::error(
             "no active pile review",
             format!(
@@ -2068,6 +2102,17 @@ pub(crate) fn retry(ctx: &Ctx, slug: &str, repo: Option<&str>) -> Result<Option<
     // process. Persist the new review phase before a parked lane is reopened.
     if let Some(id) = &record.reviewer {
         let lane = thread::load(&home, id)?;
+        // Thread retries normally preserve their frozen launch brief. A review
+        // retry deliberately refreshes its contract, while keeping member
+        // briefs/seals frozen and preserving the reviewer's checkout.
+        let packet = task(&home, &record);
+        project::write_atomic(&thread::task_path_for_write(&home, id)?, packet.as_bytes())?;
+        let brief = thread::brief_for(&home, &lane, &packet, false)?;
+        let hash = thread::store_artifact(
+            &home,
+            format!("plain: {}\n\n{brief}", lane.plain).as_bytes(),
+        )?;
+        thread::update(&home, id, |t| t.launch.brief_hash = hash)?;
         record.retry_attempt = Some(lane.attempt.max(1));
         record.retry_generation += 1;
         record.reviewer_after = crate::events::latest_done_event(
