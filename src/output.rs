@@ -155,6 +155,13 @@ fn take() -> State {
     STATE.with(|state| std::mem::take(&mut *state.borrow_mut()))
 }
 
+#[cfg(test)]
+pub(crate) fn captured_success() -> serde_json::Value {
+    let mut bytes = Vec::new();
+    render_to(take(), None, &mut bytes).unwrap();
+    serde_json::from_slice(&bytes).unwrap()
+}
+
 pub fn finish_success() -> std::io::Result<()> {
     render(take(), None)
 }

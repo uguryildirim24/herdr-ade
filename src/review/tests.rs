@@ -942,7 +942,7 @@ fn old_round_reviewer_with_missing_worktree_repo_does_not_break_plan() {
             .historical_seal
             .is_empty()
     );
-    assert!(crate::plan::show(&fx.world.ctx(), "demo", false).is_ok());
+    assert!(crate::plan::show(&fx.world.ctx(), "demo").is_ok());
     assert!(start(&fx.world.ctx(), "demo", None).unwrap().is_none());
 }
 
