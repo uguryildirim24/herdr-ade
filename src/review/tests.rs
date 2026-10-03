@@ -1981,6 +1981,26 @@ fn partial_no_change_research_cannot_unlock_dependents_but_evidenced_no_change_c
             .is_empty()
     );
     assert!(list(&fx.project).unwrap().is_empty());
+    let source = crate::events::load(&fx.project, &complete)
+        .unwrap()
+        .payload
+        .done
+        .unwrap()
+        .artifact;
+    let source_path = crate::events::artifact_path(&fx.project, &source);
+    let original = std::fs::read(&source_path).unwrap();
+    std::fs::remove_file(&source_path).unwrap();
+    assert!(
+        crate::plan::check_prerequisites(&fx.project, &build.id)
+            .unwrap_err()
+            .to_string()
+            .contains("source report missing or corrupt"),
+        "a judgment cannot replace lost source evidence"
+    );
+    std::fs::write(&source_path, "corrupted report").unwrap();
+    assert!(crate::plan::check_prerequisites(&fx.project, &build.id).is_err());
+    std::fs::write(&source_path, original).unwrap();
+    crate::plan::check_prerequisites(&fx.project, &build.id).unwrap();
     let mut rewritten = crate::task::load(&fx.project, &task.id).unwrap();
     rewritten.acceptance[0] = "A newly requested outcome".into();
     std::fs::write(
@@ -2452,6 +2472,22 @@ fn remote_gate_command_uses_saved_target_checkout_and_environment() {
         "{}",
         String::from_utf8_lossy(&output.stderr)
     );
+}
+
+#[test]
+fn historical_merged_acceptance_does_not_require_a_retained_done_seal() {
+    let fx = configured();
+    let (id, sha) = lane_unsealed(&fx, 1);
+    let task = job(&fx, &id);
+    thread::update(&fx.project, &id, |lane| lane.merged_sha = sha).unwrap();
+    let snapshot = crate::task::EvidenceSnapshot::load(&fx.project);
+    assert!(sealed(snapshot.events(), &thread::load(&fx.project, &id).unwrap()).is_none());
+    crate::task::require_accepted(&fx.project, &task, &snapshot).unwrap();
+    thread::update(&fx.project, &id, |lane| {
+        lane.merged_review = "review-1".into()
+    })
+    .unwrap();
+    assert!(crate::task::require_accepted(&fx.project, &task, &snapshot).is_err());
 }
 
 #[test]

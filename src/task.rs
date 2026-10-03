@@ -738,14 +738,17 @@ pub(crate) fn require_accepted(
         .last()
         .context("acceptance not established: no attempt")?;
     let lane = crate::thread::load(project, id)?;
-    let event = crate::review::sealed(snapshot.events(), &lane)
-        .context("acceptance not established: no current seal")?;
-    let done = event.payload.done.as_ref().expect("done seal");
     // Named historical consumer: pre-pile merged/installed records retain
-    // their accepted delivery semantics. No-change equality is not that fact.
+    // their accepted delivery semantics, even without a retained done seal.
+    // No-change equality is not that fact.
     if !lane.merged_sha.is_empty() && lane.merged_review.is_empty() {
         return Ok(());
     }
+    let event = crate::review::sealed(snapshot.events(), &lane)
+        .context("acceptance not established: no current seal")?;
+    let done = event.payload.done.as_ref().expect("done seal");
+    crate::thread::artifact(project, &done.artifact)
+        .context("acceptance not established: source report missing or corrupt")?;
     let accepted = task.acceptance_review.as_ref().is_some_and(|review| {
         review.event == event.id
             && review.artifact == done.artifact
