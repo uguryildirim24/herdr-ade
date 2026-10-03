@@ -884,7 +884,7 @@ fn prepare(ctx: &Ctx, project: &Project, review: &mut Review) -> Result<()> {
         let reviewer = if let Some(t) = unbound.first() {
             t.clone()
         } else {
-            crate::threads::start_during_advance(
+            crate::threads::start(
                 ctx,
                 &project.slug,
                 crate::threads::StartArgs {
@@ -897,6 +897,7 @@ fn prepare(ctx: &Ctx, project: &Project, review: &mut Review) -> Result<()> {
                     recipe: None,
                     task_id: String::new(),
                     review_id: review.id.clone(),
+                    attach: Vec::new(),
                 },
             )?
         };

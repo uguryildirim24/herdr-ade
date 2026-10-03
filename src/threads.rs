@@ -164,6 +164,8 @@ pub struct StartArgs {
     pub machine: Option<String>,
     pub base: Option<String>,
     pub task: String,
+    /// Files explicitly supplied by the coordinator, frozen with the brief.
+    pub attach: Vec<String>,
     /// Internal flow/skill label; never a coordinator model-selection input.
     pub workflow: Option<String>,
     /// An exact recipe the coordinator chose for this one lane.
@@ -173,27 +175,9 @@ pub struct StartArgs {
     pub review_id: String,
 }
 
-/// Creates the worktree or tab, the thread directory and the brief, then
-/// launches its agent and delivers its brief in the same call. The ticker
-/// resumes any unfinished startup using the same launch and delivery paths.
+/// Validate and freeze a placement intent. The ticker owns checkout creation,
+/// terminal binding, the lane card, agent submission and initial input.
 pub fn start(ctx: &Ctx, slug: &str, args: StartArgs) -> Result<Thread> {
-    start_with_ticker(ctx, slug, args, ticker::start, None, true)
-}
-
-/// Place the reviewer while `review` holds its lock. The ticker launches the
-/// durable pending attempt on its next pass, outside the repository lock.
-pub(crate) fn start_during_advance(ctx: &Ctx, slug: &str, args: StartArgs) -> Result<Thread> {
-    start_with_ticker(ctx, slug, args, ticker::ensure, None, false)
-}
-
-fn start_with_ticker(
-    ctx: &Ctx,
-    slug: &str,
-    args: StartArgs,
-    ensure_ticker: fn(&Ctx<'_>) -> Result<()>,
-    source_truncation: Option<serde_json::Value>,
-    launch_now: bool,
-) -> Result<Thread> {
     let project = Project::load(&ctx.root, slug)?;
     if args.workflow.as_deref() == Some("reviewer") && args.review_id.is_empty() {
         bail!(
@@ -212,10 +196,9 @@ fn start_with_ticker(
     }
     crate::plan::check_prerequisites(&project, &args.task_id)?;
     let (settings, _) = project.read_project_md()?;
-    // Without a running ticker nothing launches. The advance path uses the
-    // non-blocking ensure; every ordinary start replaces a stale ticker.
-    ensure_ticker(ctx)?;
-    let view = require_session(ctx, &project)?;
+    // Non-blocking even under review's lock: the ticker owns the slow work.
+    ticker::ensure(ctx)?;
+    require_session(ctx, &project)?;
 
     let role = args
         .workflow
@@ -306,7 +289,6 @@ fn start_with_ticker(
             recipe: args.recipe.as_deref(),
             recipe_basis: None,
             recipe_request: None,
-            source_truncation: source_truncation.as_ref(),
             ..Default::default()
         },
     )?;
@@ -366,22 +348,88 @@ fn start_with_ticker(
     // actually placed, including an explicit or fallback local placement.
     launch.machine = placement.dispatch_machine().to_string();
 
-    // Recipe and repository readiness both ran on the selected machine
-    // during placement, before a thread record exists.
+    // Keep repository/base and named-file refusals synchronous. No checkout,
+    // push, terminal or agent is created in this command.
+    git(
+        ctx.runner,
+        &repo,
+        &["rev-parse", "--show-toplevel"],
+        GIT_TIMEOUT,
+    )
+    .with_context(|| format!("{repo} is not a git repository"))?;
+    let integration = integration_branch(
+        ctx.runner,
+        &Thread {
+            repo: repo.clone(),
+            base: args.base.clone().unwrap_or_default(),
+            ..Thread::default()
+        },
+    )?;
+    let base = crate::git::branch_head(ctx.runner, &repo, &integration)?.ok_or_else(|| {
+        crate::refusal::error(
+            format!("integration_branch_required: `{integration}` is not a local branch"),
+            format!(
+                "ha thread start {slug} --base <existing-branch> --job <job> --task-file <file>"
+            ),
+        )
+    })?;
+    let origin = git(
+        ctx.runner,
+        &repo,
+        &["remote", "get-url", "origin"],
+        GIT_TIMEOUT,
+    )
+    .unwrap_or_default();
+    if !machine.is_empty() {
+        let (_, url) = box_repo_candidate(&ctx.config_dir, &machine, Some(&repo), listed)?;
+        remote::remote_for_url(ctx.runner, &repo, &url)?;
+    }
+    let mut attachments = BTreeMap::new();
+    let mut remaining = LINKED_FILES_CAP;
+    for path in &args.attach {
+        let path = Path::new(path);
+        let name = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .context("attachment needs a UTF-8 basename")?;
+        if attachments.contains_key(name) {
+            bail!("attachment_duplicate: `{name}` was supplied more than once");
+        }
+        let file = std::fs::File::open(path)
+            .with_context(|| format!("attachment_missing: {}", path.display()))?;
+        let metadata = file.metadata()?;
+        if !metadata.is_file() {
+            bail!("attachment is not a file: {}", path.display());
+        }
+        if metadata.len() > remaining {
+            bail!("attachments over cap (200 MiB): {}", path.display());
+        }
+        use std::io::Read;
+        let mut bytes = Vec::new();
+        file.take(remaining + 1).read_to_end(&mut bytes)?;
+        if bytes.len() as u64 > remaining {
+            bail!("attachments over cap (200 MiB): {}", path.display());
+        }
+        remaining -= bytes.len() as u64;
+        attachments.insert(name.to_string(), thread::store_artifact(&project, &bytes)?);
+    }
     let machine_id = placement.machine_id.clone();
     let record = thread::allocate(&project, |t| {
         t.title = args.title.trim().to_string();
         t.kind = Kind::Worktree;
         t.repo = repo.clone();
+        t.origin = origin.clone();
         t.machine = machine.clone();
         t.placement_reason = placement.reason.clone();
         t.machine_id = machine_id.clone();
         t.agent = launch.kind.clone();
-        t.base = args.base.clone().unwrap_or_default();
+        t.base = base.clone();
+        t.attachments = attachments.clone();
         t.role = role.to_string();
         t.review_id = args.review_id.clone();
         t.plain = args.title.trim().to_string();
         t.attempt = 1;
+        t.partial = Some("freeze".into());
         t.launch = launch.clone();
         if let Some(reason) = &provider_wait {
             t.provider_wait_started = project::now();
@@ -402,52 +450,12 @@ fn start_with_ticker(
         crate::task::link_attempt(&project, &args.task_id, &id)?;
     }
 
-    if provider_wait.is_some() {
-        return thread::load(&project, &id);
+    let started = freeze_start(ctx, &project, &thread::load(&project, &id)?, &args.task)?;
+    refresh_plan(ctx, &project);
+    if !machine.is_empty() {
+        ticker::request_remote_poll(&ctx.root, &project, &machine)?;
     }
-
-    match place_and_brief(ctx, &project, &view, &id, false) {
-        Ok(thread) => {
-            refresh_plan(ctx, &project);
-            if launch_now {
-                ticker::launch_thread_now(ctx, &project, &id)?;
-            }
-            if thread.is_remote()
-                && let Err(error) =
-                    ticker::request_remote_poll(&ctx.root, &project, thread.machine_route())
-            {
-                eprintln!(
-                    "note: thread {id} is placed, but the ticker could not be woken for its first box poll: {error:#}"
-                );
-            }
-            Ok(thread::load(&project, &id).unwrap_or(thread))
-        }
-        Err(error) => {
-            let message = format!("{error:#}");
-            if crate::remote::is_unreachable(&message) {
-                return Err(error);
-            }
-            let cleanup = fail_start(
-                ctx,
-                &project,
-                &id,
-                &message,
-                crate::contracts::FailureClass::Unknown,
-                false,
-            );
-            let error = match cleanup {
-                Ok(_) => error,
-                Err(cleanup) => error.context(format!("failed-start cleanup: {cleanup:#}")),
-            };
-            if crate::refusal::is(&error) {
-                return Err(error);
-            }
-            Err(error.context(format!(
-                "thread {id} failed to start — next: {}",
-                retry_command(slug, &id)
-            )))
-        }
-    }
+    Ok(started)
 }
 
 /// The resolved machine of a new thread: empty for a local thread. The tried
@@ -631,7 +639,7 @@ fn provider_readiness_error(error: &str) -> bool {
 /// Complete a provider-blocked placement through the ordinary startup path.
 pub(crate) fn resume_provider_start(ctx: &Ctx, project: &Project, id: &str) -> Result<()> {
     crate::plan::check_attempt_prerequisites(project, id)?;
-    let view = require_session(ctx, project)?;
+    require_session(ctx, project)?;
     let waiting = thread::load(project, id)?;
     if waiting.is_remote() {
         // Placement was deferred before its profile could be recorded. The
@@ -648,8 +656,9 @@ pub(crate) fn resume_provider_start(ctx: &Ctx, project: &Project, id: &str) -> R
             t.launch.machine = profile.label.clone();
         })?;
     }
-    place_and_brief(ctx, project, &view, id, false)?;
-    Ok(())
+    let mut record = thread::load(project, id)?;
+    record.provider_wait_started.clear();
+    place_recovery(ctx, project, &record)
 }
 
 /// Recipe readiness on a box is owned by the doctor probes.
@@ -675,42 +684,53 @@ pub(crate) fn box_launch_ready_for(
 }
 
 /// Steps 2 to 5 of starting a thread, also used when recovery must place it.
-fn place_and_brief(
-    ctx: &Ctx,
-    project: &Project,
-    view: &SessionView,
-    id: &str,
-    restart: bool,
-) -> Result<Thread> {
+fn place_and_brief(ctx: &Ctx, project: &Project, view: &SessionView, id: &str) -> Result<Thread> {
     let record = thread::load(project, id)?;
-
-    let placed = match record.kind {
-        Kind::Worktree if record.is_remote() => {
-            place_box_worktree(ctx, project, view, &record, restart)?
-        }
-        Kind::Worktree => place_ade_worktree(ctx, project, view, &record)?,
-        Kind::Tab if record.is_remote() => {
-            bail!("a box lane needs a repository; a task with no repository runs on this Mac")
-        }
-        Kind::Tab => place_ade_tab(ctx, project, view, &record)?,
-        Kind::Adopted => bail!("an adopted thread is not placed by the binary"),
-    };
+    prepare_checkout(ctx, project, &record)?;
+    let placed = thread::load(project, id)?;
     write_brief(ctx, project, &placed)?;
+    bind_terminal(ctx, project, view, &placed)?;
     finish_placement(project, view, id)
 }
 
 /// Materializes the frozen, content-addressed brief in the lane's ignored
 /// runtime folder. The product repository never tracks it.
 fn write_brief(ctx: &Ctx, project: &Project, placed: &Thread) -> Result<()> {
-    if placed.is_remote() {
-        return Ok(());
+    let machine = if placed.is_remote() {
+        Some(remote::declaration_for_route(
+            ctx.runner,
+            &ctx.env.herdr_bin(),
+            &ctx.config_dir,
+            placed.machine_route(),
+        )?)
+    } else {
+        prepare_local_dir(ctx, project, placed)?;
+        None
+    };
+    let mut files = placed
+        .attachments
+        .iter()
+        .map(|(name, hash)| {
+            (
+                format!("{}/attachments/{name}", placed.thread_dir),
+                hash.clone(),
+            )
+        })
+        .collect::<Vec<_>>();
+    if placed.kind != Kind::Tab {
+        files.push((
+            format!("{}/brief.md", placed.thread_dir),
+            placed.launch.brief_hash.clone(),
+        ));
     }
-    prepare_local_dir(ctx, project, placed)?;
-    if placed.kind == Kind::Worktree {
-        let path = Path::new(&placed.thread_dir).join("brief.md");
-        if !path.is_file() {
-            let bytes = thread::artifact(project, &placed.launch.brief_hash)?;
-            project::write_atomic(&path, &bytes)?;
+    for (path, hash) in files {
+        let bytes = thread::artifact(project, &hash)?;
+        if let Some(machine) = &machine {
+            remote::write_runtime_file(ctx.runner, &machine.target, &path, &bytes, &hash)?;
+        } else {
+            let path = Path::new(&path);
+            std::fs::create_dir_all(path.parent().context("runtime file has no parent")?)?;
+            project::write_atomic(path, &bytes)?;
         }
     }
     Ok(())
@@ -841,138 +861,185 @@ fn stage_box_review(
         .map(|member| member.artifact.clone())
         .collect();
     for hash in hashes {
-        let bytes = thread::artifact(project, &hash)?;
-        let text = String::from_utf8(bytes).context("review source artifact is not UTF-8")?;
         remote::write_runtime_file(
             ctx.runner,
             target,
             &format!("{state}/artifacts/{hash}"),
-            &text,
+            &thread::artifact(project, &hash)?,
             &hash,
         )?;
     }
     Ok(())
 }
 
-/// The box start side: freeze the brief as a project artifact, branch from an
-/// exact integration commit, provision the checkout, and materialize the brief
-/// only in the checkout's ignored runtime folder.
-fn place_box_worktree(
-    ctx: &Ctx,
-    project: &Project,
-    view: &SessionView,
-    record: &Thread,
-    restart: bool,
-) -> Result<Thread> {
-    let runner = ctx.runner;
-    let (settings, _) = project.read_project_md()?;
-    let label = crate::project::display_name(&settings.name, &project.slug);
-    let profile = remote::machine_profile(
-        runner,
-        &ctx.env.herdr_bin(),
-        &ctx.config_dir,
-        record.machine_route(),
-    )?;
-    let (box_repo, publish_url) =
-        box_repo_row(&ctx.config_dir, &settings, &profile.label, &record.repo)?;
-    // Both clones must name the configured publish URL. The push still uses
-    // the URL itself; finding the matching remote only validates this clone.
-    let _ = remote::remote_for_url(runner, &record.repo, &publish_url)?;
-    let target = profile.target.clone();
-    let box_worktree = format!("{box_repo}/.worktrees/{}", record.id);
-    let branch = if record.branch.is_empty() {
-        thread::branch_name(&project.slug, &record.id, &record.title)
+/// Freeze paths and bytes at acceptance, before any slow placement effect.
+fn freeze_start(ctx: &Ctx, project: &Project, record: &Thread, task: &str) -> Result<Thread> {
+    let machine = if record.is_remote() {
+        Some(remote::machine_declaration(
+            &ctx.config_dir,
+            &record.machine,
+        )?)
     } else {
-        record.branch.clone()
+        None
     };
-    let dir = thread::thread_dir(&box_worktree, &project.slug, &record.id);
-    let machine = crate::remote::machine_declaration(&ctx.config_dir, &profile.label)?;
-
-    // A restart reuses the exact frozen artifact and code base. A first start
-    // records both before any remote process exists.
-    let reusable = restart && !record.base.is_empty() && !record.launch.brief_hash.is_empty();
-    let (base, brief_hash) = if reusable {
-        if record.failure_event.is_empty() {
-            push_branch(runner, &record.repo, &publish_url, &branch, &record.base)?;
-        }
-        (record.base.clone(), record.launch.brief_hash.clone())
+    let repo = if record.is_remote() {
+        let (settings, _) = project.read_project_md()?;
+        box_repo_row(&ctx.config_dir, &settings, &record.machine, &record.repo)?.0
     } else {
-        let task =
-            std::fs::read_to_string(thread::task_path(project, &record.id)).unwrap_or_default();
+        record.repo.clone()
+    };
+    let folder = format!("{repo}/.worktrees/{}", record.id);
+    let mut stub = record.clone();
+    stub.thread_dir = thread::thread_dir(&folder, &project.slug, &record.id);
+    stub.branch = thread::branch_name(&project.slug, &record.id, &record.title);
+    let mut brief = thread::brief_for(project, &stub, task, false)?;
+    if record.role == "reviewer"
+        && !record.review_id.is_empty()
+        && let Some(machine) = machine
+    {
+        brief = brief.replace(
+            &project.state_dir().to_string_lossy().to_string(),
+            &format!("{}/{}/.state", machine.root, project.slug),
+        );
+    }
+    let hash = thread::store_artifact(
+        project,
+        format!("plain: {}\n\n{brief}", record.plain).as_bytes(),
+    )?;
+    thread::update(project, &record.id, |t| {
+        t.thread_dir = stub.thread_dir;
+        t.branch = stub.branch;
+        t.launch.brief_hash = hash;
+        t.recovery_pending = true;
+        t.partial = Some("worktree_add".into());
+    })
+}
+
+/// Checkout creation is independent of terminal placement. A recorded checkout
+/// is reused verbatim for retries and parked conversation reopens.
+fn prepare_checkout(ctx: &Ctx, project: &Project, record: &Thread) -> Result<()> {
+    if !record.worktree_path.is_empty() && record.partial.as_deref() != Some("worktree_add") {
+        if record.thread_dir.is_empty() {
+            thread::update(project, &record.id, |t| {
+                t.thread_dir = if t.kind == Kind::Tab {
+                    t.worktree_path.clone()
+                } else {
+                    thread::thread_dir(&t.worktree_path, &project.slug, &t.id)
+                };
+            })?;
+        }
+        return Ok(());
+    }
+    if record.kind == Kind::Tab {
+        let folder = thread::threads_dir_for_write(project)?.join(&record.id);
+        crate::claude_trust::check_folder(ctx, &record.launch.kind, false, &folder)?;
+        let task = std::fs::read_to_string(thread::task_path(project, &record.id))?;
         let stub = Thread {
-            thread_dir: dir.clone(),
+            thread_dir: folder.to_string_lossy().into_owned(),
             ..record.clone()
         };
-        let brief = thread::brief_for(project, &stub, &task, restart)?;
-        // A review task contains absolute artifact paths. Freeze paths for the
-        // machine that will read them, not the coordinator's filesystem.
-        let brief = if record.role == "reviewer" && !record.review_id.is_empty() {
-            brief.replace(
-                &project.state_dir().to_string_lossy().to_string(),
-                &format!("{}/{}/.state", machine.root, project.slug),
-            )
-        } else {
-            brief
-        };
-        let frozen = format!("plain: {}\n\n{brief}", record.plain);
-        let brief_hash = thread::store_artifact(project, frozen.as_bytes())?;
-        let integration = integration_branch(runner, record)?;
-        let repo_lock = crate::git::lock(runner, &record.repo)?;
-        if let Err(error) = crate::git::exclude_plugin_paths_locked(runner, &record.repo) {
-            eprintln!("warning: {error:#}");
+        let brief = format!(
+            "plain: {}\n\n{}",
+            record.plain,
+            thread::brief_for(project, &stub, &task, false)?
+        );
+        let (folder, hash, base) = prepare_managed_git_folder(ctx.runner, &folder, &brief)?;
+        thread::store_artifact(project, &std::fs::read(folder.join("brief.md"))?)?;
+        thread::update(project, &record.id, |t| {
+            t.worktree_path = folder.to_string_lossy().into_owned();
+            t.thread_dir = t.worktree_path.clone();
+            t.branch = "main".into();
+            t.base = base;
+            t.launch.brief_hash = hash;
+        })?;
+        return Ok(());
+    }
+    let path = if record.is_remote() {
+        let profile = remote::machine_profile(
+            ctx.runner,
+            &ctx.env.herdr_bin(),
+            &ctx.config_dir,
+            record.machine_route(),
+        )?;
+        let machine = remote::machine_declaration(&ctx.config_dir, &profile.label)?;
+        let (settings, _) = project.read_project_md()?;
+        let (repo, url) = box_repo_row(&ctx.config_dir, &settings, &profile.label, &record.repo)?;
+        let path = format!("{repo}/.worktrees/{}", record.id);
+        let _lock = project::box_lock(&ctx.root, &profile.id, &repo)?;
+        {
+            let _lock = crate::git::lock(ctx.runner, &record.repo)?;
+            crate::git::exclude_plugin_paths_locked(ctx.runner, &record.repo)?;
+            ensure_branch(ctx.runner, &record.repo, &record.branch, &record.base)?;
         }
-        let head =
-            crate::git::rev_parse(runner, &record.repo, &format!("refs/heads/{integration}"))?;
-        ensure_branch(runner, &record.repo, &branch, &head)?;
-        drop(repo_lock);
-        push_branch(runner, &record.repo, &publish_url, &branch, &head)?;
-        (head, brief_hash)
-    };
-
-    thread::update(project, &record.id, |t| {
-        t.base = base.clone();
-        t.branch = branch.clone();
-        t.worktree_path = box_worktree.clone();
-        t.thread_dir = dir.clone();
-        t.launch.brief_hash = brief_hash.clone();
-        t.partial = Some("worktree_add".into());
-    })?;
-
-    // Starts for one box repository serialize on the Mac (SPEC-remote §4.2
-    // step 3).
-    let _box_lock = project::box_lock(&ctx.root, &profile.id, &box_repo)?;
-
-    if record.failure_event.is_empty() {
+        push_branch(ctx.runner, &record.repo, &url, &record.branch, &record.base)?;
         remote::provision(
-            runner,
-            &target,
+            ctx.runner,
+            &profile.target,
             &remote::Provision {
                 path: &machine.path,
-                box_repo: &box_repo,
-                worktree: &box_worktree,
-                branch: &branch,
-                base: &base,
-                publish_url: &publish_url,
+                box_repo: &repo,
+                worktree: &path,
+                branch: &record.branch,
+                base: &record.base,
+                publish_url: &url,
             },
         )?;
-    }
-    if record.role == "reviewer" && !record.review_id.is_empty() {
-        stage_box_review(ctx, project, record, &machine.root, &target)?;
-    }
-    let frozen = thread::artifact(project, &brief_hash)?;
-    remote::write_runtime_file(
-        runner,
-        &target,
-        &format!("{dir}/brief.md"),
-        &String::from_utf8(frozen).context("brief artifact is not UTF-8")?,
-        &brief_hash,
-    )?;
+        path
+    } else {
+        let path = format!("{}/.worktrees/{}", record.repo, record.id);
+        let _lock = crate::git::lock(ctx.runner, &record.repo)?;
+        crate::git::exclude_plugin_paths_locked(ctx.runner, &record.repo)?;
+        if Path::new(&path).exists() {
+            // A crash may leave an already-created checkout. Verify its git
+            // registration and branch; never reset it to the frozen start SHA.
+            let listed = git(
+                ctx.runner,
+                &record.repo,
+                &["worktree", "list", "--porcelain"],
+                GIT_TIMEOUT,
+            )?;
+            if !listed.split("\n\n").any(|row| {
+                row.lines().any(|line| line == format!("worktree {path}"))
+                    && row
+                        .lines()
+                        .any(|line| line == format!("branch refs/heads/{}", record.branch))
+            }) {
+                bail!("placement_checkout_mismatch: {path}");
+            }
+        } else {
+            ensure_branch(ctx.runner, &record.repo, &record.branch, &record.base)?;
+            git(
+                ctx.runner,
+                &record.repo,
+                &["worktree", "add", &path, &record.branch],
+                GIT_TIMEOUT,
+            )?;
+        }
+        path
+    };
+    thread::update(project, &record.id, |t| {
+        t.worktree_path = path;
+        t.partial = Some("tab_create".into());
+    })?;
+    Ok(())
+}
 
-    // Step 4: route by the stable profile id. `workspace create` already
-    // creates a first tab, so that pane is the lane instead of adding a
-    // second tab beside an unused shell. A restart always gets a fresh
-    // workspace; it never adopts whatever survived an earlier attempt.
-    let herdr = view.herdr.on_machine(&profile.id);
+/// The one terminal/card binding path, regardless of how placement was queued.
+fn bind_terminal(ctx: &Ctx, project: &Project, view: &SessionView, record: &Thread) -> Result<()> {
+    let runner = ctx.runner;
+    let (settings, _) = project.read_project_md()?;
+    let label = project::display_name(&settings.name, &project.slug);
+    let machine = if record.is_remote() {
+        Some(remote::declaration_for_route(
+            runner,
+            &ctx.env.herdr_bin(),
+            &ctx.config_dir,
+            record.machine_route(),
+        )?)
+    } else {
+        None
+    };
+    let herdr = view.herdr.on_machine(record.machine_route());
     let spec = crate::contracts::RoleSpec {
         kind: record.launch.kind.clone(),
         args: record.launch.args.clone(),
@@ -984,8 +1051,8 @@ fn place_box_worktree(
         &project.slug,
         &record.id,
         attempt,
-        &brief_hash,
-        Some(&machine),
+        &record.launch.brief_hash,
+        machine.as_ref(),
         &spec,
     );
     // The agent launch supplies its exclusive wrapper PATH after bashrc has
@@ -993,39 +1060,44 @@ fn place_box_worktree(
     // One project owns one workspace on this machine. Starts can provision
     // repositories independently, but find-or-create is serialized so two
     // simultaneous lanes cannot both observe "missing" and create duplicates.
-    let _workspace_lock = project::remote_workspace_lock(&ctx.root, &project.slug, &profile.id)?;
-    let matching: Vec<_> = herdr
-        .workspace_list()
-        .map_err(|error| anyhow::anyhow!("{error}"))?
-        .into_iter()
-        .filter(|workspace| workspace.label == label)
-        .collect();
-    if matching.len() > 1 {
-        bail!(
-            "remote_workspace_duplicate: machine `{}` has {} workspaces labelled `{label}`",
-            record.machine,
-            matching.len()
-        );
-    }
-    let created = match matching.first() {
-        Some(workspace) => herdr
-            .tab_create_env(
-                &workspace.workspace_id,
-                Path::new(&box_worktree),
-                &record.id,
-                false,
-                &env,
-            )
-            .map_err(|error| anyhow::anyhow!("{error}"))?,
-        None => herdr
-            .workspace_create_env(Path::new(&box_worktree), &label, false, &env)
-            .map_err(|error| anyhow::anyhow!("{error}"))?,
+    let folder = Path::new(&record.worktree_path);
+    let created = if record.partial.as_deref() == Some("lane_card") && !record.pane_id.is_empty() {
+        let pane = herdr
+            .pane_list()?
+            .into_iter()
+            .find(|p| thread::pane_matches(record, p))
+            .context("placement_identity_mismatch: bound terminal disappeared")?;
+        crate::herdr::Created {
+            workspace_id: pane.workspace_id,
+            tab_id: pane.tab_id,
+            pane_id: pane.pane_id,
+        }
+    } else if record.is_remote() {
+        let _lock =
+            project::remote_workspace_lock(&ctx.root, &project.slug, record.machine_route())?;
+        let matching: Vec<_> = herdr
+            .workspace_list()?
+            .into_iter()
+            .filter(|w| w.label == label)
+            .collect();
+        if matching.len() > 1 {
+            bail!("remote_workspace_duplicate: multiple workspaces for {label}");
+        }
+        match matching.first() {
+            Some(w) => herdr.tab_create_env(&w.workspace_id, folder, &record.id, false, &env)?,
+            None => herdr.workspace_create_env(folder, &label, false, &env)?,
+        }
+    } else {
+        let coord = project
+            .coordinator()
+            .context("project coordinator missing")?;
+        herdr.tab_create_env(&coord.workspace_id, folder, &record.id, false, &env)?
     };
     let cwd = herdr
         .pane_cwd(&created.pane_id)
-        .unwrap_or_else(|_| box_worktree.clone());
+        .unwrap_or_else(|_| record.worktree_path.clone());
     let cwd = if cwd.is_empty() {
-        box_worktree.clone()
+        record.worktree_path.clone()
     } else {
         cwd
     };
@@ -1038,13 +1110,13 @@ fn place_box_worktree(
         t.pane_id = created.pane_id.clone();
         t.partial = Some("lane_card".into());
     })?;
-    herdr
-        .tab_rename(&created.tab_id, &format!("{} starting…", record.id))
-        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    if record.is_remote() {
+        herdr.tab_rename(&created.tab_id, &format!("{} starting…", record.id))?;
+    }
 
     // The box lane nests from placement onward. Its agent start does not
     // pass --parent; the pane carries the machine-qualified token instead.
-    if let Some(coord) = project.coordinator() {
+    if let Some(coord) = project.coordinator().filter(|_| record.is_remote()) {
         herdr
             .pane_set_parent(&created.pane_id, &parent_token(record, &coord.pane_id))
             .map_err(|error| {
@@ -1055,65 +1127,57 @@ fn place_box_worktree(
             })?;
     }
 
-    // Step 5: the lane card, now that the pane id exists.
-    let recipient = project
-        .coordinator()
-        .map(|c| {
-            let attempt = c.attempt();
-            crate::contracts::Recipient {
-                pane: c.pane_id,
-                coordinator_attempt: attempt,
-            }
-        })
-        .unwrap_or_default();
-    let remote_prefix = format!("{} --root {}", machine.ade_bin, machine.root);
-    let start_line = thread::launch_prompt(
-        &remote_prefix,
-        &project.slug,
-        &Thread {
-            machine: record.machine.clone(),
-            ..record.clone()
-        },
-    );
-    let card = crate::contracts::LaneCard {
-        project: project.slug.clone(),
-        thread: record.id.clone(),
-        attempt,
-        brief_hash: brief_hash.clone(),
-        role: record.role.clone(),
-        kind: record.launch.kind.clone(),
-        pane_id: created.pane_id.clone(),
-        machine_label: record.machine.clone(),
-        machine_id: record.machine_id.clone(),
-        box_repo: box_repo.clone(),
-        box_worktree: box_worktree.clone(),
-        brief_commit: base.clone(),
-        branch: branch.clone(),
-        publish_url: publish_url.clone(),
-        recipient,
-        start_line,
-        created: crate::project::now(),
-    };
-    let card_path = format!(
-        "{}/{}/.state/lanes/{}.toml",
-        machine.root, project.slug, record.id
-    );
-    remote::provision_card(
-        runner,
-        &target,
-        &project.slug,
-        &card_path,
-        &toml::to_string(&card)?,
-    )?;
-
-    thread::update(project, &record.id, |t| {
-        t.cwd = cwd.clone();
-        t.worktree_path = box_worktree.clone();
-        t.workspace_id = created.workspace_id.clone();
-        t.tab_id = created.tab_id.clone();
-        t.pane_id = created.pane_id.clone();
-        t.partial = None;
-    })
+    // Step 5: box seals authenticate this exact binding against its card.
+    if let Some(machine) = machine {
+        let (box_repo, publish_url) =
+            box_repo_row(&ctx.config_dir, &settings, &record.machine, &record.repo)?;
+        if record.role == "reviewer" && !record.review_id.is_empty() {
+            stage_box_review(ctx, project, record, &machine.root, &machine.target)?;
+        }
+        let recipient = project
+            .coordinator()
+            .map(|c| {
+                let attempt = c.attempt();
+                crate::contracts::Recipient {
+                    pane: c.pane_id,
+                    coordinator_attempt: attempt,
+                }
+            })
+            .unwrap_or_default();
+        let remote_prefix = format!("{} --root {}", machine.ade_bin, machine.root);
+        let start_line = thread::launch_prompt(&remote_prefix, &project.slug, record);
+        let card = crate::contracts::LaneCard {
+            project: project.slug.clone(),
+            thread: record.id.clone(),
+            attempt,
+            brief_hash: record.launch.brief_hash.clone(),
+            role: record.role.clone(),
+            kind: record.launch.kind.clone(),
+            pane_id: created.pane_id.clone(),
+            machine_label: record.machine.clone(),
+            machine_id: record.machine_id.clone(),
+            box_repo: box_repo.clone(),
+            box_worktree: record.worktree_path.clone(),
+            brief_commit: record.base.clone(),
+            branch: record.branch.clone(),
+            publish_url: publish_url.clone(),
+            recipient,
+            start_line,
+            created: crate::project::now(),
+        };
+        let card_path = format!(
+            "{}/{}/.state/lanes/{}.toml",
+            machine.root, project.slug, record.id
+        );
+        remote::provision_card(
+            runner,
+            &machine.target,
+            &project.slug,
+            &card_path,
+            &toml::to_string(&card)?,
+        )?;
+    }
+    Ok(())
 }
 
 /// The integration branch whose exact head becomes the lane's code base:
@@ -1165,229 +1229,6 @@ fn push_branch(runner: &dyn Runner, repo: &str, url: &str, branch: &str, sha: &s
         bail!("push of {branch} to {url}: {}", out.error_text());
     }
     Ok(())
-}
-
-/// Places a code lane from an exact integration commit. Its frozen brief is a
-/// project artifact and is materialized later under `.herdr-project`, never
-/// committed to the code repository.
-fn place_ade_worktree(
-    ctx: &Ctx,
-    project: &Project,
-    view: &SessionView,
-    record: &Thread,
-) -> Result<Thread> {
-    let runner = ctx.runner;
-    git(
-        runner,
-        &record.repo,
-        &["rev-parse", "--show-toplevel"],
-        GIT_TIMEOUT,
-    )
-    .with_context(|| format!("{} is not a git repository", record.repo))?;
-    let origin = git(
-        runner,
-        &record.repo,
-        &["remote", "get-url", "origin"],
-        GIT_TIMEOUT,
-    )
-    .unwrap_or_default();
-    // The integration branch is a local branch: `--base`, else the branch
-    // the repository has checked out. A remote-tracking ref or bare sha is
-    // not a mutable integration branch.
-    let integration = if record.base.is_empty() {
-        git(
-            runner,
-            &record.repo,
-            &["symbolic-ref", "--short", "HEAD"],
-            GIT_TIMEOUT,
-        )
-        .context("integration_branch_required: the repository is on a detached HEAD; pass --base <branch>")?
-    } else {
-        record.base.clone()
-    };
-    if crate::git::branch_head(runner, &record.repo, &integration)?.is_none() {
-        return Err(crate::refusal::error(
-            format!("integration_branch_required: `{integration}` is not a local branch"),
-            "ha thread start <project> --base <existing-branch> --job <job> --task-file <file>",
-        ));
-    }
-    let branch = thread::branch_name(&project.slug, &record.id, &record.title);
-    let task = std::fs::read_to_string(thread::task_path(project, &record.id)).unwrap_or_default();
-    let planned = Path::new(&record.repo).join(".worktrees").join(&record.id);
-    let stub = Thread {
-        thread_dir: thread::thread_dir(&planned.to_string_lossy(), &project.slug, &record.id),
-        ..record.clone()
-    };
-    let brief = thread::brief_for(project, &stub, &task, false)?;
-    let frozen = format!("plain: {}\n\n{brief}", record.plain);
-    let brief_hash = thread::store_artifact(project, frozen.as_bytes())?;
-
-    let placed = {
-        let _repo_lock = crate::git::lock(runner, &record.repo)?;
-        if let Err(error) = crate::git::exclude_plugin_paths_locked(runner, &record.repo) {
-            eprintln!("warning: {error:#}");
-        }
-        let head =
-            crate::git::rev_parse(runner, &record.repo, &format!("refs/heads/{integration}"))?;
-        // The artifact hash and exact code base are durable before the lane
-        // branch or worktree exists.
-        thread::update(project, &record.id, |t| {
-            t.launch.brief_hash = brief_hash.clone();
-            t.thread_dir = stub.thread_dir.clone();
-            t.base = head.clone();
-            t.branch = branch.clone();
-            t.partial = Some("worktree_add".into());
-        })?;
-        let path = crate::git::worktree_add(runner, &record.repo, &record.id, &branch, &head)?;
-        (head, path)
-    };
-    let (sha, path) = placed;
-    let cwd = path.to_string_lossy().into_owned();
-    thread::update(project, &record.id, |t| {
-        t.worktree_path = cwd.clone();
-        t.partial = Some("tab_create".into());
-    })?;
-    let coordinator = project
-        .coordinator()
-        .context("the project has never been opened")?;
-    let spec = crate::contracts::RoleSpec {
-        kind: record.launch.kind.clone(),
-        args: record.launch.args.clone(),
-        env: record.launch.env.clone(),
-        ready_timeout_ms: record.launch.ready_timeout_ms,
-    };
-    let env = project::tab_env(
-        &project.slug,
-        &record.id,
-        record.attempt.max(1),
-        &brief_hash,
-        None,
-        &spec,
-    );
-    match view
-        .herdr
-        .tab_create_env(&coordinator.workspace_id, &path, &record.id, false, &env)
-    {
-        Ok(created) => {
-            let pane_cwd = view
-                .herdr
-                .pane_cwd(&created.pane_id)
-                .unwrap_or_else(|_| cwd.clone());
-            thread::update(project, &record.id, |t| {
-                t.origin = origin;
-                t.base = sha;
-                t.branch = branch;
-                t.worktree_path = cwd.clone();
-                t.cwd = if pane_cwd.is_empty() { cwd } else { pane_cwd };
-                t.workspace_id = created.workspace_id;
-                t.tab_id = created.tab_id;
-                t.pane_id = created.pane_id;
-                t.launch.brief_hash = brief_hash;
-                t.partial = None;
-            })
-        }
-        Err(error) => {
-            let _ = thread::update(project, &record.id, |t| {
-                t.origin = origin;
-                t.cwd = cwd;
-            });
-            Err(anyhow::anyhow!("{error}"))
-        }
-    }
-}
-
-fn place_ade_tab(
-    ctx: &Ctx,
-    project: &Project,
-    view: &SessionView,
-    record: &Thread,
-) -> Result<Thread> {
-    let coordinator = project
-        .coordinator()
-        .context("the project has never been opened")?;
-    if !view.panes.iter().any(|p| {
-        p.workspace_id == coordinator.workspace_id && coordinator::pane_matches(&coordinator, p)
-    }) {
-        bail!(
-            "the project's workspace is not open; run `open {}` first",
-            project.slug
-        );
-    }
-    let folder = if record.worktree_path.is_empty() {
-        thread::threads_dir_for_write(project)?.join(&record.id)
-    } else {
-        Path::new(&record.worktree_path).to_path_buf()
-    };
-    crate::claude_trust::check_folder(ctx, &record.launch.kind, record.is_remote(), &folder)?;
-    let managed = record.kind == Kind::Tab;
-    let (folder, brief_hash, base) = if managed {
-        let task =
-            std::fs::read_to_string(thread::task_path(project, &record.id)).unwrap_or_default();
-        let stub = Thread {
-            worktree_path: folder.to_string_lossy().into_owned(),
-            thread_dir: folder.to_string_lossy().into_owned(),
-            ..record.clone()
-        };
-        let brief = format!(
-            "plain: {}\n\n{}",
-            record.plain,
-            thread::brief_for(project, &stub, &task, false)?
-        );
-        prepare_managed_git_folder(ctx.runner, &folder, &brief)?
-    } else {
-        (
-            folder,
-            record.launch.brief_hash.clone(),
-            record.base.clone(),
-        )
-    };
-    let folder_text = folder.to_string_lossy().into_owned();
-    if managed {
-        thread::update(project, &record.id, |t| {
-            t.worktree_path = folder_text.clone();
-            t.thread_dir = folder_text.clone();
-            t.branch = "main".into();
-            t.base = base.clone();
-            t.launch.brief_hash = brief_hash.clone();
-        })?;
-    }
-    let spec = crate::contracts::RoleSpec {
-        kind: record.launch.kind.clone(),
-        args: record.launch.args.clone(),
-        env: record.launch.env.clone(),
-        ready_timeout_ms: record.launch.ready_timeout_ms,
-    };
-    let env = project::tab_env(
-        &project.slug,
-        &record.id,
-        record.attempt.max(1),
-        &brief_hash,
-        None,
-        &spec,
-    );
-    let created = view
-        .herdr
-        .tab_create_env(&coordinator.workspace_id, &folder, &record.id, false, &env)
-        .map_err(|e| anyhow::anyhow!("{e}"))?;
-    let cwd = view.herdr.pane_cwd(&created.pane_id).unwrap_or_default();
-    let cwd = if cwd.is_empty() {
-        folder.to_string_lossy().into_owned()
-    } else {
-        cwd
-    };
-    thread::update(project, &record.id, |t| {
-        t.cwd = cwd;
-        t.workspace_id = created.workspace_id;
-        t.tab_id = created.tab_id;
-        t.pane_id = created.pane_id;
-        if managed {
-            t.worktree_path = folder_text.clone();
-            t.thread_dir = folder_text;
-            t.branch = "main".into();
-            t.base = base;
-            t.launch.brief_hash = brief_hash;
-        }
-    })
 }
 
 /// Makes the project-owned git folder used by a thread with no code
@@ -1522,9 +1363,12 @@ fn finish_placement(project: &Project, view: &SessionView, id: &str) -> Result<T
         }
         t.agent_name = thread::agent_name(&project.slug, &t.id);
         t.prompt_pending = true;
+        t.brief_submitted = false;
+        t.brief_submitted_at.clear();
         t.launch_attempts = 0;
         t.startup_wait_started.clear();
         t.recovery_pending = false;
+        t.partial = None;
         t.status = Status::Open;
         t.error.clear();
         t.last_state.clear();
@@ -1551,52 +1395,72 @@ fn lists_for(view: &SessionView, record: &Thread) -> Result<(Vec<Agent>, Vec<Pan
     ))
 }
 
-/// Resume a persisted recovery without re-picking or touching worktree files.
+/// Drive a persisted start, retry or reopen without re-picking or resetting work.
 pub fn place_recovery(ctx: &Ctx, project: &Project, record: &Thread) -> Result<()> {
+    if record.kind == Kind::Adopted {
+        bail!("an adopted thread is not placed by the binary");
+    }
+    if !record.provider_wait_started.is_empty() {
+        return Ok(());
+    }
+    crate::plan::check_attempt_prerequisites(project, &record.id)?;
     if record.launch_attempts >= thread::MAX_LAUNCH_ATTEMPTS {
-        thread::update(project, &record.id, |t| {
-            t.recovery_pending = false;
-            t.error = "recovery_placement_exhausted: could not open the replacement lane".into();
-        })?;
-        bail!("recovery_placement_exhausted");
+        fail_start(
+            ctx,
+            project,
+            &record.id,
+            &format!("recovery_placement_exhausted: {}", record.error),
+            crate::contracts::FailureClass::Unknown,
+            false,
+        )?;
+        return Ok(());
     }
     thread::update(project, &record.id, |t| t.launch_attempts += 1)?;
-    let view = require_session(ctx, project)?;
-    let herdr = view.herdr.on_machine(record.machine_route());
-    if !record.tab_id.is_empty() {
-        // Only this lane's failed attempt is stopped, never a coordinator.
-        let panes = herdr.pane_list()?;
-        if let Some(pane) = panes.iter().find(|p| p.pane_id == record.pane_id) {
-            if pane.workspace_id != record.workspace_id || pane.tab_id != record.tab_id {
-                bail!("recovery_identity_mismatch: old pane was reused");
+    let result = (|| -> Result<()> {
+        let view = require_session(ctx, project)?;
+        let herdr = view.herdr.on_machine(record.machine_route());
+        if !record.tab_id.is_empty() && record.partial.as_deref() != Some("lane_card") {
+            // Only this failed/parked attempt is stopped, never an adopted process.
+            if let Some(pane) = herdr
+                .pane_list()?
+                .iter()
+                .find(|p| p.pane_id == record.pane_id)
+            {
+                if pane.workspace_id != record.workspace_id || pane.tab_id != record.tab_id {
+                    bail!("recovery_identity_mismatch: old pane was reused");
+                }
+                close_pane(ctx, project, record)?;
             }
-            close_pane(ctx, project, record)?;
+            thread::update(project, &record.id, |t| {
+                t.pane_id.clear();
+                t.tab_id.clear();
+                t.workspace_id.clear();
+            })?;
         }
-    }
-    if record.is_remote() {
-        let profile = remote::machine_profile(
-            ctx.runner,
-            &ctx.env.herdr_bin(),
-            &ctx.config_dir,
-            record.machine_route(),
-        )?;
-        box_launch_ready(ctx, &profile, &record.launch)?;
-        place_and_brief(ctx, project, &view, &record.id, true)?;
-    } else {
-        crate::doctor::recipe_ready_local(ctx, &record.launch)?;
-        if record.kind == Kind::Worktree && record.worktree_path.is_empty()
-            || record.kind == Kind::Tab && record.pane_id.is_empty()
-        {
-            place_and_brief(ctx, project, &view, &record.id, true)?;
-        } else {
-            place_ade_tab(ctx, project, &view, record)?;
-            let placed = thread::load(project, &record.id)?;
-            write_brief(ctx, project, &placed)?;
-            finish_placement(project, &view, &record.id)?;
+        if record.launch.brief_hash.is_empty() && record.kind == Kind::Worktree {
+            // Historical pre-placement records have no frozen brief/base yet.
+            let task = std::fs::read_to_string(thread::task_path(project, &record.id))?;
+            let integration = integration_branch(ctx.runner, record)?;
+            let base = crate::git::rev_parse(ctx.runner, &record.repo, &integration)?;
+            let saved = thread::update(project, &record.id, |t| t.base = base)?;
+            freeze_start(ctx, project, &saved, &task)?;
         }
+        place_and_brief(ctx, project, &view, &record.id)?;
+        if record.is_remote() {
+            ticker::request_remote_poll(&ctx.root, project, record.machine_route())?;
+        }
+        Ok(())
+    })();
+    if let Err(error) = &result {
+        let message = format!("{error:#}");
+        thread::update(project, &record.id, |t| {
+            t.error = message.clone();
+            if remote::is_unreachable(&message) || message.starts_with("disk_low:") {
+                t.launch_attempts = record.launch_attempts;
+            }
+        })?;
     }
-    thread::update(project, &record.id, |t| t.recovery_pending = false)?;
-    Ok(())
+    result
 }
 
 /// Typed recovery result shared by human and JSON rendering.
@@ -1617,7 +1481,7 @@ pub struct RetryOutcome {
 /// process. Its durable failure class decides whether recovery stays on the
 /// same recipe within its retry budget, or waits for evidence.
 pub fn retry(ctx: &Ctx, slug: &str, id: &str, reason: &str) -> Result<RetryOutcome> {
-    retry_with_ticker(ctx, slug, id, reason, ticker::start, true, false)
+    retry_inner(ctx, slug, id, reason, false)
 }
 
 /// Round recovery already holds the advance lock, so it must not replace and
@@ -1630,16 +1494,14 @@ pub(crate) fn retry_during_advance(
 ) -> Result<RetryOutcome> {
     // A manual review retry is the same coordinator decision as `thread
     // retry`; only its ticker handling differs because advance_lock is held.
-    retry_with_ticker(ctx, slug, id, reason, ticker::ensure, true, true)
+    retry_inner(ctx, slug, id, reason, true)
 }
 
-fn retry_with_ticker(
+fn retry_inner(
     ctx: &Ctx,
     slug: &str,
     id: &str,
     reason: &str,
-    ensure_ticker: fn(&Ctx<'_>) -> Result<()>,
-    launch_now: bool,
     replace_busy: bool,
 ) -> Result<RetryOutcome> {
     let project = Project::load(&ctx.root, slug)?;
@@ -1661,11 +1523,7 @@ fn retry_with_ticker(
     // A crash after the attempt transition but before placement resumes the
     // same selected attempt. It must not spend another routing recovery.
     if record.recovery_pending {
-        ensure_ticker(ctx)?;
-        place_prelaunch_recovery(ctx, &project, &record)?;
-        if launch_now {
-            ticker::launch_thread_now(ctx, &project, id)?;
-        }
+        ticker::ensure(ctx)?;
         let placed = thread::load(&project, id)?;
         return Ok(RetryOutcome {
             thread: placed.id,
@@ -1745,7 +1603,7 @@ fn retry_with_ticker(
     };
     // No agent was submitted: retry the same selection without spending a
     // process/provider recovery allowance.
-    let mut launch = if record.launch_attempts == 0 {
+    let mut launch = if record.launch_attempts == 0 || record.partial.is_some() {
         record.launch.clone()
     } else {
         crate::launch::resolve_coordinator_retry(ctx, &project, &input, record.failure_class)?
@@ -1805,11 +1663,12 @@ fn retry_with_ticker(
             );
         }
         t.launch = launch;
-        t.status = Status::Failed;
+        t.status = Status::Starting;
         t.prompt_pending = false;
         t.launch_attempts = 0;
         t.startup_wait_started.clear();
         t.bootstrap.clear();
+        t.partial = Some("placement".into());
         t.error.clear();
         t.last_failure = reason.to_string();
         t.cleanup_pending = false;
@@ -1818,11 +1677,7 @@ fn retry_with_ticker(
         Ok(())
     })?;
 
-    ensure_ticker(ctx)?;
-    place_prelaunch_recovery(ctx, &project, &thread::load(&project, id)?)?;
-    if launch_now {
-        ticker::launch_thread_now(ctx, &project, id)?;
-    }
+    ticker::ensure(ctx)?;
     let placed = thread::load(&project, id)?;
     Ok(RetryOutcome {
         thread: placed.id,
@@ -1831,26 +1686,6 @@ fn retry_with_ticker(
         recipe: selected_recipe,
         screen,
     })
-}
-
-// Placement counts its own tries; if it failed before submitting an agent,
-// keep the launch counter at zero so review recovery never calls it process gone.
-// A reviewer is retried by the review's retry, not the ticker's immediate
-// recovery pass (which would bypass that clock and exhaust placement).
-fn place_prelaunch_recovery(ctx: &Ctx, project: &Project, record: &Thread) -> Result<()> {
-    let result = place_recovery(ctx, project, record);
-    if let Err(error) = &result
-        && record.launch_attempts == 0
-    {
-        thread::update(project, &record.id, |t| {
-            t.launch_attempts = 0;
-            if t.role == "reviewer" {
-                t.recovery_pending = false;
-                t.error = format!("{error:#}");
-            }
-        })?;
-    }
-    result
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -3222,7 +3057,7 @@ pub(crate) fn startup_screen(herdr: &Herdr<'_>, pane: &str) -> String {
 
 pub(crate) fn retry_command(slug: &str, id: &str) -> String {
     format!(
-        "ha thread retry {} {} --reason \"<why replace this attempt>\"",
+        "ha thread retry {} {} --reason \"retry failed startup\"",
         remote::quote(slug),
         remote::quote(id)
     )
@@ -3305,8 +3140,6 @@ pub(crate) fn fail_start_checked(
                 "automatic same-recipe retry selected for attempt {}; wait for startup",
                 t.attempt.max(1).saturating_add(1)
             )
-        } else if class == crate::contracts::FailureClass::Unknown {
-            "wait for the coordinator to classify the missing failure evidence".into()
         } else {
             retry_command(&project.slug, id)
         };
@@ -3334,13 +3167,15 @@ pub(crate) fn fail_start_checked(
         t.error = recovery_error.clone().unwrap_or_else(|| reason.to_string());
         t.failure_class = class;
         t.provider_failure_kind = provider_kind.clone();
+        t.recovery_pending = recovery.is_some();
         if let Some(mut selected) = recovery.clone() {
             t.attempt = t.attempt.max(1).saturating_add(1);
             selected.attempt = t.attempt;
             selected.brief_hash = t.launch.brief_hash.clone();
             t.launch = selected;
-            // This transition is still evidence about the attempt that just
-            // launched. Placement resets the counter for the next attempt.
+            // Placement gets its own bounded counter for the selected attempt.
+            t.launch_attempts = 0;
+            t.partial = Some("placement".into());
             t.recovery_pending = true;
         }
         t.last_group = Group::WaitingOnYou.token().to_string();
@@ -3406,209 +3241,46 @@ fn reopen_parked(
     text: &str,
     events: &[crate::contracts::Event],
 ) -> Result<()> {
-    let view = require_session(ctx, project)?;
-    let herdr = view.herdr.on_machine(record.machine_route());
-    let coordinator = project
-        .coordinator()
-        .context("project coordinator missing")?;
-    let machine = if record.is_remote() {
-        Some(remote::declaration_for_route(
-            ctx.runner,
-            &ctx.env.herdr_bin(),
-            &ctx.config_dir,
-            record.machine_route(),
-        )?)
-    } else {
-        None
-    };
-    let spec = crate::contracts::RoleSpec {
-        kind: record.launch.kind.clone(),
-        args: record.launch.args.clone(),
-        env: record.launch.env.clone(),
-        ready_timeout_ms: record.launch.ready_timeout_ms,
-    };
-    let env = project::tab_env(
-        &project.slug,
-        &record.id,
-        record.attempt.max(1),
-        &record.launch.brief_hash,
-        machine.as_ref(),
-        &spec,
-    );
-    let folder = Path::new(&record.worktree_path);
-    let created = if record.is_remote() {
-        let _lock =
-            project::remote_workspace_lock(&ctx.root, &project.slug, record.machine_route())?;
-        let (settings, _) = project.read_project_md()?;
-        let label = project::display_name(&settings.name, &project.slug);
-        let workspaces: Vec<_> = herdr
-            .workspace_list()?
-            .into_iter()
-            .filter(|w| w.label == label)
-            .collect();
-        if workspaces.len() > 1 {
-            bail!("remote_workspace_duplicate: multiple workspaces for {label}");
+    require_session(ctx, project)?;
+    ticker::ensure(ctx)?;
+    let resuming =
+        crate::adapters::resume_args(&record.launch, record.identity.agent_session.as_deref())
+            .is_some();
+    thread::update_checked(project, &record.id, |t| {
+        if !t.parked || t.attempt != record.attempt {
+            bail!("reopen_stale: completion changed during reopen");
         }
-        match workspaces.first() {
-            Some(workspace) => {
-                herdr.tab_create_env(&workspace.workspace_id, folder, &record.id, false, &env)?
-            }
-            None => herdr.workspace_create_env(folder, &label, false, &env)?,
-        }
-    } else {
-        herdr.tab_create_env(&coordinator.workspace_id, folder, &record.id, false, &env)?
-    };
-    let cwd = herdr
-        .pane_cwd(&created.pane_id)
-        .unwrap_or_else(|_| record.worktree_path.clone());
-    let mut placed = record.clone();
-    placed.workspace_id = created.workspace_id;
-    placed.tab_id = created.tab_id;
-    placed.pane_id = created.pane_id;
-    placed.cwd = if cwd.is_empty() {
-        record.worktree_path.clone()
-    } else {
-        cwd
-    };
-    let old_session = record.identity.agent_session.as_deref();
-    let mut args = record.launch.args.clone();
-    let resuming = match (record.launch.kind.as_str(), old_session) {
-        ("pi", Some(id)) => {
-            args.extend(["--session".into(), id.into()]);
-            true
-        }
-        ("claude", Some(id)) => {
-            args.extend(["--resume".into(), id.into()]);
-            true
-        }
-        ("codex", Some(id)) => {
-            args.extend(["resume".into(), id.into()]);
-            true
-        }
-        _ => false,
-    };
-    // A fresh agent must read the old report and the new instruction, rather
-    // than silently starting from an empty conversation.
-    let result = (|| -> Result<()> {
-        if let Some(machine) = &machine {
-            herdr.pane_set_parent(&placed.pane_id, &parent_token(record, &coordinator.pane_id))?;
-            // The box's `ha done` authenticates the pane against its lane
-            // card. Rebind that card before starting a resumed agent.
-            let profile = remote::machine_profile(
-                ctx.runner,
-                &ctx.env.herdr_bin(),
-                &ctx.config_dir,
-                record.machine_route(),
-            )?;
-            let (settings, _) = project.read_project_md()?;
-            let (box_repo, publish_url) =
-                box_repo_row(&ctx.config_dir, &settings, &profile.label, &record.repo)?;
-            let card = crate::contracts::LaneCard {
-                project: project.slug.clone(),
-                thread: record.id.clone(),
-                attempt: record.attempt.max(1),
-                brief_hash: record.launch.brief_hash.clone(),
-                role: record.role.clone(),
-                kind: record.launch.kind.clone(),
-                pane_id: placed.pane_id.clone(),
-                machine_label: record.machine.clone(),
-                machine_id: record.machine_id.clone(),
-                box_repo,
-                box_worktree: record.worktree_path.clone(),
-                brief_commit: record.base.clone(),
-                branch: record.branch.clone(),
-                publish_url,
-                recipient: crate::contracts::Recipient {
-                    pane: coordinator.pane_id.clone(),
-                    coordinator_attempt: coordinator.attempt(),
-                },
-                start_line: thread::launch_prompt(
-                    &format!("{} --root {}", machine.ade_bin, machine.root),
-                    &project.slug,
-                    record,
-                ),
-                created: project::now(),
-            };
-            remote::provision_card(
-                ctx.runner,
-                &profile.target,
-                &project.slug,
-                &format!(
-                    "{}/{}/.state/lanes/{}.toml",
-                    machine.root, project.slug, record.id
-                ),
-                &toml::to_string(&card)?,
-            )?;
-        }
-        let agent = herdr.agent_start_opts(&crate::herdr::AgentStart {
-            name: &record.agent_name,
-            kind: &record.launch.kind,
-            pane: &placed.pane_id,
-            agent_args: &args,
-            launch_bin: None,
-            parent: if record.is_remote() {
-                None
-            } else {
-                Some(&coordinator.pane_id)
+        t.parked = false;
+        t.status = Status::Starting;
+        t.recovery_pending = true;
+        t.launch_attempts = 0;
+        t.startup_wait_started.clear();
+        t.brief_submitted = false;
+        t.brief_submitted_at.clear();
+        t.partial = Some("placement".into());
+        t.last_group = Group::Working.token().into();
+        t.prompt_pending = false;
+        // The launch adapter supplies resume arguments from the saved identity.
+        // Only readiness of that new process converts this into a receipt.
+        t.bootstrap = if resuming {
+            "resuming".into()
+        } else {
+            String::new()
+        };
+        t.follow_ups.push(FollowUp {
+            attempt: t.attempt.max(1),
+            text: if resuming { text.to_string() } else {
+                format!("Read your frozen brief at {}/brief.md and sealed report at {}. Continue in the same folder.\n\n{}",
+                    record.thread_dir, record.report_path(), text)
             },
-            ready_timeout_ms: record.launch.ready_timeout_ms,
-        })?;
-        let process = herdr
-            .pane_process_info(&placed.pane_id)
-            .ok()
-            .and_then(|info| info.identity(&record.launch.kind));
-        thread::update_checked(project, &record.id, |t| {
-            if !t.parked || t.attempt != record.attempt {
-                bail!("reopen_stale: completion changed during reopen");
-            }
-            t.workspace_id = placed.workspace_id.clone();
-            t.tab_id = placed.tab_id.clone();
-            t.pane_id = placed.pane_id.clone();
-            t.cwd = placed.cwd.clone();
-            t.parked = false;
-            t.last_group = Group::Working.token().into();
-            // Only a resumed conversation has consumed the frozen brief.
-            // A fresh process must earn a receipt for its new pane before any
-            // queued correction is delivered.
-            t.prompt_pending = !resuming;
-            t.bootstrap = if resuming {
-                "acknowledged".into()
-            } else {
-                String::new()
-            };
-            t.follow_ups.push(FollowUp {
-                attempt: t.attempt.max(1),
-                text: if resuming {
-                    text.to_string()
-                } else {
-                    format!(
-                        "Read your frozen brief at {}/brief.md and sealed report at {}. Continue in the same folder.\n\n{}",
-                        record.thread_dir,
-                        record.report_path(),
-                        text
-                    )
-                },
-                state: FollowUpState::Queued,
-                waiting_event: latest_waiting_event_id(events, &record.id, record.attempt.max(1))
-                    .unwrap_or_default(),
-                queued_at: project::now(),
-                ..FollowUp::default()
-            });
-            t.last_state = agent.agent_status.clone();
-            t.last_state_change = project::now();
-            let prior_session = t.identity.agent_session.clone();
-            thread::bind_identity(t, &coordinator.socket, &agent, process);
-            if resuming && t.identity.agent_session.is_none() {
-                t.identity.agent_session = prior_session;
-            }
-            Ok(())
-        })?;
+            state: FollowUpState::Queued,
+            waiting_event: latest_waiting_event_id(events, &record.id, record.attempt.max(1)).unwrap_or_default(),
+            queued_at: project::now(),
+            ..FollowUp::default()
+        });
         Ok(())
-    })();
-    if result.is_err() {
-        let _ = close_pane(ctx, project, &placed);
-    }
-    result
+    })?;
+    Ok(())
 }
 
 pub(crate) fn park_completed(ctx: &Ctx, project: &Project) -> Result<()> {
@@ -6154,7 +5826,7 @@ mod tests {
     }
 
     #[test]
-    fn failed_reviewer_placement_waits_for_review_retry_instead_of_ticker_recovery() {
+    fn failed_placement_is_bounded_and_notifies_with_an_executable_retry() {
         let world = crate::scenarios::World::new();
         let project = crate::project::create(&world.root, "demo", "", vec![]).unwrap();
         let reviewer = thread::allocate(&project, |t| {
@@ -6164,20 +5836,26 @@ mod tests {
             t.launch_attempts = 0;
         })
         .unwrap();
-        let error = place_prelaunch_recovery(&world.ctx(), &project, &reviewer).unwrap_err();
-        assert!(error.to_string().contains("not reachable"), "{error:#}");
+        for count in 1..=thread::MAX_LAUNCH_ATTEMPTS {
+            let pending = thread::load(&project, &reviewer.id).unwrap();
+            let error = place_recovery(&world.ctx(), &project, &pending).unwrap_err();
+            assert!(error.to_string().contains("not reachable"), "{error:#}");
+            assert_eq!(
+                thread::load(&project, &reviewer.id)
+                    .unwrap()
+                    .launch_attempts,
+                count
+            );
+        }
+        crate::recovery::tick(&world.ctx(), &project).unwrap();
         let failed = thread::load(&project, &reviewer.id).unwrap();
-        assert_eq!(failed.launch_attempts, 0);
         assert_eq!(failed.status, Status::Failed);
         assert!(!failed.recovery_pending);
         assert!(failed.error.contains("not reachable"));
-        // The next ticker pass cannot place this reviewer ahead of its clock.
-        crate::recovery::tick(&world.ctx(), &project).unwrap();
-        assert_eq!(
-            thread::load(&project, &reviewer.id)
-                .unwrap()
-                .launch_attempts,
-            0
+        assert!(
+            failed.start_notices[0]
+                .line
+                .contains(&retry_command("demo", &reviewer.id))
         );
     }
 
@@ -6561,7 +6239,10 @@ mod tests {
         let reopened = thread::load(&project, &lane.id).unwrap();
         assert!(!reopened.parked);
         assert!(!reopened.prompt_pending);
-        assert_eq!(reopened.bootstrap, "acknowledged");
+        assert!(reopened.recovery_pending);
+        assert_eq!(reopened.bootstrap, "resuming");
+        assert_eq!(world.runner.count("tab create"), 0);
+        assert_eq!(world.runner.count("agent start"), 0);
         assert_eq!(
             reopened.identity.agent_session.as_deref(),
             Some("session-42")
@@ -6577,6 +6258,18 @@ mod tests {
         assert!(!thread::load(&project, &lane.id).unwrap().parked);
         assert_eq!(reopened.worktree_path, lane.worktree_path);
         assert_eq!(reopened.attempt, 1);
+        thread::update(&project, &lane.id, |t| {
+            t.launch.brief_hash = thread::store_artifact(&project, b"brief").unwrap();
+        })
+        .unwrap();
+        let reopened = place_started(&ctx, &project, &thread::load(&project, &lane.id).unwrap());
+        *world.agents.borrow_mut() = "[]".into();
+        *world.panes.borrow_mut() = format!(
+            "[{}]",
+            crate::scenarios::pane_json("w1", "w1:t2", "w1:p2", &reopened.cwd)
+        );
+        thread::update(&project, &lane.id, |t| t.error = "provider ready".into()).unwrap();
+        ticker::launch_thread_with_wait(&ctx, &project, &lane.id, Duration::ZERO).unwrap();
         assert!(world.runner.calls.borrow().iter().any(|c| {
             let text = c.display();
             text.contains("agent start")
@@ -6596,7 +6289,8 @@ mod tests {
         .unwrap();
         let retried = retry_during_advance(&ctx, "demo", &lane.id, "Repair the conflict").unwrap();
         assert_eq!(retried.attempt, 1);
-        assert_eq!(retried.pane_id, "w1:p2");
+        assert_eq!(retried.pane_id, "w2:p1");
+        assert!(thread::load(&project, &lane.id).unwrap().recovery_pending);
         assert_eq!(
             thread::load(&project, &lane.id).unwrap().worktree_path,
             lane.worktree_path
@@ -6605,6 +6299,11 @@ mod tests {
         let retried_lane = thread::load(&project, &lane.id).unwrap();
         assert_eq!(retried_lane.follow_ups.len(), 1);
         assert_eq!(retried_lane.follow_ups[0].text, "Repair the conflict");
+    }
+
+    fn place_started(ctx: &Ctx, project: &Project, record: &Thread) -> Thread {
+        place_recovery(ctx, project, record).unwrap();
+        thread::load(project, &record.id).unwrap()
     }
 
     struct GitReal<'a> {
@@ -6684,6 +6383,7 @@ mod tests {
             detached_ticker: false,
         };
         let install = crate::harness::lock(&ctx.config_dir).unwrap();
+        let accepted_at = std::time::Instant::now();
         let started = start(
             &ctx,
             "demo",
@@ -6693,6 +6393,7 @@ mod tests {
                 machine: None,
                 base: None,
                 task: "Repair the lane.".into(),
+                attach: Vec::new(),
                 workflow: None,
                 recipe: None,
                 task_id: String::new(),
@@ -6700,18 +6401,22 @@ mod tests {
             },
         )
         .unwrap();
-        assert!(started.prompt_pending);
-        assert!(Path::new(&started.thread_dir).join("brief.md").exists());
-        assert_eq!(
-            thread::load(&project, &started.id).unwrap().status,
-            Status::Open
+        eprintln!(
+            "start acceptance returned in {:?}; no checkout, pane or agent created",
+            accepted_at.elapsed()
         );
+        assert!(!started.prompt_pending);
+        assert!(!Path::new(&started.thread_dir).join("brief.md").exists());
+        assert_eq!(started.status, Status::Starting);
+        assert!(started.recovery_pending);
+        assert!(started.worktree_path.is_empty());
+        assert_eq!(world.runner.count("tab create"), 0);
         assert!(!world.runner.calls.borrow().iter().any(|cmd| {
             cmd.display().contains("agent start") && !cmd.display().contains("--help")
         }));
 
         drop(install);
-        let wt = started.worktree_path.clone();
+        let wt = repo.clone() + "/.worktrees/" + &started.id;
         *world.panes.borrow_mut() = format!(
             "[{},{}]",
             world.coordinator_pane(&project),
@@ -6805,6 +6510,7 @@ mod tests {
                 base: None,
                 // The CLI maps `--task-file` to this verbatim field.
                 task: lead_brief.into(),
+                attach: Vec::new(),
                 workflow: None,
                 recipe: Some("chosen_claude".into()),
                 // The CLI maps `--job` to this stable task id.
@@ -6822,7 +6528,12 @@ mod tests {
         assert!(!started.launch.brief_hash.is_empty());
         assert_eq!(started.attempt, 1);
         let wt = Path::new(&repo_s).join(".worktrees").join(&started.id);
-        assert!(wt.is_dir(), "git worktree should exist");
+        assert_eq!(started.status, Status::Starting);
+        assert!(started.recovery_pending);
+        assert!(!wt.exists(), "start must not create a checkout");
+        assert_eq!(world.runner.count("tab create"), 0);
+        let started = place_started(&ctx, &project, &started);
+        assert!(wt.is_dir(), "ticker placement creates the checkout");
         // The lane branches from the exact integration commit while its brief
         // is a content-addressed project artifact and ignored runtime file.
         let git_out = |args: &[&str]| {
@@ -6916,6 +6627,8 @@ mod tests {
         retry(&ctx, "demo", &started.id, "the first process disappeared").unwrap();
         drop(install);
         let retried = thread::load(&project, &started.id).unwrap();
+        assert!(retried.recovery_pending);
+        let retried = place_started(&ctx, &project, &retried);
         assert_eq!(retried.attempt, 2);
         assert_eq!(retried.launch.kind, kind);
         assert_eq!(retried.launch.attempt, 2);
@@ -6987,6 +6700,7 @@ mod tests {
         };
         let args = |repo: String| StartArgs {
             title: "Fix login".into(),
+            attach: Vec::new(),
             repo: Some(repo),
             machine: None,
             base: None,
@@ -7173,6 +6887,7 @@ mod tests {
     fn start_args(repo: Option<String>, machine: Option<String>) -> StartArgs {
         StartArgs {
             title: "Fix login".into(),
+            attach: Vec::new(),
             repo,
             machine,
             base: None,
@@ -7182,6 +6897,191 @@ mod tests {
             task_id: String::new(),
             review_id: String::new(),
         }
+    }
+
+    #[test]
+    fn attachments_are_frozen_staged_and_kept_on_retry_and_reopen() {
+        for remote in [false, true] {
+            let (fx, _) = box_fixture();
+            write_config(&fx, &lane_config());
+            stub_box(&fx);
+            let name = "named ' input.bin";
+            let source = fx.world.home.path().join(name);
+            let bytes = b"\0\xffnamed bytes\n";
+            std::fs::write(&source, bytes).unwrap();
+            let mut args = start_args(
+                Some(fx.repo.to_string_lossy().into_owned()),
+                Some(if remote { "buildbox" } else { "local" }.into()),
+            );
+            args.attach = vec![source.to_string_lossy().into_owned()];
+            let started = start(&fx.world.ctx(), "demo", args).unwrap();
+            assert_eq!(started.status, Status::Starting);
+            assert!(started.worktree_path.is_empty());
+            assert_eq!(fx.world.runner.count("tab create"), 0);
+            assert_eq!(fx.world.runner.count("workspace create"), 0);
+            let brief = String::from_utf8(
+                thread::artifact(&fx.project, &started.launch.brief_hash).unwrap(),
+            )
+            .unwrap();
+            let path = format!("{}/attachments/{name}", started.thread_dir);
+            assert!(
+                brief.contains(&format!("- Attachment: `{path}`")),
+                "{brief}"
+            );
+            std::fs::write(&source, b"changed after acceptance").unwrap();
+            let check = |lane: &Thread| {
+                assert_eq!(
+                    thread::artifact(&fx.project, &lane.attachments[name]).unwrap(),
+                    bytes
+                );
+                if remote {
+                    let encoded: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
+                    assert!(fx.world.runner.calls.borrow().iter().any(|call| {
+                        call.program == "ssh"
+                            && call.stdin.as_deref() == Some(&encoded)
+                            && call
+                                .args
+                                .last()
+                                .unwrap()
+                                .contains(&format!("{}/attachments/", lane.thread_dir))
+                    }));
+                } else {
+                    assert_eq!(std::fs::read(&path).unwrap(), bytes);
+                }
+            };
+            let placed = place_started(&fx.world.ctx(), &fx.project, &started);
+            check(&placed);
+            // A crash after binding but before finishing the card reuses that
+            // exact terminal, rather than leaking a second pane.
+            *fx.world.panes.borrow_mut() = serde_json::json!([{
+                "workspace_id": placed.workspace_id, "tab_id": placed.tab_id,
+                "pane_id": placed.pane_id, "cwd": placed.cwd
+            }])
+            .to_string();
+            let partial = thread::update(&fx.project, &placed.id, |t| {
+                t.partial = Some("lane_card".into());
+                t.recovery_pending = true;
+                t.status = Status::Starting;
+            })
+            .unwrap();
+            let tabs = fx.world.runner.count("tab create");
+            let workspaces = fx.world.runner.count("workspace create");
+            let placed = place_started(&fx.world.ctx(), &fx.project, &partial);
+            assert_eq!(fx.world.runner.count("tab create"), tabs);
+            assert_eq!(fx.world.runner.count("workspace create"), workspaces);
+            assert_eq!(placed.pane_id, partial.pane_id);
+            if !remote {
+                let checkout = Path::new(&placed.worktree_path);
+                std::fs::write(checkout.join("progress.txt"), b"keep this work").unwrap();
+                crate::testkit::git(checkout, &["add", "progress.txt"]);
+                crate::testkit::git(checkout, &["commit", "-qm", "lane progress"]);
+                thread::update(&fx.project, &placed.id, |t| {
+                    t.status = Status::Failed;
+                    t.partial = Some("placement".into());
+                    t.launch_attempts = thread::MAX_LAUNCH_ATTEMPTS;
+                })
+                .unwrap();
+            }
+            retry(
+                &fx.world.ctx(),
+                "demo",
+                &placed.id,
+                "retry before agent submission",
+            )
+            .unwrap();
+            let retried = place_started(
+                &fx.world.ctx(),
+                &fx.project,
+                &thread::load(&fx.project, &placed.id).unwrap(),
+            );
+            check(&retried);
+            let parked = thread::update(&fx.project, &retried.id, |t| {
+                t.parked = true;
+                t.prompt_pending = false;
+                t.identity.agent_session = Some("saved-session".into());
+            })
+            .unwrap();
+            reopen_parked(&fx.world.ctx(), &fx.project, &parked, "continue", &[]).unwrap();
+            let reopened = place_started(
+                &fx.world.ctx(),
+                &fx.project,
+                &thread::load(&fx.project, &placed.id).unwrap(),
+            );
+            check(&reopened);
+            assert_eq!(reopened.attachments, started.attachments);
+            assert_eq!(reopened.launch.brief_hash, started.launch.brief_hash);
+            assert_eq!(
+                reopened.launch.same_recipe_retries,
+                started.launch.same_recipe_retries
+            );
+            if !remote {
+                assert_eq!(
+                    std::fs::read(Path::new(&reopened.worktree_path).join("progress.txt")).unwrap(),
+                    b"keep this work"
+                );
+            }
+            assert_eq!(
+                fx.world
+                    .runner
+                    .calls
+                    .borrow()
+                    .iter()
+                    .filter(|call| call.program == "git" && call.display().contains("worktree add"))
+                    .count(),
+                if remote { 0 } else { 1 }
+            );
+        }
+    }
+
+    #[test]
+    fn bad_attachments_and_base_are_refused_before_allocating_a_lane() {
+        let fx = crate::testkit::fixture();
+        let file = fx.world.home.path().join("input.bin");
+        std::fs::write(&file, b"input").unwrap();
+        let second = fx.world.home.path().join("second/input.bin");
+        std::fs::create_dir_all(second.parent().unwrap()).unwrap();
+        std::fs::write(&second, b"another input").unwrap();
+        for files in [
+            vec!["/missing-input.bin".into()],
+            vec![
+                file.to_string_lossy().into_owned(),
+                second.to_string_lossy().into_owned(),
+            ],
+        ] {
+            let mut args = start_args(Some(fx.repo.to_string_lossy().into_owned()), None);
+            args.attach = files;
+            assert!(
+                start(&fx.world.ctx(), "demo", args)
+                    .unwrap_err()
+                    .to_string()
+                    .contains("attachment_")
+            );
+            assert!(thread::list(&fx.project).is_empty());
+        }
+        std::fs::File::options()
+            .write(true)
+            .open(&file)
+            .unwrap()
+            .set_len(LINKED_FILES_CAP + 1)
+            .unwrap();
+        let mut args = start_args(Some(fx.repo.to_string_lossy().into_owned()), None);
+        args.attach = vec![file.to_string_lossy().into_owned()];
+        assert!(
+            start(&fx.world.ctx(), "demo", args)
+                .unwrap_err()
+                .to_string()
+                .contains("over cap")
+        );
+        let mut args = start_args(Some(fx.repo.to_string_lossy().into_owned()), None);
+        args.base = Some("missing-branch".into());
+        assert!(
+            start(&fx.world.ctx(), "demo", args)
+                .unwrap_err()
+                .to_string()
+                .contains("integration_branch_required")
+        );
+        assert!(thread::list(&fx.project).is_empty());
+        assert_eq!(fx.world.runner.count("tab create"), 0);
     }
 
     #[test]
@@ -7220,6 +7120,7 @@ mod tests {
         stub_box(&fx);
         let args = start_args(Some(fx.repo.to_string_lossy().into_owned()), None);
         let started = start(&fx.world.ctx(), "demo", args).unwrap();
+        let started = place_started(&fx.world.ctx(), &fx.project, &started);
         assert_eq!(started.machine, "buildbox");
         // A placed attempt keeps its saved machine when retried.
         thread::update(&fx.project, &started.id, |t| {
@@ -7238,6 +7139,7 @@ mod tests {
         );
         local_args.base = Some("main".into());
         let local = start(&fx.world.ctx(), "demo", local_args).unwrap();
+        let local = place_started(&fx.world.ctx(), &fx.project, &local);
         crate::testkit::git(
             &fx.repo,
             &["worktree", "remove", "--force", &local.worktree_path],
@@ -7265,6 +7167,8 @@ mod tests {
             t.machine_id.clear();
             t.placement_reason.clear();
             t.launch.machine = "local".into();
+            t.recovery_pending = false;
+            t.status = Status::Failed;
             t.pane_id.clear();
             t.tab_id.clear();
             t.workspace_id.clear();
@@ -7320,7 +7224,8 @@ mod tests {
         )
         .unwrap();
         assert_eq!(started.machine, "buildbox");
-        assert!(!started.worktree_path.is_empty());
+        assert!(started.worktree_path.is_empty());
+        assert!(started.recovery_pending);
     }
 
     #[test]
@@ -7335,6 +7240,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(started.machine, "buildbox");
+        let started = place_started(&fx.world.ctx(), &fx.project, &started);
         assert_eq!(started.machine_id, "buildbox-id");
         assert_eq!(started.launch.machine, "buildbox");
         assert!(
@@ -7348,6 +7254,7 @@ mod tests {
             start_args(Some(fx.repo.to_string_lossy().into_owned()), None),
         )
         .unwrap();
+        let second = place_started(&fx.world.ctx(), &fx.project, &second);
         assert_eq!(second.workspace_id, started.workspace_id);
         let calls = fx.world.runner.calls.borrow();
         for lane in [&started, &second] {
@@ -7394,6 +7301,7 @@ mod tests {
             start_args(Some(fx.repo.to_string_lossy().into_owned()), None),
         )
         .unwrap();
+        let started = place_started(&fx.world.ctx(), &fx.project, &started);
         let parked = thread::update(&fx.project, &started.id, |t| {
             t.parked = true;
             t.identity.agent_session = Some("session-42".into());
@@ -7414,6 +7322,17 @@ mod tests {
             &[],
         )
         .unwrap();
+        let reopened = place_started(
+            &fx.world.ctx(),
+            &fx.project,
+            &thread::load(&fx.project, &started.id).unwrap(),
+        );
+        *fx.world.panes.borrow_mut() = format!(
+            "[{}]",
+            crate::scenarios::pane_json("w1", "w1:t3", "w1:p3", &reopened.cwd)
+        );
+        ticker::launch_thread_with_wait(&fx.world.ctx(), &fx.project, &started.id, Duration::ZERO)
+            .unwrap();
         assert!(fx.world.runner.calls.borrow().iter().any(|call| {
             call.display().contains("--machine buildbox-id pane report-metadata w1:p3 --source herdr-ade --token parent=Local:w1:p9")
         }));
@@ -7447,7 +7366,8 @@ mod tests {
         );
         assert_eq!(claude.launch.recipe_id, "test_claude");
         assert_eq!(claude.kind, Kind::Worktree);
-        assert!(!claude.worktree_path.is_empty());
+        assert!(claude.worktree_path.is_empty());
+        assert!(claude.recovery_pending);
         assert!(claude.machine.is_empty());
         assert_eq!(claude.launch.machine, "local");
 
@@ -7720,6 +7640,7 @@ mod tests {
         assert!(started.machine.is_empty());
         assert_eq!(started.launch.machine, "local");
         assert!(started.placement_reason.contains("box_publish_url_missing"));
+        let started = place_started(&fx.world.ctx(), &fx.project, &started);
         let summary = placement_summary(&thread::load(&fx.project, &started.id).unwrap());
         assert!(summary.contains("runs_on = \"local\""), "{summary}");
         assert!(summary.contains("box_publish_url_missing"), "{summary}");
@@ -7766,6 +7687,7 @@ mod tests {
         assert!(started.machine.is_empty());
         assert!(started.machine_id.is_empty());
         assert_eq!(started.launch.machine, "local");
+        let started = place_started(&fx.world.ctx(), &fx.project, &started);
         assert!(
             started
                 .worktree_path

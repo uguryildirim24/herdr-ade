@@ -214,6 +214,9 @@ pub(crate) struct Thread {
     pub(crate) merged_review: String,
     pub(crate) review_after: String,
     pub(crate) review_reason: String,
+    /// Basename -> immutable artifact hash. Historical records have none.
+    #[serde(skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub(crate) attachments: std::collections::BTreeMap<String, String>,
     pub(crate) launch: crate::contracts::Launch,
     pub(crate) attempt: u32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -938,7 +941,7 @@ pub(crate) fn brief_for(
     } else {
         &thread.machine
     };
-    Ok(compose_brief(&BriefInput {
+    let mut brief = compose_brief(&BriefInput {
         task: &task,
         supplied_task,
         instructions: &instructions,
@@ -949,7 +952,14 @@ pub(crate) fn brief_for(
         restart,
         report_path: &thread.report_path(),
         library_path: &thread.library_path(),
-    }))
+    });
+    for name in thread.attachments.keys() {
+        brief.push_str(&format!(
+            "- Attachment: `{}/attachments/{name}`\n",
+            thread.thread_dir
+        ));
+    }
+    Ok(brief)
 }
 
 // ---------------------------------------------------------------- groups
@@ -1059,7 +1069,10 @@ pub(crate) fn recorded_group(thread: &Thread, now: jiff::Timestamp) -> Group {
         {
             Group::Working
         }
-        Status::Starting if seconds_since(&thread.created, now) >= STARTING_TIMEOUT_SECS => {
+        Status::Starting
+            if !thread.recovery_pending
+                && seconds_since(&thread.created, now) >= STARTING_TIMEOUT_SECS =>
+        {
             Group::WaitingOnYou
         }
         Status::Starting => Group::Working,
@@ -1090,7 +1103,8 @@ pub(crate) fn group(thread: &Thread, live: &Live, now: jiff::Timestamp) -> Group
     }
     // 2
     if thread.status == Status::Starting {
-        return if !thread.startup_wait_started.is_empty()
+        return if thread.recovery_pending
+            || !thread.startup_wait_started.is_empty()
             || !thread.provider_wait_started.is_empty()
             || seconds_since(&thread.created, now) < STARTING_TIMEOUT_SECS
         {
@@ -1251,6 +1265,9 @@ pub(crate) fn bind_identity(
     agent: &Agent,
     process: Option<crate::contracts::ProcessIdentity>,
 ) {
+    let resumed_session = (thread.bootstrap == "resuming")
+        .then(|| thread.identity.agent_session.clone())
+        .flatten();
     thread.identity = crate::contracts::IdentityBinding {
         socket: socket.to_string(),
         workspace_id: agent.workspace_id.clone(),
@@ -1267,7 +1284,8 @@ pub(crate) fn bind_identity(
             .agent_session
             .as_ref()
             .map(|s| s.id.clone())
-            .filter(|s| !s.is_empty()),
+            .filter(|s| !s.is_empty())
+            .or(resumed_session),
     };
 }
 
@@ -1718,14 +1736,22 @@ mod tests {
     fn historical_pr_fields_do_not_prevent_loading_a_thread() {
         let root = tempfile::tempdir().unwrap();
         let project = project::create(root.path(), "demo", "", vec![]).unwrap();
-        let lane = allocate(&project, |lane| lane.title = "Old lane".into()).unwrap();
+        let lane = allocate(&project, |lane| {
+            lane.title = "Old lane".into();
+            lane.kind = Kind::Tab;
+        })
+        .unwrap();
         let path = record_path(&project, &lane.id);
         let saved = std::fs::read_to_string(&path).unwrap();
+        assert!(!saved.contains("attachments"));
         let legacy = format!(
             "pr = \"https://github.com/acme/demo/pull/1\"\npr_state = \"OPEN\"\npr_review = \"APPROVED\"\npr_note = \"\"\npr_summary = {{ state = \"OPEN\", comments = [] }}\n{saved}"
         );
         std::fs::write(&path, legacy).unwrap();
-        assert_eq!(load(&project, &lane.id).unwrap().title, "Old lane");
+        let loaded = load(&project, &lane.id).unwrap();
+        assert_eq!(loaded.title, "Old lane");
+        assert_eq!(loaded.kind, Kind::Tab);
+        assert!(loaded.attachments.is_empty());
         assert_eq!(list_with_errors(&project).0.len(), 1);
         update(&project, &lane.id, |lane| {
             lane.title = "Updated lane".into()

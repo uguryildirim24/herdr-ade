@@ -153,25 +153,6 @@ pub(crate) fn lock(runner: &dyn Runner, repo: &str) -> Result<RepoLock> {
     })
 }
 
-/// `git worktree add <repo>/.worktrees/<id> -b <branch> <base>` (SPEC-ADE D4).
-pub(crate) fn worktree_add(
-    runner: &dyn Runner,
-    repo: &str,
-    id: &str,
-    branch: &str,
-    base: &str,
-) -> Result<PathBuf> {
-    let path = Path::new(repo).join(".worktrees").join(id);
-    let path_s = path.to_string_lossy().into_owned();
-    git(
-        runner,
-        repo,
-        &["worktree", "add", &path_s, "-b", branch, base],
-        GIT_TIMEOUT,
-    )?;
-    Ok(path)
-}
-
 /// `git worktree remove` without `--force`. Callers run ADE's stricter status
 /// inspection first because Git itself permits deletion of ignored files.
 pub(crate) fn worktree_remove(runner: &dyn Runner, repo: &str, path: &str) -> Result<()> {
@@ -441,7 +422,21 @@ mod tests {
     fn worktree_lifecycle_on_a_real_repo() {
         let (_dir, repo) = repo_with_commit();
         let repo_s = repo.to_string_lossy().into_owned();
-        let wt = worktree_add(&RealRunner, &repo_s, "t-0001", "lane/t-0001", "main").unwrap();
+        let wt = repo.join(".worktrees/t-0001");
+        git(
+            &RealRunner,
+            &repo_s,
+            &[
+                "worktree",
+                "add",
+                &wt.to_string_lossy(),
+                "-b",
+                "lane/t-0001",
+                "main",
+            ],
+            GIT_TIMEOUT,
+        )
+        .unwrap();
         assert!(wt.is_dir());
         assert!(wt.join("README").is_file());
         worktree_remove(&RealRunner, &repo_s, &wt.to_string_lossy()).unwrap();

@@ -235,6 +235,22 @@ fn builtin() -> BTreeMap<String, Adapter> {
     rows
 }
 
+/// Resume spelling belongs to the harness boundary, not lane placement.
+pub(crate) fn resume_args(
+    launch: &crate::contracts::Launch,
+    session: Option<&str>,
+) -> Option<Vec<String>> {
+    let flag = match launch.kind.as_str() {
+        "pi" => "--session",
+        "claude" => "--resume",
+        "codex" => "resume",
+        _ => return None,
+    };
+    let mut args = launch.args.clone();
+    args.extend([flag.to_string(), session?.to_string()]);
+    Some(args)
+}
+
 pub(crate) fn launch_args(adapter: &Adapter, recipe: &Recipe) -> Vec<String> {
     let mut args = recipe.args.clone();
     for flag in &adapter.launch_flags {

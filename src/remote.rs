@@ -519,17 +519,20 @@ pub(crate) fn write_runtime_file(
     runner: &dyn Runner,
     target: &str,
     path: &str,
-    contents: &str,
+    contents: &[u8],
     hash: &str,
 ) -> Result<()> {
+    // Runner stdin is text; hex preserves arbitrary attached bytes without
+    // interpreting filenames or file contents as shell input.
+    let encoded: String = contents.iter().map(|byte| format!("{byte:02x}")).collect();
     let tmp = format!("{path}.tmp-{}", std::process::id());
     let script = format!(
-        "set -e\nmkdir -p \"$(dirname {path})\"\ncat > {tmp}\ngot=$(sha256sum {tmp} | awk '{{print $1}}')\ntest \"$got\" = {hash} || {{ rm -f {tmp}; echo runtime_file_hash_mismatch >&2; exit 8; }}\nmv {tmp} {path}",
+        "set -e\nmkdir -p \"$(dirname {path})\"\npython3 -c 'import sys,binascii; sys.stdout.buffer.write(binascii.unhexlify(sys.stdin.buffer.read()))' > {tmp}\ngot=$(sha256sum {tmp} | awk '{{print $1}}')\ntest \"$got\" = {hash} || {{ rm -f {tmp}; echo runtime_file_hash_mismatch >&2; exit 8; }}\nmv {tmp} {path}",
         path = quote(path),
         tmp = quote(&tmp),
         hash = quote(hash),
     );
-    let out = ssh(runner, target, &script, Some(contents), SSH_START_TIMEOUT)?;
+    let out = ssh(runner, target, &script, Some(&encoded), SSH_START_TIMEOUT)?;
     if !out.success() {
         bail!(
             "could not write runtime file on {target}: {}",
@@ -698,7 +701,7 @@ mod tests {
     }
 
     #[test]
-    fn the_card_script_works_against_a_real_directory_with_a_hostile_path() {
+    fn runtime_and_card_scripts_preserve_binary_bytes_and_hostile_paths() {
         let root = tempfile::tempdir().unwrap();
         let dir = root.path().join("it's a $(box)");
         let card = dir.join(".state/lanes/t-0001.toml");
@@ -714,6 +717,22 @@ mod tests {
                 })
             },
         );
+        let file = dir.join("attachments/named ' input.bin");
+        let bytes = b"\0\xff\xfe\r\nnamed bytes";
+        let hash = crate::thread::sha256_hex(bytes);
+        write_runtime_file(&runner, "box", &file.to_string_lossy(), bytes, &hash).unwrap();
+        assert_eq!(std::fs::read(&file).unwrap(), bytes);
+        assert!(
+            write_runtime_file(
+                &runner,
+                "box",
+                &file.to_string_lossy(),
+                b"wrong bytes",
+                &hash
+            )
+            .is_err()
+        );
+        assert_eq!(std::fs::read(&file).unwrap(), bytes);
         provision_card(&runner, "box", "demo", &card_s, "thread = \"t-0001\"\n").unwrap();
         assert_eq!(
             std::fs::read_to_string(&card).unwrap(),

@@ -171,8 +171,8 @@ fn decide_start(lock: &LockState, my_version: &str) -> StartAction {
 /// Ensures a ticker is running without waiting for a running one to stop.
 /// `review` must not block while replacing a ticker: the ticker's own
 /// pass calls `advance`, so waiting here would deadlock against the ticker
-/// waiting on `advance`'s lock. Ordinary thread starts and explicit `ticker
-/// start` calls attempt to replace a stale-version ticker when it can stop.
+/// waiting on `advance`'s lock. Thread starts only ensure; explicit `ticker
+/// start` and installation replace a stale-version ticker when it can stop.
 pub(crate) fn ensure(ctx: &Ctx) -> Result<()> {
     let root = &ctx.root;
     if !ctx.detached_ticker || project::list_slugs(root).is_empty() || install_in_progress(ctx) {
@@ -1078,6 +1078,7 @@ pub(crate) fn resume_provider_starts(
     let mut reachable = true;
     for lane in thread::list_live(project) {
         if lane.provider_wait_started.is_empty()
+            || lane.partial.as_deref() == Some("freeze")
             || !matches!(lane.status, thread::Status::Starting | thread::Status::Open)
         {
             continue;
@@ -1192,8 +1193,9 @@ fn startup_failure(input: &LaunchPass<'_>, thread: &thread::Thread, detail: &str
         t.last_group = thread::Group::WaitingOnYou.token().into();
         t.start_notices.push(steps::Notice {
             line: format!(
-                "{} did not become ready during startup: {reason}. Read `thread show {} {}` before retrying.",
-                thread.id, input.project.slug, thread.id
+                "FAILED {}: {reason} — next: {}",
+                thread.id,
+                threads::retry_command(&input.project.slug, &thread.id)
             ),
             submitted: false,
         });
@@ -1528,7 +1530,7 @@ fn thread_pass(
             }
             continue;
         }
-        if t.parked || !t.provider_wait_started.is_empty() {
+        if t.parked || t.recovery_pending || !t.provider_wait_started.is_empty() {
             continue;
         }
         if t.status == thread::Status::Starting && t.startup_wait_started.is_empty() {
@@ -1609,6 +1611,10 @@ fn thread_pass(
                 thread::update(project, &t.id, |t| {
                     t.startup_wait_started.clear();
                     t.status = thread::Status::Open;
+                    if t.bootstrap == "resuming" {
+                        t.bootstrap = "acknowledged".into();
+                        t.prompt_pending = false;
+                    }
                 })?;
             } else if (state == "blocked" || (state.is_empty() && live.pane_exists))
                 && thread::seconds_since(&t.startup_wait_started, now).max(0) as u64 * 1000
@@ -1680,6 +1686,11 @@ fn thread_pass(
             }
         }
         let mut delivered = false;
+        if t.bootstrap == "resuming" && ready {
+            // Readiness established the resumed conversation's receipt above.
+            // Drain its persisted correction through the ordinary next pass.
+            continue;
+        }
         if t.prompt_pending && (ready || t.brief_submitted || t.bootstrap == "acknowledged") {
             // The CLI and ticker can observe the same ready agent. Serialize
             // the first prompt and recheck its attempt before either sends it.
@@ -2211,13 +2222,19 @@ struct LaunchPass<'a> {
     panes: &'a [Pane],
 }
 
-/// Start a just-placed attempt in the caller, without a later ticker or
-/// courier pass. The periodic path still owns unfinished startup and retries.
+/// Exercise the ordinary launch and delivery passes in startup regression tests.
+#[cfg(test)]
 pub(crate) fn launch_thread_now(ctx: &Ctx, project: &Project, id: &str) -> Result<()> {
     launch_thread_with_wait(ctx, project, id, Duration::from_secs(20))
 }
 
-fn launch_thread_with_wait(ctx: &Ctx, project: &Project, id: &str, wait: Duration) -> Result<()> {
+#[cfg(test)]
+pub(crate) fn launch_thread_with_wait(
+    ctx: &Ctx,
+    project: &Project,
+    id: &str,
+    wait: Duration,
+) -> Result<()> {
     let lane = thread::load(project, id)?;
     if lane.status != thread::Status::Open || !lane.prompt_pending {
         return Ok(());
@@ -2459,13 +2476,25 @@ fn launch_pass(
         .coordinator()
         .filter(|_| !first.is_remote())
         .map(|coordinator| coordinator.pane_id);
+    let args: Vec<_> = pending
+        .iter()
+        .map(|t| {
+            if t.bootstrap == "resuming" {
+                crate::adapters::resume_args(&t.launch, t.identity.agent_session.as_deref())
+                    .unwrap_or_else(|| t.launch.args.clone())
+            } else {
+                t.launch.args.clone()
+            }
+        })
+        .collect();
     let starts: Vec<_> = pending
         .iter()
-        .map(|t| crate::herdr::AgentStart {
+        .zip(&args)
+        .map(|(t, args)| crate::herdr::AgentStart {
             name: &t.agent_name,
             kind: &t.launch.kind,
             pane: &t.pane_id,
-            agent_args: &t.launch.args,
+            agent_args: args,
             launch_bin: None,
             parent: parent.as_deref(),
             // `agent start` need not hold the ticker for the whole observation
@@ -2527,7 +2556,9 @@ fn launch_pass(
                 errors.push(error);
                 continue;
             }
-            if error.to_string().contains("agent_not_ready") {
+            if error.to_string().contains("agent_not_ready")
+                || error.to_string().contains("timeout")
+            {
                 if let Err(e) =
                     thread::update(pass.project, &t.id, |t| t.status = thread::Status::Starting)
                 {
@@ -2541,6 +2572,17 @@ fn launch_pass(
                 thread::update(pass.project, &t.id, |t| t.startup_wait_started.clear())
                     .err()
                     .map(|e| e.context(format!("{}: launch record", t.id))),
+            );
+            errors.extend(
+                threads::fail_start(
+                    pass.ctx,
+                    pass.project,
+                    &t.id,
+                    &format!("{error:#}"),
+                    crate::contracts::FailureClass::Unknown,
+                    false,
+                )
+                .err(),
             );
             errors.push(error.context(format!("{}: launch", t.id)));
         }
@@ -5890,13 +5932,14 @@ mod tests {
                 .runner
                 .on_fn(|cmd| cmd.program == "ssh", |_| Ok(ok("")));
         }
+        let brief_hash = thread::store_artifact(&project, b"frozen brief").unwrap();
         let lane = world.thread(&project, &folder, |t| {
             t.attempt = 2;
             t.parked = true;
             t.prompt_pending = false;
             t.bootstrap = "acknowledged".into();
             t.launch.kind = "pi".into();
-            t.launch.brief_hash = "frozen-brief".into();
+            t.launch.brief_hash = brief_hash.clone();
             t.agent = "pi".into();
             if resuming {
                 t.identity.agent_session = Some("saved-session".into());
@@ -5915,6 +5958,7 @@ mod tests {
         );
         world.runner.on("tab create", created.clone());
         world.runner.on("workspace create", created);
+        world.runner.on("tab rename", ok(r#"{"result":{}}"#));
         let agent = Agent {
             pane_id: "w1:p2".into(),
             tab_id: "w1:t2".into(),
@@ -5989,8 +6033,29 @@ mod tests {
         }
         let reopened = thread::load(&project, &lane.id).unwrap();
         assert!(!reopened.parked);
-        assert_eq!(reopened.prompt_pending, !resuming);
-        assert_eq!(reopened.bootstrap == "acknowledged", resuming);
+        assert!(reopened.recovery_pending);
+        assert!(!reopened.prompt_pending);
+        assert_eq!(reopened.bootstrap == "resuming", resuming);
+        assert_eq!(world.runner.count("agent start"), 0);
+        threads::place_recovery(&ctx, &project, &reopened).unwrap();
+        let reopened =
+            thread::update(&project, &lane.id, |t| t.error = "provider ready".into()).unwrap();
+        let herdr = Herdr::new("herdr", "", &world.runner).on_machine(reopened.machine_route());
+        let mut errors = Vec::new();
+        launch_pass(
+            &LaunchPass {
+                ctx: &ctx,
+                project: &project,
+                herdr: &herdr,
+                threads: std::slice::from_ref(&reopened),
+                agents: &[],
+                panes: std::slice::from_ref(&pane),
+            },
+            &mut true,
+            true,
+            &mut errors,
+        );
+        assert!(errors.is_empty(), "{errors:?}");
         assert_eq!(reopened.attempt, lane.attempt);
         assert_eq!(reopened.worktree_path, lane.worktree_path);
         assert_eq!(world.runner.count("agent start"), 1);
@@ -6011,7 +6076,7 @@ mod tests {
                 toml::from_str(card_call.stdin.as_ref().unwrap()).unwrap();
             assert_eq!(card.pane_id, reopened.pane_id);
             assert_eq!(card.attempt, 2);
-            assert_eq!(card.brief_hash, "frozen-brief");
+            assert_eq!(card.brief_hash, brief_hash);
         }
         let herdr = Herdr::new("herdr", "", &world.runner).on_machine(reopened.machine_route());
         let run_pass = || {
@@ -6032,7 +6097,14 @@ mod tests {
             .unwrap();
             pass.error
         };
-        if !resuming {
+        if resuming {
+            assert!(run_pass().is_none());
+            assert_eq!(
+                thread::load(&project, &lane.id).unwrap().bootstrap,
+                "acknowledged"
+            );
+            assert_eq!(world.runner.count("agent prompt"), 0);
+        } else {
             assert!(run_pass().is_none());
             assert_eq!(world.runner.count("agent prompt"), 1);
             // A transported brief still needs this process's skill receipt.
