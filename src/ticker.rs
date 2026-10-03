@@ -1861,13 +1861,14 @@ fn progress_notice_lines(notices: &ProgressNotices, lane: &str, pane: &str) -> V
 }
 
 fn resume_session(
+    ctx: &Ctx,
     project: &Project,
     herdr: &Herdr<'_>,
+    agents: &[Agent],
     t: &thread::Thread,
     recent: Vec<String>,
     prompt: &str,
 ) -> Result<()> {
-    let _prompt = thread::prompt_lock(project, &t.id)?;
     let can_resume = |record: &thread::Thread| {
         record.attempt == t.attempt
             && record.pane_id == t.pane_id
@@ -1891,35 +1892,19 @@ fn resume_session(
     if !claimed {
         return Ok(());
     }
-    match herdr.agent_prompt(&t.pane_id, prompt) {
-        Ok(()) => {
-            thread::update(project, &t.id, |record| {
-                if record.attempt == t.attempt && record.pane_id == t.pane_id {
-                    record.connection_waiting = false;
-                    record.error.clear();
-                    record.connection_resumes.push(project::now());
-                }
-            })?;
-            Ok(())
-        }
+    match threads::send_lane_input(ctx, project, &t.id, Some(prompt), Some((herdr, agents, t))) {
+        Ok(_) => Ok(()),
         Err(error) => {
-            if threads::prompt_refused_before_submission(&error) {
+            let saved = thread::load(project, &t.id)?;
+            if !threads::follow_up_pending_for_seal(&saved, None) {
                 thread::update(project, &t.id, |record| {
                     if record.attempt == t.attempt && record.pane_id == t.pane_id {
                         record.connection_waiting = false;
                         record.error.clear();
                     }
                 })?;
-            } else {
-                crate::inbox::write(
-                    project,
-                    "lane-connection",
-                    &t.id,
-                    "Resume delivery may have taken effect; reconcile this exact pane before resending. No new attempt was started.",
-                    "",
-                )?;
             }
-            Err(error.into())
+            Err(error)
         }
     }
 }
@@ -2251,8 +2236,10 @@ fn thread_pass(
                 continue;
             }
             resume_session(
+                ctx,
                 project,
                 herdr,
+                agents,
                 t,
                 recent,
                 "The dependency is reachable again. Continue the current task in this session; do not start a new attempt or repeat completed work or uncertain effects.",
@@ -2431,112 +2418,20 @@ fn thread_pass(
             && (t.kind == thread::Kind::Adopted || t.bootstrap == "acknowledged")
             && ready
         {
-            // Serialize queue drainage with brief delivery and other callers.
-            // A matching bootstrap receipt proves the brief was consumed, not
-            // that typing into a newly reopened process will start a turn.
-            let _prompt_lock = thread::prompt_lock(project, &t.id)?;
             loop {
-                let current = thread::load(project, &t.id)?;
-                if current.status != thread::Status::Open
-                    || current.pane_id != t.pane_id
-                    || current.attempt != t.attempt
-                    || current.prompt_pending
-                    || (current.kind != thread::Kind::Adopted
-                        && current.bootstrap != "acknowledged")
-                {
-                    break;
-                }
-                let attempt = current.attempt.max(1);
-                let Some((index, follow_up)) = current
-                    .follow_ups
-                    .iter()
-                    .enumerate()
-                    .find(|(_, follow_up)| {
-                        follow_up.attempt == attempt
-                            && matches!(
-                                follow_up.state,
-                                thread::FollowUpState::Queued | thread::FollowUpState::Uncertain
-                            )
-                    })
-                    .map(|(index, follow_up)| (index, follow_up.clone()))
-                else {
-                    break;
-                };
-                if follow_up.state == thread::FollowUpState::Uncertain {
-                    break;
-                }
-                if let Err(error) = crate::threads::sync_box_corrections(ctx, project, &current) {
-                    pass.error = pass.error.or(Some(
-                        error.context(format!("{}: correction barrier before queued prompt", t.id)),
-                    ));
-                    break;
-                }
-                thread::update_checked(project, &t.id, |thread| {
-                    if thread.status != thread::Status::Open
-                        || thread.attempt.max(1) != attempt
-                        || thread.follow_ups.get(index) != Some(&follow_up)
-                    {
-                        anyhow::bail!("queued follow-up changed before delivery");
-                    }
-                    thread.follow_ups[index].state = thread::FollowUpState::Uncertain;
-                    Ok(())
-                })?;
-                let after_seal = crate::events::latest_done_event(
-                    &crate::events::for_thread(project, &t.id),
+                match crate::threads::send_lane_input(
+                    ctx,
+                    project,
                     &t.id,
-                    attempt,
-                )
-                .map(|event| event.id.clone())
-                .unwrap_or_default();
-                match herdr.agent_prompt_wait_started(
-                    &current.pane_id,
-                    &follow_up.text,
-                    thread::agent_start_timeout(&current.launch)
-                        .min(crate::herdr::AGENT_START_TIMEOUT.as_millis() as u64),
+                    None,
+                    Some((herdr, agents, t)),
                 ) {
-                    Ok(()) => {
-                        delivered = true;
-                        crate::threads::record_follow_up_delivery(
-                            project,
-                            &t.id,
-                            index,
-                            &follow_up,
-                            &after_seal,
-                        )?;
-                    }
-                    Err(error) if crate::threads::prompt_refused_before_submission(&error) => {
-                        // Only explicit pre-submission refusals are retryable.
-                        // Stalled activity or a PTY error can occur after input
-                        // was written; those must retain the uncertain receipt.
-                        thread::update_checked(project, &t.id, |thread| {
-                            if let Some(saved) = thread.follow_ups.get_mut(index)
-                                && saved.attempt == attempt
-                                && saved.text == follow_up.text
-                                && saved.state == thread::FollowUpState::Uncertain
-                            {
-                                saved.state = thread::FollowUpState::Queued;
-                            }
-                            Ok(())
-                        })?;
-                        pass.error = pass
-                            .error
-                            .or(Some(anyhow::anyhow!("{}: queued prompt: {error}", t.id)));
-                        break;
-                    }
+                    Ok(crate::threads::PromptOutcome::Sent { .. }) => delivered = true,
+                    Ok(crate::threads::PromptOutcome::Queued { .. }) => break,
                     Err(error) => {
-                        let _ = inbox::write(
-                            project,
-                            "prompt-uncertain",
-                            &t.id,
-                            &format!(
-                                "{} attempt {attempt} may have received a follow-up; check the lane before sending it again",
-                                t.id
-                            ),
-                            "",
-                        );
                         pass.error = pass
                             .error
-                            .or(Some(anyhow::anyhow!("{}: queued prompt: {error}", t.id)));
+                            .or(Some(error.context(format!("{}: queued prompt", t.id))));
                         break;
                     }
                 }
@@ -4536,18 +4431,47 @@ mod tests {
         let lane = world.thread(&project, world.home.path(), |_| {});
         world.runner.on("agent prompt", ok(r#"{"result":{}}"#));
         let herdr = Herdr::new("herdr", "", &world.runner);
+        let agents = [Agent {
+            pane_id: lane.pane_id.clone(),
+            tab_id: lane.tab_id.clone(),
+            workspace_id: lane.workspace_id.clone(),
+            cwd: lane.cwd.clone(),
+            name: lane.agent_name.clone(),
+            agent_status: "idle".into(),
+            ..Agent::default()
+        }];
         for _ in 0..2 {
-            resume_session(&project, &herdr, &lane, vec![], "Continue").unwrap();
+            resume_session(
+                &world.ctx(),
+                &project,
+                &herdr,
+                &agents,
+                &lane,
+                vec![],
+                "Continue",
+            )
+            .unwrap();
         }
         assert_eq!(world.runner.count("agent prompt"), 1);
         let before = thread::load(&project, &lane.id).unwrap();
         assert_eq!(before.connection_resumes.len(), 1);
+        assert_eq!(before.follow_ups.len(), 1);
+        assert_eq!(before.follow_ups[0].state, thread::FollowUpState::Delivered);
         let replacement = thread::update(&project, &lane.id, |record| {
             record.attempt += 1;
             record.connection_resumes.clear();
         })
         .unwrap();
-        resume_session(&project, &herdr, &before, vec![], "Continue").unwrap();
+        resume_session(
+            &world.ctx(),
+            &project,
+            &herdr,
+            &agents,
+            &before,
+            vec![],
+            "Continue",
+        )
+        .unwrap();
         assert_eq!(world.runner.count("agent prompt"), 1);
         assert_eq!(thread::load(&project, &lane.id).unwrap(), replacement);
     }

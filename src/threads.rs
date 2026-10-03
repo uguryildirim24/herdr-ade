@@ -2174,9 +2174,16 @@ pub(crate) fn record_follow_up_delivery(
                 thread.answered_waiting_event = follow_up.waiting_event.clone();
             }
             thread.connection_waiting = false;
-            thread.connection_resumes.clear();
-            thread.failure_class = crate::contracts::FailureClass::Unknown;
-            thread.provider_failure_kind = None;
+            if thread.error.starts_with("connection_resume_uncertain:") {
+                // Recovery shares delivery receipts, but retains its rolling
+                // resume budget and dependency evidence until activity returns.
+                thread.error.clear();
+                thread.connection_resumes.push(project::now());
+            } else {
+                thread.connection_resumes.clear();
+                thread.failure_class = crate::contracts::FailureClass::Unknown;
+                thread.provider_failure_kind = None;
+            }
         }
         Ok(())
     })?;
@@ -2192,114 +2199,73 @@ pub(crate) fn prompt_refused_before_submission(error: &crate::herdr::HerdrError)
     )
 }
 
-/// Sends a follow-up. The one sender that does not use the ready-for-a-prompt
-/// predicate: agents queue a message that arrives while they work.
 pub fn prompt(ctx: &Ctx, slug: &str, id: &str, text: &str) -> Result<PromptOutcome> {
-    let project = Project::load(&ctx.root, slug)?;
-    let mut record = thread::load(&project, id)?;
-    let text = text.trim();
-    if text.is_empty() {
+    send_lane_input(ctx, &Project::load(&ctx.root, slug)?, id, Some(text), None)
+}
+
+/// Queue new input or drain the oldest queued input. CLI, recovery and ticker
+/// share ordering, reopen decisions, transport and delivery receipts.
+pub(crate) fn send_lane_input(
+    ctx: &Ctx,
+    project: &Project,
+    id: &str,
+    text: Option<&str>,
+    observed: Option<(&Herdr<'_>, &[Agent], &Thread)>,
+) -> Result<PromptOutcome> {
+    let text = text.map(str::trim);
+    if text == Some("") {
         bail!("the text is empty");
     }
-    match record.status {
-        Status::Resolved => {
-            return Err(crate::refusal::error(
-                format!("{id} is resolved"),
-                format!("ha thread show {slug} {id}"),
-            ));
-        }
-        Status::Failed => {
-            return Err(crate::refusal::error(
-                format!("{id} is gone"),
-                format!("ha thread retry {slug} {id} --reason \"<why replace attempt>\""),
-            ));
-        }
-        Status::Starting | Status::Open => {}
-    }
-    // The brief and every follow-up have one ordered delivery path. Once one
-    // message is queued, later messages join it until the ticker drains them.
-    if !record.parked
-        && (record.status == Status::Starting
-            || record.prompt_pending
-            || awaiting_bootstrap(&record)
-            || awaiting_follow_up(&record))
+    let _prompt_lock = thread::prompt_lock(project, id)?;
+    let mut record = thread::load(project, id)?;
+    let attempt = record.attempt.max(1);
+    if text.is_none()
+        && (!awaiting_follow_up(&record)
+            || observed.is_some_and(|(_, _, lane)| {
+                lane.attempt != record.attempt || lane.pane_id != record.pane_id
+            }))
     {
-        let events_before_send = crate::events::checked(&project)?;
-        // Keep the queued message invisible to the ticker until every review
-        // it affects is durably held. Working also closes the gap between this
-        // thread update and that hold for an already accepted reviewer.
-        let previous_group = record.last_group.clone();
-        thread::update(&project, id, |thread| {
-            thread.last_group = Group::Working.token().to_string();
-        })?;
-        if let Err(error) = crate::review::require_follow_up(&project, id) {
-            thread::update(&project, id, |thread| {
-                thread.last_group = previous_group;
-            })?;
-            return Err(error);
-        }
-        let mut queued = false;
-        record = thread::update_checked(&project, id, |thread| {
-            match thread.status {
-                Status::Resolved => {
-                    return Err(crate::refusal::error(
-                        format!("{id} is resolved"),
-                        format!("ha thread show {slug} {id}"),
-                    ));
-                }
-                Status::Failed => {
-                    return Err(crate::refusal::error(
-                        format!("{id} is gone"),
-                        format!("ha thread retry {slug} {id} --reason \"<why replace attempt>\""),
-                    ));
-                }
-                Status::Starting | Status::Open => {}
+        return Ok(PromptOutcome::Queued { attempt });
+    }
+    if text.is_some() {
+        match record.status {
+            Status::Resolved => {
+                return Err(crate::refusal::error(
+                    format!("{id} is resolved"),
+                    format!("ha thread show {} {id}", project.slug),
+                ));
             }
-            if thread.status == Status::Starting
-                || thread.prompt_pending
-                || awaiting_bootstrap(thread)
-                || awaiting_follow_up(thread)
-            {
-                let attempt = thread.attempt.max(1);
-                thread.follow_ups.push(FollowUp {
-                    attempt,
-                    text: text.to_string(),
-                    state: FollowUpState::Queued,
-                    waiting_event: latest_waiting_event_id(&events_before_send, id, attempt)
-                        .unwrap_or_default(),
-                    queued_at: project::now(),
-                    ..FollowUp::default()
-                });
-                queued = true;
+            Status::Failed => {
+                return Err(crate::refusal::error(
+                    format!("{id} is gone"),
+                    format!(
+                        "ha thread retry {} {id} --reason \"<why replace attempt>\"",
+                        project.slug
+                    ),
+                ));
             }
-            Ok(())
-        })?;
-        if queued {
-            return Ok(PromptOutcome::Queued {
-                attempt: record.attempt.max(1),
-            });
+            Status::Starting | Status::Open => {}
         }
     }
-    if record.parked {
-        let events = crate::events::checked(&project)?;
-        let previous_group = record.last_group.clone();
-        thread::update(&project, id, |t| {
-            t.last_group = Group::Working.token().into()
-        })?;
-        if let Err(error) = crate::review::require_follow_up(&project, id) {
-            thread::update(&project, id, |t| t.last_group = previous_group)?;
-            return Err(error);
-        }
-        // Queue the correction in the same durable update that un-parks the
-        // new pane. Otherwise a ticker pass between starting the agent and
-        // sending the text can close it against the previous done seal.
-        reopen_parked(ctx, &project, &record, text, &events)?;
-        return Ok(PromptOutcome::Queued {
-            attempt: record.attempt.max(1),
-        });
-    }
-    let view = require_session(ctx, &project)?;
-    let (agents, _) = lists_for(&view, &record)?;
+    let reopening = if text.is_some() && record.parked {
+        require_session(ctx, project)?;
+        ticker::ensure(ctx)?;
+        Some(parked_session_available(ctx, &record)?)
+    } else {
+        None
+    };
+    let queued = record.parked
+        || record.status != Status::Open
+        || record.prompt_pending
+        || awaiting_bootstrap(&record);
+    // Preserve CLI refusals before staging when this input can be sent now.
+    // A ticker drain uses the same check; it never types at a bare shell.
+    let view = if observed.is_none() && !queued && (text.is_none() || !awaiting_follow_up(&record))
+    {
+        Some(require_session(ctx, project)?)
+    } else {
+        None
+    };
     let kind = if record.launch.kind.is_empty() {
         &record.agent
     } else {
@@ -2307,82 +2273,135 @@ pub fn prompt(ctx: &Ctx, slug: &str, id: &str, text: &str) -> Result<PromptOutco
     };
     let resumable = crate::adapters::declaration(&ctx.config_dir, kind)
         .is_ok_and(|adapter| adapter.blocked_error_resumable);
-    let state = prompt_state(&record, &agents, resumable)?;
-    let herdr = view.herdr.on_machine(record.machine_route());
-    let events_before_send = crate::events::checked(&project)?;
-    // Mark the work before invalidating earlier review evidence. The merge
-    // boundary sees either this working state or the durable hold. If an
-    // already committed intent refuses the hold, restore the prior projection
-    // and never deliver the text.
-    let previous_group = record.last_group.clone();
-    thread::update(&project, id, |thread| {
-        thread.last_group = Group::Working.token().to_string();
-    })?;
-    if let Err(error) = crate::review::require_follow_up(&project, id) {
-        thread::update(&project, id, |thread| {
-            thread.last_group = previous_group;
-        })?;
-        return Err(error);
-    }
-    sync_box_corrections(ctx, &project, &record)?;
-    let attempt = record.attempt.max(1);
-    let follow_up = FollowUp {
-        attempt,
-        text: text.to_string(),
-        state: FollowUpState::Uncertain,
-        waiting_event: latest_waiting_event_id(&events_before_send, id, attempt)
-            .unwrap_or_default(),
-        queued_at: project::now(),
-        ..FollowUp::default()
+    let state = if let Some((_, agents, _)) = observed {
+        prompt_state(&record, agents, resumable)?
+    } else if let Some(view) = &view {
+        let (agents, _) = lists_for(view, &record)?;
+        prompt_state(&record, &agents, resumable)?
+    } else {
+        String::new()
     };
-    let _prompt_lock = thread::prompt_lock(&project, id)?;
-    let mut queued = false;
-    let staged = thread::update_checked(&project, id, |thread| {
-        if thread.status != Status::Open
-            || thread.attempt.max(1) != attempt
-            || thread.pane_id != record.pane_id
-        {
-            bail!("prompt_attempt_changed: {id} changed during prompt preparation");
+    if let Some(text) = text {
+        let events = crate::events::checked(project)?;
+        record = thread::update_checked(project, id, |current| {
+            if current.status != record.status
+                || current.attempt != record.attempt
+                || current.pane_id != record.pane_id
+                || current.parked != record.parked
+            {
+                bail!("prompt_attempt_changed: {id} changed during prompt preparation");
+            }
+            // The project lock also covers review membership allocation. A
+            // correction holds the old seal and queues its input in ONE write.
+            crate::review::require_follow_up(project, id)?;
+            current.review_after = crate::events::latest_done_event(&events, id, attempt)
+                .map(|event| event.id.clone())
+                .unwrap_or_default();
+            current.last_group = Group::Working.token().into();
+            if let Some(resuming) = reopening {
+                reopen_parked(current, resuming);
+            }
+            current.follow_ups.push(FollowUp {
+                attempt,
+                text: if reopening == Some(false) {
+                    reopening_prompt(&record, text)
+                } else {
+                    text.into()
+                },
+                state: FollowUpState::Queued,
+                waiting_event: latest_waiting_event_id(&events, id, attempt).unwrap_or_default(),
+                queued_at: project::now(),
+                ..FollowUp::default()
+            });
+            Ok(())
+        })?;
+        if queued || (view.is_none() && observed.is_none()) {
+            return Ok(PromptOutcome::Queued { attempt });
         }
-        queued = thread.prompt_pending || awaiting_bootstrap(thread) || awaiting_follow_up(thread);
-        let mut saved = follow_up.clone();
-        if queued {
-            saved.state = FollowUpState::Queued;
-        }
-        thread.follow_ups.push(saved);
-        Ok(())
-    })?;
+    }
     if queued {
         return Ok(PromptOutcome::Queued { attempt });
     }
-    let index = staged.follow_ups.len() - 1;
-    let after_seal = crate::events::latest_done_event(&events_before_send, id, attempt)
-        .map(|event| event.id.clone())
-        .unwrap_or_default();
-    // Adapter-owned error screens recover through their pane input hook.
-    let result = if state == "blocked" {
-        herdr.pane_submit_text(&record.pane_id, text)
+    let Some((index, follow_up)) = record
+        .follow_ups
+        .iter()
+        .enumerate()
+        .find(|(_, f)| {
+            f.attempt == attempt
+                && matches!(f.state, FollowUpState::Queued | FollowUpState::Uncertain)
+        })
+        .map(|(index, f)| (index, f.clone()))
+    else {
+        return Ok(PromptOutcome::Queued { attempt });
+    };
+    if follow_up.state == FollowUpState::Uncertain {
+        return Ok(PromptOutcome::Queued { attempt });
+    }
+    sync_box_corrections(ctx, project, &record)?;
+    thread::update_checked(project, id, |current| {
+        if current.status != Status::Open
+            || current.attempt != record.attempt
+            || current.pane_id != record.pane_id
+            || current.prompt_pending
+            || awaiting_bootstrap(current)
+            || current.follow_ups.get(index) != Some(&follow_up)
+        {
+            bail!("queued follow-up changed before delivery");
+        }
+        current.follow_ups[index].state = FollowUpState::Uncertain;
+        Ok(())
+    })?;
+    let after_seal =
+        crate::events::latest_done_event(&crate::events::for_thread(project, id), id, attempt)
+            .map(|event| event.id.clone())
+            .unwrap_or_default();
+    let herdr = if let Some((herdr, _, _)) = observed {
+        herdr.on_machine(record.machine_route())
     } else {
-        let timeout = if record.launch.ready_timeout_ms == 0 {
-            crate::herdr::AGENT_START_TIMEOUT.as_millis() as u64
-        } else {
-            record.launch.ready_timeout_ms
-        };
-        herdr.agent_prompt_wait_started(&record.pane_id, text, timeout)
+        view.as_ref()
+            .expect("live delivery view")
+            .herdr
+            .on_machine(record.machine_route())
+    };
+    let result = if state == "blocked" {
+        herdr.pane_submit_text(&record.pane_id, &follow_up.text)
+    } else {
+        herdr.agent_prompt_wait_started(
+            &record.pane_id,
+            &follow_up.text,
+            thread::agent_start_timeout(&record.launch)
+                .min(crate::herdr::AGENT_START_TIMEOUT.as_millis() as u64),
+        )
     };
     if let Err(error) = result {
         if prompt_refused_before_submission(&error) {
-            thread::update(&project, id, |thread| {
-                thread.follow_ups[index].state = FollowUpState::Queued;
+            thread::update(project, id, |current| {
+                if let Some(saved) = current.follow_ups.get_mut(index)
+                    && saved.attempt == attempt
+                    && saved.text == follow_up.text
+                    && saved.state == FollowUpState::Uncertain
+                {
+                    saved.state = FollowUpState::Queued;
+                }
             })?;
+        } else {
+            let _ = crate::inbox::write(
+                project,
+                "prompt-uncertain",
+                id,
+                &format!(
+                    "{id} attempt {attempt} may have received a follow-up; check the lane before sending it again"
+                ),
+                "",
+            );
         }
         return Err(anyhow::anyhow!("{error}"));
     }
-    record_follow_up_delivery(&project, id, index, &follow_up, &after_seal)?;
+    record_follow_up_delivery(project, id, index, &follow_up, &after_seal)?;
     if state == "blocked" {
-        thread::update(&project, id, |t| {
-            if t.attempt.max(1) == attempt {
-                t.error.clear();
+        thread::update(project, id, |current| {
+            if current.attempt.max(1) == attempt {
+                current.error.clear();
             }
         })?;
     }
@@ -2390,6 +2409,28 @@ pub fn prompt(ctx: &Ctx, slug: &str, id: &str, text: &str) -> Result<PromptOutco
         attempt,
         agent_state: state,
     })
+}
+
+/// Called under review allocation's project lock. Its earlier pile snapshot
+/// may predate a correction queued during git preparation.
+pub(crate) fn retain_current_pile_members(
+    project: &Project,
+    members: &mut Vec<crate::review::Member>,
+) -> Result<()> {
+    let events = crate::events::checked(project)?;
+    let mut current = Vec::new();
+    for member in members.drain(..) {
+        let lane = thread::load(project, &member.thread)?;
+        if lane.status != Status::Resolved
+            && lane.attempt.max(1) == member.attempt
+            && lane.merged_sha.is_empty()
+            && crate::review::sealed(&events, &lane).is_some_and(|event| event.id == member.event)
+        {
+            current.push(member);
+        }
+    }
+    *members = current;
+    Ok(())
 }
 
 /// The state a follow-up may be sent in, or the refusal.
@@ -3418,54 +3459,23 @@ pub(crate) fn resume_launch_record(
 
 /// Bring a completed lane back without provisioning its branch or replacing
 /// its frozen task. The old agent session id is kept across the pane close.
-fn reopen_parked(
-    ctx: &Ctx,
-    project: &Project,
-    record: &Thread,
-    text: &str,
-    events: &[crate::contracts::Event],
-) -> Result<()> {
-    require_session(ctx, project)?;
-    ticker::ensure(ctx)?;
-    let resuming = parked_session_available(ctx, record)?;
-    thread::update_checked(project, &record.id, |t| {
-        if !t.parked || t.attempt != record.attempt {
-            bail!("reopen_stale: completion changed during reopen");
-        }
-        t.parked = false;
-        t.status = Status::Starting;
-        t.recovery_pending = true;
-        t.launch_attempts = 0;
-        t.startup_wait_started.clear();
-        t.identity.process = None;
-        t.brief_submitted = false;
-        t.brief_submitted_at.clear();
-        t.partial = Some("placement".into());
-        t.last_group = Group::Working.token().into();
-        t.prompt_pending = false;
-        // The launch adapter supplies resume arguments from the saved identity.
-        // Only readiness of that new process converts this into a receipt.
-        t.bootstrap = if resuming {
-            "resuming".into()
-        } else {
-            String::new()
-        };
-        t.follow_ups.push(FollowUp {
-            attempt: t.attempt.max(1),
-            text: if resuming {
-                text.to_string()
-            } else {
-                reopening_prompt(record, text)
-            },
-            state: FollowUpState::Queued,
-            waiting_event: latest_waiting_event_id(events, &record.id, record.attempt.max(1))
-                .unwrap_or_default(),
-            queued_at: project::now(),
-            ..FollowUp::default()
-        });
-        Ok(())
-    })?;
-    Ok(())
+fn reopen_parked(t: &mut Thread, resuming: bool) {
+    t.parked = false;
+    t.status = Status::Starting;
+    t.recovery_pending = true;
+    t.launch_attempts = 0;
+    t.startup_wait_started.clear();
+    t.identity.process = None;
+    t.brief_submitted = false;
+    t.brief_submitted_at.clear();
+    t.partial = Some("placement".into());
+    t.prompt_pending = false;
+    // Readiness of the new process, not reopening, earns a delivery receipt.
+    t.bootstrap = if resuming {
+        "resuming".into()
+    } else {
+        String::new()
+    };
 }
 
 pub(crate) fn park_completed(ctx: &Ctx, project: &Project) -> Result<()> {
@@ -6437,6 +6447,129 @@ mod tests {
     }
 
     #[test]
+    fn cli_and_ticker_share_staging_transport_and_receipts() {
+        use crate::runner::fake::ok;
+        use crate::scenarios::{World, agent_json};
+        for ticker_delivery in [false, true] {
+            let world = World::new();
+            let project = world.project("demo", "a.sock");
+            let lane = world.thread(&project, world.home.path(), |t| {
+                t.prompt_pending = ticker_delivery;
+                t.bootstrap = "acknowledged".into();
+            });
+            *world.agents.borrow_mut() = format!(
+                "[{}]",
+                agent_json("w2", "w2:t1", "w2:p1", &lane.cwd, &lane.agent_name, "idle")
+            );
+            let sending_project = project.clone();
+            let sending_id = lane.id.clone();
+            world.runner.on_fn(
+                |cmd| cmd.display().contains("agent prompt"),
+                move |_| {
+                    let saved = thread::load(&sending_project, &sending_id).unwrap();
+                    assert_eq!(saved.follow_ups.len(), 1);
+                    assert_eq!(saved.follow_ups[0].state, FollowUpState::Uncertain);
+                    assert_eq!(saved.follow_ups[0].text, "same correction");
+                    Ok(ok(r#"{"result":{}}"#))
+                },
+            );
+            let outcome = prompt(&world.ctx(), "demo", &lane.id, "same correction").unwrap();
+            if ticker_delivery {
+                assert!(matches!(outcome, PromptOutcome::Queued { .. }));
+                thread::update(&project, &lane.id, |t| t.prompt_pending = false).unwrap();
+                assert!(matches!(
+                    send_lane_input(&world.ctx(), &project, &lane.id, None, None).unwrap(),
+                    PromptOutcome::Sent { .. }
+                ));
+            } else {
+                assert!(matches!(outcome, PromptOutcome::Sent { .. }));
+            }
+            let saved = thread::load(&project, &lane.id).unwrap();
+            assert_eq!(world.runner.count("agent prompt"), 1);
+            assert_eq!(saved.follow_ups[0].state, FollowUpState::Delivered);
+            assert!(!saved.follow_ups[0].delivered_at.is_empty());
+            assert!(matches!(
+                send_lane_input(&world.ctx(), &project, &lane.id, None, None).unwrap(),
+                PromptOutcome::Queued { .. }
+            ));
+            assert_eq!(world.runner.count("agent prompt"), 1);
+        }
+    }
+
+    #[test]
+    fn correction_during_review_preparation_excludes_the_stale_pile_snapshot() {
+        use crate::runner::{RealRunner, Runner};
+        use crate::testkit::{fixture, git};
+        let fx = fixture();
+        let (id, sha) = fx.lane(1);
+        let event = fx.seal_done(&id, 1, 1, &sha, "finished");
+        let base = git(&fx.repo, &["rev-parse", "main"]);
+        thread::update(&fx.project, &id, |t| {
+            t.base = base;
+            t.parked = true;
+            t.prompt_pending = false;
+        })
+        .unwrap();
+        let (mut settings, body) = fx.project.read_project_md().unwrap();
+        settings.repos[0].branch = Some("main".into());
+        std::fs::write(
+            fx.project.project_md(),
+            format!("+++\n{}+++\n{body}", toml::to_string(&settings).unwrap()),
+        )
+        .unwrap();
+        let env = fx.world.env.clone();
+        let root = fx.world.root.clone();
+        let config_dir = fx.world.ctx().config_dir;
+        let corrected_id = id.clone();
+        let corrected_project = fx.project.clone();
+        // Review has already selected the old seal. Inject the CLI correction
+        // while it prepares git evidence, immediately before membership commit.
+        let runner = crate::runner::fake::FakeRunner::new();
+        runner.on_fn(
+            |cmd| cmd.program == "git" && cmd.display().contains("diff --name-only"),
+            move |cmd| {
+                let runner = crate::runner::fake::FakeRunner::new();
+                runner.on(
+                    "agent list",
+                    crate::runner::fake::ok(r#"{"result":{"agents":[]}}"#),
+                );
+                runner.on(
+                    "pane list",
+                    crate::runner::fake::ok(r#"{"result":{"panes":[]}}"#),
+                );
+                let ctx = Ctx {
+                    env: &env,
+                    root: root.clone(),
+                    config_dir: config_dir.clone(),
+                    runner: &runner,
+                    detached_ticker: false,
+                };
+                assert!(matches!(
+                    prompt(&ctx, "demo", &corrected_id, "fix this before review").unwrap(),
+                    PromptOutcome::Queued { .. }
+                ));
+                let saved = thread::load(&corrected_project, &corrected_id).unwrap();
+                assert_eq!(saved.review_after, event);
+                assert_eq!(saved.follow_ups[0].state, FollowUpState::Queued);
+                RealRunner.run(cmd)
+            },
+        );
+        runner.on_fn(|cmd| cmd.program == "git", |cmd| RealRunner.run(cmd));
+        let ctx = Ctx {
+            runner: &runner,
+            ..fx.world.ctx()
+        };
+        assert!(crate::review::start(&ctx, "demo", None).unwrap().is_none());
+        assert!(crate::review::list(&fx.project).unwrap().is_empty());
+        let saved = thread::load(&fx.project, &id).unwrap();
+        assert!(!saved.parked);
+        assert_eq!(saved.status, Status::Starting);
+        assert!(!parkable(&fx.project, &saved));
+        assert_eq!(saved.follow_ups.len(), 1);
+        assert!(saved.follow_ups[0].text.ends_with("fix this before review"));
+    }
+
+    #[test]
     fn successful_follow_up_keeps_its_delivery_receipt_when_the_attempt_changes() {
         use crate::runner::fake::ok;
         use crate::scenarios::{World, agent_json};
@@ -7388,7 +7521,7 @@ mod tests {
                 t.identity.agent_session = Some("saved-session".into());
             })
             .unwrap();
-            reopen_parked(&fx.world.ctx(), &fx.project, &parked, "continue", &[]).unwrap();
+            prompt(&fx.world.ctx(), "demo", &parked.id, "continue").unwrap();
             let reopened = place_started(
                 &fx.world.ctx(),
                 &fx.project,
@@ -7724,14 +7857,7 @@ mod tests {
             "agent start",
             ok(r#"{"result":{"agent":{"workspace_id":"w1","tab_id":"w1:t3","pane_id":"w1:p3","agent_status":"idle"}}}"#),
         );
-        reopen_parked(
-            &fx.world.ctx(),
-            &fx.project,
-            &parked,
-            "Fix the rejection",
-            &[],
-        )
-        .unwrap();
+        prompt(&fx.world.ctx(), "demo", &parked.id, "Fix the rejection").unwrap();
         let reopened = place_started(
             &fx.world.ctx(),
             &fx.project,
