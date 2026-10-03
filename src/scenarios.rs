@@ -263,7 +263,7 @@ fn one_agent_start_per_project_per_tick_and_missing_agent_state_stays_unknown() 
     );
 
     let ctx = world.ctx();
-    for tick in 1..=6 {
+    for tick in 1..=2 {
         let _ = ticker::tick_project(&ctx, &project);
         assert_eq!(
             world.runner.count("agent start"),
@@ -271,11 +271,18 @@ fn one_agent_start_per_project_per_tick_and_missing_agent_state_stays_unknown() 
             "one lane start per tick; a closed coordinator is not relaunched"
         );
     }
-    // Six lane starts: three each. The absent coordinator stays unavailable.
-    // Absent agent state in the listed lane panes is still unknown.
+    // A timed-out API may have submitted its process. Observe the original
+    // terminal instead of submitting another agent into it.
     let _ = ticker::tick_project(&ctx, &project);
+    assert_eq!(world.runner.count("agent start"), 2);
+    for id in ["t-0001", &second.id] {
+        thread::update(&project, id, |t| {
+            t.startup_wait_started = "2000-01-01T00:00:00Z".into()
+        })
+        .unwrap();
+    }
     let _ = ticker::tick_project(&ctx, &project);
-    assert_eq!(world.runner.count("agent start"), 6);
+    assert_eq!(world.runner.count("agent start"), 2);
     assert_eq!(world.runner.count("tab close"), 0);
     assert!(project.coordinator().unwrap().closed_by_rolf_at.is_empty());
     assert!(
@@ -285,11 +292,12 @@ fn one_agent_start_per_project_per_tick_and_missing_agent_state_stays_unknown() 
     );
     for id in ["t-0001", &second.id] {
         let t = thread::load(&project, id).unwrap();
-        assert_eq!(t.status, Status::Open, "{id}");
-        assert_eq!(t.launch_attempts, thread::MAX_LAUNCH_ATTEMPTS, "{id}");
-        assert!(t.prompt_pending, "{id}");
-        assert!(t.error.is_empty(), "{id}: {}", t.error);
-        assert_eq!(t.last_group, thread::Group::Unknown.token(), "{id}");
+        assert_eq!(t.status, Status::Failed, "{id}");
+        assert_eq!(t.launch_attempts, 1, "{id}");
+        assert!(!t.prompt_pending, "{id}");
+        assert!(t.error.starts_with("agent_not_ready:"), "{id}: {}", t.error);
+        assert_eq!(t.failure_class, crate::contracts::FailureClass::Unknown);
+        assert_eq!(t.last_group, thread::Group::WaitingOnYou.token(), "{id}");
     }
 }
 
@@ -576,6 +584,14 @@ fn coordinator_retry_moves_an_unknown_failure_without_replacing_its_work() {
         "the coordinator chose to retry after the network recovered",
     )
     .unwrap();
+    let t = thread::load(&project, "t-0001").unwrap();
+    assert_eq!(
+        (t.status, t.prompt_pending, t.launch_attempts),
+        (Status::Starting, false, 0)
+    );
+    assert!(t.recovery_pending);
+    assert_eq!(world.runner.count("tab create"), 0);
+    threads::place_recovery(&world.ctx(), &project, &t).unwrap();
     let t = thread::load(&project, "t-0001").unwrap();
     assert_eq!(
         (t.status, t.prompt_pending, t.launch_attempts),
@@ -1464,6 +1480,7 @@ fn thread_start_is_refused_when_paused() {
         machine: None,
         base: None,
         task: "t".into(),
+        attach: Vec::new(),
         workflow: None,
         recipe: None,
         task_id: String::new(),
@@ -1865,6 +1882,7 @@ fn a_thread_without_any_listed_repo_is_refused() {
         machine: Some("box".into()),
         base: None,
         task: "t".into(),
+        attach: Vec::new(),
         workflow: None,
         recipe: None,
         task_id: String::new(),

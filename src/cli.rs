@@ -732,6 +732,9 @@ enum ThreadCommand {
         /// The task; `-` reads standard input
         #[arg(long, value_name = "FILE")]
         task_file: String,
+        /// Named files to carry beside the lane's frozen brief (repeatable)
+        #[arg(long, value_name = "PATH")]
+        attach: Vec<String>,
         /// Instruction set for this lane; the routing table may match it
         #[arg(long, value_name = "FLOW")]
         workflow: Option<String>,
@@ -1506,6 +1509,7 @@ fn dispatch_with_start(
                 machine,
                 base,
                 task_file,
+                attach,
                 workflow,
                 recipe,
                 job,
@@ -1562,6 +1566,7 @@ fn dispatch_with_start(
                         machine,
                         base,
                         task,
+                        attach,
                         workflow,
                         recipe,
                         task_id: task_id.clone(),
@@ -1582,6 +1587,7 @@ fn dispatch_with_start(
                 };
                 crate::output::insert("machine", machine);
                 crate::output::insert("placement_reason", thread.placement_reason.clone());
+                crate::output::insert("state", serde_json::to_value(thread.status)?);
                 let mut note = mac_only_brief_note(&ctx.config_dir, &project, machine, &brief_text);
                 if thread.prompt_pending && !thread.pane_id.is_empty() {
                     let pending = "brief pending; the ticker delivers it when the agent registers";
@@ -1593,7 +1599,7 @@ fn dispatch_with_start(
                 if let Some(note) = &note {
                     crate::output::insert("note", note.clone());
                 }
-                let result = serde_json::json!({ "id": thread.id, "kind": thread.kind, "branch": thread.branch, "pane_id": thread.pane_id, "machine": machine, "placement_reason": thread.placement_reason });
+                let result = serde_json::json!({ "id": thread.id, "state": thread.status, "kind": thread.kind, "branch": thread.branch, "pane_id": thread.pane_id, "machine": machine, "placement_reason": thread.placement_reason });
                 println!("{result}");
                 if let Some(note) = note {
                     println!("{note}");
@@ -1991,6 +1997,33 @@ mod tests {
                 "{command}"
             );
         }
+    }
+
+    #[test]
+    fn start_accepts_repeatable_named_attachments() {
+        let cli = Cli::try_parse_from([
+            "ha",
+            "thread",
+            "start",
+            "demo",
+            "--job",
+            "job-0001",
+            "--task-file",
+            "task.md",
+            "--attach",
+            "report.md",
+            "--attach",
+            "image.png",
+            "--json",
+        ])
+        .unwrap();
+        let Command::Thread {
+            command: ThreadCommand::Start { attach, .. },
+        } = cli.command
+        else {
+            panic!("start");
+        };
+        assert_eq!(attach, ["report.md", "image.png"]);
     }
 
     #[test]

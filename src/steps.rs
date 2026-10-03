@@ -2764,7 +2764,7 @@ mod tests {
         deliver_events(&world.ctx(), &project).unwrap();
         assert_eq!(typed_lines(&world).len(), 1);
         assert!(typed_lines(&world)[0].contains(&format!(
-            "FAILED {}: provider_wait_expired — next: ha thread retry demo {} --reason \"<why replace this attempt>\"",
+            "FAILED {}: provider_wait_expired — next: ha thread retry demo {} --reason \"retry failed startup\"",
             lane.id, lane.id
         )));
     }

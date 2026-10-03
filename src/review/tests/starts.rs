@@ -263,9 +263,12 @@ fn reviewer_placement_leaves_launch_pending_and_releases_the_lock() {
     let review = start(&fx.world.ctx(), "demo", None).unwrap().unwrap();
     let reviewer = thread::load(&fx.project, review.reviewer.as_deref().unwrap()).unwrap();
     assert!(
-        reviewer.prompt_pending,
-        "ticker must own the pending launch"
+        reviewer.recovery_pending,
+        "ticker must own placement and launch"
     );
+    assert_eq!(reviewer.status, Status::Starting);
+    assert!(reviewer.worktree_path.is_empty());
+    assert!(reviewer.pane_id.is_empty());
     let held = try_operation_lock(&fx.world.ctx(), &review.repo).unwrap();
     assert!(held.is_some(), "review lock must be free before launch");
     drop(held);
