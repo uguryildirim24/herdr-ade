@@ -164,7 +164,10 @@ mod tests {
         let layout = Layout::for_test(dir.path().join("pi"));
         let first = ensure(&layout).unwrap();
         assert!(first.wrote_settings && first.wrote_models && first.wrote_trust);
-        assert!(!layout.auth().exists(), "setup never writes auth.json");
+        assert!(
+            !layout.agent().join("auth.json").exists(),
+            "setup never writes auth.json"
+        );
         assert!(exists(&layout));
 
         std::fs::write(layout.settings(), "{\"defaultProjectTrust\":\"ask\"}").unwrap();

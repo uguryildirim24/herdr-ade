@@ -268,55 +268,15 @@ fn parse_project_md(text: &str) -> Result<(Settings, String)> {
     };
     let value: toml::Value =
         toml::from_str(front).context("PROJECT.md front matter does not parse")?;
-    if let Some(table) = value.as_table() {
-        if table.contains_key("roles") {
-            bail!(
-                "roles_removed: remove roles from PROJECT.md; recipes and routing live in config.toml"
-            );
-        }
-        if table.contains_key("gates") {
-            bail!("gates_removed: move gates into each repository row in PROJECT.md");
-        }
+    if let Some(table) = value.as_table()
+        && table.contains_key("gates")
+    {
+        bail!("gates_removed: move gates into each repository row in PROJECT.md");
     }
     let settings: Settings = value
         .try_into()
         .context("PROJECT.md front matter does not parse")?;
     Ok((settings, body.trim_start_matches('\n').to_string()))
-}
-
-/// Removed keys that `doctor` refuses when they remain in front matter.
-pub(crate) fn removed_project_keys(front: &str) -> Vec<String> {
-    let Ok(value) = toml::from_str::<toml::Value>(front) else {
-        return Vec::new();
-    };
-    let Some(table) = value.as_table() else {
-        return Vec::new();
-    };
-    [
-        "coordinator_agent",
-        "thread_agent",
-        "coordinator_agent_args",
-        "thread_agent_args",
-        "max_parallel_threads",
-        "gates",
-    ]
-    .into_iter()
-    .filter(|key| table.contains_key(*key))
-    .map(str::to_string)
-    .collect()
-}
-
-/// Front matter between the `+++` lines.
-pub(crate) fn project_md_front(text: &str) -> Result<&str> {
-    let rest = text
-        .strip_prefix("+++\n")
-        .context("PROJECT.md must start with a `+++` line")?;
-    match rest.split_once("\n+++\n") {
-        Some((front, _)) => Ok(front),
-        None => rest
-            .strip_suffix("\n+++")
-            .context("PROJECT.md front matter has no closing `+++` line"),
-    }
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Default)]
@@ -1704,30 +1664,6 @@ mod tests {
                 .unwrap()
                 .flatten()
                 .all(|e| !e.file_name().to_string_lossy().ends_with(".tmp"))
-        );
-    }
-
-    #[test]
-    fn new_project_does_not_write_removed_settings() {
-        let root = tempfile::tempdir().unwrap();
-        let project = create(root.path(), "demo", "", vec![]).unwrap();
-        let text = std::fs::read_to_string(project.project_md()).unwrap();
-        let front = project_md_front(&text).unwrap();
-        assert!(removed_project_keys(front).is_empty(), "{front}");
-        assert!(!front.contains("max_parallel_threads"), "{front}");
-        assert!(!front.contains("talk"), "{front}");
-        let (settings, _) = parse_project_md(&text).unwrap();
-        assert_eq!(settings.name, "Demo");
-    }
-
-    #[test]
-    fn project_model_overrides_are_refused() {
-        let front = "[roles.lane]\nkind = \"claude\"";
-        assert!(
-            parse_project_md(&format!("+++\n{front}\n+++\n"))
-                .unwrap_err()
-                .to_string()
-                .contains("roles_removed")
         );
     }
 

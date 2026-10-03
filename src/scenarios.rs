@@ -10,7 +10,6 @@ use crate::coordinator;
 use crate::paths::{Ctx, Env};
 use crate::project::{self, Project};
 use crate::runner::Cmd;
-use crate::runner::Runner;
 use crate::runner::fake::{FakeRunner, fail, ok};
 use crate::thread::{self, Kind, Status, Thread};
 use crate::threads::{self, ResolveArgs, StartArgs};
@@ -500,7 +499,7 @@ fn cancel_keeps_non_disposable_ignored_data() {
     });
     world.runner.on(
         "status --porcelain --ignored --untracked-files=all",
-        ok("!! runs/raw.bin\n"),
+        ok("!! runs/raw.bin\0"),
     );
 
     let outcome = threads::cancel(&world.ctx(), "demo", &t.id, "stop this run").unwrap();
@@ -538,7 +537,7 @@ fn cancel_uses_the_repository_specific_disposable_list() {
     });
     world.runner.on(
         "status --porcelain --ignored --untracked-files=all",
-        ok("!! runs/pytest-cancel/cache\n"),
+        ok("!! runs/pytest-cancel/cache\0"),
     );
     world.runner.on("worktree remove", ok(""));
 
@@ -830,7 +829,7 @@ fn resolving_a_dirty_finished_worktree_keeps_it_with_a_reason() {
     thread::update(&project, &t.id, |t| t.merged_sha = "landed".into()).unwrap();
     world.runner.on(
         "status --porcelain --ignored --untracked-files=all",
-        ok("?? scratch.txt\n"),
+        ok("?? scratch.txt\0"),
     );
 
     let error = threads::resolve(&world.ctx(), "demo", &t.id, &ResolveArgs::default())
@@ -858,7 +857,7 @@ fn resolving_ignored_data_keeps_the_worktree_but_resolves_the_thread() {
     thread::update(&project, &t.id, |t| t.merged_sha = "landed".into()).unwrap();
     world.runner.on(
         "status --porcelain --ignored --untracked-files=all",
-        ok("!! camber-runs/raw.bin\n"),
+        ok("!! camber-runs/raw.bin\0"),
     );
 
     let outcome = threads::resolve(&world.ctx(), "demo", &t.id, &ResolveArgs::default()).unwrap();
@@ -899,7 +898,7 @@ fn resolving_disposable_ignored_output_removes_the_worktree() {
     thread::update(&project, &t.id, |t| t.merged_sha = "landed".into()).unwrap();
     world.runner.on(
         "status --porcelain --ignored --untracked-files=all",
-        ok("!! target/debug/cache\n"),
+        ok("!! target/debug/cache\0"),
     );
     world.runner.on("worktree remove", ok(""));
 
@@ -924,7 +923,7 @@ fn resolving_a_lane_with_only_its_stored_report_removes_the_worktree() {
     record_stored_report(&project, &t.id);
     world.runner.on(
         "status --porcelain --ignored --untracked-files=all",
-        ok("!! .reports/t-0001.md\n"),
+        ok("!! .reports/t-0001.md\0"),
     );
     world.runner.on("worktree remove", ok(""));
 
@@ -953,7 +952,7 @@ fn resolve_uses_the_repository_specific_disposable_list() {
     thread::update(&project, &t.id, |t| t.merged_sha = "landed".into()).unwrap();
     world.runner.on(
         "status --porcelain --ignored --untracked-files=all",
-        ok("!! runs/pytest-resolve/cache\n"),
+        ok("!! runs/pytest-resolve/cache\0"),
     );
     world.runner.on("worktree remove", ok(""));
 
@@ -985,7 +984,7 @@ fn a_nested_worktree_is_kept_inside_a_disposable_folder() {
     thread::update(&project, &t.id, |t| t.merged_sha = "landed".into()).unwrap();
     world.runner.on(
         "status --porcelain --ignored --untracked-files=all",
-        ok("!! target/child/output.bin\n"),
+        ok("!! target/child/output.bin\0"),
     );
 
     let outcome = threads::resolve(&world.ctx(), "demo", &t.id, &ResolveArgs::default()).unwrap();
@@ -1826,7 +1825,7 @@ fn forty_minute_sleep_defers_dark_wakes_and_imports_seals_before_resuming_starts
     let bytes = crate::events::bytes(&event).unwrap();
     let hash = thread::sha256_hex(&bytes);
     let manifest = format!(
-        "boot\tboot-1\nfree\t100\nagents\t{{\"result\":{{\"agents\":[]}}}}\npanes\t{{\"result\":{{\"panes\":[]}}}}\n\
+        "boot\tboot-1\nagents\t{{\"result\":{{\"agents\":[]}}}}\npanes\t{{\"result\":{{\"panes\":[]}}}}\n\
          event\tdemo\tt-0001-1-1\t/box/events/t-0001-1-1.toml\t{hash}\t/box/artifacts/{artifact}\t{artifact}\n\
          receipt\tdemo\tt-0001-1-1\t{hash}\t{artifact}\n"
     );
@@ -2071,7 +2070,7 @@ fn a_successful_courier_clears_a_persisted_lost_connection_after_restart() {
     .unwrap();
     world
         .runner
-        .on("ssh", ok("boot\tboot-1\nfree\t1\nagents\t-\npanes\t-\n"));
+        .on("ssh", ok("boot\tboot-1\nagents\t-\npanes\t-\n"));
     let ctx = world.ctx();
     let mut fresh_memory = Memory::new(&ctx);
     fresh_memory.tick = 1;
@@ -2101,7 +2100,7 @@ fn a_long_machine_outage_gives_one_item_and_one_recovery_item() {
                 fail(255, "ssh: connect to host box: Operation timed out")
             } else {
                 ok(&format!(
-                    "boot\tboot-1\nfree\t1\nagents\t{{\"result\":{{\"agents\":{agents}}}}}\npanes\t{{\"result\":{{\"panes\":[]}}}}\n"
+                    "boot\tboot-1\nagents\t{{\"result\":{{\"agents\":{agents}}}}}\npanes\t{{\"result\":{{\"panes\":[]}}}}\n"
                 ))
             })
         },
@@ -2177,7 +2176,7 @@ fn a_remote_thread_blocked_at_a_poll_is_waiting_on_you_at_once() {
     };
     scripted.runner.on(
         "ssh",
-        ok("boot\tboot-1\nfree\t1\nagents\t{\"result\":{\"agents\":[{\"pane_id\":\"w2:p1\",\"tab_id\":\"w2:t1\",\"workspace_id\":\"w2\",\"cwd\":\"/home/me/wt\",\"name\":\"hp-demo-t-0001\",\"agent_status\":\"blocked\"}]}}\npanes\t{\"result\":{\"panes\":[]}}\n"),
+        ok("boot\tboot-1\nagents\t{\"result\":{\"agents\":[{\"pane_id\":\"w2:p1\",\"tab_id\":\"w2:t1\",\"workspace_id\":\"w2\",\"cwd\":\"/home/me/wt\",\"name\":\"hp-demo-t-0001\",\"agent_status\":\"blocked\"}]}}\npanes\t{\"result\":{\"panes\":[]}}\n"),
     );
     scripted
         .runner
@@ -2863,98 +2862,6 @@ fn the_digest_uses_the_complete_fact_from_the_project_page() {
         "{digest}"
     );
     assert!(!digest.contains("memory over budget"), "{digest}");
-}
-
-fn parse_json_stdout(out: &crate::runner::Output) -> serde_json::Value {
-    if out.stdout.trim().is_empty() {
-        return serde_json::json!({});
-    }
-    serde_json::from_str(out.stdout.trim()).unwrap()
-}
-
-#[test]
-fn ade_new_verb_scenarios_have_canned_herdr_replies() {
-    use crate::runner::fake::{ADE_NEW_VERB_SCENARIOS, FakeRunner};
-    assert_eq!(
-        ADE_NEW_VERB_SCENARIOS,
-        ["thread_start_parent", "ha_done", "ha_waiting", "ask", "say",]
-    );
-    let runner = FakeRunner::new();
-    runner.on_ade_new_verbs();
-
-    // thread start --parent (SPEC-ADE D3 / D4)
-    let parent = runner
-        .run(&Cmd::new("herdr", std::time::Duration::from_secs(1)).args([
-            "agent", "start", "lane", "--kind", "claude", "--pane", "w2:p1", "--parent", "w1:p1",
-        ]))
-        .unwrap();
-    assert_eq!(
-        parse_json_stdout(&parent)["result"]["agent"]["pane_id"],
-        "w2:p1"
-    );
-    let tab = runner
-        .run(&Cmd::new("herdr", std::time::Duration::from_secs(1)).args([
-            "tab",
-            "create",
-            "--workspace",
-            "w1",
-            "--cwd",
-            "/wt",
-            "--label",
-            "t-0001",
-            "--no-focus",
-            "--env",
-            "HERDR_ADE_LAUNCH=demo/t-0001/1/abcd",
-        ]))
-        .unwrap();
-    assert_eq!(
-        parse_json_stdout(&tab)["result"]["root_pane"]["pane_id"],
-        "w1:p2"
-    );
-
-    // ha done / ha waiting (SPEC-ADE D5)
-    let status = runner
-        .run(&Cmd::new("git", std::time::Duration::from_secs(1)).args(["status", "--short"]))
-        .unwrap();
-    assert!(status.success());
-    assert!(status.stdout.is_empty());
-    let head = runner
-        .run(&Cmd::new("git", std::time::Duration::from_secs(1)).args(["rev-parse", "HEAD"]))
-        .unwrap();
-    assert!(head.stdout.starts_with('a'));
-    let done_line = runner
-        .run(&Cmd::new("herdr", std::time::Duration::from_secs(1)).args([
-            "agent",
-            "prompt",
-            "w1:p1",
-            "DONE t-0001 .reports/t-0001-report.md aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-        ]))
-        .unwrap();
-    assert_eq!(
-        parse_json_stdout(&done_line)["result"],
-        serde_json::json!({})
-    );
-    let waiting_line = runner
-        .run(&Cmd::new("herdr", std::time::Duration::from_secs(1)).args([
-            "agent",
-            "prompt",
-            "w1:p1",
-            "WAITING t-0002 need a look",
-        ]))
-        .unwrap();
-    assert!(waiting_line.success());
-
-    // ask / say (SPEC-ADE D17)
-    let ask = runner
-        .run(&Cmd::new("herdr", std::time::Duration::from_secs(1)).args([
-            "notification",
-            "show",
-            "keep the experiment running another hour? (2 choices)",
-            "--body",
-            "1 keep it running another hour\n2 stop it now",
-        ]))
-        .unwrap();
-    assert!(ask.success());
 }
 
 // ---------------------------------------------------------- harness (t-0054)

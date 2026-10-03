@@ -1376,7 +1376,7 @@ fn large_landing_shares_every_ticker_pass_with_other_projects_due_work() {
     );
     fx.world.runner.on_fn(
         |cmd| cmd.program == "ssh",
-        |_| Ok(ok("boot\tboot-1\nfree\t100\nagents\t{\"result\":{\"agents\":[]}}\npanes\t{\"result\":{\"panes\":[]}}\n")),
+        |_| Ok(ok("boot\tboot-1\nagents\t{\"result\":{\"agents\":[]}}\npanes\t{\"result\":{\"panes\":[]}}\n")),
     );
 
     let ctx = fx.world.ctx();

@@ -511,20 +511,6 @@ pub(crate) fn doctor_rows_with(
         ));
     }
 
-    // Cursor: informational unless something Cursor-shaped is installed.
-    let artifacts = cursor_artifacts(layout);
-    if artifacts.is_empty() {
-        rows.push(Row::ok(
-            "Cursor",
-            "outside pi; native cursor lanes only, then retired",
-        ));
-    } else {
-        rows.push(Row::fail(
-            "Cursor",
-            format!("outside pi, but found {}", artifacts.join(", ")),
-        ));
-    }
-
     // each enabled provider: a login or a named missing-login failure.
     if layout.wrapper().is_file() {
         for provider in providers {
@@ -541,9 +527,6 @@ pub(crate) fn doctor_rows_with(
                     error.detail,
                 )),
             }
-        }
-        if providers.contains(&"cursor") {
-            rows.push(Row::fail("provider cursor", "no Cursor route under pi"));
         }
     } else {
         rows.push(Row::fail("providers", "no wrapper; run `herdr-pi setup`"));
@@ -564,9 +547,6 @@ pub(crate) fn doctor_rows_with(
 
 /// The `--provider` a `check <provider>` call must refuse before any start.
 fn check_provider_allowed(provider: &str) -> Result<()> {
-    if provider.eq_ignore_ascii_case("cursor") {
-        anyhow::bail!("pi_cursor_forbidden: Cursor stays outside pi (decision 18:30)");
-    }
     if !launch::PROVIDERS.contains(&provider) {
         anyhow::bail!("pi_args_forbidden: `{provider}` is not a pi provider");
     }
@@ -646,16 +626,6 @@ impl CheckReport {
             "checks": rows,
         })
     }
-}
-
-/// The full `check <provider>`: everything A1 refuses a start on.
-pub(crate) fn check_report(
-    env: &Env,
-    layout: &Layout,
-    runner: &dyn sh::Runner,
-    provider: &str,
-) -> CheckReport {
-    check_report_model(env, layout, runner, provider, None)
 }
 
 pub(crate) fn check_report_model(
@@ -1164,42 +1134,6 @@ fn pinned_range(layout: &Layout) -> Option<String> {
         .map(str::to_string)
 }
 
-fn cursor_artifacts(layout: &Layout) -> Vec<String> {
-    let mut found = Vec::new();
-    if layout.npm().join("node_modules/@cursor/sdk").exists() {
-        found.push("@cursor/sdk".to_string());
-    }
-    let modules = layout.npm().join("node_modules");
-    if let Ok(entries) = std::fs::read_dir(&modules) {
-        for entry in entries.flatten() {
-            let name = entry.file_name().to_string_lossy().into_owned();
-            if name.starts_with("pi-cursor") {
-                found.push(name.clone());
-            }
-            if name.starts_with('@')
-                && let Ok(inner) = std::fs::read_dir(entry.path())
-            {
-                for item in inner.flatten() {
-                    let scoped = format!("{name}/{}", item.file_name().to_string_lossy());
-                    if scoped.to_ascii_lowercase().contains("pi-cursor") || scoped == "@cursor/sdk"
-                    {
-                        found.push(scoped);
-                    }
-                }
-            }
-        }
-    }
-    for ext in [
-        layout.extensions().join("herdr-pi-cursor.ts"),
-        layout.extensions().join("pi-cursor.ts"),
-    ] {
-        if ext.exists() {
-            found.push(ext.display().to_string());
-        }
-    }
-    found
-}
-
 fn parse_node(version: &str) -> Option<(u32, u32, u32)> {
     let v = version.trim().trim_start_matches('v');
     let mut parts = v.split('.');
@@ -1293,7 +1227,6 @@ mod tests {
             "{text:?}"
         );
         assert!(text.iter().any(|l| l.contains("[ok  ] guard")), "{text:?}");
-        assert!(text.iter().any(|l| l.contains("[ok  ] Cursor")), "{text:?}");
         assert!(!text.iter().any(|l| l.contains("[FAIL]")), "{text:?}");
         assert!(healthy(&rows));
     }
@@ -1530,22 +1463,6 @@ mod tests {
     }
 
     #[test]
-    fn a_cursor_package_fails_the_cursor_row() {
-        let dir = tempfile::tempdir().unwrap();
-        let layout = installed_layout(dir.path());
-        std::fs::create_dir_all(layout.npm().join("node_modules/@cursor/sdk")).unwrap();
-        std::fs::create_dir_all(layout.npm().join("node_modules/pi-cursor-sdk")).unwrap();
-        let env = Env::for_test(dir.path(), &[("HERDR_BIN_PATH", "/h/herdr")]);
-        let rows = doctor_rows_with(&env, &layout, &scripted(&env), &[]);
-        let text: Vec<String> = rows.iter().map(Row::line).collect();
-        let cursor = text.iter().find(|l| l.contains("Cursor")).unwrap();
-        assert!(
-            cursor.contains("[FAIL]") && cursor.contains("@cursor/sdk"),
-            "{cursor}"
-        );
-    }
-
-    #[test]
     fn the_deepseek_compaction_row_is_ok_after_setup_and_names_a_missing_model() {
         let dir = tempfile::tempdir().unwrap();
         let layout = installed_layout(dir.path());
@@ -1568,8 +1485,7 @@ mod tests {
     }
 
     #[test]
-    fn check_refuses_cursor_and_unknown_providers() {
-        assert!(check_provider_allowed("cursor").is_err());
+    fn check_refuses_unknown_providers() {
         assert!(check_provider_allowed("moonshot").is_err());
         assert!(check_provider_allowed("kimi-coding").is_ok());
     }
@@ -1598,7 +1514,7 @@ mod tests {
             custom.on("--print Reply OK.", fail(1, "subscription expired"));
             custom
         };
-        let first = check_report(&env, &layout, &runner, "kimi-coding");
+        let first = check_report_model(&env, &layout, &runner, "kimi-coding", None);
         assert!(!first.ok);
         let login = first.rows.iter().find(|row| row.label == "login").unwrap();
         assert!(
@@ -1608,7 +1524,7 @@ mod tests {
         );
         let cache = std::fs::read_to_string(probe_cache_path(&layout, "kimi-coding")).unwrap();
         assert!(!cache.contains("subscription expired"), "{cache}");
-        let second = check_report(&env, &layout, &runner, "kimi-coding");
+        let second = check_report_model(&env, &layout, &runner, "kimi-coding", None);
         assert!(!second.ok);
         assert_eq!(runner.count("auth check"), 1);
         assert_eq!(runner.count("--print"), 1);
@@ -1641,7 +1557,7 @@ mod tests {
             custom
         };
 
-        let report = check_report(&env, &layout, &runner, "openai-codex");
+        let report = check_report_model(&env, &layout, &runner, "openai-codex", None);
         assert!(!report.ok);
         assert_eq!(report.failure_evidence(), FailureEvidence::Unknown);
         let failure = report
@@ -1667,7 +1583,7 @@ mod tests {
                 r#"{"status":"not_ready","reason":"credentials_not_configured"}"#,
             ),
         );
-        let report = check_report(&env, &layout, &runner, "kimi-coding");
+        let report = check_report_model(&env, &layout, &runner, "kimi-coding", None);
         assert!(!report.ok);
         assert!(report.error_text().contains("not ready"));
         let json = report.json();

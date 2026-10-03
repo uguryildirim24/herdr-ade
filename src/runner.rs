@@ -415,52 +415,7 @@ pub(crate) mod fake {
                 .filter(|cmd| cmd.display().contains(needle))
                 .count()
         }
-
-        /// Canned herdr replies for the ADE verbs named in SPEC-ADE §1.3.
-        /// No plugin behaviour is implemented yet; later lanes match on these needles.
-        pub(crate) fn on_ade_new_verbs(&self) -> &Self {
-            for (needle, stdout) in ADE_NEW_VERB_REPLIES {
-                self.on(needle, ok(stdout));
-            }
-            self
-        }
     }
-
-    /// Scenario names in SPEC-ADE §1.3 for the new verbs.
-    pub(crate) const ADE_NEW_VERB_SCENARIOS: [&str; 5] =
-        ["thread_start_parent", "ha_done", "ha_waiting", "ask", "say"];
-
-    /// Needle → canned stdout for each new verb's herdr or git call (SPEC-ADE §1.3).
-    /// More specific needles come first so FakeRunner's first-match rule is stable.
-    const ADE_NEW_VERB_REPLIES: &[(&str, &str)] = &[
-        (
-            "--parent",
-            r#"{"result":{"agent":{"pane_id":"w2:p1","tab_id":"w2:t1","workspace_id":"w2"}}}"#,
-        ),
-        (
-            "HERDR_ADE_LAUNCH",
-            r#"{"result":{"root_pane":{"workspace_id":"w1","tab_id":"w1:t2","pane_id":"w1:p2","cwd":"/wt"}}}"#,
-        ),
-        ("git status --short", ""),
-        (
-            "rev-parse HEAD",
-            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n",
-        ),
-        ("git ls-tree", ""),
-        ("worktree add", ""),
-        ("update-ref", ""),
-        ("workspace report-metadata", r#"{"result":{}}"#),
-        ("notification show", r#"{"result":{}}"#),
-        ("agent prompt", r#"{"result":{}}"#),
-        (
-            "tab create",
-            r#"{"result":{"root_pane":{"workspace_id":"w1","tab_id":"w1:t2","pane_id":"w1:p2","cwd":"/wt"}}}"#,
-        ),
-        (
-            "agent start",
-            r#"{"result":{"agent":{"pane_id":"w2:p1","tab_id":"w2:t1","workspace_id":"w2","name":"lane-t-0001"}}}"#,
-        ),
-    ];
 
     pub(crate) fn ok(stdout: &str) -> Output {
         Output {

@@ -1,8 +1,8 @@
 //! Pinned pi integration for `herdr-ade` (SPEC-pi v2 §3).
 //!
 //! The library owns pi itself: the pinned npm prefix, the wrapper the login
-//! shell finds, one shared pi folder for every lane, the D2 rows, resume
-//! helpers, doctor rows, and the guard extension that turns a provider failure
+//! shell finds, one shared pi folder for every lane, the D2 rows,
+//! doctor rows, and the guard extension that turns a provider failure
 //! into `blocked` / `WAITING` instead of a silent `done`.
 //!
 //! The module compiles into two targets: the `herdr-ade` binary and the thin
@@ -19,7 +19,6 @@ pub(crate) mod folder;
 pub(crate) mod install;
 pub(crate) mod launch;
 pub(crate) mod provider;
-pub(crate) mod resume;
 pub(crate) mod sh;
 
 #[cfg(test)]
@@ -132,10 +131,6 @@ impl Layout {
 
     pub(crate) fn models(&self) -> PathBuf {
         self.agent().join("models.json")
-    }
-
-    pub(crate) fn auth(&self) -> PathBuf {
-        self.agent().join("auth.json")
     }
 
     pub(crate) fn trust(&self) -> PathBuf {

@@ -1115,23 +1115,6 @@ fn report_with_checks(
         if let Some(warning) = crate::thread::memory_use(&project).warning() {
             check(&mut out, None, &format!("{label} memory"), warning);
         }
-        if let Ok(text) = std::fs::read_to_string(project.project_md())
-            && let Ok(front) = project::project_md_front(&text)
-        {
-            let removed = project::removed_project_keys(front);
-            if !removed.is_empty() {
-                check(
-                    &mut out,
-                    Some(false),
-                    &label,
-                    format!(
-                        "PROJECT.md has removed settings: {}; delete these lines",
-                        removed.join(", ")
-                    ),
-                );
-                continue;
-            }
-        }
         let Some(record) = project.coordinator() else {
             check(
                 &mut out,
@@ -2715,37 +2698,6 @@ recipe = "claude_fable_xhigh"
     }
 
     #[test]
-    fn doctor_refuses_the_removed_parallel_thread_setting() {
-        let home = tempfile::tempdir().unwrap();
-        let env = Env::for_test(home.path(), &[]);
-        let config = home.path().join("cfg");
-        write_routing_config(&config);
-        let root = home.path().join("root");
-        let project = project::create(&root, "demo", "", vec![]).unwrap();
-        let text = std::fs::read_to_string(project.project_md()).unwrap();
-        std::fs::write(
-            project.project_md(),
-            text.replacen("+++\n", "+++\nmax_parallel_threads = 9\n", 1),
-        )
-        .unwrap();
-        let runner = runner_with_herdr("herdr 0.9.1\n");
-        runner.on(
-            "agent start --help",
-            ok("[possible values: pi, claude, agy]"),
-        );
-
-        let (text, healthy) = report(&env, &root, &config, &SessionFlags::default(), &runner);
-
-        assert!(!healthy, "{text}");
-        assert!(
-            text.contains(
-                "[FAIL] project demo: PROJECT.md has removed settings: max_parallel_threads; delete these lines"
-            ),
-            "{text}"
-        );
-    }
-
-    #[test]
     fn doctor_without_a_routing_table_names_the_config_fix() {
         let home = tempfile::tempdir().unwrap();
         let config = home.path().join("cfg");
@@ -3501,8 +3453,7 @@ recipe = "claude_fable_xhigh"
         let runner = FakeRunner::new();
         runner.on(
             "ssh",
-            ok(&(box_facts() + "pi_openai-codex/gpt-6-astra\tok\n")
-                .replace("login_codex\tok", "login_codex\tmissing")),
+            ok(&box_facts().replace("login_codex\tok", "login_codex\tmissing")),
         );
         runner.on(
             "pane read",
@@ -3511,10 +3462,6 @@ recipe = "claude_fable_xhigh"
         probe_fakes(&runner);
         let mut recipes = default_recipes();
         recipes.retain(|_, recipe| recipe.kind == "pi" && recipe.provider == "openai-codex");
-        // Every routed model gets its own readiness call.
-        for recipe in recipes.values_mut() {
-            recipe.enabled = true;
-        }
         let rows = box_rows(
             &runner,
             "herdr",
@@ -3528,7 +3475,7 @@ recipe = "claude_fable_xhigh"
             rows.iter()
                 .filter(|row| row.1.starts_with("box buildbox pi openai-codex/"))
                 .count(),
-            2
+            1
         );
         assert!(!rows.iter().any(|row| row.1.contains(" login ")));
         let calls = runner.calls.borrow();
@@ -3537,7 +3484,7 @@ recipe = "claude_fable_xhigh"
             .find(|call| call.program == "ssh")
             .unwrap()
             .display();
-        assert_eq!(ssh.matches("check openai-codex").count(), 2, "{ssh}");
+        assert_eq!(ssh.matches("check openai-codex").count(), 1, "{ssh}");
         assert!(!ssh.contains("codex login status"), "{ssh}");
         assert!(!ssh.contains("command -v codex"), "{ssh}");
     }

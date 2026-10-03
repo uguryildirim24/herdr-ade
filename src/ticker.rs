@@ -3896,7 +3896,7 @@ mod tests {
                 String::new()
             };
             let manifest = format!(
-                "boot\tboot-1\nfree\t1\nagents\t{{\"result\":{{\"agents\":[{agent}]}}}}\npanes\t{{\"result\":{{\"panes\":[{pane}]}}}}\n{receipt}"
+                "boot\tboot-1\nagents\t{{\"result\":{{\"agents\":[{agent}]}}}}\npanes\t{{\"result\":{{\"panes\":[{pane}]}}}}\n{receipt}"
             );
             world
                 .runner
@@ -3991,7 +3991,7 @@ mod tests {
                 move |_| Ok(if flag.get() {
                     fail(255, detail)
                 } else {
-                    ok("boot\tboot-1\nfree\t1\nagents\t{\"result\":{\"agents\":[]}}\npanes\t{\"result\":{\"panes\":[]}}\n")
+                    ok("boot\tboot-1\nagents\t{\"result\":{\"agents\":[]}}\npanes\t{\"result\":{\"panes\":[]}}\n")
                 }),
             );
             world.runner.on(

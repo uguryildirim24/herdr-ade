@@ -161,51 +161,6 @@ pub(crate) fn write_wrapper(layout: &super::Layout) -> Result<PathBuf> {
     Ok(path)
 }
 
-/// The args after `--` on the start line (SPEC-pi v2 §3.4).
-pub(crate) fn start_args(provider: &str, model: &str, thinking: &str) -> Vec<String> {
-    vec![
-        "--provider".into(),
-        provider.into(),
-        "--model".into(),
-        model.into(),
-        "--thinking".into(),
-        thinking.into(),
-        "--no-skills".into(),
-    ]
-}
-
-/// The full `herdr agent start` argv for kind `pi`. `session` is ADE's
-/// `launch.resume_session` (process recovery), never a recipe value.
-pub(crate) fn agent_start_args(
-    name: &str,
-    pane: &str,
-    parent: &str,
-    timeout_ms: u64,
-    recipe_args: &[String],
-    session: Option<&Path>,
-) -> Result<Vec<String>> {
-    validate_args(recipe_args)?;
-    let mut args = vec![
-        "agent".to_string(),
-        "start".to_string(),
-        name.to_string(),
-        "--kind".to_string(),
-        "pi".to_string(),
-        "--pane".to_string(),
-        pane.to_string(),
-        "--parent".to_string(),
-        parent.to_string(),
-        "--timeout".to_string(),
-        timeout_ms.to_string(),
-        "--".to_string(),
-    ];
-    args.extend(recipe_args.iter().cloned());
-    if let Some(session) = session {
-        args.extend(super::resume::append_resume_session(session, recipe_args)?);
-    }
-    Ok(args)
-}
-
 /// A `kind = "pi"` recipe is refused when it carries a session or trust flag
 /// (SPEC-pi v2 §3.5). The code is part of the message, so callers can name it.
 pub(crate) fn validate_args(args: &[String]) -> Result<()> {
@@ -218,34 +173,14 @@ pub(crate) fn validate_args(args: &[String]) -> Result<()> {
     if args.iter().any(|a| a == "--force") {
         bail!("pi_args_forbidden: `--force` never appears on a pi row");
     }
-    let provider = flag_value(args, "--provider")
+    flag_value(args, "--provider")
         .ok_or_else(|| anyhow::anyhow!("pi_args_forbidden: `--provider` is required"))?;
-    if provider.eq_ignore_ascii_case("cursor") {
-        bail!("pi_cursor_forbidden: Cursor stays outside pi (decision 18:30)");
-    }
-    if args.iter().any(|a| {
-        let v = a.to_ascii_lowercase();
-        v.contains("cursor/sdk") || v.contains("pi-cursor")
-    }) {
-        bail!("pi_cursor_forbidden: no Cursor SDK or community add-on under pi");
-    }
     // Every pi row, a known provider or not (the T3 mock row too).
     if flag_value(args, "--model").is_none_or(|model| model.is_empty()) {
         bail!("pi_args_forbidden: `--model` is required on a pi row");
     }
     if !args.iter().any(|a| a == "--no-skills") {
         bail!("pi_args_forbidden: `--no-skills` is required on a pi row");
-    }
-    Ok(())
-}
-
-/// `env` on a pi row must not set `PI_CODING_AGENT_DIR`
-/// (SPEC-pi v2 §3.5: the wrapper supplies it).
-fn validate_env(env: &[(String, String)]) -> Result<()> {
-    for (key, _) in env {
-        if key == "PI_CODING_AGENT_DIR" {
-            bail!("pi_env_forbidden: the wrapper supplies PI_CODING_AGENT_DIR");
-        }
     }
     Ok(())
 }
@@ -332,72 +267,12 @@ mod tests {
     }
 
     #[test]
-    fn start_args_are_exactly_the_spec_line() {
-        let recipe = args(&[
-            "--provider",
-            "kimi-coding",
-            "--model",
-            "k3",
-            "--thinking",
-            "low",
-            "--no-skills",
-        ]);
-        let start = agent_start_args("a5", "w1F:p13", "w1F:p1", 30000, &recipe, None).unwrap();
-        assert_eq!(
-            start,
-            args(&[
-                "agent",
-                "start",
-                "a5",
-                "--kind",
-                "pi",
-                "--pane",
-                "w1F:p13",
-                "--parent",
-                "w1F:p1",
-                "--timeout",
-                "30000",
-                "--",
-                "--provider",
-                "kimi-coding",
-                "--model",
-                "k3",
-                "--thinking",
-                "low",
-                "--no-skills",
-            ])
-        );
-        assert!(!start.iter().any(|a| a == "--approve"));
-        assert!(!start.iter().any(|a| a == "-a"));
-    }
-
-    #[test]
-    fn forbidden_flags_and_cursor_are_refused() {
+    fn forbidden_flags_are_refused() {
         for flag in FORBIDDEN_ARGS {
             let bad = args(&["--provider", "kimi-coding", "--model", "x", flag]);
             let error = validate_args(&bad).unwrap_err().to_string();
             assert!(error.contains("pi_args_forbidden"), "{flag}: {error}");
         }
-        for provider in ["cursor", "Cursor", "CURSOR"] {
-            let cursor = args(&["--provider", provider, "--model", "x", "--no-skills"]);
-            assert!(
-                validate_args(&cursor)
-                    .unwrap_err()
-                    .to_string()
-                    .contains("pi_cursor_forbidden"),
-                "{provider}"
-            );
-        }
-        let sdk = args(&[
-            "--provider",
-            "kimi-coding",
-            "--model",
-            "x",
-            "--extension",
-            "@cursor/sdk",
-        ]);
-        let error = validate_args(&sdk).unwrap_err().to_string();
-        assert!(error.contains("pi_cursor_forbidden") || error.contains("pi_args_forbidden"));
     }
 
     #[test]
@@ -420,18 +295,6 @@ mod tests {
             let error = validate_args(&bad).unwrap_err().to_string();
             assert!(error.contains("pi_args_forbidden"), "{bad:?}: {error}");
         }
-    }
-
-    #[test]
-    fn env_with_the_agent_dir_is_refused() {
-        let env = vec![("PI_CODING_AGENT_DIR".to_string(), "/x".to_string())];
-        assert!(
-            validate_env(&env)
-                .unwrap_err()
-                .to_string()
-                .contains("pi_env_forbidden")
-        );
-        assert!(validate_env(&[]).is_ok());
     }
 
     #[test]

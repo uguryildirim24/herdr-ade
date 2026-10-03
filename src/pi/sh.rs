@@ -6,7 +6,7 @@
 //! commands, with the scripted fake the tests drive (SPEC-pi v2 §7: the same
 //! shape as `crate::runner::fake`, kept separate so the second binary builds).
 
-use std::io::{Read, Write};
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex};
@@ -25,9 +25,6 @@ pub(crate) struct Cmd {
     pub(crate) args: Vec<String>,
     pub(crate) env: Vec<(String, String)>,
     pub(crate) env_remove: Vec<String>,
-    pub(crate) cwd: Option<PathBuf>,
-    /// `None` closes stdin (`</dev/null` for every doctor and check run).
-    pub(crate) stdin: Option<String>,
     pub(crate) timeout: Duration,
 }
 
@@ -38,8 +35,6 @@ impl Cmd {
             args: Vec::new(),
             env: Vec::new(),
             env_remove: Vec::new(),
-            cwd: None,
-            stdin: None,
             timeout,
         }
     }
@@ -63,17 +58,8 @@ impl Cmd {
         self
     }
 
-    pub(crate) fn cwd(mut self, cwd: impl Into<PathBuf>) -> Self {
-        self.cwd = Some(cwd.into());
-        self
-    }
-
-    pub(crate) fn stdin(mut self, text: impl Into<String>) -> Self {
-        self.stdin = Some(text.into());
-        self
-    }
-
     /// The command as one line; the scripted fake matches on it.
+    #[cfg(test)]
     pub(crate) fn display(&self) -> String {
         let mut line = self.program.clone();
         for arg in &self.args {
@@ -130,15 +116,8 @@ impl Runner for RealRunner {
         for (key, value) in &cmd.env {
             command.env(key, value);
         }
-        if let Some(cwd) = &cmd.cwd {
-            command.current_dir(cwd);
-        }
         command
-            .stdin(if cmd.stdin.is_some() {
-                Stdio::piped()
-            } else {
-                Stdio::null()
-            })
+            .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
         // Every command runs in its own process group, so a timeout reaches
@@ -153,15 +132,6 @@ impl Runner for RealRunner {
             .spawn()
             .with_context(|| format!("could not run `{}`", cmd.program))?;
 
-        let stdin_thread = child
-            .stdin
-            .take()
-            .zip(cmd.stdin.clone())
-            .map(|(mut pipe, text)| {
-                std::thread::spawn(move || {
-                    let _ = pipe.write_all(text.as_bytes());
-                })
-            });
         let stdout_thread = child.stdout.take().map(read_all);
         let stderr_thread = child.stderr.take().map(read_all);
 
@@ -182,24 +152,17 @@ impl Runner for RealRunner {
         // The wrapper can exit before its network child releases the pipes.
         // Reader joins must share the same command deadline.
         while !timed_out
-            && (stdin_thread.as_ref().is_some_and(|t| !t.is_finished())
-                || stdout_thread.as_ref().is_some_and(|t| !t.is_finished())
+            && (stdout_thread.as_ref().is_some_and(|t| !t.is_finished())
                 || stderr_thread.as_ref().is_some_and(|t| !t.is_finished()))
             && Instant::now() < deadline
         {
             std::thread::sleep(Duration::from_millis(20));
         }
-        if stdin_thread.as_ref().is_some_and(|t| !t.is_finished())
-            || stdout_thread.as_ref().is_some_and(|t| !t.is_finished())
+        if stdout_thread.as_ref().is_some_and(|t| !t.is_finished())
             || stderr_thread.as_ref().is_some_and(|t| !t.is_finished())
         {
             timed_out = true;
             kill_group(&mut child);
-        }
-        if let Some(thread) = stdin_thread
-            && thread.is_finished()
-        {
-            let _ = thread.join();
         }
         let stdout = stdout_thread.map(PipeReader::text).unwrap_or_default();
         let stderr = stderr_thread.map(PipeReader::text).unwrap_or_default();
@@ -366,13 +329,6 @@ pub(crate) mod fake {
         Output {
             code: Some(code),
             stderr: stderr.to_string(),
-            ..Output::default()
-        }
-    }
-
-    pub(crate) fn timeout() -> Output {
-        Output {
-            timed_out: true,
             ..Output::default()
         }
     }
