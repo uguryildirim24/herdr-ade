@@ -4660,7 +4660,7 @@ mod tests {
             fail(1, "transport disconnected after submission"),
         );
         let ctx = world.ctx();
-        let herdr = Herdr::new("herdr", "", &world.runner);
+        let herdr = Herdr::new("herdr", "test.sock", &world.runner);
         let panes = [Pane {
             pane_id: lane.pane_id.clone(),
             tab_id: lane.tab_id.clone(),
@@ -4715,7 +4715,7 @@ mod tests {
         let project = world.project("demo", "a.sock");
         let lane = world.thread(&project, world.home.path(), |_| {});
         world.runner.on("agent prompt", ok(r#"{"result":{}}"#));
-        let herdr = Herdr::new("herdr", "", &world.runner);
+        let herdr = Herdr::new("herdr", "test.sock", &world.runner);
         let agents = [Agent {
             pane_id: lane.pane_id.clone(),
             tab_id: lane.tab_id.clone(),
@@ -5539,7 +5539,7 @@ mod tests {
             runner: &runner,
             detached_ticker: false,
         };
-        let herdr = Herdr::new("herdr", "", &runner);
+        let herdr = Herdr::new("herdr", "test.sock", &runner);
         let mut may_start = true;
         let mut errors = Vec::new();
         launch_pass(
@@ -5603,7 +5603,7 @@ mod tests {
             runner: &runner,
             detached_ticker: false,
         };
-        let herdr = Herdr::new("herdr", "", &runner);
+        let herdr = Herdr::new("herdr", "test.sock", &runner);
         let panes = [Pane {
             pane_id: record.pane_id.clone(),
             tab_id: record.tab_id.clone(),
@@ -5739,7 +5739,7 @@ mod tests {
             runner: &runner,
             detached_ticker: false,
         };
-        let herdr = Herdr::new("herdr", "", &runner);
+        let herdr = Herdr::new("herdr", "test.sock", &runner);
         let panes = [Pane {
             pane_id: record.pane_id.clone(),
             tab_id: record.tab_id.clone(),
@@ -5819,7 +5819,7 @@ mod tests {
             workspace_id: lane.workspace_id.clone(),
             cwd: lane.cwd.clone(),
         };
-        let herdr = Herdr::new("herdr", "", &world.runner);
+        let herdr = Herdr::new("herdr", "test.sock", &world.runner);
         let view = ObservationView {
             machine_id: "",
             threads: &[],
@@ -5880,7 +5880,7 @@ mod tests {
         );
         let shell = FakeRunner::new();
         shell.on("pane process-info", ok(r#"{"result":{"process_info":{"pane_id":"w2:p1","foreground_processes":[{"pid":5,"name":"bash"}]}}}"#));
-        let herdr = Herdr::new("herdr", "", &shell);
+        let herdr = Herdr::new("herdr", "test.sock", &shell);
         assert!(LaneObservation::read(&lane, view, &herdr, false).presence == Presence::Absent);
     }
 
@@ -5905,7 +5905,7 @@ mod tests {
             ..Default::default()
         };
         let ctx = world.ctx();
-        let herdr = Herdr::new("herdr", "", &world.runner);
+        let herdr = Herdr::new("herdr", "test.sock", &world.runner);
         let view = steps::CourierOutcome {
             machine_id: "box".into(),
             boot_id: "boot-1".into(),
@@ -6091,7 +6091,7 @@ mod tests {
             runner: &runner,
             detached_ticker: false,
         };
-        let herdr = Herdr::new("herdr", "", &runner);
+        let herdr = Herdr::new("herdr", "test.sock", &runner);
         let poll = |agent: &Agent| {
             let current = thread::load(&f.project, &lane.id).unwrap();
             thread_pass(
@@ -6173,7 +6173,7 @@ mod tests {
             runner: &runner,
             detached_ticker: false,
         };
-        let herdr = Herdr::new("herdr", "", &runner);
+        let herdr = Herdr::new("herdr", "test.sock", &runner);
         let panes = [Pane {
             pane_id: record.pane_id.clone(),
             tab_id: record.tab_id.clone(),
@@ -6260,7 +6260,7 @@ mod tests {
             runner: &runner,
             detached_ticker: false,
         };
-        let herdr = Herdr::new("herdr", "", &runner);
+        let herdr = Herdr::new("herdr", "test.sock", &runner);
         let pass = thread_pass(
             &LaunchPass {
                 ctx: &ctx,
@@ -6508,7 +6508,7 @@ mod tests {
             runner: &runner,
             detached_ticker: false,
         };
-        let herdr = Herdr::new("herdr", "", &runner);
+        let herdr = Herdr::new("herdr", "test.sock", &runner);
         let pass = thread_pass(
             &LaunchPass {
                 ctx: &ctx,
@@ -6602,7 +6602,7 @@ mod tests {
             runner: &runner,
             detached_ticker: false,
         };
-        let herdr = Herdr::new("herdr", "", &runner);
+        let herdr = Herdr::new("herdr", "test.sock", &runner);
         let coordinator_pane = Pane {
             workspace_id: "w1".into(),
             tab_id: "w1:t1".into(),
@@ -7340,7 +7340,7 @@ mod tests {
             runner: &runner,
             detached_ticker: false,
         };
-        let herdr = Herdr::new("herdr", "", &runner);
+        let herdr = Herdr::new("herdr", "test.sock", &runner);
         let inspect = |agent: &Agent| {
             let current = thread::load(&f.project, &lane.id).unwrap();
             thread_pass(
@@ -8472,7 +8472,8 @@ mod tests {
             }
             resuming = false;
         }
-        let herdr = Herdr::new("herdr", "", &world.runner).on_machine(reopened.machine_route());
+        let herdr =
+            Herdr::new("herdr", "test.sock", &world.runner).on_machine(reopened.machine_route());
         let mut errors = Vec::new();
         let input = LaunchPass {
             ctx: &ctx,
@@ -8578,7 +8579,8 @@ mod tests {
             assert_eq!(card.attempt, reopened.attempt);
             assert_eq!(card.brief_hash, brief_hash);
         }
-        let herdr = Herdr::new("herdr", "", &world.runner).on_machine(reopened.machine_route());
+        let herdr =
+            Herdr::new("herdr", "test.sock", &world.runner).on_machine(reopened.machine_route());
         let run_pass = || {
             let pass = thread_pass(
                 &LaunchPass {
@@ -8873,7 +8875,7 @@ mod tests {
             workspace_id: lane.workspace_id.clone(),
             cwd: lane.cwd.clone(),
         };
-        let herdr = Herdr::new("herdr", "", &runner);
+        let herdr = Herdr::new("herdr", "test.sock", &runner);
         let run_pass = || {
             thread_pass(
                 &LaunchPass {
@@ -8984,7 +8986,7 @@ mod tests {
                 runner: &uncertain_runner,
                 detached_ticker: false,
             };
-            let uncertain_herdr = Herdr::new("herdr", "", &uncertain_runner);
+            let uncertain_herdr = Herdr::new("herdr", "test.sock", &uncertain_runner);
             let uncertain_pass = || {
                 thread_pass(
                     &LaunchPass {

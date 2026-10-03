@@ -115,37 +115,86 @@ fn owned_tabs(
 /// Reopen only existing, proven single-pane Rundown tabs. Never add a tab to
 /// a workspace that did not have one, or close a tab that acquired a split.
 pub(crate) fn reopen_existing(ctx: &crate::paths::Ctx) -> anyhow::Result<()> {
-    for slug in crate::project::list_slugs(&ctx.root) {
-        let project = crate::project::Project::load(&ctx.root, &slug)?;
-        let Some(coordinator) = project.coordinator() else {
-            continue;
-        };
-        let herdr = Herdr::new(ctx.env.herdr_bin(), &coordinator.socket, ctx.runner);
-        let owned = owned_tabs(&herdr, &coordinator.workspace_id, true)?;
-        if owned.is_empty() {
-            continue;
-        }
-        let title = herdr.workspace_label(&coordinator.workspace_id)?;
-        let mut closed = false;
-        for old in owned {
-            let panes = herdr.pane_list()?;
-            let current: Vec<_> = panes
-                .iter()
-                .filter(|pane| pane.tab_id == old.tab_id)
-                .collect();
-            if current.len() == 1
-                && current[0].pane_id == old.pane_id
-                && current[0].workspace_id == old.workspace_id
-            {
-                herdr.tab_close(&old.tab_id)?;
-                closed = true;
+    let (slugs, mut failures) = crate::project::list_slugs_with_errors(&ctx.root);
+    let mut observations = Vec::new();
+    for slug in slugs {
+        let result = reopen_project(ctx, &slug);
+        let (outcome, reason) = match result {
+            Ok(observation) => observation,
+            Err(error) => {
+                let reason = format!("{error:#}");
+                failures.push(anyhow::anyhow!("{slug}: {reason}"));
+                ("failed", reason)
             }
-        }
-        if closed {
-            ensure_tab(&herdr, &coordinator.workspace_id, &ctx.root, &slug, &title)?;
-        }
+        };
+        let message = format!("Rundown {slug}: {outcome}: {reason}");
+        eprintln!("{message}");
+        observations.push(serde_json::json!({
+            "project": slug, "outcome": outcome, "reason": reason
+        }));
+    }
+    if ctx.root.exists() {
+        crate::project::write_atomic(
+            &ctx.root.join(".rundown-reopen.json"),
+            &serde_json::to_vec_pretty(&observations)?,
+        )?;
+    }
+    if !failures.is_empty() {
+        anyhow::bail!(
+            "Rundown reopen failures: {}",
+            failures
+                .iter()
+                .map(|e| format!("{e:#}"))
+                .collect::<Vec<_>>()
+                .join("; ")
+        );
     }
     Ok(())
+}
+
+fn reopen_project(ctx: &crate::paths::Ctx, slug: &str) -> anyhow::Result<(&'static str, String)> {
+    let project = crate::project::Project::load(&ctx.root, slug)?;
+    let Some(coordinator) = project.coordinator() else {
+        return Ok(("skipped", "no coordinator session recorded".into()));
+    };
+    if coordinator.socket.is_empty() {
+        return Ok(("skipped", "no coordinator session recorded".into()));
+    }
+    let herdr = Herdr::new(ctx.env.herdr_bin(), &coordinator.socket, ctx.runner);
+    if !herdr.reachable() {
+        return Ok((
+            "skipped",
+            format!(
+                "coordinator server does not answer at {}",
+                coordinator.socket
+            ),
+        ));
+    }
+    let owned = owned_tabs(&herdr, &coordinator.workspace_id, true)?;
+    if owned.is_empty() {
+        return Ok(("unchanged", "no proven single-pane Rundown tab".into()));
+    }
+    let title = herdr.workspace_label(&coordinator.workspace_id)?;
+    let mut closed = false;
+    for old in owned {
+        let panes = herdr.pane_list()?;
+        let current: Vec<_> = panes
+            .iter()
+            .filter(|pane| pane.tab_id == old.tab_id)
+            .collect();
+        if current.len() == 1
+            && current[0].pane_id == old.pane_id
+            && current[0].workspace_id == old.workspace_id
+        {
+            herdr.tab_close(&old.tab_id)?;
+            closed = true;
+        }
+    }
+    if closed {
+        ensure_tab(&herdr, &coordinator.workspace_id, &ctx.root, slug, &title)?;
+        return Ok(("reopened", "existing Rundown tab replaced".into()));
+    }
+    Ok(("unchanged", "Rundown tab changed before closing".into()))
 }
 
 #[cfg(test)]
@@ -238,12 +287,18 @@ mod tests {
             let project = crate::project::create(&root, "demo", "", vec![]).unwrap();
             project
                 .update_coordinator(|coordinator| {
-                    coordinator.socket = "scratch.sock".into();
+                    coordinator.socket = home
+                        .path()
+                        .join("scratch.sock")
+                        .to_string_lossy()
+                        .into_owned();
                     coordinator.workspace_id = "w1".into();
                 })
                 .unwrap();
+            std::fs::write(home.path().join("scratch.sock"), "").unwrap();
             let closed = std::rc::Rc::new(std::cell::Cell::new(false));
             let runner = FakeRunner::new();
+            runner.on("status server", ok(r#"{"result":{}}"#));
             let flag = closed.clone();
             runner.on_fn(|cmd| cmd.display().contains("tab list"), move |_| {
                 let mut tabs = serde_json::json!([
@@ -329,6 +384,125 @@ mod tests {
                 );
             }
             assert_eq!(runner.count("plugin pane focus w2:p1"), 0);
+        }
+    }
+
+    #[test]
+    fn reopen_continues_past_closed_dead_and_failed_middle_projects() {
+        for middle in ["closed", "dead", "failed"] {
+            let home = tempfile::tempdir().unwrap();
+            let root = home.path().join("root");
+            for slug in ["alpha", "bravo", "charlie"] {
+                let project = crate::project::create(&root, slug, "", vec![]).unwrap();
+                let socket = home.path().join(format!("{slug}.sock"));
+                std::fs::write(&socket, "").unwrap();
+                project
+                    .update_coordinator(|c| {
+                        c.socket = if slug == "bravo" && middle == "closed" {
+                            String::new()
+                        } else {
+                            socket.to_string_lossy().into_owned()
+                        };
+                        c.workspace_id = "w1".into();
+                    })
+                    .unwrap();
+            }
+            let runner = FakeRunner::new();
+            let socket_of = |cmd: &crate::runner::Cmd| {
+                cmd.env
+                    .iter()
+                    .find(|(key, _)| key == "HERDR_SOCKET_PATH")
+                    .unwrap()
+                    .1
+                    .clone()
+            };
+            runner.on_fn(
+                |cmd| cmd.display().contains("status server"),
+                move |cmd| {
+                    Ok(
+                        if middle == "dead" && socket_of(cmd).ends_with("bravo.sock") {
+                            fail(1, "connection refused")
+                        } else {
+                            ok(r#"{"result":{}}"#)
+                        },
+                    )
+                },
+            );
+            let closed =
+                std::rc::Rc::new(std::cell::RefCell::new(std::collections::BTreeSet::new()));
+            let flag = closed.clone();
+            runner.on_fn(
+                |cmd| cmd.display().contains("tab list"),
+                move |cmd| {
+                    if middle == "failed" && socket_of(cmd).ends_with("bravo.sock") {
+                        return Ok(fail(1, "tab list failed"));
+                    }
+                    Ok(if flag.borrow().contains(&socket_of(cmd)) {
+                        ok(r#"{"result":{"tabs":[]}}"#)
+                    } else {
+                        ok(r#"{"result":{"tabs":[{"tab_id":"w1:t1","workspace_id":"w1"}]}}"#)
+                    })
+                },
+            );
+            runner.on("pane list", ok(r#"{"result":{"panes":[{"pane_id":"w1:p1","tab_id":"w1:t1","workspace_id":"w1"}]}}"#));
+            runner.on("api snapshot", ok(r#"{"result":{"snapshot":{}}}"#));
+            runner.on("plugin pane focus", ok(r#"{"result":{"plugin_pane":{"plugin_id":"herdr-ade","entrypoint":"rundown","pane":{"pane_id":"w1:p1","tab_id":"w1:t1","workspace_id":"w1"}}}}"#));
+            runner.on(
+                "workspace get",
+                ok(r#"{"result":{"workspace":{"label":"Demo"}}}"#),
+            );
+            runner.on_fn(
+                |cmd| cmd.display().contains("tab close"),
+                move |cmd| {
+                    closed.borrow_mut().insert(socket_of(cmd));
+                    Ok(ok(r#"{"result":{}}"#))
+                },
+            );
+            runner.on(
+                "plugin pane open",
+                ok(r#"{"result":{"plugin_pane":{"pane":{"tab_id":"w1:t2"}}}}"#),
+            );
+            runner.on("tab rename", ok(r#"{"result":{}}"#));
+            let env = crate::paths::Env::for_test(home.path(), &[]);
+            let ctx = crate::paths::Ctx {
+                env: &env,
+                root: root.clone(),
+                config_dir: home.path().join("cfg"),
+                runner: &runner,
+                detached_ticker: false,
+            };
+            let result = reopen_existing(&ctx);
+            assert_eq!(result.is_err(), middle == "failed");
+            if let Err(error) = result {
+                assert!(error.to_string().contains("bravo: herdr:"));
+            }
+            assert_eq!(runner.count("plugin pane open"), 2);
+            let report: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(root.join(".rundown-reopen.json")).unwrap())
+                    .unwrap();
+            assert_eq!(report[0]["project"], "alpha");
+            assert_eq!(report[0]["outcome"], "reopened");
+            assert_eq!(report[1]["project"], "bravo");
+            assert_eq!(
+                report[1]["outcome"],
+                if middle == "failed" {
+                    "failed"
+                } else {
+                    "skipped"
+                }
+            );
+            assert!(
+                report[1]["reason"]
+                    .as_str()
+                    .unwrap()
+                    .contains(match middle {
+                        "closed" => "no coordinator session recorded",
+                        "dead" => "does not answer",
+                        _ => "tab list failed",
+                    })
+            );
+            assert_eq!(report[2]["project"], "charlie");
+            assert_eq!(report[2]["outcome"], "reopened");
         }
     }
 

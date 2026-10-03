@@ -351,7 +351,7 @@ mod tests {
                 runner: &fake,
                 detached_ticker: false,
             };
-            let herdr = Herdr::new("herdr", "", &fake);
+            let herdr = Herdr::new("herdr", "test.sock", &fake);
             assert_eq!(answer(&ctx, &project, &saved, &herdr).unwrap(), right_path);
             let answered = thread::load(&project, &t.id).unwrap();
             assert_eq!(answered.trust_answered, right_path);
@@ -427,7 +427,7 @@ mod tests {
             runner: &fake,
             detached_ticker: false,
         };
-        let herdr = Herdr::new("herdr", "", &fake);
+        let herdr = Herdr::new("herdr", "test.sock", &fake);
         assert!(answer(&live_ctx, &project, &saved, &herdr).unwrap());
         let answered = thread::load(&project, &id).unwrap();
         assert!(answered.trust_answered);

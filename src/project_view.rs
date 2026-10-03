@@ -106,12 +106,41 @@ fn action_row(
     row: &mut Row,
     events: &[Event],
     reviews: &[crate::review::Review],
+    tasks: &[crate::task::Task],
 ) {
     let t = &row.thread;
     if t.status == Status::Resolved {
         return;
     }
     let event = crate::events::latest_event(events, &t.id, t.attempt.max(1));
+    if let Some(task) = tasks
+        .iter()
+        .find(|task| !task.dropped.is_empty() && task.attempts.contains(&t.id))
+        && t.merged_sha.is_empty()
+        && crate::review::lane_review_from(reviews, t).is_none()
+    {
+        if crate::task::sealed_unlanded(t, events, reviews) {
+            row.group = Group::WaitingOnYou;
+            row.note = format!(
+                "task {} dropped; {} seal retained; not landed; retire with ha thread resolve {} {}; {}",
+                task.id,
+                if event.is_some_and(|e| e.payload.done.is_some()) {
+                    "done"
+                } else {
+                    "waiting"
+                },
+                project.slug,
+                t.id,
+                row.note
+            );
+        } else {
+            row.note = format!(
+                "task {} dropped; lane not retired; cancel with ha thread cancel {} {} --reason \"task {} dropped\"; {}",
+                task.id, project.slug, t.id, task.id, row.note
+            );
+        }
+        return;
+    }
     let unknown = process_unknown(row);
     let absent = row.note.starts_with("process gone:")
         || (!unknown && t.is_remote() && row.note.starts_with("no agent;"));
@@ -309,7 +338,7 @@ impl View {
                 .collect()
         });
         for row in &mut lanes {
-            action_row(project, row, events, &reviews);
+            action_row(project, row, events, &reviews, &evidence.tasks);
         }
         lanes.sort_by_key(|row| Group::DISPLAY_ORDER.iter().position(|g| *g == row.group));
         let mut plan = match crate::plan::load(project) {

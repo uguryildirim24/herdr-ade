@@ -8753,7 +8753,7 @@ mod tests {
         use crate::runner::fake::{FakeRunner, ok};
         let runner = FakeRunner::new();
         runner.on("agent list", ok(r#"{"result":{"agents":[]}}"#));
-        let herdr = Herdr::new("herdr", "", &runner);
+        let herdr = Herdr::new("herdr", "test.sock", &runner);
         let record = Thread {
             id: "t-0001".into(),
             pane_id: "w1:p2".into(),
@@ -8771,7 +8771,7 @@ mod tests {
             let runner = FakeRunner::new();
             runner.on("agent list", ok(&format!(r#"{{"result":{{"agents":[{{"pane_id":"w1:p2","tab_id":"w1:t2","workspace_id":"w1","cwd":"/repo","name":"hp-demo-t-0001","agent_status":"{state}"}}]}}}}"#)));
             runner.on("pane read", ok("Trust this folder?\n"));
-            let herdr = Herdr::new("herdr", "", &runner);
+            let herdr = Herdr::new("herdr", "test.sock", &runner);
             let record = Thread {
                 id: "t-0001".into(),
                 pane_id: "w1:p2".into(),
@@ -8813,7 +8813,7 @@ mod tests {
             let runner = FakeRunner::new();
             runner.on("agent list", ok(&format!(r#"{{"result":{{"agents":[{{"pane_id":"w1:p2","tab_id":"w1:t2","workspace_id":"w1","cwd":"/repo","name":"hp-demo-t-0001","agent_status":"{state}"}}]}}}}"#)));
             runner.on("pane read", ok("empty prompt\n"));
-            let herdr = Herdr::new("herdr", "", &runner);
+            let herdr = Herdr::new("herdr", "test.sock", &runner);
             let record = Thread {
                 id: "t-0001".into(),
                 pane_id: "w1:p2".into(),
@@ -8841,7 +8841,7 @@ mod tests {
         use crate::runner::fake::{FakeRunner, ok};
         let runner = FakeRunner::new();
         runner.on("pane read", ok("Trust this folder?\n  1. Yes\n"));
-        let herdr = Herdr::new("herdr", "", &runner);
+        let herdr = Herdr::new("herdr", "test.sock", &runner);
         let record = Thread {
             id: "t-0001".into(),
             pane_id: "w1:p2".into(),
@@ -8854,7 +8854,7 @@ mod tests {
 
         let changed = FakeRunner::new();
         changed.on("pane read", ok("The helper is now ready\n"));
-        let herdr = Herdr::new("herdr", "", &changed);
+        let herdr = Herdr::new("herdr", "test.sock", &changed);
         let error = same_startup_screen(&herdr, &record)
             .unwrap_err()
             .to_string();

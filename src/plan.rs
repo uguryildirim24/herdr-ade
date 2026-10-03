@@ -1971,7 +1971,7 @@ mod tests {
             fx.seal_done(&lane, 1, n, &sha, "# report\n");
             crate::thread::update(&fx.project, &lane, |t| t.merged_sha = sha.clone()).unwrap();
         }
-        crate::task::drop_task(&fx.project, "job-0003", "No longer needed").unwrap();
+        crate::task::drop_task(&ctx, &fx.project, "job-0003", "No longer needed").unwrap();
         // Both the display and the launch gate must use the same projection,
         // even when the persisted card has not yet been synced.
         let shown: serde_json::Value = serde_json::to_value(show(&ctx, "demo").unwrap()).unwrap();

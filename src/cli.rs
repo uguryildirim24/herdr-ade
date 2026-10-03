@@ -1550,12 +1550,23 @@ fn dispatch_with_start(
             } => {
                 let project = Project::load(&ctx.root, &slug)?;
                 if acceptance.is_empty() {
-                    let record = crate::task::drop_task(&project, &id, &reason)?;
-                    let view = crate::task::view(&project, record);
+                    let outcome = crate::task::drop_task(&ctx, &project, &id, &reason)?;
+                    let view = crate::task::view(&project, outcome.task);
+                    let mut message = format!("{} dropped: {}\n", view.record.id, reason.trim());
+                    for lane in &outcome.lanes {
+                        if lane.state == "resolved" || lane.state == "cancelled" {
+                            message.push_str(&lane.message(&slug));
+                        } else {
+                            message.push_str(&format!(
+                                "{} retirement incomplete ({}): {}; retry with ha thread resolve {} {}\n",
+                                lane.thread, lane.state, lane.copy_notes.join("; "), slug, lane.thread
+                            ));
+                        }
+                    }
                     crate::output::success(
                         Some("dropped"),
-                        &serde_json::json!({ "task": view }),
-                        &format!("{} dropped: {}\n", view.record.id, reason.trim()),
+                        &serde_json::json!({ "task": view, "lanes": outcome.lanes }),
+                        &message,
                         "",
                     )
                 } else {
