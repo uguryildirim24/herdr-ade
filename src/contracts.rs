@@ -77,6 +77,8 @@ pub(crate) struct LaneCard {
     pub(crate) box_worktree: String,
     /// The exact code base the box fetch verified as `FETCH_HEAD`.
     pub(crate) brief_commit: String,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub(crate) paths: Vec<String>,
     /// The lane branch and URL-matched remote that `ha done` publishes to
     /// (SPEC-remote §4.2 step 7).
     pub(crate) branch: String,
@@ -501,6 +503,34 @@ mod tests {
     {
         json_roundtrip(value);
         toml_roundtrip(value);
+    }
+
+    #[test]
+    fn historical_lane_card_has_unrestricted_paths() {
+        // Actual oci record: adeherdr/.state/lanes/t-0058.toml (2026-09-19).
+        let card: LaneCard = toml::from_str(r#"
+project = "adeherdr"
+thread = "t-0058"
+attempt = 1
+brief_hash = "b30ac4a77438c86faf97c5fb05e10cff6239e9e1c006bf5e82bf6478d113eb2e"
+role = "lane"
+kind = "pi"
+pane_id = "w2:p2"
+machine_label = "oci"
+machine_id = "example-machine"
+box_repo = "/home/ubuntu/projects/herdr-ade"
+box_worktree = "/home/ubuntu/projects/herdr-ade/.worktrees/t-0058"
+brief_commit = "7649a3322cc2b3c19e6d974121249b1a300df8f6"
+branch = "hp/adeherdr/t-0058-round-advance-starts-the-check-again-aft"
+publish_url = "https://github.com/uguryildirim24/herdr-ade.git"
+start_line = "Run /home/ubuntu/.local/bin/herdr-ade --root /home/ubuntu/.herdr-ade skill lane, then read tasks/t-0058.md and do what it says. You run on the cloud box named `oci`; finish with `ha done`, never with a parent prompt."
+created = "2026-09-19T22:39:16Z"
+[recipient]
+pane = "w1G:p1"
+coordinator_attempt = 1
+"#).unwrap();
+        assert!(card.paths.is_empty());
+        both(&card);
     }
 
     #[test]

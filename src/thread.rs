@@ -151,6 +151,9 @@ pub(crate) struct Thread {
     pub(crate) origin: String,
     pub(crate) branch: String,
     pub(crate) base: String,
+    /// Writable repository-relative globs; empty means unrestricted.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub(crate) paths: Vec<String>,
     pub(crate) machine: String,
     /// Why placement selected this machine for the current attempt.
     #[serde(default, skip_serializing_if = "String::is_empty")]
@@ -841,6 +844,7 @@ pub(crate) struct BriefInput<'a> {
     pub(crate) restart: bool,
     pub(crate) report_path: &'a str,
     pub(crate) library_path: &'a str,
+    pub(crate) paths: &'a [String],
 }
 
 fn compose_brief(input: &BriefInput) -> String {
@@ -921,9 +925,15 @@ fn compose_brief(input: &BriefInput) -> String {
             }
         }
     }
+    if !input.paths.is_empty() {
+        brief.push_str("\n# Writable paths\n\n");
+        for path in input.paths {
+            brief.push_str(&format!("- `{path}`\n"));
+        }
+    }
     brief.push_str(&format!(
-        "\n# Finish\n\nCommit the finished work, then run `ha done --report {} --sha <commit-sha>`.\n\n# Paths\n\n- Report: `{}`\n- Library folder for files meant for Rolf: `{}`\n",
-        input.report_path, input.report_path, input.library_path
+        "\n# Finish\n\nCommit repository changes if any; leave runtime deliverables untracked; run `ha done`.\n\n# Paths\n\n- Report: `{}`\n- Library folder for files meant for Rolf: `{}`\n",
+        input.report_path, input.library_path
     ));
     brief
 }
@@ -1005,6 +1015,7 @@ pub(crate) fn brief_for(
         restart,
         report_path: &thread.report_path(),
         library_path: &thread.library_path(),
+        paths: &thread.paths,
     });
     for name in thread.attachments.keys() {
         brief.push_str(&format!(
@@ -1798,6 +1809,7 @@ mod tests {
         let saved = std::fs::read_to_string(&path).unwrap();
         assert!(!saved.contains("attachments"));
         assert!(!saved.contains("retirement"));
+        assert!(!saved.contains("paths"));
         let legacy = format!(
             "pr = \"https://github.com/acme/demo/pull/1\"\npr_state = \"OPEN\"\npr_review = \"APPROVED\"\npr_note = \"\"\npr_summary = {{ state = \"OPEN\", comments = [] }}\n{saved}"
         );
@@ -1805,6 +1817,7 @@ mod tests {
         let loaded = load(&project, &lane.id).unwrap();
         assert_eq!(loaded.title, "Old lane");
         assert_eq!(loaded.kind, Kind::Tab);
+        assert!(loaded.paths.is_empty());
         assert!(loaded.attachments.is_empty());
         assert!(loaded.retirement.is_none());
         assert_eq!(list_with_errors(&project).0.len(), 1);

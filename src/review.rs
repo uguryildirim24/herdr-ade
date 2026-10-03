@@ -904,6 +904,7 @@ fn prepare(ctx: &Ctx, project: &Project, review: &mut Review) -> Result<()> {
                     task_id: String::new(),
                     review_id: review.id.clone(),
                     attach: Vec::new(),
+                    paths: Vec::new(),
                 },
             )?
         };

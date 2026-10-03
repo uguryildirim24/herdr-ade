@@ -197,19 +197,15 @@ enum Command {
     Pane { id: String },
     /// Seal and deliver this lane's completion
     Done {
+        /// Report inside the recorded checkout (default: the brief's report)
         #[arg(long, value_name = "PATH")]
-        report: String,
+        report: Option<String>,
+        /// Exact commit (default: the recorded checkout's HEAD)
         #[arg(long)]
-        sha: String,
+        sha: Option<String>,
     },
-    /// Seal and deliver why this lane must wait
-    Waiting {
-        #[arg(long, value_enum, default_value = "unknown")]
-        class: crate::contracts::FailureClass,
-        #[arg(long, requires = "class")]
-        provider_kind: Option<String>,
-        what: String,
-    },
+    /// Seal and deliver the input this lane needs
+    Waiting { what: String },
     /// Record a failed lane attempt and request bounded routing recovery
     Failed {
         #[arg(long, value_enum, default_value = "work_failed")]
@@ -732,6 +728,9 @@ enum ThreadCommand {
         /// Named files to carry beside the lane's frozen brief (repeatable)
         #[arg(long, value_name = "PATH")]
         attach: Vec<String>,
+        /// Writable repository-relative globs (repeatable; *, ?, **)
+        #[arg(long, value_name = "GLOB")]
+        paths: Vec<String>,
         /// Instruction set for this lane; the routing table may match it
         #[arg(long, value_name = "FLOW")]
         workflow: Option<String>,
@@ -1503,6 +1502,7 @@ fn dispatch_with_start(
                 base,
                 task_file,
                 attach,
+                paths,
                 workflow,
                 recipe,
                 job,
@@ -1560,6 +1560,7 @@ fn dispatch_with_start(
                         base,
                         task,
                         attach,
+                        paths,
                         workflow,
                         recipe,
                         task_id: task_id.clone(),
@@ -1807,12 +1808,8 @@ fn dispatch_with_start(
         Command::Action { id } => actions::run_action(&ctx, &id),
         Command::Recover => crate::ops::recover_box(&ctx),
         Command::Pane { id } => actions::run_pane(&ctx, &id),
-        Command::Done { report, sha } => crate::lane::done(&ctx, &report, &sha),
-        Command::Waiting {
-            class,
-            provider_kind,
-            what,
-        } => crate::lane::waiting_class(&ctx, &what, class, provider_kind.as_deref()),
+        Command::Done { report, sha } => crate::lane::done(&ctx, report.as_deref(), sha.as_deref()),
+        Command::Waiting { what } => crate::lane::waiting(&ctx, &what),
         Command::Failed {
             class,
             provider_kind,
@@ -1993,7 +1990,7 @@ mod tests {
     }
 
     #[test]
-    fn start_accepts_repeatable_named_attachments() {
+    fn start_accepts_repeatable_named_attachments_and_paths() {
         let cli = Cli::try_parse_from([
             "ha",
             "thread",
@@ -2007,16 +2004,50 @@ mod tests {
             "report.md",
             "--attach",
             "image.png",
+            "--paths",
+            "src/**",
+            "--paths",
+            "Cargo.?oml",
             "--json",
         ])
         .unwrap();
         let Command::Thread {
-            command: ThreadCommand::Start { attach, .. },
+            command: ThreadCommand::Start { attach, paths, .. },
         } = cli.command
         else {
             panic!("start");
         };
         assert_eq!(attach, ["report.md", "image.png"]);
+        assert_eq!(paths, ["src/**", "Cargo.?oml"]);
+    }
+
+    #[test]
+    fn done_defaults_and_overrides_and_waiting_only_accepts_missing_input() {
+        for (args, report, sha) in [
+            (vec!["ha", "done"], None, None),
+            (
+                vec!["ha", "done", "--report", "report with spaces.md"],
+                Some("report with spaces.md"),
+                None,
+            ),
+            (vec!["ha", "done", "--sha", "abc"], None, Some("abc")),
+            (
+                vec!["ha", "done", "--report", "report.md", "--sha", "abc"],
+                Some("report.md"),
+                Some("abc"),
+            ),
+        ] {
+            let cli = Cli::try_parse_from(args).unwrap();
+            assert!(matches!(cli.command, Command::Done { report: r, sha: s }
+                if r.as_deref() == report && s.as_deref() == sha));
+        }
+        let cli = Cli::try_parse_from(["ha", "waiting", "Need a design"]).unwrap();
+        assert!(matches!(cli.command, Command::Waiting { what } if what == "Need a design"));
+        for flag in ["--class", "--provider-kind"] {
+            assert!(
+                Cli::try_parse_from(["ha", "waiting", "Need a design", flag, "provider"]).is_err()
+            );
+        }
     }
 
     #[test]

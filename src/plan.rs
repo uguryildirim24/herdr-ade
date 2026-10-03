@@ -1341,6 +1341,7 @@ mod tests {
                 task_id: "job-0002".into(),
                 review_id: String::new(),
                 attach: Vec::new(),
+                paths: Vec::new(),
             },
         )
         .unwrap_err();

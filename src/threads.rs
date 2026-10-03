@@ -169,6 +169,7 @@ pub struct StartArgs {
     pub task: String,
     /// Files explicitly supplied by the coordinator, frozen with the brief.
     pub attach: Vec<String>,
+    pub paths: Vec<String>,
     /// Internal flow/skill label; never a coordinator model-selection input.
     pub workflow: Option<String>,
     /// An exact recipe the coordinator chose for this one lane.
@@ -196,6 +197,9 @@ pub fn start(ctx: &Ctx, slug: &str, args: StartArgs) -> Result<Thread> {
     }
     if args.task.trim().is_empty() {
         bail!("the task is empty");
+    }
+    for path in &args.paths {
+        crate::gate_paths::validate(path)?;
     }
     crate::plan::check_prerequisites(&project, &args.task_id)?;
     let (settings, _) = project.read_project_md()?;
@@ -428,6 +432,7 @@ pub fn start(ctx: &Ctx, slug: &str, args: StartArgs) -> Result<Thread> {
         t.agent = launch.kind.clone();
         t.base = base.clone();
         t.attachments = attachments.clone();
+        t.paths = args.paths.clone();
         t.role = role.to_string();
         t.review_id = args.review_id.clone();
         t.plain = args.title.trim().to_string();
@@ -1162,6 +1167,7 @@ fn bind_terminal(ctx: &Ctx, project: &Project, view: &SessionView, record: &Thre
             box_repo: box_repo.clone(),
             box_worktree: record.worktree_path.clone(),
             brief_commit: record.base.clone(),
+            paths: record.paths.clone(),
             branch: record.branch.clone(),
             publish_url: publish_url.clone(),
             recipient,
@@ -6496,6 +6502,7 @@ mod tests {
                 base: None,
                 task: "Repair the lane.".into(),
                 attach: Vec::new(),
+                paths: Vec::new(),
                 workflow: None,
                 recipe: None,
                 task_id: String::new(),
@@ -6613,6 +6620,7 @@ mod tests {
                 // The CLI maps `--task-file` to this verbatim field.
                 task: lead_brief.into(),
                 attach: Vec::new(),
+                paths: Vec::new(),
                 workflow: None,
                 recipe: Some("chosen_claude".into()),
                 // The CLI maps `--job` to this stable task id.
@@ -6803,6 +6811,7 @@ mod tests {
         let args = |repo: String| StartArgs {
             title: "Fix login".into(),
             attach: Vec::new(),
+            paths: Vec::new(),
             repo: Some(repo),
             machine: None,
             base: None,
@@ -6990,6 +6999,7 @@ mod tests {
         StartArgs {
             title: "Fix login".into(),
             attach: Vec::new(),
+            paths: Vec::new(),
             repo,
             machine,
             base: None,
@@ -7016,6 +7026,7 @@ mod tests {
                 Some(if remote { "buildbox" } else { "local" }.into()),
             );
             args.attach = vec![source.to_string_lossy().into_owned()];
+            args.paths = vec!["src/**".into(), "progress.txt".into()];
             let started = start(&fx.world.ctx(), "demo", args).unwrap();
             assert_eq!(started.status, Status::Starting);
             assert!(started.worktree_path.is_empty());
@@ -7031,12 +7042,25 @@ mod tests {
                 "{brief}"
             );
             std::fs::write(&source, b"changed after acceptance").unwrap();
+            assert!(brief.contains("# Writable paths\n\n- `src/**`\n- `progress.txt`"));
+            assert!(brief.contains("run `ha done`."));
+            assert!(!brief.contains("--report"));
             let check = |lane: &Thread| {
+                assert_eq!(lane.paths, started.paths);
                 assert_eq!(
                     thread::artifact(&fx.project, &lane.attachments[name]).unwrap(),
                     bytes
                 );
                 if remote {
+                    let calls = fx.world.runner.calls.borrow();
+                    let card = calls
+                        .iter()
+                        .filter_map(|call| call.stdin.as_deref())
+                        .filter_map(|text| toml::from_str::<crate::contracts::LaneCard>(text).ok())
+                        .rfind(|card| card.thread == lane.id)
+                        .unwrap();
+                    assert_eq!(card.paths, lane.paths);
+                    assert_eq!(card.attempt, lane.attempt);
                     let encoded: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
                     assert!(fx.world.runner.calls.borrow().iter().any(|call| {
                         call.program == "ssh"
@@ -7136,8 +7160,19 @@ mod tests {
     }
 
     #[test]
-    fn bad_attachments_and_base_are_refused_before_allocating_a_lane() {
+    fn bad_attachments_base_and_paths_are_refused_before_allocating_a_lane() {
         let fx = crate::testkit::fixture();
+        for path in ["/src/**", "../src/**", "src/**.rs", "src/[ab].rs"] {
+            let mut args = start_args(Some(fx.repo.to_string_lossy().into_owned()), None);
+            args.paths = vec![path.into()];
+            assert!(
+                start(&fx.world.ctx(), "demo", args)
+                    .unwrap_err()
+                    .to_string()
+                    .contains("gate_paths_invalid")
+            );
+            assert!(thread::list(&fx.project).is_empty());
+        }
         let file = fx.world.home.path().join("input.bin");
         std::fs::write(&file, b"input").unwrap();
         let second = fx.world.home.path().join("second/input.bin");

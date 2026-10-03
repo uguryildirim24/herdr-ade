@@ -34,21 +34,31 @@ impl Binding {
     }
 }
 
-pub(crate) fn done(ctx: &Ctx, report: &str, sha: &str) -> Result<()> {
-    // The path goes verbatim into the typed DONE line (D10).
-    if report.is_empty() || report.chars().any(|c| c.is_control() || c.is_whitespace()) {
+pub(crate) fn done(ctx: &Ctx, report: Option<&str>, sha: Option<&str>) -> Result<()> {
+    let binding = current_lane(ctx)?;
+    let recorded_report = binding.thread.report_path();
+    let report = report.unwrap_or(&recorded_report);
+    if report.is_empty() || report.chars().any(char::is_control) {
         return Err(crate::refusal::error(
-            "report_path_invalid: a report path has no spaces or control characters",
-            "ha done --report <path-inside-worktree> --sha <HEAD-sha>",
+            "report_path_invalid: a report path must be nonempty and have no control characters",
+            "ha done --report '<path-inside-worktree>'",
         ));
     }
-    let binding = current_lane(ctx)?;
     let recipient = binding.recipient()?;
     let attempt = binding.thread.attempt.max(1);
     let git_folder = if crate::threads::managed_git_folder(&binding.project, &binding.thread) {
         &binding.thread.worktree_path
     } else {
         &binding.thread.cwd
+    };
+    let head;
+    let sha = match sha {
+        Some(sha) => sha,
+        None => {
+            head = crate::repo::Git::new(ctx.runner, Path::new(git_folder))
+                .run(&["rev-parse", "HEAD"])?;
+            &head
+        }
     };
     if binding.thread.role == "critic" {
         let path = Path::new(report);
@@ -107,13 +117,8 @@ pub(crate) fn done(ctx: &Ctx, report: &str, sha: &str) -> Result<()> {
     Ok(())
 }
 
-pub(crate) fn waiting_class(
-    ctx: &Ctx,
-    text: &str,
-    class: FailureClass,
-    provider_kind: Option<&str>,
-) -> Result<()> {
-    seal_message(ctx, text, false, class, provider_kind)
+pub(crate) fn waiting(ctx: &Ctx, text: &str) -> Result<()> {
+    seal_message(ctx, text, false, FailureClass::Unknown, None)
 }
 
 pub(crate) fn failed_class(
@@ -309,10 +314,10 @@ fn local_lanes(ctx: &Ctx, pane: &str) -> Result<Vec<Binding>> {
             let managed = crate::threads::managed_git_folder(&project, &lane)
                 .then(|| std::fs::canonicalize(&lane.worktree_path).ok())
                 .flatten();
-            if cwd.is_some()
-                && cwd.as_ref() != Some(&recorded)
-                && (managed.is_none() || cwd != managed)
-            {
+            if !cwd.as_ref().is_some_and(|cwd| {
+                cwd.starts_with(&recorded)
+                    || managed.as_ref().is_some_and(|root| cwd.starts_with(root))
+            }) {
                 continue;
             }
             matches.push(Binding {
@@ -335,6 +340,8 @@ fn thread_from_card(card: &LaneCard) -> thread::Thread {
         worktree_path: card.box_worktree.clone(),
         repo: card.box_repo.clone(),
         branch: card.branch.clone(),
+        paths: card.paths.clone(),
+        thread_dir: thread::thread_dir(&card.box_worktree, &card.project, &card.thread),
         machine: card.machine_label.clone(),
         machine_id: card.machine_id.clone(),
         launch: crate::contracts::Launch {
@@ -363,8 +370,10 @@ fn validate_card(ctx: &Ctx, card: &LaneCard) -> Result<()> {
     let cwd = std::env::current_dir()
         .and_then(std::fs::canonicalize)
         .context("bootstrap_mismatch: cwd cannot be resolved")?;
-    if cwd.to_string_lossy() != card.box_worktree {
-        bail!("bootstrap_mismatch: cwd is not the card's box worktree");
+    let root = std::fs::canonicalize(&card.box_worktree)
+        .context("bootstrap_mismatch: box worktree cannot be resolved")?;
+    if !cwd.starts_with(root) {
+        bail!("bootstrap_mismatch: cwd is outside the card's box worktree");
     }
     let socket = std::env::var("HERDR_SOCKET_PATH")
         .context("bootstrap_mismatch: HERDR_SOCKET_PATH is missing")?;
@@ -591,7 +600,10 @@ mod tests {
         .unwrap();
         let live = thread::allocate(&project, |lane| {
             lane.pane_id = "w1:p2".into();
+            // This shell is below the recorded checkout, not exactly at its root.
             lane.cwd = std::env::current_dir()
+                .unwrap()
+                .parent()
                 .unwrap()
                 .to_string_lossy()
                 .into_owned();
