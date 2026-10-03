@@ -14,7 +14,6 @@ use crate::project::{self, Project};
 use crate::runner::{Cmd, Runner};
 
 pub const HELP_TIMEOUT: Duration = Duration::from_secs(10);
-pub const COMPACT_LIMIT: usize = 80;
 pub const TEMPLATE_PINNED: &str = "You chose {plain} for {job}.";
 pub const TEMPLATE_USUAL: &str = "{job} runs on {plain}, chosen for this work.";
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -78,27 +77,7 @@ pub fn doctor_config(config_dir: &Path) -> Result<DoctorConfig> {
 
 pub fn parse_launch_config(config_dir: &Path) -> Result<LaunchConfig> {
     let document = crate::config::Document::read(config_dir)?;
-    let value = toml::Value::Table(document.decode::<toml::Table>()?);
-    if value.get("roles").is_some() {
-        bail!(
-            "roles_removed: remove [roles] and every [roles.*] table from config.toml; keep model rows in [recipes.*]"
-        );
-    }
-    if value
-        .get("routing")
-        .and_then(|routing| routing.get("rules"))
-        .and_then(toml::Value::as_array)
-        .is_some_and(|rules| {
-            rules
-                .iter()
-                .any(|rule| rule.get("requires_claude").is_some())
-        })
-    {
-        bail!(
-            "routing_requires_claude_removed: replace `requires_claude = true` with `capability = \"native-chat\"` in each [[routing.rules]] row"
-        );
-    }
-    let raw: RawConfig = value.try_into()?;
+    let raw: RawConfig = document.decode()?;
     validate_doctor_config(&raw.doctor)?;
     let defaults: RawConfig = toml::from_str(include_str!("../assets/default-recipes.toml"))
         .context("shipped recipe declarations do not parse")?;
@@ -553,7 +532,6 @@ fn resolve(ctx: &Ctx, project: &Project, input: &ResolveInput) -> Result<Launch>
         } else {
             usual_reason(input.workflow, &recipe.plain)
         },
-        compact_reason: compact_reason(input.workflow, &recipe.plain),
         source_truncation: input.source_truncation.cloned(),
         machine: config.dispatch.machine,
         ..Launch::default()
@@ -661,23 +639,6 @@ pub fn usual_reason(role: &str, plain: &str) -> String {
     render(TEMPLATE_USUAL, job_noun(role), plain)
 }
 
-/// `"<job> runs on <plain>"`, at most 80 characters: the ticker's `ade_last`
-/// token.
-pub fn compact_reason(role: &str, plain: &str) -> String {
-    let sentence = format!("{} runs on {}", job_noun(role), plain.trim());
-    if sentence.len() <= COMPACT_LIMIT {
-        return sentence;
-    }
-    let mut end = COMPACT_LIMIT;
-    while end > 0 && !sentence.is_char_boundary(end) {
-        end -= 1;
-    }
-    match sentence[..end].rfind(char::is_whitespace) {
-        Some(pos) if pos > 0 => sentence[..pos].trim_end().to_string(),
-        _ => sentence[..end].trim_end().to_string(),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -755,25 +716,5 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(error.contains("recipe_unreachable"), "{error}");
-    }
-
-    #[test]
-    fn removed_claude_matcher_names_the_exact_config_replacement() {
-        let dir = tempfile::tempdir().unwrap();
-        std::fs::write(
-            dir.path().join("config.toml"),
-            r#"[routing]
-default = "claude_fable_xhigh"
-[[routing.rules]]
-requires_claude = true
-recipe = "claude_fable_xhigh"
-"#,
-        )
-        .unwrap();
-        let error = parse_launch_config(dir.path()).unwrap_err().to_string();
-        assert!(
-            error.contains("replace `requires_claude = true` with `capability = \"native-chat\"`"),
-            "{error}"
-        );
     }
 }

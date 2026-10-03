@@ -127,30 +127,19 @@ pub(crate) fn disposable_for_rows(
 fn parse_status(text: &str) -> (Vec<String>, Vec<String>) {
     let mut dirty = Vec::new();
     let mut ignored = Vec::new();
-    let nul_delimited = text.contains('\0');
-    let mut records: Box<dyn Iterator<Item = &str>> = if nul_delimited {
-        Box::new(text.split('\0'))
-    } else {
-        // Scripted tests written before status used `-z` still use lines.
-        Box::new(text.lines())
-    };
+    let mut records = text.split('\0');
     while let Some(record) = records.next() {
         if record.len() <= 3 {
             continue;
         }
-        if nul_delimited
-            && record.as_bytes()[..2]
-                .iter()
-                .any(|b| matches!(b, b'R' | b'C'))
+        if record.as_bytes()[..2]
+            .iter()
+            .any(|b| matches!(b, b'R' | b'C'))
         {
             // In porcelain -z, the destination is followed by the original path.
             records.next();
         }
-        let path = if nul_delimited {
-            record[3..].to_string()
-        } else {
-            record[3..].trim().trim_matches('"').replace("\\\"", "\"")
-        };
+        let path = record[3..].to_string();
         if &record[..2] == "!!" {
             ignored.push(path);
         } else {

@@ -121,10 +121,6 @@ pub(crate) struct Launch {
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub(crate) recipe_request: String,
     pub(crate) reason: String,
-    /// The compact `<job> runs on <plain>` sentence for the
-    /// `ade_last` token (D17 item 14), stored on the record so the ticker
-    /// never rereads live config.
-    pub(crate) compact_reason: String,
     /// Evidence intentionally left out before dispatch (for example a review
     /// diff that the agent reads from its checkout). Retries retain it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -707,7 +703,6 @@ mod tests {
             recipe_basis: String::new(),
             recipe_request: String::new(),
             reason: "this task runs on the web research helper, the usual choice.".into(),
-            compact_reason: "this task runs on the web research helper".into(),
             source_truncation: None,
             machine: "buildbox".into(),
         });

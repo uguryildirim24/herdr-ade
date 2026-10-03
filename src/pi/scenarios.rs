@@ -1,4 +1,4 @@
-//! FakeRunner scenarios for a pi lane: start and restart
+//! FakeRunner scenarios for pi setup and readiness
 //! (SPEC-pi v2 §7; SPEC-ADE §1.3).
 //!
 //! Every command is scripted through `pi::sh::fake`; no herdr, no pi process,
@@ -28,57 +28,6 @@ fn world(dir: &Path) -> (Env, Layout) {
     std::fs::create_dir_all(env.home.join(".local/bin")).unwrap();
     std::os::unix::fs::symlink(layout.wrapper(), env.home.join(".local/bin/pi")).unwrap();
     (env, layout)
-}
-
-#[test]
-fn scenario_start_is_the_spec_line_and_never_a_trust_flag() {
-    let dir = tempfile::tempdir().unwrap();
-    let (_env, _layout) = world(dir.path());
-    let args = launch::start_args("kimi-coding", "k3", "high");
-    let start = launch::agent_start_args("a5", "w1F:p13", "w1F:p1", 30_000, &args, None).unwrap();
-    let line = start.join(" ");
-    assert_eq!(
-        line,
-        "agent start a5 --kind pi --pane w1F:p13 --parent w1F:p1 --timeout 30000 -- \
-         --provider kimi-coding --model k3 --thinking high --no-skills"
-            .split_whitespace()
-            .collect::<Vec<_>>()
-            .join(" ")
-    );
-    for forbidden in ["--approve", "-na", "--no-approve", "--session"] {
-        assert!(!start.iter().any(|a| a == forbidden), "{forbidden}");
-    }
-    // A trust dialog never appears because trust is settled by settings.
-    assert!(folder::SETTINGS_JSON.contains("\"defaultProjectTrust\": \"never\""));
-}
-
-#[test]
-fn scenario_restart_uses_the_reported_session_and_the_recipe_stays_clean() {
-    let dir = tempfile::tempdir().unwrap();
-    let (_env, _layout) = world(dir.path());
-    let args = launch::start_args("kimi-coding", "k3", "high");
-    let pane_get = r#"{"result":{"pane":{"agent_session":{"source":"herdr:pi","agent":"pi","kind":"path","value":"/state/pi/agent/sessions/--/lane.jsonl"}}}}"#;
-    let session = super::resume::session_from_pane_get(pane_get)
-        .unwrap()
-        .expect("the extension reported a session");
-    let session = Path::new(&session);
-
-    let restart =
-        launch::agent_start_args("a5", "w1F:p13", "w1F:p1", 30_000, &args, Some(session)).unwrap();
-    assert_eq!(
-        restart.iter().filter(|a| *a == "--session").count(),
-        1,
-        "exactly one --session"
-    );
-    assert!(
-        restart
-            .iter()
-            .any(|a| a == "/state/pi/agent/sessions/--/lane.jsonl")
-    );
-    assert!(!restart.iter().any(|a| a == "-c" || a == "--continue"));
-    assert!(!restart.iter().any(|a| a == "--approve"));
-    // The configured recipe arguments stay valid across resume.
-    launch::validate_args(&args).unwrap();
 }
 
 /// Script the login shell's own probes, the same shell `doctor` runs. The
@@ -122,7 +71,7 @@ fn scenario_setup_then_check_for_kimi() {
     );
     runner.on("--print Reply OK.", ok("OK\n"));
 
-    let report = doctor::check_report(&env, &layout, &runner, "kimi-coding");
+    let report = doctor::check_report_model(&env, &layout, &runner, "kimi-coding", None);
     assert!(report.ok, "{}", report.error_text());
     assert_eq!(
         runner
@@ -146,7 +95,7 @@ fn scenario_check_refuses_a_missing_login_before_any_start() {
         "auth check --provider kimi-coding",
         ok(r#"{"status":"not_ready","reason":"credentials_not_configured"}"#),
     );
-    let report = doctor::check_report(&env, &layout, &runner, "kimi-coding");
+    let report = doctor::check_report_model(&env, &layout, &runner, "kimi-coding", None);
     assert!(!report.ok);
     assert!(report.error_text().contains("credentials_not_configured"));
     // The refusal is the check path A1 calls; a start never happens.

@@ -8,10 +8,10 @@
 //! Compiles `src/pi/` through a path attribute because the package has no
 //! library target by design (SPEC-pi v2 §3: one library crate, two binaries).
 
-#[allow(dead_code)]
+#[allow(dead_code)] // Shared with herdr-ade, which also uses section().
 #[path = "../config.rs"]
 mod config;
-#[allow(dead_code)]
+#[allow(dead_code)] // Shared with herdr-ade; each binary uses a different subset.
 #[path = "../pi/mod.rs"]
 mod pi;
 

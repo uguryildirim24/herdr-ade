@@ -995,7 +995,6 @@ pub(crate) struct LaneProgress {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct CourierManifest {
     pub(crate) boot_id: String,
-    pub(crate) free_bytes: u64,
     /// Box-local `herdr agent list` JSON; `None` when the box server did not
     /// answer this pass.
     pub(crate) agents: Option<String>,
@@ -1034,8 +1033,6 @@ cursor=$(mktemp)
 trap 'rm -f "$cursor"' EXIT
 cat > "$cursor"
 printf 'boot\t%s\n' "$(cat /proc/sys/kernel/random/boot_id 2>/dev/null || true)"
-avail=$(df -B1 --output=avail / 2>/dev/null | tail -n1 | tr -d ' ')
-printf 'free\t%s\n' "${avail:-0}"
 if ! "$ade_bin" --root "$root" recover >/dev/null; then
   printf 'box recovery failed: %s\n' "$ade_bin" >&2
   exit 1
@@ -1122,7 +1119,6 @@ fn parse_courier_manifest(text: &str) -> Result<CourierManifest> {
         let fields: Vec<&str> = line.split('\t').collect();
         match fields.as_slice() {
             ["boot", id] => manifest.boot_id = (*id).to_string(),
-            ["free", bytes] => manifest.free_bytes = bytes.trim().parse().unwrap_or(0),
             ["agents", json] => {
                 if *json != "-" && !json.is_empty() {
                     manifest.agents = Some((*json).to_string());
@@ -2762,7 +2758,7 @@ mod tests {
 
     #[test]
     fn courier_manifest_parses_records_and_refuses_junk() {
-        let text = "boot\tboot-1\nfree\t1234\nagents\t{\"result\":{\"agents\":[]}}\npanes\t-\n\
+        let text = "boot\tboot-1\nagents\t{\"result\":{\"agents\":[]}}\npanes\t-\n\
                     receipt\tdemo\tt-0001-1-1\tabc\tdef\n\
                     bootstrap\tdemo\tt-0001\tabcd\tw1:p2\n\
                     progress\tdemo\tt-0001\tw1:p2\tscreenhash\theadsha\n\
@@ -2770,7 +2766,6 @@ mod tests {
                     event\tdemo\tt-0002-1-1\t/r/demo/.state/events/t-0002-1-1.toml\tabc\t-\t-\n";
         let manifest = parse_courier_manifest(text).unwrap();
         assert_eq!(manifest.boot_id, "boot-1");
-        assert_eq!(manifest.free_bytes, 1234);
         assert!(manifest.agents.is_some());
         assert!(manifest.panes.is_none());
         assert_eq!(manifest.receipts.len(), 1);
@@ -2820,7 +2815,6 @@ mod tests {
             .unwrap();
         assert!(out.success(), "{}", out.error_text());
         assert!(out.stdout.contains("boot\t"), "{}", out.stdout);
-        assert!(out.stdout.contains("free\t"), "{}", out.stdout);
         assert!(out.stdout.contains("agents\t-\n"), "{}", out.stdout);
         assert!(out.stdout.contains("panes\t-\n"), "{}", out.stdout);
     }
@@ -3354,7 +3348,7 @@ pi_bin = "/home/agent/.local/bin/herdr-pi"
             ),
         );
         let manifest = format!(
-            "boot\tboot-1\nfree\t100\nagents\t{{\"result\":{{\"agents\":[]}}}}\npanes\t{{\"result\":{{\"panes\":[]}}}}\n\
+            "boot\tboot-1\nagents\t{{\"result\":{{\"agents\":[]}}}}\npanes\t{{\"result\":{{\"panes\":[]}}}}\n\
              event\talpha\tt-0001-1-1\t/box/alpha/.state/events/t-0001-1-1.toml\t{event_hash}\t/box/alpha/.state/artifacts/{artifact_hash}\t{artifact_hash}\n\
              receipt\talpha\tt-0001-1-1\t{event_hash}\t{artifact_hash}\n\
              bootstrap\talpha\tt-0001\t\tw2:p1\n\
@@ -3442,7 +3436,7 @@ pi_bin = "/home/agent/.local/bin/herdr-pi"
             ),
         );
         let manifest = format!(
-            "boot\tboot-1\nfree\t100\nagents\t-\npanes\t-\n\
+            "boot\tboot-1\nagents\t-\npanes\t-\n\
              event\talpha\tt-0001-1-1\t/box/alpha/.state/events/t-0001-1-1.toml\t{event_hash}\t/box/alpha/.state/artifacts/{artifact_hash}\t{artifact_hash}\n\
              receipt\talpha\tt-0001-1-1\tdeadbeef\t{artifact_hash}\n"
         );

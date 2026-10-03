@@ -31,12 +31,6 @@ impl sh::Runner for Adapter<'_> {
         for key in &cmd.env_remove {
             adapted = adapted.env_remove(key.clone());
         }
-        if let Some(cwd) = &cmd.cwd {
-            adapted = adapted.cwd(cwd.clone());
-        }
-        if let Some(stdin) = &cmd.stdin {
-            adapted = adapted.stdin(stdin.clone());
-        }
         let output = self.0.run(&adapted)?;
         Ok(sh::Output {
             code: output.code,
