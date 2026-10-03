@@ -1381,8 +1381,8 @@ pub(crate) fn agent_start_timeout(launch: &crate::contracts::Launch) -> u64 {
     }
 }
 
-/// A placement owns its ready window, even before `agent start` is submitted.
-/// Historical records without a clock retain their already-started semantics.
+/// Placement gives the pane an observation grace period; agent submission
+/// resets this clock for its full ready window. No clock means no grace period.
 pub(crate) fn in_start_window(thread: &Thread, now: jiff::Timestamp) -> bool {
     !thread.startup_wait_started.is_empty()
         && seconds_since(&thread.startup_wait_started, now).max(0) as u64 * 1000

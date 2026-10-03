@@ -2027,6 +2027,7 @@ fn thread_pass(
                     }
                 })?;
             } else if (state == "blocked" || (state.is_empty() && live.pane_exists))
+                && (t.launch_attempts > 0 || thread::process_bound_to_pane(t))
                 && !thread::in_start_window(t, now)
                 && !(state.is_empty()
                     && !agents.iter().any(|a| a.pane_id == t.pane_id)
@@ -7293,13 +7294,21 @@ mod tests {
             parked_pi_reopens_with_brief_then_ordered_follow_ups(remote, true, late, None);
         }
         for remote in [false, true] {
-            parked_pi_reopens_with_brief_then_ordered_follow_ups(
-                remote,
-                true,
-                false,
-                Some("delayed"),
-            );
+            for timing in ["delayed", "delayed-unobserved"] {
+                parked_pi_reopens_with_brief_then_ordered_follow_ups(
+                    remote,
+                    true,
+                    false,
+                    Some(timing),
+                );
+            }
         }
+        parked_pi_reopens_with_brief_then_ordered_follow_ups(
+            true,
+            true,
+            false,
+            Some("session-unobserved"),
+        );
     }
 
     #[test]
@@ -7354,7 +7363,12 @@ mod tests {
             )
             .unwrap();
         }
-        let session_present = std::rc::Rc::new(std::cell::Cell::new(recovery != Some("missing")));
+        let session_reply =
+            std::rc::Rc::new(std::cell::Cell::new(if recovery == Some("missing") {
+                "missing"
+            } else {
+                "present"
+            }));
         if remote {
             let config = world.home.path().join("cfg/config.toml");
             let existing = std::fs::read_to_string(&config).unwrap();
@@ -7367,15 +7381,19 @@ mod tests {
             )
             .unwrap();
             world.runner.on("machine list --json", ok("[]"));
-            let present = session_present.clone();
+            let reply = session_reply.clone();
             world.runner.on_fn(
                 |cmd| cmd.program == "ssh",
                 move |cmd| {
-                    Ok(ok(if cmd.display().contains("if test -f") {
-                        if !present.get() { "missing" } else { "present" }
+                    Ok(if cmd.display().contains("if test -f") {
+                        if reply.get() == "unreachable" {
+                            fail(255, "ssh: Connection timed out")
+                        } else {
+                            ok(reply.get())
+                        }
                     } else {
-                        ""
-                    }))
+                        ok("")
+                    })
                 },
             );
         }
@@ -7479,7 +7497,11 @@ mod tests {
         world.runner.on("pane parent", ok(r#"{"result":{}}"#));
         world.runner.on(
             "pane process-info",
-            ok(r#"{"result":{"process_info":{"pane_id":"w1:p2","foreground_processes":[{"pid":99,"name":"bash"}]}}}"#),
+            if recovery == Some("delayed-unobserved") {
+                fail(1, r#"{"error":{"code":"timeout","message":"process observation unavailable"}}"#)
+            } else {
+                ok(r#"{"result":{"process_info":{"pane_id":"w1:p2","foreground_processes":[{"pid":99,"name":"bash"}]}}}"#)
+            },
         );
         let delivery_project = project.clone();
         let delivery_id = lane.id.clone();
@@ -7557,7 +7579,10 @@ mod tests {
         threads::place_recovery(&ctx, &project, &reopened).unwrap();
         let mut reopened = thread::update(&project, &lane.id, |t| {
             t.error = "provider ready".into();
-            if recovery == Some("delayed") {
+            if matches!(
+                recovery,
+                Some("delayed" | "delayed-unobserved" | "session-unobserved")
+            ) {
                 t.startup_wait_started =
                     (jiff::Timestamp::now() - jiff::SignedDuration::from_secs(600)).to_string();
             }
@@ -7661,7 +7686,7 @@ mod tests {
             resuming = false;
         }
         if recovery == Some("disappeared") {
-            session_present.set(false);
+            session_reply.set("missing");
             if !remote {
                 std::fs::remove_file(&session).unwrap();
             }
@@ -7678,16 +7703,49 @@ mod tests {
             panes: std::slice::from_ref(&pane),
         };
         if remote {
+            let view = steps::CourierOutcome {
+                machine_id: reopened.machine_route().into(),
+                boot_id: "boot-1".into(),
+                agents: Some(vec![]),
+                panes: Some(vec![pane.clone()]),
+                progress: Default::default(),
+            };
+            if recovery == Some("session-unobserved") {
+                session_reply.set("unreachable");
+                remote_pass(
+                    &input,
+                    reopened.machine_route(),
+                    &view,
+                    &mut true,
+                    &mut errors,
+                )
+                .unwrap();
+                assert!(
+                    errors.iter().any(|error| {
+                        let message = format!("{error:#}");
+                        message.contains("resume session")
+                            && crate::remote::is_unreachable(&message)
+                    }),
+                    "{errors:?}"
+                );
+                let waiting = thread::load(&project, &lane.id).unwrap();
+                assert_eq!(waiting.status, thread::Status::Open);
+                assert_eq!(waiting.attempt, lane.attempt);
+                assert_eq!(waiting.launch_attempts, 0);
+                assert_eq!(
+                    waiting.launch.same_recipe_retries,
+                    lane.launch.same_recipe_retries
+                );
+                assert_eq!(waiting.bootstrap, "resuming");
+                assert!(waiting.start_notices.is_empty());
+                assert_eq!(world.runner.count("agent start"), 0);
+                session_reply.set("present");
+                errors.clear();
+            }
             remote_pass(
                 &input,
                 reopened.machine_route(),
-                &steps::CourierOutcome {
-                    machine_id: reopened.machine_route().into(),
-                    boot_id: "boot-1".into(),
-                    agents: Some(vec![]),
-                    panes: Some(vec![pane.clone()]),
-                    progress: Default::default(),
-                },
+                &view,
                 &mut true,
                 &mut errors,
             )
@@ -7698,6 +7756,7 @@ mod tests {
         }
         assert!(errors.is_empty(), "{errors:?}");
         let submitted = thread::load(&project, &lane.id).unwrap();
+        assert_eq!(submitted.status, thread::Status::Open, "{submitted:?}");
         assert!(
             thread::in_start_window(&submitted, jiff::Timestamp::now()),
             "submission, not the old placement, starts the ready window"
@@ -7861,6 +7920,10 @@ mod tests {
         if !resuming {
             assert!(prompts[0].contains("skill lane"));
             assert!(prompts[0].contains("brief.md"));
+            assert!(prompts[expected_prompts - 2].contains(&lane.report_path()));
+            assert!(
+                prompts[expected_prompts - 2].contains(&format!("{}/brief.md", lane.thread_dir))
+            );
         }
         assert!(prompts[expected_prompts - 2].contains("first correction"));
         assert!(prompts[expected_prompts - 1].contains("second correction"));
