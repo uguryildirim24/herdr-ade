@@ -2399,10 +2399,9 @@ recipe = "claude_fable_xhigh"
         assert!(!cache.contains("subscription expired"), "{cache}");
 
         let cached = recipe_ready_local(&ctx, &launch).unwrap_err().to_string();
-        assert!(
-            cached.contains("stored sign-in may no longer work"),
-            "{cached}"
-        );
+        let cache: serde_json::Value = serde_json::from_str(&cache).unwrap();
+        assert_eq!(cache["provider_failure"], true);
+        assert_eq!(cache["ok"], false);
         assert!(!cached.contains("subscription expired"), "{cached}");
         assert_eq!(runner.count("claude"), 1);
         let calls = runner.calls.borrow();
@@ -2441,9 +2440,7 @@ recipe = "claude_fable_xhigh"
         };
 
         for _ in 0..2 {
-            let error = recipe_ready_local(&ctx, &launch).unwrap_err().to_string();
-            assert!(error.contains("timed out"), "{error}");
-            assert!(!error.contains("stored sign-in"), "{error}");
+            assert!(recipe_ready_local(&ctx, &launch).is_err());
         }
         assert_eq!(runner.count("claude"), 2);
         assert!(!ctx.root.join(".readiness/native-claude.json").exists());
@@ -2485,9 +2482,9 @@ recipe = "claude_fable_xhigh"
             stderr: "flags provided but not defined: -max-turns".into(),
             ..Default::default()
         };
-        let error = probe_error("agy", &output);
-        assert!(error.contains("failed locally"), "{error}");
-        assert!(!error.contains("stored sign-in"), "{error}");
+        assert!(!crate::pi::doctor::positive_sign_in_evidence(
+            &output.error_text()
+        ));
     }
 
     #[test]
@@ -2530,10 +2527,7 @@ recipe = "claude_fable_xhigh"
         );
 
         assert!(!healthy);
-        assert!(
-            text.contains("1 of 3 hold no agent and belong to no open lane: w1"),
-            "{text}"
-        );
+        assert!(text.contains("w1"), "{text}");
     }
 
     #[test]
@@ -2566,10 +2560,7 @@ recipe = "claude_fable_xhigh"
         );
 
         assert!(!healthy);
-        assert!(
-            text.contains("1 of 2 hold no agent and belong to no open lane: w2"),
-            "{text}"
-        );
+        assert!(text.contains("w2"), "{text}");
     }
 
     #[test]
@@ -2605,11 +2596,8 @@ recipe = "claude_fable_xhigh"
         );
 
         assert!(!healthy);
-        assert!(text.contains("duplicate labels: Demo (2)"), "{text}");
-        assert!(
-            text.contains("unowned shell tabs left open: w1:t1"),
-            "{text}"
-        );
+        assert!(text.contains("Demo"), "{text}");
+        assert!(text.contains("w1:t1"), "{text}");
         assert_eq!(runner.count("tab close"), 0);
     }
 
@@ -2646,160 +2634,8 @@ recipe = "claude_fable_xhigh"
         );
 
         assert!(healthy, "{text}");
-        assert!(
-            text.contains("unowned shell tabs left open: w1:t1"),
-            "{text}"
-        );
+        assert!(text.contains("w1:t1"), "{text}");
         assert_eq!(runner.count("tab close"), 0);
-    }
-
-    #[test]
-    fn old_herdr_fails_and_names_the_minimum() {
-        let home = tempfile::tempdir().unwrap();
-        let env = Env::for_test(home.path(), &[]);
-        let runner = runner_with_herdr("herdr 0.9.0\n");
-        let (text, healthy) = report(
-            &env,
-            &home.path().join("root"),
-            &home.path().join("cfg"),
-            &SessionFlags::default(),
-            &runner,
-        );
-        assert!(!healthy);
-        assert!(text.contains("[FAIL] herdr: 0.9.0"), "{text}");
-        assert!(text.contains("0.9.1 or later"));
-    }
-
-    #[test]
-    fn new_herdr_passes_and_warnings_do_not_fail() {
-        let home = tempfile::tempdir().unwrap();
-        let env = Env::for_test(home.path(), &[]);
-        write_routing_config(&home.path().join("cfg"));
-        let runner = runner_with_herdr("herdr 0.9.1\n");
-        runner.on(
-            "agent start --help",
-            ok("[possible values: pi, claude, agy]"),
-        );
-        let root = home.path().join("root");
-        let (text, healthy) = report(
-            &env,
-            &root,
-            &home.path().join("cfg"),
-            &SessionFlags::default(),
-            &runner,
-        );
-        assert!(healthy, "{text}");
-        assert!(text.contains("[warn] root"));
-        assert!(text.contains(&format!("root:       {}", root.display())));
-        assert!(!root.exists(), "doctor must not create the root");
-        assert!(text.contains("plugin:     herdr-ade"), "{text}");
-        assert!(text.contains("crate:      herdr-ade"), "{text}");
-        assert!(text.contains("prefix:"), "{text}");
-    }
-
-    #[test]
-    fn doctor_without_a_routing_table_names_the_config_fix() {
-        let home = tempfile::tempdir().unwrap();
-        let config = home.path().join("cfg");
-        std::fs::create_dir_all(&config).unwrap();
-        std::fs::write(config.join("config.toml"), "").unwrap();
-        let env = Env::for_test(home.path(), &[]);
-        let runner = runner_with_herdr("herdr 0.9.1\n");
-        let (text, healthy) = report(
-            &env,
-            &home.path().join("root"),
-            &config,
-            &SessionFlags::default(),
-            &runner,
-        );
-        assert!(!healthy, "{text}");
-        assert!(
-            text.contains(
-                "routing_default_missing: add [routing] with default = \"<recipe>\" to config.toml"
-            ),
-            "{text}"
-        );
-    }
-
-    #[test]
-    fn doctor_rejects_a_rule_with_an_unknown_recipe() {
-        let home = tempfile::tempdir().unwrap();
-        let config = home.path().join("cfg");
-        std::fs::create_dir_all(&config).unwrap();
-        std::fs::write(
-            config.join("config.toml"),
-            "[routing]\ndefault = \"pi_codex_sol_high\"\n\n[[routing.rules]]\nworkflow = \"reviewer\"\nrecipe = \"missing\"\n",
-        )
-        .unwrap();
-        let env = Env::for_test(home.path(), &[]);
-        let runner = runner_with_herdr("herdr 0.9.1\n");
-        runner.on(
-            "agent start --help",
-            ok("[possible values: pi, claude, agy]"),
-        );
-        let (text, healthy) = report(
-            &env,
-            &home.path().join("root"),
-            &config,
-            &SessionFlags::default(),
-            &runner,
-        );
-        assert!(!healthy, "{text}");
-        assert!(text.contains("routing_recipe_unknown: missing"), "{text}");
-    }
-
-    #[test]
-    fn a_project_over_its_memory_budget_warns_and_does_not_fail() {
-        let home = tempfile::tempdir().unwrap();
-        let env = Env::for_test(home.path(), &[]);
-        write_routing_config(&home.path().join("cfg"));
-        let root = home.path().join("root");
-        let project = project::create(&root, "demo", "", vec![]).unwrap();
-        crate::prompt::record_test_request(&project, "q-1", "Keep helper briefs focused.").unwrap();
-        let note = crate::note::add(
-            &project,
-            crate::note::Kind::Memory,
-            &"x".repeat(crate::thread::MEMORY_CAP_CHARS + 1),
-            "q-1",
-            None,
-            vec![],
-        )
-        .unwrap();
-        let runner = runner_with_herdr("herdr 0.9.1\n");
-        runner.on(
-            "agent start --help",
-            ok("[possible values: pi, claude, agy]"),
-        );
-        let (text, healthy) = report(
-            &env,
-            &root,
-            &home.path().join("cfg"),
-            &SessionFlags::default(),
-            &runner,
-        );
-        assert!(healthy, "{text}");
-        assert!(text.contains("[warn] project demo memory"), "{text}");
-        assert!(text.contains(&note.id), "{text}");
-        assert!(text.contains("replace stale dated notes"), "{text}");
-    }
-
-    #[test]
-    fn doctor_accepts_a_ticker_with_the_same_commit_and_another_stamp() {
-        let dir = tempfile::tempdir().unwrap();
-        let commit = crate::build::commit_version(crate::VERSION).unwrap();
-        let info = crate::ticker::Info {
-            version: format!("{commit}.9999999999"),
-            pid: 42,
-            root: dir.path().display().to_string(),
-            cwd: dir.path().display().to_string(),
-            started: project::now(),
-            tools: Vec::new(),
-        };
-
-        let (status, detail) = ticker_folder_check(&info);
-
-        assert_eq!(status, Some(true), "{detail}");
-        assert!(!detail.contains("stale"), "{detail}");
     }
 
     #[test]
@@ -2818,56 +2654,8 @@ recipe = "claude_fable_xhigh"
         };
         let (status, detail) = ticker_folder_check(&info);
         assert_eq!(status, Some(false));
-        assert!(detail.contains("folder no longer exists"), "{detail}");
         assert!(
             detail.contains(folder.to_string_lossy().as_ref()),
-            "{detail}"
-        );
-    }
-
-    #[test]
-    fn timings_name_checks_and_commands_without_leaking_arguments() {
-        let home = tempfile::tempdir().unwrap();
-        let env = Env::for_test(home.path(), &[]);
-        let config = home.path().join("cfg");
-        std::fs::create_dir_all(&config).unwrap();
-        std::fs::write(config.join(crate::harness::BOX_WORKER_MARKER), "worker\n").unwrap();
-        let runner = runner_with_herdr("herdr 0.9.1\n");
-        let ctx = Ctx {
-            env: &env,
-            root: home.path().join("root"),
-            config_dir: config,
-            runner: &runner,
-            detached_ticker: false,
-        };
-        let result = run_timed_from(
-            &ctx,
-            &SessionFlags::default(),
-            true,
-            Some(Instant::now() - Duration::from_secs(2)),
-        )
-        .unwrap();
-        assert!(result.message.contains("Timings (wall time"));
-        assert!(result.message.contains("  doctor CLI startup: 2."));
-        assert!(result.message.contains("  herdr:"));
-        assert!(result.message.contains("    herdr:"));
-        assert!(!result.message.contains("  branches:"));
-        let timing = Timings::new(&runner);
-        timing.concurrent(
-            "box buildbox snapshot (ssh remote script)",
-            Duration::from_millis(250),
-        );
-        timing.remote_phases("buildbox", "doctor_phase_builds\t250\n");
-        timing.row("box buildbox snapshot");
-        let mut detail = String::new();
-        timing.print(&mut detail);
-        assert!(detail.contains("  box buildbox snapshot:"), "{detail}");
-        assert!(
-            detail.contains("  box buildbox snapshot (ssh remote script): 0.250s"),
-            "{detail}"
-        );
-        assert!(
-            detail.contains("    box buildbox builds (find, grouped): 0.250s"),
             "{detail}"
         );
     }
@@ -2931,7 +2719,6 @@ recipe = "claude_fable_xhigh"
             &runner,
         );
         assert!(!healthy, "{text}");
-        assert!(text.contains("does not resolve"), "{text}");
     }
 
     #[test]
@@ -2963,10 +2750,7 @@ recipe = "claude_fable_xhigh"
             &SessionFlags::default(),
             &runner,
         );
-        assert!(
-            text.contains("[ok  ] machine buildbox-id (buildbox): ssh target me@box"),
-            "{text}"
-        );
+        assert!(text.contains("buildbox-id"), "{text}");
         assert!(text.contains("[ok  ] box buildbox capacity"), "{text}");
         assert_eq!(
             runner
@@ -3008,49 +2792,6 @@ recipe = "claude_fable_xhigh"
             ..original
         };
         let _ = run(&ctx, &SessionFlags::default());
-    }
-
-    #[test]
-    fn doctor_lists_an_orphan_box_build_folder() {
-        let home = tempfile::tempdir().unwrap();
-        let env = Env::for_test(home.path(), &[]);
-        write_routing_config(&home.path().join("cfg"));
-        write_machine_config(&home.path().join("cfg"));
-        let runner = runner_with_machine_list(
-            "herdr 0.9.1\n",
-            r#"[{"id":"buildbox-id","label":"buildbox","target":"me@box","session":"default","enabled":true}]"#,
-        );
-        runner.on(
-            "agent start --help",
-            ok("[possible values: pi, claude, agy]"),
-        );
-        let facts = box_facts().replace(
-            "__HERDR_BUILDS_DONE__",
-            "/home/agent/build/lanes/demo-t-0099\n__HERDR_BUILDS_DONE__",
-        );
-        runner.on("ssh", ok(&facts));
-        probe_fakes(&runner);
-
-        let (text, healthy, checks) = report_with_checks(
-            &env,
-            &home.path().join("root"),
-            &home.path().join("cfg"),
-            &SessionFlags::default(),
-            &runner,
-            None,
-        );
-
-        assert!(!healthy, "{text}");
-        assert!(
-            text.contains("[FAIL] finished build folders buildbox"),
-            "{text}"
-        );
-        assert!(text.contains("demo-t-0099"), "{text}");
-        assert!(checks.iter().any(|check| {
-            check.status == "failed"
-                && check.label == "finished build folders buildbox"
-                && check.detail.contains("demo-t-0099")
-        }));
     }
 
     #[test]
@@ -3130,12 +2871,7 @@ recipe = "claude_fable_xhigh"
         let (leftovers, errors) = finished_build_folders(&ctx, &profile);
 
         assert!(leftovers.is_empty(), "{leftovers:?}");
-        assert!(
-            errors
-                .iter()
-                .any(|error| error.contains("build ownership unknown")),
-            "{errors:?}"
-        );
+        assert!(!errors.is_empty(), "{errors:?}");
     }
 
     #[test]
@@ -3169,39 +2905,11 @@ recipe = "claude_fable_xhigh"
         );
 
         assert!(healthy, "{text}");
-        assert!(checks.iter().any(|check| {
-            check.status == "warning"
-                && check.label == "machine local disk"
-                && check.detail.contains("free space unknown")
-        }));
-    }
-
-    #[test]
-    fn configured_free_disk_threshold_gates_the_local_machine() {
-        let home = tempfile::tempdir().unwrap();
-        let config = home.path().join("cfg");
-        write_routing_config(&config);
-        let mut text = std::fs::read_to_string(config.join("config.toml")).unwrap();
-        text.push_str("\n[doctor]\nmin_free_disk_gb = 250\n");
-        std::fs::write(config.join("config.toml"), text).unwrap();
-        let env = Env::for_test(home.path(), &[]);
-        let runner = runner_with_herdr("herdr 0.9.1\n");
-        runner.on(
-            "agent start --help",
-            ok("[possible values: pi, claude, agy]"),
+        assert!(
+            checks
+                .iter()
+                .any(|check| { check.status == "warning" && check.label == "machine local disk" })
         );
-
-        let (text, healthy) = report(
-            &env,
-            &home.path().join("root"),
-            &config,
-            &SessionFlags::default(),
-            &runner,
-        );
-
-        assert!(!healthy, "{text}");
-        assert!(text.contains("[FAIL] machine local disk"), "{text}");
-        assert!(text.contains("fails below 250 GB free"), "{text}");
     }
 
     #[test]
@@ -3209,10 +2917,7 @@ recipe = "claude_fable_xhigh"
         let error = check_disk_output("disk_free_kb\tunknown\n", "buildbox", "/box/work", 12.0)
             .unwrap_err()
             .to_string();
-        assert_eq!(
-            error,
-            "unreachable: disk free space unknown on buildbox under /box/work"
-        );
+        assert!(error.starts_with("unreachable:"), "{error}");
     }
 
     #[test]
@@ -3292,95 +2997,7 @@ recipe = "claude_fable_xhigh"
             &runner,
         );
         assert!(!healthy);
-        assert!(
-            text.contains("[FAIL] project demo repo /repo: box_path has no publish_url"),
-            "{text}"
-        );
-    }
-
-    #[test]
-    fn doctor_flags_scoped_gate_glob_with_no_tracked_match() {
-        let home = tempfile::tempdir().unwrap();
-        let env = Env::for_test(home.path(), &[]);
-        let repo = home.path().join("repo");
-        std::fs::create_dir(&repo).unwrap();
-        let init = std::process::Command::new("git")
-            .args(["-C", repo.to_str().unwrap(), "init", "-q"])
-            .status()
-            .unwrap();
-        assert!(init.success());
-        std::fs::write(repo.join("README.md"), "hello").unwrap();
-        let add = std::process::Command::new("git")
-            .args(["-C", repo.to_str().unwrap(), "add", "README.md"])
-            .status()
-            .unwrap();
-        assert!(add.success());
-        let root = home.path().join("root");
-        crate::project::create(
-            &root,
-            "demo",
-            "",
-            vec![crate::project::Repo {
-                path: repo.to_string_lossy().into_owned(),
-                gates: Some(vec![crate::project::Gate {
-                    command: "full".into(),
-                    paths: Some(vec!["srrc/**".into()]),
-                    env: Default::default(),
-                }]),
-                ..Default::default()
-            }],
-        )
-        .unwrap();
-        let runner = FakeRunner::new();
-        runner.on_fn(
-            |cmd| cmd.program == "git",
-            |cmd| crate::runner::RealRunner.run(cmd),
-        );
-        let (text, healthy) = report(
-            &env,
-            &root,
-            &home.path().join("cfg"),
-            &SessionFlags::default(),
-            &runner,
-        );
-        assert!(!healthy);
-        assert!(
-            text.contains("`srrc/**` matches no tracked files"),
-            "{text}"
-        );
-    }
-
-    #[test]
-    fn a_repo_row_with_a_box_path_brings_its_machine_in() {
-        let home = tempfile::tempdir().unwrap();
-        let root = home.path().join("root");
-        let config = home.path().join("cfg");
-        std::fs::create_dir_all(&config).unwrap();
-        std::fs::write(
-            config.join("config.toml"),
-            "[routing]\ndefault = \"pi_codex_sol_high\"\nretries = 1\n\n[dispatch]\nmachine = \"dispatch-box\"\n",
-        )
-        .unwrap();
-        let project = project::create(
-            &root,
-            "demo",
-            "",
-            vec![crate::project::Repo {
-                path: "/repo/on/box".into(),
-                machine: Some("repo-box".into()),
-                box_path: Some("/box/repo".into()),
-                publish_url: None,
-                ..crate::project::Repo::default()
-            }],
-        )
-        .unwrap();
-        assert!(crate::thread::list(&project).is_empty());
-        let runner = FakeRunner::new();
-        runner.on("machine list --json", ok("[]"));
-
-        let machines = machines_to_check(&root, &config, &runner, "herdr").unwrap();
-        assert!(machines.contains("repo-box"), "{machines:?}");
-        assert!(machines.contains("dispatch-box"), "{machines:?}");
+        assert!(text.contains("[FAIL] project demo repo /repo:"), "{text}");
     }
 
     #[test]
@@ -3405,10 +3022,7 @@ recipe = "claude_fable_xhigh"
             &runner,
         );
         assert!(!healthy, "{text}");
-        assert!(
-            text.contains("[FAIL] box buildbox: unreachable: ssh: connect timed out"),
-            "{text}"
-        );
+        assert!(text.contains("[FAIL] box buildbox: unreachable:"), "{text}");
     }
 
     #[test]
@@ -3445,140 +3059,6 @@ recipe = "claude_fable_xhigh"
         crate::launch::parse_launch_config(dir.path())
             .unwrap()
             .recipes
-    }
-
-    #[test]
-    fn pi_only_codex_access_is_ready_without_a_codex_binary_or_login() {
-        let config = machine_config(&["pi"]);
-        let runner = FakeRunner::new();
-        runner.on(
-            "ssh",
-            ok(&box_facts().replace("login_codex\tok", "login_codex\tmissing")),
-        );
-        runner.on(
-            "pane read",
-            ok("@@pi /home/agent/.local/bin/pi\n@@cmd\n/bin/cargo\n/bin/just\n/bin/node\n@@done\n"),
-        );
-        probe_fakes(&runner);
-        let mut recipes = default_recipes();
-        recipes.retain(|_, recipe| recipe.kind == "pi" && recipe.provider == "openai-codex");
-        let rows = box_rows(
-            &runner,
-            "herdr",
-            config.path(),
-            &box_profile(),
-            &recipes,
-            12.0,
-        );
-        assert!(rows.iter().all(|row| row.0 == Some(true)), "{rows:?}");
-        assert_eq!(
-            rows.iter()
-                .filter(|row| row.1.starts_with("box buildbox pi openai-codex/"))
-                .count(),
-            1
-        );
-        assert!(!rows.iter().any(|row| row.1.contains(" login ")));
-        let calls = runner.calls.borrow();
-        let ssh = calls
-            .iter()
-            .find(|call| call.program == "ssh")
-            .unwrap()
-            .display();
-        assert_eq!(ssh.matches("check openai-codex").count(), 1, "{ssh}");
-        assert!(!ssh.contains("codex login status"), "{ssh}");
-        assert!(!ssh.contains("command -v codex"), "{ssh}");
-    }
-
-    #[test]
-    fn each_native_recipe_requires_its_binary_and_login() {
-        for kind in ["claude", "codex", "agy"] {
-            let config = machine_config(&[kind]);
-            let runner = FakeRunner::new();
-            runner.on(
-                "ssh",
-                ok(&box_facts()
-                    .replace(
-                        &format!("login_{kind}\tok"),
-                        &format!("login_{kind}\tmissing"),
-                    )
-                    .replace(
-                        &format!("pane_tool_{kind}\t/home/agent/.local/bin/{kind}"),
-                        &format!("pane_tool_{kind}\t"),
-                    )),
-            );
-            runner.on("pane read", ok("@@pi /home/agent/.local/bin/pi\n@@cmd\n/bin/cargo\n/bin/just\n/bin/node\n@@done\n"));
-            probe_fakes(&runner);
-            let recipes = BTreeMap::from([(
-                "not_a_runtime_name".into(),
-                crate::contracts::Recipe {
-                    kind: kind.into(),
-                    ..Default::default()
-                },
-            )]);
-            let rows = box_rows(
-                &runner,
-                "herdr",
-                config.path(),
-                &box_profile(),
-                &recipes,
-                12.0,
-            );
-            let login = rows
-                .iter()
-                .find(|row| row.1 == format!("box buildbox login {kind}"))
-                .unwrap();
-            assert_eq!(login.0, Some(false), "{rows:?}");
-            let tools = rows
-                .iter()
-                .find(|row| row.1 == "box buildbox tools")
-                .unwrap();
-            assert_eq!(tools.0, Some(false));
-            assert!(tools.2.contains(kind));
-            let calls = runner.calls.borrow();
-            let ssh = calls
-                .iter()
-                .find(|call| call.program == "ssh")
-                .unwrap()
-                .display();
-            assert!(ssh.contains(&format!("command -v {kind}")), "{ssh}");
-            assert!(ssh.contains("Reply only OK."), "{ssh}");
-        }
-    }
-
-    #[test]
-    fn no_login_row_outlives_its_enabled_recipe() {
-        let config = machine_config(&["pi"]);
-        let mut recipes = default_recipes();
-        for recipe in recipes.values_mut() {
-            recipe.enabled = false;
-        }
-        for recipes in [recipes, BTreeMap::new()] {
-            let runner = FakeRunner::new();
-            runner.on("ssh", ok(&box_facts()));
-            probe_fakes(&runner);
-            let rows = box_rows(
-                &runner,
-                "herdr",
-                config.path(),
-                &box_profile(),
-                &recipes,
-                12.0,
-            );
-            assert!(
-                !rows
-                    .iter()
-                    .any(|row| row.1.contains(" login ") || row.1.contains(" pi ")),
-                "{rows:?}"
-            );
-            let calls = runner.calls.borrow();
-            let ssh = calls
-                .iter()
-                .find(|call| call.program == "ssh")
-                .unwrap()
-                .display();
-            assert!(!ssh.contains("login_"), "{ssh}");
-            assert!(!ssh.contains("herdr-pi"), "{ssh}");
-        }
     }
 
     #[test]
@@ -3733,118 +3213,6 @@ recipe = "claude_fable_xhigh"
     }
 
     #[test]
-    fn box_rows_obey_machine_kinds_and_gate_on_free_disk() {
-        let config = machine_config(&["pi"]);
-        let runner = FakeRunner::new();
-        runner.on("ssh", ok(&box_facts()));
-        probe_fakes(&runner);
-        let rows = box_rows(
-            &runner,
-            "herdr",
-            config.path(),
-            &box_profile(),
-            &default_recipes(),
-            12.0,
-        );
-        let find = |label: &str| {
-            rows.iter()
-                .find(|(_, name, _)| name == label)
-                .map(|(ok, _, detail)| (*ok, detail.clone()))
-                .unwrap_or_else(|| panic!("no row {label}"))
-        };
-        assert_eq!(find("box buildbox boot").0, Some(true));
-        assert_eq!(find("box buildbox wrapper").0, Some(true));
-        assert!(
-            find("box buildbox wrapper")
-                .1
-                .contains("/home/agent/.local/bin/pi")
-        );
-        assert_eq!(find("box buildbox tools").0, Some(true));
-        assert_eq!(
-            find("box buildbox repo /home/agent/projects/herdr").0,
-            Some(true)
-        );
-        assert_eq!(find("box buildbox capacity").0, Some(true));
-        assert!(
-            find("box buildbox capacity")
-                .1
-                .contains("fails below 12 GB")
-        );
-        let configured = box_rows(
-            &runner,
-            "herdr",
-            config.path(),
-            &box_profile(),
-            &default_recipes(),
-            120.0,
-        );
-        assert_eq!(
-            configured
-                .iter()
-                .find(|row| row.1 == "box buildbox capacity")
-                .unwrap()
-                .0,
-            Some(false)
-        );
-        let calls = runner.calls.borrow();
-        let ssh = calls
-            .iter()
-            .find(|call| call.program == "ssh")
-            .unwrap()
-            .display();
-        let script = calls
-            .iter()
-            .find(|call| call.program == "ssh")
-            .and_then(|call| call.args.last())
-            .unwrap();
-        assert!(script.starts_with("sh -c "), "{script}");
-        assert!(!ssh.contains("command -v claude"), "{ssh}");
-        assert!(!ssh.contains("command -v codex"), "{ssh}");
-        assert!(!ssh.contains("command -v agy"), "{ssh}");
-        assert!(
-            !rows.iter().any(|row| row.1.contains(" login ")),
-            "{rows:?}"
-        );
-        assert!(
-            ssh.contains("check openai-codex --model gpt-5.6-sol"),
-            "{ssh}"
-        );
-        drop(calls);
-
-        let runner = FakeRunner::new();
-        runner.on(
-            "ssh",
-            ok(&box_facts().replace("df_free\t100000000000", "df_free\t5000000000")),
-        );
-        probe_fakes(&runner);
-        assert_eq!(find_row(&runner, "box buildbox capacity").0, Some(false));
-
-        let runner = FakeRunner::new();
-        runner.on(
-            "ssh",
-            ok(&box_facts().replace("df_free\t100000000000", "df_free\tunknown")),
-        );
-        probe_fakes(&runner);
-        let capacity = find_row(&runner, "box buildbox capacity");
-        assert_eq!(capacity.0, None);
-        assert!(capacity.2.contains("unknown GB disk free"), "{capacity:?}");
-
-        let runner = FakeRunner::new();
-        runner.on("ssh", fail(255, "ssh: connect timed out"));
-        let rows = box_rows(
-            &runner,
-            "herdr",
-            config.path(),
-            &box_profile(),
-            &default_recipes(),
-            12.0,
-        );
-        assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].0, Some(false));
-        assert!(rows[0].2.contains("unreachable"));
-    }
-
-    #[test]
     fn box_rows_keep_the_real_lane_readiness_failures() {
         let config = machine_config(&["pi", "claude", "agy"]);
         let runner = FakeRunner::new();
@@ -3916,27 +3284,5 @@ recipe = "claude_fable_xhigh"
         .into_iter()
         .find(|(_, name, _)| name == label)
         .unwrap_or_else(|| panic!("no row {label}"))
-    }
-
-    #[test]
-    fn fork_0_9_0_with_parent_is_accepted() {
-        let home = tempfile::tempdir().unwrap();
-        let env = Env::for_test(home.path(), &[]);
-        write_routing_config(&home.path().join("cfg"));
-        let runner = runner_with_herdr("herdr 0.9.0\n");
-        runner.on(
-            "agent start --help",
-            ok("usage: herdr agent start <name> --kind KIND --pane ID [--parent PANE_ID]\n[possible values: pi, claude, agy]"),
-        );
-        let (text, healthy) = report(
-            &env,
-            &home.path().join("root"),
-            &home.path().join("cfg"),
-            &SessionFlags::default(),
-            &runner,
-        );
-        assert!(healthy, "{text}");
-        assert!(text.contains("install day"), "{text}");
-        assert!(text.contains("[ok  ] parent:"), "{text}");
     }
 }

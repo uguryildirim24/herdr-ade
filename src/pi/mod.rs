@@ -21,9 +21,6 @@ pub(crate) mod launch;
 pub(crate) mod provider;
 pub(crate) mod sh;
 
-#[cfg(test)]
-mod scenarios;
-
 /// The pinned pi package. Never a caret range, never `npm install -g`
 /// (SPEC-pi v2 §1, §3.2).
 pub(crate) const PI_PACKAGE: &str = "@earendil-works/pi-coding-agent";

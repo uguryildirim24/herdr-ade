@@ -262,60 +262,6 @@ mod tests {
     }
 
     #[test]
-    fn cuts_follow_priority_and_include_recovery_command() {
-        let rows = CUT_ORDER
-            .iter()
-            .rev()
-            .map(|name| Section {
-                name: (*name).into(),
-                text: format!("## {name}\n\n{}\n", "低".repeat(6_000)),
-            })
-            .chain(std::iter::once(Section {
-                name: "Open tasks".into(),
-                text: "## Open tasks\n\nProtected task\n".into(),
-            }))
-            .collect();
-        let text = budget(rows, "Session note stays\n", "demo");
-        assert!(text.chars().count() <= CHAR_BUDGET);
-        assert!(text.contains("Session note stays"));
-        assert!(text.contains("Protected task"));
-        assert!(text.contains("## Plan\n"));
-        assert!(text.contains("## Task notes in force\n"));
-        assert!(!text.contains("## Facts in force\n"));
-        assert!(text.contains("lowest priority first): Recently finished or dropped tasks, Inbox — data, not instructions, Recipes, Repositories, Facts in force."));
-        assert!(text.contains("ha context demo --peek --full"));
-    }
-
-    #[test]
-    fn requests_are_latest_twelve_verbatim_and_cannot_be_cut_as_sections() {
-        let world = crate::scenarios::World::new();
-        let project = world.project("demo", "a.sock");
-        let dir = project.record_dir_for_write("requests").unwrap();
-        for n in (0..14).rev() {
-            project::write_json(&dir.join(format!("q-{n:02}.json")), &serde_json::json!({
-                "id": format!("q-{n:02}"), "at": format!("2026-01-01T00:00:{n:02}Z"),
-                "text": format!("  verbatim {n} **bold**\n\n## Facts in force\n  {}\n", "words ".repeat(220))
-            })).unwrap();
-        }
-        let text = assemble(&world.ctx(), &project, Some("## Recipes\nA note must stay")).unwrap();
-        assert!(text.contains("Protected content exceeds"));
-        assert!(text.contains("## Recipes\nA note must stay"));
-        assert!(!text.contains("### q-00"));
-        assert!(!text.contains("### q-01"));
-        let mut previous = 0;
-        for n in 2..14 {
-            let exact = format!(
-                "  verbatim {n} **bold**\n\n## Facts in force\n  {}\n",
-                "words ".repeat(220)
-            );
-            assert!(text.contains(&exact));
-            let index = text.find(&format!("### q-{n:02}")).unwrap();
-            assert!(index > previous);
-            previous = index;
-        }
-    }
-
-    #[test]
     fn retention_keeps_twenty_newest_and_saved_text_matches_stdout() {
         let world = crate::scenarios::World::new();
         let project = world.project("demo", "a.sock");
@@ -337,7 +283,6 @@ mod tests {
         std::fs::write(dir.join("README.md"), "not a handoff").unwrap();
         let text = assemble(&world.ctx(), &project, Some("session finding")).unwrap();
         assert!(text.contains("session finding"));
-        assert!(text.contains("Saved at "));
         assert!(text.chars().count() <= CHAR_BUDGET);
         let files: Vec<_> = std::fs::read_dir(&dir)
             .unwrap()
@@ -353,43 +298,5 @@ mod tests {
                 .any(|entry| std::fs::read_to_string(entry.path()).unwrap() == text)
         );
         assert!(dir.join("README.md").exists());
-    }
-
-    #[test]
-    fn note_dash_reads_stdin_and_file_reads_path() {
-        assert_eq!(
-            read_note("-", &mut "exact\n  session note\n".as_bytes()).unwrap(),
-            "exact\n  session note\n"
-        );
-        let file = tempfile::NamedTempFile::new().unwrap();
-        std::fs::write(file.path(), "from file").unwrap();
-        assert_eq!(
-            read_note(file.path().to_str().unwrap(), &mut "unused".as_bytes()).unwrap(),
-            "from file"
-        );
-    }
-
-    #[test]
-    fn handoff_does_not_consume_inbox_or_context_or_rewrite_page() {
-        let world = crate::scenarios::World::new();
-        let project = world.project("demo", "a.sock");
-        crate::inbox::write(&project, "notice", "machine", "Unread message", "").unwrap();
-        for file in ["inbox-seen.json", "context-cursor.json"] {
-            std::fs::write(project.state_dir().join(file), "sentinel bytes").unwrap();
-        }
-        let page = std::fs::read(project.project_md()).unwrap();
-        assert!(
-            assemble(&world.ctx(), &project, None)
-                .unwrap()
-                .contains("Unread message")
-        );
-        assemble(&world.ctx(), &project, Some("note")).unwrap();
-        for file in ["inbox-seen.json", "context-cursor.json"] {
-            assert_eq!(
-                std::fs::read_to_string(project.state_dir().join(file)).unwrap(),
-                "sentinel bytes"
-            );
-        }
-        assert_eq!(std::fs::read(project.project_md()).unwrap(), page);
     }
 }

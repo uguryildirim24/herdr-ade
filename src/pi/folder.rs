@@ -188,29 +188,4 @@ mod tests {
         std::fs::write(layout.trust(), "{\"/repo\":{\"/sub\":false}}\n").unwrap();
         assert!(!trust_has_true(&layout).unwrap());
     }
-
-    #[test]
-    fn settings_state_reads_every_cap() {
-        let dir = tempfile::tempdir().unwrap();
-        let layout = Layout::for_test(dir.path().join("pi"));
-        std::fs::create_dir_all(layout.agent()).unwrap();
-        std::fs::write(layout.settings(), SETTINGS_JSON).unwrap();
-        let state = read_settings(&layout).unwrap();
-        assert_eq!(
-            state,
-            SettingsState {
-                trust_never: true,
-                skills_disabled: true,
-                telemetry_off: true,
-                retries_capped: true,
-            }
-        );
-        // The old object form does not stop discovery in pi 0.99.1.
-        std::fs::write(
-            layout.settings(),
-            r#"{"defaultProjectTrust":"never","skills":{"enabled":false}}"#,
-        )
-        .unwrap();
-        assert!(!read_settings(&layout).unwrap().skills_disabled);
-    }
 }

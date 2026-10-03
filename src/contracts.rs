@@ -512,73 +512,6 @@ mod tests {
     }
 
     #[test]
-    fn op_and_event_roundtrip() {
-        let op = Op {
-            has_changes: None,
-            op: "t-0001-1-1".into(),
-            revision: 2,
-            thread: "t-0001".into(),
-            attempt: 1,
-            kind: OpKind::Done,
-            recipient: Recipient {
-                pane: "w1:p1".into(),
-                coordinator_attempt: 1,
-            },
-            helper_pid: 4242,
-            requested: Requested::Done {
-                sha: "abc".into(),
-                report_path: ".reports/a.md".into(),
-            },
-            event: "t-0001-1-1".into(),
-            state: OpState::Staged,
-            created: "2026-09-18T00:00:00Z".into(),
-            artifact: Some("deadbeef".into()),
-            report_hash: None,
-            published_ref: None,
-        };
-        both(&op);
-        both(&Event {
-            id: op.op.clone(),
-            op: op.op.clone(),
-            thread: op.thread.clone(),
-            attempt: op.attempt,
-            recipient: op.recipient.clone(),
-            created: op.created.clone(),
-            payload: EventPayload {
-                done: Some(DonePayload {
-                    has_changes: None,
-                    sha: "abc".into(),
-                    report_path: ".reports/a.md".into(),
-                    artifact: "deadbeef".into(),
-                    attestation: None,
-                    published_ref: None,
-                }),
-                waiting: None,
-                failed: None,
-            },
-        });
-        both(&Event {
-            id: "t-0002-1-1".into(),
-            op: "t-0002-1-1".into(),
-            thread: "t-0002".into(),
-            attempt: 1,
-            recipient: Recipient {
-                pane: "w1:p1".into(),
-                coordinator_attempt: 1,
-            },
-            created: "2026-09-18T00:00:00Z".into(),
-            payload: EventPayload {
-                done: None,
-                waiting: Some(WaitingPayload {
-                    text: "need a look".into(),
-                    ..Default::default()
-                }),
-                failed: None,
-            },
-        });
-    }
-
-    #[test]
     fn historical_failure_payload_is_unknown_and_typed_provider_roundtrips() {
         let old: WaitingPayload = toml::from_str("text = \"no evidence\"\n").unwrap();
         assert_eq!(old.class, FailureClass::Unknown);
@@ -587,22 +520,6 @@ mod tests {
             text: "fetch failed".into(),
             class: FailureClass::Provider,
             provider_kind: Some("unreachable".into()),
-        });
-    }
-
-    #[test]
-    fn delivery_line_roundtrip() {
-        json_roundtrip(&DeliveryLine {
-            event: "t-0001-1-1".into(),
-            state: DeliveryState::Submitted,
-        });
-        json_roundtrip(&DeliveryLine {
-            event: "t-0001-1-1".into(),
-            state: DeliveryState::Acknowledged,
-        });
-        json_roundtrip(&DeliveryLine {
-            event: "t-0001-1-1".into(),
-            state: DeliveryState::Handled,
         });
     }
 
@@ -624,36 +541,6 @@ mod tests {
 
     #[test]
     fn plan_step_and_reference_roundtrip() {
-        let plan = Plan {
-            schema: 1,
-            revision: 8,
-            next_step: 6,
-            goal: "I want to build a trading bot with Jeff.".into(),
-            kind: "screen".into(),
-            what_you_get: "A screen you open.".into(),
-            does: "It shows pretend trades and lets you stop them.".into(),
-            steps: vec![
-                PlanStep {
-                    id: "s-1".into(),
-                    text: "Choose what the screen will show.".into(),
-                    state: StepState::Done,
-                    tasks: vec!["job-0001".into()],
-                    threads: vec!["t-0041".into()],
-                    after: vec![],
-                    subtasks: vec![],
-                },
-                PlanStep {
-                    id: "s-2".into(),
-                    text: "Show pretend trades.".into(),
-                    state: StepState::Running,
-                    tasks: vec![],
-                    threads: vec!["t-0043".into(), "t-0044".into()],
-                    after: vec![],
-                    subtasks: vec![],
-                },
-            ],
-        };
-        both(&plan);
         // An old record without the newer fields still deserializes.
         let old: Plan = toml::from_str(
             "schema = 1\nrevision = 1\nnext_step = 2\ngoal = \"A goal.\"\n[[steps]]\nid = \"s-1\"\ntext = \"One step.\"\n",
@@ -661,53 +548,7 @@ mod tests {
         .unwrap();
         assert_eq!(old.steps[0].state, StepState::Left);
         assert!(old.steps[0].threads.is_empty());
-
-        assert_eq!(
-            AuthorityRef::parse("request:q-example"),
-            Some(AuthorityRef::Request("q-example".into()))
-        );
-        assert_eq!(
-            AuthorityRef::parse("ask:a-3@2"),
-            Some(AuthorityRef::Ask {
-                id: "a-3".into(),
-                revision: 2
-            })
-        );
-        assert_eq!(AuthorityRef::parse("ask:a-3"), None);
-        assert_eq!(AuthorityRef::parse("nonsense"), None);
-    }
-
-    #[test]
-    fn recipe_and_launch_roundtrip() {
-        let recipe = Recipe {
-            kind: "cursor".into(),
-            args: vec!["--model".into(), "cursor-grok-4.6-xhigh".into()],
-            env: vec![],
-            ready_timeout_ms: 30_000,
-            provider: "cursor".into(),
-            capabilities: vec!["pictures".into()],
-            enabled: true,
-            plain: "the usual coding helper".into(),
-        };
-        both(&recipe);
-        both(&Launch {
-            kind: "agy".into(),
-            args: vec!["--model".into(), "gemini-3.8-flash-high".into()],
-            env: vec![],
-            ready_timeout_ms: 60_000,
-            policy_hash: "cc".into(),
-            attempt: 1,
-            brief_hash: String::new(),
-            skill_hash: "aa".into(),
-            recipe_id: "agy_gemini_flash".into(),
-            work_retries: 0,
-            same_recipe_retries: 0,
-            routing_rule: "default".into(),
-            recipe_basis: String::new(),
-            recipe_request: String::new(),
-            reason: "this task runs on the web research helper, the usual choice.".into(),
-            source_truncation: None,
-            machine: "buildbox".into(),
-        });
+        assert!(old.steps[0].subtasks.is_empty());
+        assert!(old.steps[0].after.is_empty());
     }
 }

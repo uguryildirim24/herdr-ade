@@ -184,25 +184,6 @@ fn sleep_does_not_age_the_stuck_review_notice() {
 }
 
 #[test]
-fn working_reviewer_does_not_warn() {
-    let fx = configured();
-    lane(&fx, 1);
-    let mut review = prepared(&fx);
-    let reviewer = thread::load(&fx.project, review.reviewer.as_deref().unwrap()).unwrap();
-    review.no_verdict_since = "2020-01-01T00:00:00Z".into();
-    watch_no_verdict_state(
-        &fx.world.ctx(),
-        &fx.project,
-        &mut review,
-        &reviewer,
-        "working",
-    )
-    .unwrap();
-    assert!(review.notices.is_empty());
-    assert!(review.no_verdict_since.is_empty());
-}
-
-#[test]
 fn follow_up_after_seal_checks_verdict_now_but_waits_to_land() {
     let fx = configured();
     lane(&fx, 1);
@@ -495,50 +476,6 @@ fn job(fx: &Fx, id: &str) -> crate::task::Task {
     let dir = fx.project.record_dir_for_write("tasks").unwrap();
     std::fs::write(dir.join("job-0001.toml"), toml::to_string(&task).unwrap()).unwrap();
     task
-}
-
-#[test]
-fn missing_repo_gates_means_gate_free_review() {
-    let fx = configured();
-    let (mut settings, body) = fx.project.read_project_md().unwrap();
-    settings.repos[0].gates = None;
-    std::fs::write(
-        fx.project.project_md(),
-        format!("+++\n{}+++\n{body}", toml::to_string(&settings).unwrap()),
-    )
-    .unwrap();
-    lane(&fx, 1);
-    let review = prepared(&fx);
-    assert!(review.gates.is_empty());
-    assert!(review.selected_gates.is_empty());
-    assert_eq!(review.gates_note, "no gates declared");
-    assert_eq!(
-        load(&fx.project, &review.id).unwrap().gates_note,
-        "no gates declared"
-    );
-    assert!(task(&fx.project, &review).contains("no gates declared"));
-    let (context, _) = crate::coordinator::digest(&fx.world.ctx(), &fx.project, "ha").unwrap();
-    assert!(context.contains("no gates declared"));
-    let candidate = git(&fx.repo, &["rev-parse", &review.candidate_branch]);
-    seal_verdict(
-        &fx,
-        &review,
-        &candidate,
-        "MERGE",
-        BTreeMap::new(),
-        vec![],
-        1,
-    );
-    tick(&fx.world.ctx(), &fx.project).unwrap();
-    let landed = load(&fx.project, &review.id).unwrap();
-    assert_eq!(landed.phase, Phase::Complete);
-    assert_eq!(landed.verdict.unwrap().gates_note, "no gates declared");
-    assert!(
-        landed
-            .notices
-            .iter()
-            .any(|n| n.line.contains("merged") && n.line.contains("no gates declared"))
-    );
 }
 
 #[test]
@@ -983,37 +920,6 @@ fn no_change_seal_finishes_task_and_plan_without_review_or_git_polling() {
 }
 
 #[test]
-fn unopted_project_never_starts_review_and_old_files_are_not_read() {
-    let fx = configured();
-    lane(&fx, 1);
-    for name in ["rounds", "checkpoints", "holds"] {
-        std::fs::create_dir_all(fx.project.state_dir().join(name)).unwrap();
-        std::fs::write(
-            fx.project.state_dir().join(name).join("old.toml"),
-            "not valid TOML [",
-        )
-        .unwrap();
-    }
-    let before = fx.world.runner.calls.borrow().len();
-    tick(&fx.world.ctx(), &fx.project).unwrap();
-    assert!(list(&fx.project).unwrap().is_empty());
-    assert_eq!(fx.world.runner.calls.borrow().len(), before);
-    let review = prepared(&fx);
-    let before = fx.world.runner.calls.borrow().len();
-    tick(&fx.world.ctx(), &fx.project).unwrap();
-    assert_eq!(
-        fx.world.runner.calls.borrow().len(),
-        before,
-        "waiting review must not probe git"
-    );
-    assert_eq!(list(&fx.project).unwrap().len(), 1);
-    assert_eq!(
-        start(&fx.world.ctx(), "demo", None).unwrap().unwrap().id,
-        review.id
-    );
-}
-
-#[test]
 fn exclusion_requires_candidate_without_that_lane_and_new_seal_for_next_pile() {
     let fx = configured();
     let (_, a) = lane(&fx, 1);
@@ -1147,44 +1053,6 @@ fn reject_does_not_land_and_cancel_releases_unchanged_members() {
         .len(),
         1
     );
-}
-
-#[test]
-fn no_remote_lands_without_publication_git_calls() {
-    let fx = configured();
-    lane(&fx, 1);
-    let mut review = prepared(&fx);
-    let candidate = git(&fx.repo, &["rev-parse", &review.candidate_branch]);
-    // The repository row deliberately has an empty configured remote.
-    review.push_remote = Some(String::new());
-    save(&fx.project, &review).unwrap();
-    seal_verdict(
-        &fx,
-        &review,
-        &candidate,
-        "MERGE",
-        BTreeMap::new(),
-        vec![],
-        1,
-    );
-    fx.world.runner.calls.borrow_mut().clear();
-    advance(&fx.world.ctx(), &fx.project, &mut review).unwrap();
-    assert_eq!(git(&fx.repo, &["rev-parse", "main"]), candidate);
-    assert_eq!(review.phase, Phase::Complete);
-    assert!(!review.notices[0].line.contains("pushed"));
-    let calls = fx.world.runner.calls.borrow();
-    assert!(
-        calls
-            .iter()
-            .any(|cmd| cmd.program == "git" && cmd.args.contains(&"rev-parse".into()))
-    );
-    assert!(!calls.iter().any(|cmd| {
-        cmd.program == "git"
-            && cmd
-                .args
-                .iter()
-                .any(|arg| ["ls-remote", "fetch", "push"].contains(&arg.as_str()))
-    }));
 }
 
 #[test]

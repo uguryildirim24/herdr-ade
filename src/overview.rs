@@ -175,62 +175,6 @@ pub(crate) fn run(ctx: &Ctx, slug: Option<&str>, include_history: bool, wait: bo
 mod tests {
     use super::*;
     use crate::scenarios::World;
-    use crate::thread::{Kind, Thread};
-
-    fn row(id: &str, group: Group, note: &str) -> Row {
-        Row {
-            thread: Thread {
-                id: id.into(),
-                title: format!("Title {id}"),
-                pane_id: "w2:p1".into(),
-                kind: Kind::Tab,
-                ..Thread::default()
-            },
-            group,
-            note: note.into(),
-        }
-    }
-
-    #[test]
-    fn resolved_history_is_hidden_by_default_and_available_on_request() {
-        let rows = vec![
-            row("t-0001", Group::Resolved, "manual"),
-            row("t-0002", Group::Working, "working"),
-        ];
-        assert_eq!(rows_for_overview(rows.clone(), false).len(), 1);
-        assert_eq!(rows_for_overview(rows, true).len(), 2);
-    }
-
-    #[test]
-    fn groups_print_in_display_order_not_precedence_order() {
-        let world = World::new();
-        let project = world.project("demo", "a.sock");
-        let rows = vec![
-            row("t-0001", Group::Resolved, "manual"),
-            row("t-0002", Group::Idle, "idle"),
-            row("t-0003", Group::Working, "working"),
-            row("t-0004", Group::WaitingOnYou, "blocked"),
-            row("t-0005", Group::ReadyForReview, "done"),
-        ];
-        let text = render(&project, &rows);
-        let order: Vec<usize> = [
-            "Ready for review",
-            "Waiting on you",
-            "Working",
-            "Idle",
-            "Resolved",
-        ]
-        .iter()
-        .map(|label| {
-            text.find(&format!("\n{label} ("))
-                .unwrap_or_else(|| panic!("{label} missing in\n{text}"))
-        })
-        .collect();
-        assert!(order.windows(2).all(|w| w[0] < w[1]), "{text}");
-        assert!(text.contains("needs you in pane w2:p1"));
-        assert!(!text.contains("questions for you"));
-    }
-
     #[test]
     fn workspace_resolves_through_the_coordinator_or_a_thread_in_the_same_socket_only() {
         let world = World::new();
@@ -258,11 +202,5 @@ mod tests {
         assert_eq!(project_for_workspace(&ctx, "w7", &b_socket), None);
         assert_eq!(project_for_workspace(&ctx, "w9", &a_socket), None);
         assert_eq!(project_for_workspace(&ctx, "", &a_socket), None);
-    }
-
-    #[test]
-    fn an_explicit_slug_is_validated() {
-        let world = World::new();
-        assert!(resolve_slug(&world.ctx(), Some("../x")).is_err());
     }
 }

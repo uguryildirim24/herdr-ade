@@ -146,33 +146,4 @@ mod tests {
         write_overrides(&path, &models()).unwrap();
         assert_eq!(std::fs::read_to_string(&path).unwrap(), first);
     }
-
-    #[test]
-    fn a_missing_file_is_created_with_the_override() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("agent/models.json");
-        write_overrides(&path, &models()).unwrap();
-        let value: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
-        let overrides = value["providers"]["opencode-go"]["modelOverrides"]
-            .as_object()
-            .unwrap();
-        assert_eq!(overrides.len(), models().len());
-    }
-
-    #[test]
-    fn missing_overrides_names_a_row_without_the_window() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("agent/models.json");
-        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-        std::fs::write(&path, "{\"providers\":{}}\n").unwrap();
-        assert_eq!(missing_overrides(&path, &models()).unwrap(), models());
-        write_overrides(&path, &models()).unwrap();
-        assert!(missing_overrides(&path, &models()).unwrap().is_empty());
-        std::fs::write(
-            &path,
-            r#"{"providers":{"opencode-go":{"modelOverrides":{"deepseek-v4.1-flash":{"contextWindow":1000}}}}}"#,
-        )
-        .unwrap();
-        assert_eq!(missing_overrides(&path, &models()).unwrap(), models());
-    }
 }

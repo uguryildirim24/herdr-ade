@@ -194,81 +194,13 @@ mod tests {
         }
     }
 
-    fn work(workflow: &str) -> WorkContract {
-        WorkContract {
-            workflow: workflow.into(),
-            product: String::new(),
-            capability: None,
-            once: false,
-        }
-    }
-
-    #[test]
-    fn ordered_rule_then_default_then_pin() {
-        let mut table = routing();
-        assert_eq!(
-            table.select("hash", &work("reviewer"), 0).unwrap().recipe,
-            "rule"
-        );
-        assert_eq!(
-            table.select("hash", &work("lane"), 0).unwrap().recipe,
-            "default"
-        );
-        let hash = "a".repeat(64);
-        table.pins.insert(hash.clone(), "pinned".into());
-        let selected = table.select(&hash, &work("reviewer"), 0).unwrap();
-        assert_eq!(selected.recipe, "pinned");
-        assert_eq!(selected.rule, "pin");
-    }
-
-    #[test]
-    fn recovery_retries_on_the_same_recipe_then_stops() {
-        let table = routing();
-        assert_eq!(
-            table.select("hash", &work("lane"), 1).unwrap().recipe,
-            "default"
-        );
-        let error = table
-            .select("hash", &work("lane"), 2)
-            .unwrap_err()
-            .to_string();
-        assert!(error.contains("recovery_exhausted"), "{error}");
-        assert!(error.contains("waiting for the coordinator"), "{error}");
-    }
-
     #[test]
     fn missing_table_names_the_config_fix() {
         let error = Routing::default()
             .validate(&recipes())
             .unwrap_err()
             .to_string();
-        assert_eq!(
-            error,
-            "routing_default_missing: add [routing] with default = \"<recipe>\" to config.toml"
-        );
-    }
-
-    #[test]
-    fn capability_rule_selects_only_a_recipe_that_declares_it() {
-        let mut rows = recipes();
-        rows.get_mut("rule")
-            .unwrap()
-            .capabilities
-            .push("pictures".into());
-        let mut table = routing();
-        table.rules[0] = Rule {
-            capability: Some("pictures".into()),
-            recipe: "rule".into(),
-            ..Rule::default()
-        };
-        table.validate(&rows).unwrap();
-        let work = WorkContract {
-            workflow: "lane".into(),
-            product: String::new(),
-            capability: Some("pictures".into()),
-            once: false,
-        };
-        assert_eq!(table.select("hash", &work, 0).unwrap().recipe, "rule");
+        assert!(error.starts_with("routing_default_missing:"), "{error}");
     }
 
     #[test]

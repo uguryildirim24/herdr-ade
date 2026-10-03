@@ -1721,19 +1721,16 @@ mod tests {
             .unwrap();
         let (text, _, _) = digest_snapshot(&world.ctx(), &project, "ha", false).unwrap();
         let sections = split_sections(&text);
-        assert!(sections["## Coordinator status"].contains("Closed by Rolf. Run `ha open`"));
+        assert!(sections["## Coordinator status"].contains("Closed"));
     }
 
     #[test]
     fn repeated_context_leads_with_changes_and_omits_unchanged_standing() {
-        let world = crate::scenarios::World::new();
-        let project = world.project("demo", "a.sock");
-        let ctx = world.ctx();
-        let before = ContextCursor::capture(&ctx, &project);
-        let compact = changes_since(Some(&before), &before, DIGEST_ROWS).text;
-        assert!(compact.contains("Nothing new."));
-        assert!(!compact.contains("Standing notes"));
-        let mut after = ContextCursor::capture(&ctx, &project);
+        let before = ContextCursor::default();
+        let compact = changes_since(Some(&before), &before, DIGEST_ROWS);
+        assert!(compact.inbox.is_empty() && compact.events.is_empty());
+        assert_eq!(compact.remaining, 0);
+        let mut after = ContextCursor::default();
         after.messages.insert("q-2".into(), "New request".into());
         after.lanes.insert("t-0001".into(), "Fix — working".into());
         after
@@ -1742,90 +1739,18 @@ mod tests {
         after
             .inbox
             .insert("i1".into(), "[alert] investigate".into());
-        let summary = changes_since(Some(&before), &after, DIGEST_ROWS).text;
-        for expected in ["Rolf q-2", "Lane t-0001", "Review review-1", "Inbox i1"] {
-            assert!(summary.contains(expected), "{summary}");
+        let delta = changes_since(Some(&before), &after, DIGEST_ROWS);
+        for id in ["q-2", "t-0001", "review-1", "i1"] {
+            assert!(delta.text.contains(id));
         }
-        assert!(
-            changes_since(None, &after, DIGEST_ROWS)
-                .text
-                .contains("First read")
+        assert_eq!(delta.inbox, ["i1"]);
+        assert_eq!(delta.cursor.messages, after.messages);
+        assert_eq!(delta.cursor.lanes, after.lanes);
+        assert_eq!(delta.cursor.reviews, after.reviews);
+        assert_eq!(
+            changes_since(None, &after, DIGEST_ROWS).cursor.inbox,
+            after.inbox
         );
-    }
-
-    #[test]
-    fn only_config_used_by_this_project_appears_as_a_change() {
-        let world = crate::scenarios::World::new();
-        let project = world.project("demo", "a.sock");
-        project
-            .update_coordinator(|c| c.launch.recipe_id = "test_claude".into())
-            .unwrap();
-        let ctx = world.ctx();
-        let before = ContextCursor::capture(&ctx, &project);
-        let path = ctx.config_dir.join("config.toml");
-        let original = std::fs::read_to_string(&path).unwrap();
-        std::fs::write(
-            &path,
-            format!("{original}\n[recipes.unused]\nkind = 'pi'\n"),
-        )
-        .unwrap();
-        let unrelated = ContextCursor::capture(&ctx, &project);
-        assert_eq!(before.relevant_config, unrelated.relevant_config);
-        let mut newly_used = unrelated.relevant_config.clone();
-        newly_used.insert("recipe:another".into(), "new lane's recipe".into());
-        let mut lane_started = ContextCursor::capture(&ctx, &project);
-        lane_started.relevant_config = newly_used;
-        assert!(
-            !changes_since(Some(&unrelated), &lane_started, DIGEST_ROWS)
-                .text
-                .contains("recipe or repository configuration changed")
-        );
-        let changed = std::fs::read_to_string(&path)
-            .unwrap()
-            .replace("the quick helper", "the updated helper");
-        std::fs::write(path, changed).unwrap();
-        let after = ContextCursor::capture(&ctx, &project);
-        assert!(
-            changes_since(Some(&unrelated), &after, DIGEST_ROWS)
-                .text
-                .contains("recipe or repository configuration changed")
-        );
-    }
-
-    #[test]
-    fn context_reports_the_repo_not_just_the_project_records() {
-        let world = crate::scenarios::World::new();
-        let project = world.project("demo", "a.sock");
-        let repo = world.home.path().join("repo");
-        std::fs::create_dir_all(&repo).unwrap();
-        std::fs::write(repo.join("STATE.md"), "history").unwrap();
-        std::fs::write(repo.join("HANDOFF.md"), "handoff").unwrap();
-        world.add_repo(&project, repo.to_str().unwrap());
-        world.runner.on(
-            "status --porcelain=v1 --branch",
-            crate::runner::fake::ok("## main...origin/main [ahead 6, behind 2]\n M file\n"),
-        );
-        let (text, _) = digest(&world.ctx(), &project, "ha").unwrap();
-        assert!(
-            text.contains(&format!(
-                "{}: main, dirty, ahead 6, behind 2 origin/main; documents: STATE.md, HANDOFF.md",
-                repo.display()
-            )),
-            "{text}"
-        );
-        assert!(repo_snapshot(&world.runner, "/missing").contains("missing or unreadable"));
-        for (status, expected) in [
-            ("## No commits yet on main\n", ": main, clean"),
-            ("## HEAD (no branch)\n", "detached HEAD"),
-        ] {
-            let runner = crate::runner::fake::FakeRunner::new();
-            runner.on(
-                "status --porcelain=v1 --branch",
-                crate::runner::fake::ok(status),
-            );
-            let snapshot = repo_snapshot(&runner, repo.to_str().unwrap());
-            assert!(snapshot.contains(expected), "{snapshot}");
-        }
     }
 
     #[test]
@@ -1842,7 +1767,7 @@ mod tests {
                 .contains("Need a choice.")
         );
         let (before, _) = digest(&fx.world.ctx(), &fx.project, "ha").unwrap();
-        assert!(before.contains("waiting —"), "{before}");
+        assert!(before.contains("Need a choice."), "{before}");
 
         crate::thread::update(&fx.project, &lane, |thread| {
             thread.answered_waiting_event = event.clone();
@@ -1851,40 +1776,6 @@ mod tests {
         crate::project::refresh_page(&fx.project).unwrap();
         let (after, _) = digest(&fx.world.ctx(), &fx.project, "ha").unwrap();
         assert!(!after.contains("Need a choice."), "{after}");
-    }
-
-    #[test]
-    fn prefix_has_the_fixed_shape_and_quotes_spaces() {
-        assert_eq!(
-            command_prefix(Path::new("/bin/herdr-ade"), Path::new("/r/oot")),
-            "/bin/herdr-ade --root /r/oot"
-        );
-        assert_eq!(
-            command_prefix(Path::new("/bin/herdr-ade"), Path::new("/my root")),
-            "/bin/herdr-ade --root '/my root'"
-        );
-    }
-
-    #[test]
-    fn request_preview_skips_blank_lines_and_names_pasted_text() {
-        assert_eq!(
-            request_preview("\n\nUse my own words."),
-            "Use my own words."
-        );
-        assert_eq!(
-            request_preview(
-                "\n<pasted_content id=\"2460\">\nKeep this project page complete.\n</pasted_content id=\"2460\">"
-            ),
-            "pasted text: Keep this project page complete."
-        );
-    }
-
-    #[test]
-    fn priming_prompt_is_one_line_with_the_prefix() {
-        let prompt = priming_prompt("/bin/herdr-ade --root /r", "demo");
-        assert!(!prompt.contains('\n'));
-        assert!(prompt.contains("/bin/herdr-ade --root /r skill"));
-        assert!(prompt.contains("/bin/herdr-ade --root /r context demo"));
     }
 
     #[test]

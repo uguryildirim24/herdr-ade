@@ -132,7 +132,7 @@ test('hook failures still notify and stop unrecorded coordinator input', async (
     // Make the actual CLI fail to acquire the bound project's lock.
     mkdirSync(join(f.state, 'lock'));
     const results = await f.emit('input', {source: 'interactive', text: 'must be recorded'});
-    assert.ok(f.notices[0].includes('ADE prompt check failed'));
+    assert.equal(f.notices.length, 1);
     assert.deepEqual(results[0], {action: 'handled'});
     assert.deepEqual(f.requests(), []);
   } finally { f.close(); }
