@@ -760,6 +760,10 @@ fn start_locked(ctx: &Ctx, project: &Project, row: project::Repo) -> Result<Opti
     // Different repositories can start concurrently in the same project.
     // Allocate the id and write its intent under the project lock.
     let allocation = project.lock()?;
+    crate::threads::retain_current_pile_members(project, &mut members)?;
+    if members.is_empty() {
+        return Ok(None);
+    }
     let next = list(project)?
         .iter()
         .filter_map(|r| r.id.strip_prefix("review-")?.parse::<u64>().ok())
@@ -2119,12 +2123,6 @@ pub(crate) fn require_follow_up(project: &Project, id: &str) -> Result<()> {
                 ),
             ));
         }
-    }
-    let lane = thread::load(project, id)?;
-    if let Some(event) =
-        crate::events::latest_done_event(&crate::events::checked(project)?, id, lane.attempt.max(1))
-    {
-        thread::update(project, id, |t| t.review_after = event.id.clone())?;
     }
     Ok(())
 }
