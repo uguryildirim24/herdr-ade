@@ -319,8 +319,11 @@ pub(crate) fn resolved_thread(ctx: &Ctx, project: &Project, record: &Thread) -> 
             .filter(|done| done.published_ref.is_some());
     let has_seal_refs = last_box_seal.is_some();
     let retained_tip = record
-        .cleanup_reason
-        .strip_prefix("retained worktree removal: ");
+        .retirement
+        .as_ref()
+        .filter(|request| request.authority == crate::thread::RetirementAuthority::Retained)
+        .map(|request| request.retained_tip.as_str())
+        .filter(|tip| !tip.is_empty());
     let expected = if has_seal_refs && record.is_remote() && !record.base.is_empty() {
         Some(record.base.as_str())
     } else {
@@ -535,7 +538,11 @@ mod tests {
             tip
         );
         run(&fx.repo, &["worktree", "remove", &record.worktree_path]);
-        record.cleanup_reason = format!("retained worktree removal: {tip}");
+        record.retirement = Some(crate::thread::RetirementRequest {
+            authority: crate::thread::RetirementAuthority::Retained,
+            retained_tip: tip,
+            ..Default::default()
+        });
         resolved_thread(&fx.world.ctx(), &fx.project, &record).unwrap();
         assert!(
             !refs(&crate::runner::RealRunner, &record.repo, None)
@@ -712,8 +719,38 @@ mod tests {
                     &["push", "-q", bare.path().to_str().unwrap(), &record.branch],
                 );
             }
-            crate::threads::remove_kept_worktree(&fx.world.ctx(), "demo", &record.id).unwrap();
+            // Ref retirement is not the last owed effect. A failed scratch
+            // teardown must keep the typed pin and obligation for the ticker.
+            struct ScratchFailure<'a>(&'a dyn crate::runner::Runner, std::cell::Cell<bool>);
+            impl crate::runner::Runner for ScratchFailure<'_> {
+                fn run(&self, cmd: &Cmd) -> Result<crate::runner::Output> {
+                    if self.1.get()
+                        && cmd.program == "ssh"
+                        && cmd
+                            .args
+                            .last()
+                            .is_some_and(|script| script.contains("state=$(herdr session list"))
+                    {
+                        return Ok(crate::runner::fake::fail(1, "busy"));
+                    }
+                    self.0.run(cmd)
+                }
+            }
+            let runner = ScratchFailure(&fx.world.runner, std::cell::Cell::new(true));
+            let mut ctx = fx.world.ctx();
+            ctx.runner = &runner;
+            let error = crate::threads::remove_kept_worktree(&ctx, "demo", &record.id).unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains("could not delete scratch session")
+            );
             assert!(!Path::new(&record.worktree_path).exists());
+            let pending = thread::load(&fx.project, &record.id).unwrap();
+            assert!(pending.cleanup_pending);
+            assert_eq!(pending.retirement.unwrap().retained_tip, sha);
+            runner.1.set(false);
+            crate::threads::retry_pending_cleanup(&ctx, &fx.project).unwrap();
             let saved = thread::load(&fx.project, &record.id).unwrap();
             assert!(saved.worktree_path.is_empty());
             assert!(!saved.cleanup_pending);

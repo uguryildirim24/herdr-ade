@@ -68,6 +68,26 @@ pub(crate) enum Kind {
     Adopted,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Default)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum RetirementAuthority {
+    #[default]
+    Resolve,
+    Cancel,
+    Retained,
+}
+
+/// Durable choices for the one resumable retirement sequence.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+#[serde(default)]
+pub(crate) struct RetirementRequest {
+    pub authority: RetirementAuthority,
+    pub retained_tip: String,
+    pub skip_copy: bool,
+    pub discard_uncopied: bool,
+    pub keep_pane: bool,
+}
+
 /// `threads/<id>.toml`. An empty string means "not set". Paths are stored as
 /// they are on the thread's own machine.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
@@ -186,9 +206,11 @@ pub(crate) struct Thread {
     /// `thread resolve` performs. The ticker retries it instead of making a
     /// landed review wait on an external session.
     pub(crate) cleanup_pending: bool,
-    /// The resolved reason to record after automatic cleanup succeeds.
+    /// Why retirement is pending; authority and pins never live in this prose.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub(crate) cleanup_reason: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) retirement: Option<RetirementRequest>,
     /// ADE role name (SPEC-ADE D2). Empty on a pre-ADE thread.
     pub(crate) role: String,
     /// Pile review this reviewer belongs to.
@@ -229,6 +251,15 @@ pub(crate) struct Thread {
 }
 
 impl Thread {
+    /// Explicit commands can change their choices, but never drop a durable
+    /// retained-removal pin. Automatic retries resume the request unchanged.
+    pub(crate) fn retirement_request(&self, request: RetirementRequest) -> RetirementRequest {
+        self.retirement
+            .clone()
+            .filter(|r| r.authority == RetirementAuthority::Retained)
+            .unwrap_or(request)
+    }
+
     pub(crate) fn is_remote(&self) -> bool {
         !self.machine.is_empty()
     }
@@ -347,7 +378,23 @@ pub(crate) fn load(project: &Project, id: &str) -> Result<Thread> {
     THREAD_READS.with(|count| count.set(count.get() + 1));
     let text = std::fs::read_to_string(&path)
         .with_context(|| format!("no thread `{id}` in `{}`", project.slug))?;
-    toml::from_str(&text).with_context(|| format!("{} does not parse", path.display()))
+    let mut record: Thread =
+        toml::from_str(&text).with_context(|| format!("{} does not parse", path.display()))?;
+    // Historical pins lived in prose. Decode once at the record boundary;
+    // execution and ref verification only consume the typed request.
+    if record.retirement.is_none()
+        && let Some(tip) = record
+            .cleanup_reason
+            .strip_prefix("retained worktree removal: ")
+    {
+        record.retirement = Some(RetirementRequest {
+            authority: RetirementAuthority::Retained,
+            retained_tip: tip.into(),
+            ..Default::default()
+        });
+        record.cleanup_reason.clear();
+    }
+    Ok(record)
 }
 
 pub(crate) fn list_with_errors(project: &Project) -> (Vec<Thread>, Vec<anyhow::Error>) {
@@ -1744,6 +1791,7 @@ mod tests {
         let path = record_path(&project, &lane.id);
         let saved = std::fs::read_to_string(&path).unwrap();
         assert!(!saved.contains("attachments"));
+        assert!(!saved.contains("retirement"));
         let legacy = format!(
             "pr = \"https://github.com/acme/demo/pull/1\"\npr_state = \"OPEN\"\npr_review = \"APPROVED\"\npr_note = \"\"\npr_summary = {{ state = \"OPEN\", comments = [] }}\n{saved}"
         );
@@ -1752,17 +1800,29 @@ mod tests {
         assert_eq!(loaded.title, "Old lane");
         assert_eq!(loaded.kind, Kind::Tab);
         assert!(loaded.attachments.is_empty());
+        assert!(loaded.retirement.is_none());
         assert_eq!(list_with_errors(&project).0.len(), 1);
         update(&project, &lane.id, |lane| {
             lane.title = "Updated lane".into()
         })
         .unwrap();
         assert_eq!(load(&project, &lane.id).unwrap().title, "Updated lane");
-        assert!(
-            !std::fs::read_to_string(path)
-                .unwrap()
-                .contains("pr_summary")
-        );
+        let saved = std::fs::read_to_string(&path).unwrap();
+        assert!(!saved.contains("pr_summary"));
+        std::fs::write(
+            &path,
+            format!("cleanup_reason = \"retained worktree removal: old-tip\"\n{saved}"),
+        )
+        .unwrap();
+        let historical = load(&project, &lane.id).unwrap();
+        let request = historical.retirement.unwrap();
+        assert_eq!(request.authority, RetirementAuthority::Retained);
+        assert_eq!(request.retained_tip, "old-tip");
+        update(&project, &lane.id, |lane| {
+            lane.cleanup_reason = "scratch busy".into()
+        })
+        .unwrap();
+        assert_eq!(load(&project, &lane.id).unwrap().retirement, Some(request));
     }
 
     #[test]

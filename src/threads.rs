@@ -12,7 +12,10 @@ use crate::herdr::{Agent, Herdr, Pane};
 use crate::paths::Ctx;
 use crate::project::{self, Project};
 use crate::runner::{Cmd, Runner};
-use crate::thread::{self, CopyOutcome, FollowUp, FollowUpState, Group, Kind, Status, Thread};
+use crate::thread::{
+    self, CopyOutcome, FollowUp, FollowUpState, Group, Kind, RetirementAuthority,
+    RetirementRequest, Status, Thread,
+};
 use crate::{coordinator, remote, ticker};
 
 const GIT_TIMEOUT: Duration = Duration::from_secs(5);
@@ -1673,6 +1676,7 @@ fn retry_inner(
         t.last_failure = reason.to_string();
         t.cleanup_pending = false;
         t.cleanup_reason.clear();
+        t.retirement = None;
         t.recovery_pending = true;
         Ok(())
     })?;
@@ -1772,6 +1776,7 @@ pub fn rebind(ctx: &Ctx, slug: &str, id: &str, pane_id: &str) -> Result<RebindOu
         t.error.clear();
         t.cleanup_pending = false;
         t.cleanup_reason.clear();
+        t.retirement = None;
         thread::bind_identity(t, &socket, agent, process.clone());
         Ok(())
     })?;
@@ -1809,131 +1814,33 @@ pub fn cancel(ctx: &Ctx, slug: &str, id: &str, reason: &str) -> Result<CancelOut
         ));
     }
     crate::review::require_resolvable(&project, id)?;
-    let before = thread::load(&project, id)?;
-    let recorded_reason = if before.cancellation_reason.is_empty() {
-        reason.to_string()
-    } else {
-        before.cancellation_reason.clone()
-    };
-    let record = thread::update(&project, id, |t| {
-        t.status = Status::Resolved;
-        t.resolved_reason = "cancelled".into();
-        t.cancellation_reason = recorded_reason.clone();
-        t.prompt_pending = false;
-        t.cleanup_pending = true;
-        if !t.cleanup_reason.starts_with("retained worktree removal: ") {
-            t.cleanup_reason = "cancelled".into();
-        }
-    })?;
-    if let Some(view) = session_view(ctx, &project) {
-        clear_thread_tokens(&view.herdr, &record);
+    let mut record = thread::load(&project, id)?;
+    if record.cancellation_reason.is_empty() {
+        record.cancellation_reason = reason.into();
     }
-
-    let (pane, close_error) = if record.tab_id.is_empty() {
-        ("already_gone".to_string(), None)
-    } else {
-        match close_pane(ctx, &project, &record) {
-            Ok(true) => ("closed".to_string(), None),
-            Ok(false) => ("already_gone".to_string(), None),
-            Err(error) => ("cleanup_pending".to_string(), Some(format!("{error:#}"))),
-        }
-    };
-    let mut worktree = "not_applicable".to_string();
-    let mut worktree_reason = close_error;
-    if removable_folder(&project, &record) {
-        if !worktree_exists(ctx, &project, &record)? {
-            thread::update(&project, id, |t| t.worktree_path.clear())?;
-            worktree = "removed".into();
-        } else if pane == "cleanup_pending" {
-            worktree = "kept".into();
-        } else if let Err(error) = preserve_report_links(ctx, &project, &record) {
-            let detail = format!("linked_files_not_kept: {error:#}");
-            worktree = "kept".into();
-            worktree_reason = Some(detail);
-        } else {
-            let inspection = inspect_worktree_for_removal(ctx, &project, &record)?;
-            let kept_reason = if !inspection.dirty.is_empty() {
-                Some(format!(
-                    "worktree_dirty: uncommitted changes in {}; not removing ({})",
-                    record.worktree_path,
-                    inspection.dirty.join(", ")
-                ))
-            } else {
-                inspection.ignored_reason(&record.worktree_path)
-            };
-            if let Some(reason) = kept_reason {
-                worktree = "kept".into();
-                worktree_reason = Some(reason);
-            } else {
-                match remove_worktree(ctx, &project, &record) {
-                    Ok(()) => {
-                        thread::update(&project, id, |t| t.worktree_path.clear())?;
-                        worktree = "removed".into();
-                    }
-                    Err(error) => {
-                        worktree = "kept".into();
-                        worktree_reason = Some(format!("{error:#}"));
-                    }
-                }
-            }
-        }
-    }
-    let mut cleanup_failed = false;
-    if pane != "cleanup_pending" {
-        // The review may already be cancelling when a superseded reviewer reaches
-        // here. Keep cleanup retryable instead of failing its worker's prompt.
-        let cleanup = (|| -> Result<()> {
-            // A cleared worktree path still owes owned-ref retirement on retry.
-            if worktree == "removed" || !removable_folder(&project, &record) {
-                crate::branches::resolved_thread(ctx, &project, &record)?;
-            }
-            remove_finished_build_folder(ctx, &project, &record)?;
-            remove_scratch_session(ctx, &record)?;
-            Ok(())
-        })();
-        match cleanup {
-            Ok(())
-                if !worktree_reason
-                    .as_ref()
-                    .is_some_and(|reason| reason.starts_with("linked_files_not_kept:")) =>
-            {
-                thread::update(&project, id, |t| {
-                    t.cleanup_pending = false;
-                    t.cleanup_reason.clear();
-                })?;
-            }
-            Ok(()) => {}
-            Err(error) => {
-                cleanup_failed = true;
-                worktree_reason = Some(format!("cleanup pending: {error:#}"));
-            }
-        }
-    }
-    if let Some(detail) = &worktree_reason {
-        thread::update(&project, id, |t| {
-            if t.cleanup_pending && !t.cleanup_reason.starts_with("retained worktree removal: ") {
-                t.cleanup_reason = detail.clone();
-            }
-        })?;
-    }
+    let recorded_reason = record.cancellation_reason.clone();
+    let request = record.retirement_request(RetirementRequest {
+        authority: RetirementAuthority::Cancel,
+        ..Default::default()
+    });
+    let outcome = retire(
+        ctx,
+        &project,
+        &record,
+        request,
+        "cancelled",
+        true,
+        &mut CleanupViews::default(),
+    )
+    .unwrap_or_else(|error| retirement_failure(&project, &record, error));
     refresh_plan(ctx, &project);
     Ok(CancelOutcome {
-        thread: id.to_string(),
-        state: if pane == "cleanup_pending"
-            || cleanup_failed
-            || worktree_reason
-                .as_ref()
-                .is_some_and(|reason| reason.starts_with("linked_files_not_kept:"))
-        {
-            "cleanup_pending"
-        } else {
-            "cancelled"
-        }
-        .into(),
+        thread: outcome.thread,
+        state: outcome.state,
         reason: recorded_reason,
-        pane,
-        worktree,
-        worktree_reason,
+        pane: outcome.pane,
+        worktree: outcome.worktree,
+        worktree_reason: outcome.worktree_reason,
     })
 }
 
@@ -1956,79 +1863,22 @@ pub(crate) fn resolve_automatically_with_views(
     reason: &str,
     views: &mut CleanupViews,
 ) -> ResolveOutcome {
-    // Record the terminal lifecycle before touching Herdr or a worktree. A
-    // process death at any later instruction leaves a ticker-visible retry.
-    let before = thread::load(project, id).unwrap_or_default();
-    if let Err(error) = thread::update(project, id, |t| {
-        t.status = Status::Resolved;
-        t.resolved_reason = "cleanup pending".into();
-        t.prompt_pending = false;
-        t.cleanup_pending = true;
-        if !t.cleanup_reason.starts_with("retained worktree removal: ") {
-            t.cleanup_reason = reason.to_string();
-        }
-    }) {
-        let detail = format!("could not record pending cleanup: {error:#}");
-        refresh_plan(ctx, project);
-        return ResolveOutcome {
-            thread: id.to_string(),
-            state: "cleanup_pending".into(),
-            final_copy: "pending".into(),
-            copy_notes: vec![detail.clone()],
-            pane: "cleanup_pending".into(),
-            worktree: if before.worktree_path.is_empty() {
-                "not_recorded"
-            } else {
-                "kept"
-            }
-            .into(),
-            worktree_path: before.worktree_path,
-            worktree_reason: Some(detail),
-            branch: before.branch,
-        };
-    }
-    let attempted = resolve_with_views(ctx, &project.slug, id, &ResolveArgs::default(), views);
-    match attempted {
-        Ok(mut outcome) => {
-            let pending = thread::load(project, id).is_ok_and(|t| t.cleanup_pending);
-            if !pending {
-                let _ = thread::update(project, id, |t| {
-                    t.resolved_reason = reason.to_string();
-                    t.cleanup_reason.clear();
-                });
-            } else {
-                outcome.state = "cleanup_pending".into();
-            }
-            outcome
-        }
-        Err(error) => {
-            let detail = format!("{error:#}");
-            let _ = thread::update(project, id, |t| {
-                if t.cleanup_pending && !t.cleanup_reason.starts_with("retained worktree removal: ")
-                {
-                    t.cleanup_reason = detail.clone();
-                }
-            });
-            let before = thread::load(project, id).unwrap_or_default();
-            refresh_plan(ctx, project);
-            ResolveOutcome {
-                thread: id.to_string(),
-                state: "cleanup_pending".into(),
-                final_copy: "pending".into(),
-                copy_notes: vec![detail.clone()],
-                pane: "cleanup_pending".into(),
-                worktree: if before.worktree_path.is_empty() {
-                    "not_recorded"
-                } else {
-                    "kept"
-                }
-                .into(),
-                worktree_path: before.worktree_path,
-                worktree_reason: Some(detail),
-                branch: before.branch,
-            }
-        }
-    }
+    let record = thread::load(project, id).unwrap_or_else(|_| Thread {
+        id: id.into(),
+        ..Default::default()
+    });
+    let request = record.retirement.clone().unwrap_or(RetirementRequest {
+        authority: if record.cancellation_reason.is_empty() {
+            RetirementAuthority::Resolve
+        } else {
+            RetirementAuthority::Cancel
+        },
+        ..Default::default()
+    });
+    let outcome = retire(ctx, project, &record, request, reason, true, views)
+        .unwrap_or_else(|error| retirement_failure(project, &record, error));
+    refresh_plan(ctx, project);
+    outcome
 }
 
 /// Retry a bounded slice of durable cleanup, including after a landed pile.
@@ -2037,7 +1887,6 @@ pub(crate) fn retry_pending_cleanup(ctx: &Ctx, project: &Project) -> Result<()> 
     let mut pending = thread::list_live(project)
         .into_iter()
         .filter(|record| record.cleanup_pending)
-        .filter(|record| !record.cleanup_reason.starts_with("linked_files_not_kept:"))
         .collect::<Vec<_>>();
     // Every attempt updates the thread. Oldest first prevents an unreachable
     // member at the front of the pile from starving the rest of the queue.
@@ -2045,19 +1894,12 @@ pub(crate) fn retry_pending_cleanup(ctx: &Ctx, project: &Project) -> Result<()> 
     for record in pending.into_iter().take(CLEANUP_BATCH_SIZE) {
         // A moved-tip refusal can become resolvable after a reviewed box seal
         // lands; let the pinned branch checks decide on each retry.
-        if !record.cancellation_reason.is_empty() {
-            if let Err(error) = cancel(ctx, &project.slug, &record.id, &record.cancellation_reason)
-            {
-                eprintln!("note: cleanup pending for {}: {error:#}", record.id);
-            }
+        let reason = if record.resolved_reason.is_empty() {
+            "automatic"
         } else {
-            let reason = if record.cleanup_reason.is_empty() {
-                "automatic"
-            } else {
-                &record.cleanup_reason
-            };
-            resolve_automatically_with_views(ctx, project, &record.id, reason, &mut views);
-        }
+            &record.resolved_reason
+        };
+        resolve_automatically_with_views(ctx, project, &record.id, reason, &mut views);
     }
 
     Ok(())
@@ -2702,16 +2544,7 @@ impl ResolveOutcome {
 }
 
 pub fn resolve(ctx: &Ctx, slug: &str, id: &str, args: &ResolveArgs) -> Result<ResolveOutcome> {
-    resolve_with_views(ctx, slug, id, args, &mut CleanupViews::default())
-}
-
-fn resolve_with_views(
-    ctx: &Ctx,
-    slug: &str,
-    id: &str,
-    args: &ResolveArgs,
-    views: &mut CleanupViews,
-) -> Result<ResolveOutcome> {
+    let mut views = CleanupViews::default();
     let project = Project::load(&ctx.root, slug)?;
     let record = thread::load(&project, id)?;
     if args.reopen {
@@ -2738,163 +2571,285 @@ fn resolve_with_views(
     if args.skip_copy && args.discard_uncopied {
         bail!("--skip-copy cannot be combined with --discard-uncopied");
     }
-    let events = crate::events::for_thread(&project, id);
-    if follow_up_pending_for_seal(
-        &record,
-        crate::events::latest_done_event(&events, id, record.attempt.max(1)),
-    ) {
-        bail!(
-            "follow_up_pending: {id} must finish the queued follow-up and seal again before resolution"
-        );
+    let request = record.retirement_request(RetirementRequest {
+        skip_copy: args.skip_copy,
+        discard_uncopied: args.discard_uncopied,
+        keep_pane: args.keep_pane,
+        ..Default::default()
+    });
+    let outcome = retire(ctx, &project, &record, request, "manual", false, &mut views);
+    refresh_plan(ctx, &project);
+    outcome
+}
+
+fn begin_retirement(
+    project: &Project,
+    record: &Thread,
+    request: &RetirementRequest,
+    reason: &str,
+) -> Result<Thread> {
+    thread::update(project, &record.id, |t| {
+        if t.cancellation_reason.is_empty() {
+            t.cancellation_reason = record.cancellation_reason.clone();
+        }
+        t.status = Status::Resolved;
+        t.resolved_reason = reason.into();
+        t.prompt_pending = false;
+        t.cleanup_pending = true;
+        t.cleanup_reason.clear();
+        t.retirement = Some(request.clone());
+    })
+}
+
+/// One obligation, from preservation and authority checks through the last
+/// scratch/build effect. Intentional retention exempts checkout/ref deletion;
+/// failed preservation or any owed external effect leaves the obligation live.
+fn retire(
+    ctx: &Ctx,
+    project: &Project,
+    before: &Thread,
+    mut request: RetirementRequest,
+    reason: &str,
+    durable: bool,
+    views: &mut CleanupViews,
+) -> Result<ResolveOutcome> {
+    let record = before.clone();
+    let id = record.id.as_str();
+    if durable {
+        begin_retirement(project, &record, &request, reason)?;
     }
-    crate::review::require_resolvable(&project, id)?;
-
-    let removable = removable_folder(&project, &record);
-    let already_removed = removable && !worktree_exists(ctx, &project, &record)?;
-
-    // Every path that resolves a thread performs a final copy first.
-    let mut removal_refusal = None;
-    let (mut final_copy, mut copy_notes) = if args.skip_copy {
-        ("skipped".to_string(), Vec::new())
-    } else {
-        let copied = final_copy(ctx, &project, &record);
-        match copied.outcome {
-            CopyOutcome::Complete => ("complete".to_string(), Vec::new()),
-            CopyOutcome::Partial(notes) => {
-                if removable && !already_removed && !args.discard_uncopied {
-                    removal_refusal = Some(
-                        "copy_incomplete: the worktree was kept because some files were not copied; pass --discard-uncopied to accept that loss"
-                            .to_string(),
-                    );
-                }
-                ("partial".to_string(), notes)
-            }
-            CopyOutcome::Failed(error) => {
+    let attempted = (|| -> Result<ResolveOutcome> {
+        if request.authority == RetirementAuthority::Resolve {
+            let events = crate::events::for_thread(project, id);
+            if follow_up_pending_for_seal(
+                &record,
+                crate::events::latest_done_event(&events, id, record.attempt.max(1)),
+            ) {
                 bail!(
-                    "the final copy failed ({error}); not resolving. `--skip-copy` resolves without it."
+                    "follow_up_pending: {id} must finish the queued follow-up and seal again before resolution"
                 );
             }
         }
-    };
-
-    // Even an explicit copy override cannot delete linked files that were not
-    // preserved. The sealed report is still available when --skip-copy is set.
-    {
-        let preserved = thread::load(&project, id)?;
-        if let Err(error) = preserve_report_links(ctx, &project, &preserved) {
-            let detail = format!("linked_files_not_kept: {error:#}");
-            copy_notes.push(detail.clone());
-            final_copy = "partial".into();
-            removal_refusal = Some(detail);
+        if request.authority != RetirementAuthority::Retained {
+            crate::review::require_resolvable(project, id)?;
         }
-    }
+        let removable = removable_folder(project, &record);
+        let already_removed = removable && !worktree_exists(ctx, project, &record)?;
 
-    let mut pane_closed = false;
-    let mut worktree_removed = false;
-    if already_removed {
-        thread::update(&project, id, |t| t.worktree_path.clear())?;
-        worktree_removed = true;
-    } else if removable {
-        if args.keep_pane && removal_refusal.is_none() {
-            removal_refusal = Some(
+        // Every path that resolves a thread performs a final copy first.
+        let mut removal_refusal = None;
+        let (mut final_copy, mut copy_notes) = if request.skip_copy {
+            ("skipped".to_string(), Vec::new())
+        } else {
+            let copied = final_copy(ctx, project, &record);
+            match copied.outcome {
+                CopyOutcome::Complete => ("complete".to_string(), Vec::new()),
+                CopyOutcome::Partial(notes) => {
+                    if removable
+                        && !already_removed
+                        && !request.discard_uncopied
+                        && request.authority != RetirementAuthority::Retained
+                    {
+                        removal_refusal = Some(
+                        "copy_incomplete: the worktree was kept because some files were not copied; pass --discard-uncopied to accept that loss"
+                            .to_string(),
+                    );
+                    }
+                    ("partial".to_string(), notes)
+                }
+                CopyOutcome::Failed(error) => {
+                    bail!(
+                        "the final copy failed ({error}); not resolving. `--skip-copy` resolves without it."
+                    );
+                }
+            }
+        };
+
+        // Even an explicit copy override cannot delete linked files that were not
+        // preserved. The sealed report is still available when --skip-copy is set.
+        let preserved = thread::load(project, id)?;
+        let preservation_pending =
+            if let Err(error) = preserve_report_links(ctx, project, &preserved) {
+                let detail = format!("linked_files_not_kept: {error:#}");
+                copy_notes.push(detail.clone());
+                final_copy = "partial".into();
+                removal_refusal = Some(detail);
+                true
+            } else {
+                false
+            };
+
+        if removable && !already_removed {
+            if request.keep_pane && removal_refusal.is_none() {
+                removal_refusal = Some(
                 "worktree_in_use: the worktree was kept because --keep-pane leaves its pane open"
                     .into(),
             );
-        }
-        if removal_refusal.is_none() {
-            removal_refusal = finished_worktree_reason(ctx, &project, &record)?;
-        }
-        if removal_refusal.is_none() {
-            let inspection = inspect_worktree_for_removal(ctx, &project, &record)?;
-            if !inspection.dirty.is_empty() {
-                return Err(crate::refusal::error(
-                    format!(
+            }
+            if removal_refusal.is_none() && request.authority != RetirementAuthority::Cancel {
+                removal_refusal = finished_worktree_reason(ctx, project, &record)?;
+                if request.authority == RetirementAuthority::Retained
+                    && let Some(detail) = &removal_refusal
+                {
+                    bail!("{id} is not finished; not removing its worktree: {detail}");
+                }
+            }
+            if removal_refusal.is_none() {
+                let inspection = inspect_worktree_for_removal(ctx, project, &record)?;
+                if !inspection.dirty.is_empty() {
+                    let detail = format!(
                         "worktree_dirty: uncommitted changes in {}; not removing ({})",
                         record.worktree_path,
                         inspection.dirty.join(", ")
-                    ),
-                    format!("ha thread show {slug} {id}"),
-                ));
+                    );
+                    if request.authority != RetirementAuthority::Cancel {
+                        return Err(crate::refusal::error(
+                            detail,
+                            format!("ha thread show {} {id}", project.slug),
+                        ));
+                    }
+                    removal_refusal = Some(detail);
+                } else if request.authority != RetirementAuthority::Retained {
+                    removal_refusal = inspection.ignored_reason(&record.worktree_path);
+                }
             }
-            removal_refusal = inspection.ignored_reason(&record.worktree_path);
+            if removal_refusal.is_none() {
+                if request.authority == RetirementAuthority::Retained {
+                    let tip = crate::branches::require_published_tip(ctx, project, &record)?;
+                    if !request.retained_tip.is_empty() && request.retained_tip != tip {
+                        bail!("{id} moved beyond its retained-removal pin");
+                    }
+                    request.retained_tip = tip;
+                }
+                removal_in_use_gate(
+                    ctx,
+                    project,
+                    &record,
+                    views,
+                    request.authority == RetirementAuthority::Cancel,
+                )?;
+            }
         }
-        if removal_refusal.is_none() {
-            removal_in_use_gate(ctx, &project, &record, views)?;
-            // Stop the idle agent before removing its current directory. This
-            // also makes the raw box-side `git worktree remove` independent of
-            // Herdr workspace ownership.
-            pane_closed = close_pane_with_views(ctx, &project, &record, views)?;
-            remove_worktree(ctx, &project, &record)?;
-            thread::update(&project, id, |t| t.worktree_path.clear())?;
-            worktree_removed = true;
+        let resolved = begin_retirement(project, &record, &request, reason)?;
+        if let Ok(Some(view)) = views.for_thread(ctx, project, &resolved) {
+            clear_thread_tokens(&view.herdr, &resolved);
         }
-    }
-    if worktree_removed || !removable {
-        crate::branches::resolved_thread(ctx, &project, &record)?;
-    }
-    let resolved = thread::update(&project, id, |t| {
-        t.status = Status::Resolved;
-        t.resolved_reason = "manual".into();
-        t.prompt_pending = false;
-        t.cleanup_pending = true;
-    })?;
-    if let Ok(Some(view)) = views.for_thread(ctx, &project, &resolved) {
-        clear_thread_tokens(&view.herdr, &resolved);
-    }
-    let pane_closed = if args.keep_pane || pane_closed {
-        pane_closed
-    } else {
-        close_pane_with_views(ctx, &project, &resolved, views)?
-    };
-    remove_finished_build_folder(ctx, &project, &resolved)?;
-    remove_scratch_session(ctx, &resolved)?;
-    let resolved = thread::update(&project, id, |t| {
-        t.cleanup_pending = removal_refusal
-            .as_ref()
-            .is_some_and(|r| r.starts_with("linked_files_not_kept:"));
-        t.cleanup_reason = if t.cleanup_pending {
-            removal_refusal.clone().unwrap_or_default()
+        let pane = if request.keep_pane {
+            "kept_open"
+        } else if close_pane_with_views(ctx, project, &resolved, views)? {
+            "closed"
         } else {
-            String::new()
+            "already_gone"
         };
-    })?;
-    let pane = if args.keep_pane {
-        "kept_open"
-    } else if pane_closed {
-        "closed"
-    } else {
-        "already_gone"
-    };
-    let (worktree, worktree_reason) = if worktree_removed {
-        ("removed", None)
-    } else if let Some(reason) = &removal_refusal {
-        ("kept", Some(reason.clone()))
-    } else if resolved.kind == Kind::Worktree || managed_git_folder(&project, &resolved) {
-        ("not_recorded", None)
-    } else {
-        ("not_applicable", None)
-    };
-    refresh_plan(ctx, &project);
-    Ok(ResolveOutcome {
-        thread: id.to_string(),
-        state: if resolved.cleanup_pending {
+        if removable && (already_removed || removal_refusal.is_none()) {
+            if !already_removed {
+                if request.authority == RetirementAuthority::Retained {
+                    remove_worktree_force_ignored(ctx, project, &resolved)?;
+                } else {
+                    remove_worktree(ctx, project, &resolved)?;
+                }
+            }
+            thread::update(project, id, |t| t.worktree_path.clear())?;
+        }
+        if already_removed || removal_refusal.is_none() {
+            crate::branches::resolved_thread(ctx, project, &resolved)?;
+        }
+        remove_finished_build_folder(ctx, project, &resolved)?;
+        remove_scratch_session(ctx, &resolved)?;
+        thread::update(project, id, |t| {
+            t.cleanup_pending = preservation_pending;
+            t.cleanup_reason = if preservation_pending {
+                removal_refusal.clone().unwrap_or_default()
+            } else {
+                String::new()
+            };
+            if !preservation_pending {
+                t.retirement = None;
+            }
+        })?;
+        Ok(retirement_outcome(
+            project,
+            &record,
+            final_copy,
+            copy_notes,
+            pane,
+            if already_removed {
+                None
+            } else {
+                removal_refusal
+            },
+        ))
+    })();
+    if let Err(error) = &attempted {
+        let _ = thread::update(project, id, |t| {
+            if t.cleanup_pending {
+                t.cleanup_reason = format!("{error:#}");
+            }
+        });
+    }
+    attempted
+}
+
+fn retirement_outcome(
+    project: &Project,
+    before: &Thread,
+    final_copy: String,
+    copy_notes: Vec<String>,
+    pane: &str,
+    worktree_reason: Option<String>,
+) -> ResolveOutcome {
+    let record = thread::load(project, &before.id).unwrap_or_else(|_| Thread {
+        cleanup_pending: true,
+        ..before.clone()
+    });
+    let removed = removable_folder(project, before) && record.worktree_path.is_empty();
+    ResolveOutcome {
+        thread: record.id.clone(),
+        state: if record.cleanup_pending {
             "cleanup_pending"
         } else {
-            "resolved"
+            match record.status {
+                Status::Resolved if !record.cancellation_reason.is_empty() => "cancelled",
+                Status::Resolved => "resolved",
+                Status::Open => "open",
+                Status::Failed => "failed",
+                Status::Starting => "starting",
+            }
         }
         .into(),
         final_copy,
         copy_notes,
         pane: pane.into(),
-        worktree: worktree.into(),
-        worktree_path: if worktree_removed {
-            record.worktree_path
+        worktree: if removed {
+            "removed"
+        } else if worktree_reason.is_some() && !record.worktree_path.is_empty() {
+            "kept"
+        } else if record.kind == Kind::Worktree || managed_git_folder(project, &record) {
+            "not_recorded"
         } else {
-            resolved.worktree_path
+            "not_applicable"
+        }
+        .into(),
+        worktree_path: if removed {
+            before.worktree_path.clone()
+        } else {
+            record.worktree_path
         },
         worktree_reason,
-        branch: resolved.branch,
-    })
+        branch: record.branch,
+    }
+}
+
+fn retirement_failure(project: &Project, before: &Thread, error: anyhow::Error) -> ResolveOutcome {
+    let detail = format!("{error:#}");
+    retirement_outcome(
+        project,
+        before,
+        "pending".into(),
+        vec![detail.clone()],
+        "cleanup_pending",
+        Some(detail.clone()),
+    )
 }
 
 /// The shared plan refresh at a thread lifecycle change. A refresh failure is
@@ -4686,34 +4641,28 @@ pub(crate) fn remove_kept_worktree(ctx: &Ctx, slug: &str, id: &str) -> Result<St
     if !removable_folder(&project, &record) || !worktree_exists(ctx, &project, &record)? {
         bail!("{id} has no removable worktree at {}", record.worktree_path);
     }
-    if let Some(reason) = finished_worktree_reason(ctx, &project, &record)? {
-        bail!("{id} is not finished; not removing its worktree: {reason}");
+    let request = record.retirement_request(RetirementRequest {
+        authority: RetirementAuthority::Retained,
+        ..Default::default()
+    });
+    let outcome = retire(
+        ctx,
+        &project,
+        &record,
+        request,
+        &record.resolved_reason,
+        false,
+        &mut CleanupViews::default(),
+    )?;
+    if outcome.state == "cleanup_pending" || outcome.worktree != "removed" {
+        bail!(
+            "{}",
+            outcome
+                .worktree_reason
+                .as_deref()
+                .unwrap_or("cleanup pending")
+        );
     }
-    preserve_report_links(ctx, &project, &record)
-        .with_context(|| format!("linked_files_not_kept: cannot discard {id}'s worktree"))?;
-    let inspection = inspect_worktree_for_removal(ctx, &project, &record)?;
-    if !inspection.dirty.is_empty() {
-        bail!("worktree_dirty: {}", inspection.dirty.join(", "));
-    }
-    // Pin the checked-out branch tip before discarding the checkout. A retained
-    // box branch must also match its published tip or verified immutable seal.
-    let tip = crate::branches::require_published_tip(ctx, &project, &record)?;
-    let mut views = CleanupViews::default();
-    removal_in_use_gate(ctx, &project, &record, &mut views)?;
-    close_pane_with_views(ctx, &project, &record, &mut views)?;
-    // The marker makes ref retirement retryable even if the process dies
-    // between removing the checkout and deleting the branch.
-    let pinned = thread::update(&project, id, |t| {
-        t.cleanup_pending = true;
-        t.cleanup_reason = format!("retained worktree removal: {tip}");
-    })?;
-    remove_worktree_force_ignored(ctx, &project, &record)?;
-    thread::update(&project, id, |t| t.worktree_path.clear())?;
-    crate::branches::resolved_thread(ctx, &project, &pinned)?;
-    thread::update(&project, id, |t| {
-        t.cleanup_pending = false;
-        t.cleanup_reason.clear();
-    })?;
     Ok(format!(
         "removed {} and branch {}",
         record.worktree_path, record.branch
@@ -4918,6 +4867,7 @@ fn removal_in_use_gate(
     project: &Project,
     record: &Thread,
     views: &mut CleanupViews,
+    cancelling: bool,
 ) -> Result<()> {
     let Some(view) = views.for_thread(ctx, project, record)? else {
         return Ok(());
@@ -4927,7 +4877,7 @@ fn removal_in_use_gate(
     if agents.iter().any(|agent| {
         (thread::agent_matches(record, agent)
             || Path::new(&agent.cwd).starts_with(&record.worktree_path))
-            && !(thread::agent_matches(record, agent) && agent.ready())
+            && !(thread::agent_matches(record, agent) && (cancelling || agent.ready()))
     }) {
         bail!(
             "worktree_in_use: {} is working; not removing the worktree",
@@ -5494,7 +5444,14 @@ mod tests {
             )
             .unwrap();
             let error = remove_kept_worktree(&fx.world.ctx(), "demo", &lane.id).unwrap_err();
-            assert_eq!(error.to_string(), "worktree_dirty: README.md", "{remote}");
+            assert_eq!(
+                error.to_string(),
+                format!(
+                    "worktree_dirty: uncommitted changes in {}; not removing (README.md)",
+                    lane.worktree_path
+                ),
+                "{remote}"
+            );
             assert!(Path::new(&lane.worktree_path).exists());
         }
     }
@@ -7831,47 +7788,118 @@ mod tests {
     #[test]
     fn failed_resolve_tail_keeps_cleanup_pending_until_retry_finishes() {
         use crate::runner::fake::{FakeRunner, fail, ok};
-        let world = crate::scenarios::World::new();
-        let project = world.project("demo", "a.sock");
-        let lane = thread::allocate(&project, |t| {
-            t.kind = Kind::Adopted;
-            t.status = Status::Open;
-            t.cwd = world.home.path().to_string_lossy().into_owned();
-        })
-        .unwrap();
-        let runner = FakeRunner::new();
-        runner.on("session list", ok(&format!(r#"{{"sessions":[{{"name":"scratch-{}","running":false,"socket_path":"/scratch.sock"}}]}}"#, lane.id)));
-        runner.on("agent list", ok(r#"{"result":{"agents":[]}}"#));
-        runner.on("pane list", ok(r#"{"result":{"panes":[]}}"#));
-        let failing = std::rc::Rc::new(std::cell::Cell::new(true));
-        let flag = failing.clone();
-        runner.on_fn(
-            |cmd| cmd.display().contains("session delete"),
-            move |_| {
-                Ok(if flag.get() {
-                    fail(1, "busy")
+        for authority in ["automatic", "manual", "cancel"] {
+            let world = crate::scenarios::World::new();
+            let project = world.project("demo", "a.sock");
+            let lane = thread::allocate(&project, |t| {
+                t.kind = Kind::Adopted;
+                t.status = Status::Open;
+                t.cwd = world.home.path().to_string_lossy().into_owned();
+                t.worktree_path = t.cwd.clone();
+            })
+            .unwrap();
+            let runner = FakeRunner::new();
+            runner.on("session list", ok(&format!(r#"{{"sessions":[{{"name":"scratch-{}","running":false,"socket_path":"/scratch.sock"}}]}}"#, lane.id)));
+            runner.on("agent list", ok(r#"{"result":{"agents":[]}}"#));
+            runner.on("pane list", ok(r#"{"result":{"panes":[]}}"#));
+            let failing = std::rc::Rc::new(std::cell::Cell::new(true));
+            let flag = failing.clone();
+            runner.on_fn(
+                |cmd| cmd.display().contains("session delete"),
+                move |_| {
+                    Ok(if flag.get() {
+                        fail(1, "busy")
+                    } else {
+                        ok("{}")
+                    })
+                },
+            );
+            let mut ctx = world.ctx();
+            ctx.runner = &runner;
+            let notes = match authority {
+                "automatic" => {
+                    let outcome = resolve_automatically(&ctx, &project, &lane.id, "finished");
+                    assert_eq!(outcome.state, "cleanup_pending");
+                    outcome.copy_notes
+                }
+                "cancel" => {
+                    let outcome = cancel(&ctx, "demo", &lane.id, "stop").unwrap();
+                    assert_eq!(outcome.state, "cleanup_pending");
+                    vec![outcome.worktree_reason.unwrap()]
+                }
+                _ => vec![
+                    resolve(&ctx, "demo", &lane.id, &ResolveArgs::default())
+                        .unwrap_err()
+                        .to_string(),
+                ],
+            };
+            let pending = thread::load(&project, &lane.id).unwrap();
+            assert!(pending.cleanup_pending);
+            assert!(pending.retirement.is_some());
+            assert!(
+                notes
+                    .iter()
+                    .any(|note| note.contains("could not delete scratch session")),
+                "{notes:?}"
+            );
+            failing.set(false);
+            retry_pending_cleanup(&ctx, &project).unwrap();
+            let finished = thread::load(&project, &lane.id).unwrap();
+            assert!(!finished.cleanup_pending);
+            assert!(finished.retirement.is_none());
+            assert_eq!(finished.status, Status::Resolved);
+            assert_eq!(finished.cwd, lane.cwd);
+            assert_eq!(finished.worktree_path, lane.worktree_path);
+            assert_eq!(finished.identity, lane.identity);
+            assert!(Path::new(&lane.worktree_path).exists());
+            let outcome = resolve(&ctx, "demo", &lane.id, &ResolveArgs::default()).unwrap();
+            assert_eq!(
+                outcome.state,
+                if authority == "cancel" {
+                    "cancelled"
                 } else {
-                    ok("{}")
-                })
-            },
+                    "resolved"
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn cancellation_stops_its_agent_but_not_another_checkout_user() {
+        use crate::scenarios::{agent_json, pane_json};
+        let fx = crate::testkit::fixture();
+        let (id, _) = fx.lane(1);
+        let lane = thread::load(&fx.project, &id).unwrap();
+        *fx.world.panes.borrow_mut() = format!(
+            "[{}]",
+            pane_json(&lane.workspace_id, &lane.tab_id, &lane.pane_id, &lane.cwd,)
         );
-        let mut ctx = world.ctx();
-        ctx.runner = &runner;
-        let outcome = resolve_automatically(&ctx, &project, &lane.id, "finished");
+        *fx.world.agents.borrow_mut() = format!(
+            "[{}]",
+            agent_json("w9", "w9:t1", "w9:p1", &lane.cwd, "other", "working",)
+        );
+        let outcome = cancel(&fx.world.ctx(), "demo", &id, "stop").unwrap();
         assert_eq!(outcome.state, "cleanup_pending");
-        assert!(thread::load(&project, &lane.id).unwrap().cleanup_pending);
-        assert!(
-            outcome
-                .copy_notes
-                .iter()
-                .any(|note| note.contains("could not delete scratch session")),
-            "{outcome:?}"
+        assert!(outcome.worktree_reason.unwrap().contains("worktree_in_use"));
+        assert!(Path::new(&lane.worktree_path).exists());
+        assert_eq!(fx.world.runner.count("tab close"), 0);
+        *fx.world.agents.borrow_mut() = format!(
+            "[{}]",
+            agent_json(
+                &lane.workspace_id,
+                &lane.tab_id,
+                &lane.pane_id,
+                &lane.cwd,
+                &lane.agent_name,
+                "working",
+            )
         );
-        failing.set(false);
-        retry_pending_cleanup(&ctx, &project).unwrap();
-        assert!(!thread::load(&project, &lane.id).unwrap().cleanup_pending);
-        let outcome = resolve(&ctx, "demo", &lane.id, &ResolveArgs::default()).unwrap();
-        assert_eq!(outcome.state, "resolved");
+        retry_pending_cleanup(&fx.world.ctx(), &fx.project).unwrap();
+        let finished = thread::load(&fx.project, &id).unwrap();
+        assert!(!finished.cleanup_pending, "{}", finished.cleanup_reason);
+        assert!(finished.worktree_path.is_empty());
+        assert!(!Path::new(&lane.worktree_path).exists());
+        assert_eq!(fx.world.runner.count("tab close"), 1);
     }
 
     #[test]
