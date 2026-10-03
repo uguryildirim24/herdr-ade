@@ -51,28 +51,12 @@ fn historical_requests(project: &Project) -> Vec<RequestRecord> {
         .collect()
 }
 
-struct Locked {
-    _file: File,
-}
-
-fn lock_file(project: &Project, name: &str) -> Result<Locked> {
+fn lock_file(project: &Project, name: &str) -> Result<File> {
     project.record_dir_for_write("talk")?;
-    let file = File::options()
-        .create(true)
-        .truncate(false)
-        .write(true)
-        .open(talk_dir(project).join(name))?;
-    file.lock()?;
-    Ok(Locked { _file: file })
+    project::lock_file(&talk_dir(project).join(name))
 }
 
 // -------------------------------------------------- coordinator-pane prompts
-
-/// A harness line (priming, nudge, event) that is not Rolf's words.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum PendingPrompt {
-    Automated,
-}
 
 #[derive(Debug, Serialize, Deserialize)]
 struct PendingPromptRecord {
@@ -587,18 +571,13 @@ pub(crate) fn mark_automated_prompt(project: &Project, pane: &str, text: &str) -
 }
 
 /// Reads and removes the marker for this pane and exact prompt.
-pub(crate) fn take_pending_prompt(
-    project: &Project,
-    pane: &str,
-    text: &str,
-) -> Option<PendingPrompt> {
+pub(crate) fn take_pending_prompt(project: &Project, pane: &str, text: &str) -> bool {
     let path = pending_prompt_path(project, pane, text);
-    let record: PendingPromptRecord = project::read_json(&path)?;
+    let Some(record) = project::read_json::<PendingPromptRecord>(&path) else {
+        return false;
+    };
     let _ = std::fs::remove_file(&path);
-    if jiff::Timestamp::now().as_second() - record.at > PENDING_PROMPT_SECS {
-        return None;
-    }
-    Some(PendingPrompt::Automated)
+    jiff::Timestamp::now().as_second() - record.at <= PENDING_PROMPT_SECS
 }
 
 fn remove_marked_once(prompt: &str, marked: &str) -> Option<String> {
@@ -672,14 +651,8 @@ pub(crate) fn take_automated_parts(project: &Project, pane: &str, text: &str) ->
 // ---------------------------------------------------------------- writer
 
 /// The serialized writer lock for coordinator prompts.
-pub(crate) struct WriterLock {
-    _lock: Locked,
-}
-
-pub(crate) fn writer_lock(project: &Project) -> Result<WriterLock> {
-    Ok(WriterLock {
-        _lock: lock_file(project, "writer.lock")?,
-    })
+pub(crate) fn writer_lock(project: &Project) -> Result<File> {
+    lock_file(project, "writer.lock")
 }
 
 #[derive(Debug, Serialize, Deserialize)]

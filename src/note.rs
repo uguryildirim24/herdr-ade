@@ -67,22 +67,11 @@ fn path(project: &Project) -> PathBuf {
     project.record_file("notes.jsonl")
 }
 
-pub(crate) struct ReplacementLock {
-    _file: File,
-}
-
 /// Serializes the check-and-append boundary shared by notes and
 /// tasks. Their own storage locks cannot prevent two different record kinds
 /// from replacing the same current row at once.
-pub(crate) fn replacement_lock(project: &Project) -> Result<ReplacementLock> {
-    let path = project.state_dir().join("replacements.lock");
-    let file = File::options()
-        .create(true)
-        .truncate(false)
-        .write(true)
-        .open(&path)?;
-    file.lock()?;
-    Ok(ReplacementLock { _file: file })
+pub(crate) fn replacement_lock(project: &Project) -> Result<File> {
+    project::lock_file(&project.state_dir().join("replacements.lock"))
 }
 
 fn records<T: serde::de::DeserializeOwned>(project: &Project, kind: &str) -> Result<Vec<T>> {
@@ -384,26 +373,8 @@ pub(crate) fn add(
     Ok(note)
 }
 
-pub(crate) fn sort_newest_first(rows: &mut Vec<Row>) {
+pub(crate) fn sort_newest_first(rows: &mut [Row]) {
     rows.sort_by(|a, b| b.at.cmp(&a.at).then_with(|| b.id.cmp(&a.id)));
-    // Rounded timestamps can tie. Explicit replacement is stronger evidence
-    // of order than an id or a guessed prose subject.
-    let replacements = replacement_map(rows);
-    for _ in 0..rows.len() {
-        let positions: BTreeMap<String, usize> = rows
-            .iter()
-            .enumerate()
-            .map(|(index, row)| (row.id.clone(), index))
-            .collect();
-        let Some((old_index, new_index)) = rows.iter().enumerate().find_map(|(old_index, row)| {
-            let new_index = *positions.get(replacements.get(&row.id)?)?;
-            (new_index > old_index).then_some((old_index, new_index))
-        }) else {
-            break;
-        };
-        let newer = rows.remove(new_index);
-        rows.insert(old_index, newer);
-    }
 }
 
 pub(crate) fn active_rows(project: &Project) -> Vec<Row> {

@@ -317,15 +317,12 @@ enum PlanCommand {
         #[arg(value_name = "PROJECT")]
         slug: String,
     },
-    /// Set the end-result kind and its one sentence
+    /// Write what this project delivers
     Set {
         /// Project slug
         #[arg(value_name = "PROJECT")]
         slug: String,
-        /// End result: screen, command, background, document, picture, number, or finding
-        #[arg(long, value_parser = ["screen", "command", "background", "document", "picture", "number", "finding"])]
-        kind: String,
-        /// One sentence about what this project delivers
+        /// Authored outcome: what this project delivers
         #[arg(long)]
         does: String,
         /// Expected plan revision; omitted uses the latest revision
@@ -452,15 +449,10 @@ fn run_project_commands(ctx: &Ctx, command: Command) -> Result<()> {
                 print!("{text}");
                 Ok(())
             }
-            PlanCommand::Set {
-                slug,
-                kind,
-                does,
-                expect,
-            } => {
-                let p = plan::set(ctx, &slug, &kind, &does, expect)?;
+            PlanCommand::Set { slug, does, expect } => {
+                let p = plan::set(ctx, &slug, &does, expect)?;
                 crate::output::insert("revision", p.revision);
-                println!("plan revision {} set to `{}`", p.revision, p.kind);
+                println!("plan revision {} set", p.revision);
                 Ok(())
             }
             PlanCommand::Step { command } => match command {
@@ -1454,7 +1446,7 @@ fn dispatch_with_start(
                 }
                 let message = views
                     .iter()
-                    .map(|view| crate::task::render_list(&project, view))
+                    .map(|view| crate::task::render(&project, view))
                     .collect::<Vec<_>>()
                     .join("");
                 crate::output::success(
@@ -1975,7 +1967,20 @@ mod tests {
         assert!(
             matches!(unlinked.command, Command::Plan { command: PlanCommand::Step { command: PlanStepCommand::Unlink { ref reason, .. } } } if reason == "Replaced")
         );
+        let plan = Cli::try_parse_from([
+            "ha",
+            "plan",
+            "set",
+            "demo",
+            "--does",
+            "Compare red.md and blue.md",
+        ])
+        .unwrap();
+        assert!(matches!(plan.command,
+            Command::Plan { command: PlanCommand::Set { ref does, .. } }
+            if does == "Compare red.md and blue.md"));
         for command in [
+            "ha plan set demo --kind screen --does Outcome",
             "ha thread start demo --task-file - --plain Extra",
             "ha thread adopt demo --pane w1:p1 --title Repair --plain Extra",
             "ha thread adopt demo --pane w1:p1 --title Repair --role critic",

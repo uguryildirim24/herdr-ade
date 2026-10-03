@@ -94,7 +94,7 @@ An early `agent_not_ready` startup block keeps the brief pending and shows as st
 
 The project keeps a plan card. Reading it never changes a plan or resolves a lane.
 
-- **The plan card** is `<project>/.state/plan.toml`, written under `<project>/.state/plan.lock` with a revision guard and an atomic rename. It holds the goal copied exactly from `PROJECT.md`, one of seven end-result kinds and any number of ordered steps. New bindings name stable tasks in each step, so one task may support several steps. A step's state is projected from those tasks. Historical thread bindings and task-side `plan_step` links still project from current lane/task records. Old round links are ignored. `plan sync` is the manual refresh.
+- **The plan card** is `<project>/.state/plan.toml`, written under `<project>/.state/plan.lock` with a revision guard and an atomic rename. It holds the goal copied exactly from `PROJECT.md`, the authored outcome (`plan set <project> --does "<outcome>"`) and any number of ordered steps. Historical outcome fields still load. New bindings name stable tasks in each step, so one task may support several steps. A step's state is projected from those tasks. Historical thread bindings and task-side `plan_step` links still project from current lane/task records. Old round links are ignored. `plan sync` is the manual refresh.
 
 Coordinators ask Rolf in their chat, as a short choice between outcomes he can picture, only about spend, irreversible steps or steps that leave the machine. While waiting for his chat reply, they keep unrelated work moving; if nothing can proceed, they wait.
 

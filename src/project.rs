@@ -362,75 +362,50 @@ pub(crate) struct Project {
     pub(crate) slug: String,
 }
 
-/// Held while reading and rewriting anything under `threads/`, `inbox/` or
-/// `.state/`. Never held across a herdr, git, gh, ssh or scp call.
-pub(crate) struct ProjectLock {
-    _file: File,
+/// Acquires an existing lock domain without creating its parent directory.
+pub(crate) fn lock_file(path: &Path) -> Result<File> {
+    let file = File::options()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(path)
+        .with_context(|| format!("could not open lock {}", path.display()))?;
+    file.lock()?;
+    Ok(file)
+}
+
+fn keyed_lock(root: &Path, hasher: Sha256) -> Result<File> {
+    let dir = root.join(".locks");
+    std::fs::create_dir_all(&dir)?;
+    let key: String = hasher
+        .finalize()
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect();
+    lock_file(&dir.join(format!("{key}.lock")))
 }
 
 /// Held while a box start fetches and creates its worktree, keyed by the
 /// stable profile id and the box repository so starts for one box repository
 /// serialize (SPEC-remote §4.2 step 3).
-pub(crate) struct BoxLock {
-    _file: File,
+pub(crate) fn box_lock(root: &Path, machine_id: &str, box_repo: &str) -> Result<File> {
+    let mut hasher = Sha256::new();
+    hasher.update(machine_id.as_bytes());
+    hasher.update(b"\n");
+    hasher.update(box_repo.as_bytes());
+    keyed_lock(root, hasher)
 }
 
 /// Held while one project finds or creates its shared workspace on a machine.
 /// Repository provisioning has a different lock because one project may span
 /// repositories while still owning exactly one remote workspace.
-pub(crate) struct RemoteWorkspaceLock {
-    _file: File,
-}
-
-pub(crate) fn remote_workspace_lock(
-    root: &Path,
-    slug: &str,
-    machine_id: &str,
-) -> Result<RemoteWorkspaceLock> {
-    let dir = root.join(".locks");
-    std::fs::create_dir_all(&dir)?;
+pub(crate) fn remote_workspace_lock(root: &Path, slug: &str, machine_id: &str) -> Result<File> {
     let mut hasher = Sha256::new();
     hasher.update(b"workspace\n");
     hasher.update(slug.as_bytes());
     hasher.update(b"\n");
     hasher.update(machine_id.as_bytes());
-    let key: String = hasher
-        .finalize()
-        .iter()
-        .map(|b| format!("{b:02x}"))
-        .collect();
-    let path = dir.join(format!("{key}.lock"));
-    let file = File::options()
-        .create(true)
-        .truncate(false)
-        .write(true)
-        .open(&path)
-        .with_context(|| format!("could not open remote workspace lock {}", path.display()))?;
-    file.lock()?;
-    Ok(RemoteWorkspaceLock { _file: file })
-}
-
-pub(crate) fn box_lock(root: &Path, machine_id: &str, box_repo: &str) -> Result<BoxLock> {
-    let dir = root.join(".locks");
-    std::fs::create_dir_all(&dir)?;
-    let mut hasher = Sha256::new();
-    hasher.update(machine_id.as_bytes());
-    hasher.update(b"\n");
-    hasher.update(box_repo.as_bytes());
-    let key: String = hasher
-        .finalize()
-        .iter()
-        .map(|b| format!("{b:02x}"))
-        .collect();
-    let path = dir.join(format!("{key}.lock"));
-    let file = File::options()
-        .create(true)
-        .truncate(false)
-        .write(true)
-        .open(&path)
-        .with_context(|| format!("could not open box lock {}", path.display()))?;
-    file.lock()?;
-    Ok(BoxLock { _file: file })
+    keyed_lock(root, hasher)
 }
 
 impl Project {
@@ -474,10 +449,6 @@ impl Project {
         self.state_dir().join(name)
     }
 
-    pub(crate) fn record_file_for_write(&self, name: &str) -> Result<PathBuf> {
-        Ok(self.record_file(name))
-    }
-
     /// The canonical folder (symlinks resolved): the key of the project's
     pub(crate) fn canonical_dir(&self) -> PathBuf {
         std::fs::canonicalize(self.dir()).unwrap_or_else(|_| self.dir())
@@ -486,19 +457,14 @@ impl Project {
     /// Takes the per-project lock. The lock file is opened without creating
     /// parent directories, and the project is re-checked afterwards, so a
     /// `delete` that lands mid-operation cannot be resurrected by a writer.
-    pub(crate) fn lock(&self) -> Result<ProjectLock> {
+    pub(crate) fn lock(&self) -> Result<File> {
         let path = self.state_dir().join("lock");
-        let file = File::options()
-            .create(true)
-            .truncate(false)
-            .write(true)
-            .open(&path)
+        let file = lock_file(&path)
             .with_context(|| format!("project `{}` is gone ({})", self.slug, path.display()))?;
-        file.lock()?;
         if !self.project_md().is_file() {
             bail!("project `{}` is gone", self.slug);
         }
-        Ok(ProjectLock { _file: file })
+        Ok(file)
     }
 
     pub(crate) fn read_project_md(&self) -> Result<(Settings, String)> {
@@ -1116,25 +1082,11 @@ pub(crate) fn page_body_with_history(
     out
 }
 
-struct PageLock {
-    _file: File,
-}
-
-fn page_lock(project: &Project) -> Result<PageLock> {
-    let file = File::options()
-        .create(true)
-        .truncate(false)
-        .write(true)
-        .open(project.state_dir().join("page.lock"))?;
-    file.lock()?;
-    Ok(PageLock { _file: file })
-}
-
 /// Rebuilds only the binary-owned body. The coordinator-owned front matter is
 /// compared immediately before the atomic replacement, so an edit is never
 /// overwritten with an older copy.
 pub(crate) fn refresh_page(project: &Project) -> Result<()> {
-    let _lock = page_lock(project)?;
+    let _lock = lock_file(&project.state_dir().join("page.lock"))?;
     let before = std::fs::read(project.project_md())?;
     let prefix = project_md_prefix(&before)?.to_vec();
     let (settings, _) = parse_project_md(std::str::from_utf8(&before)?)?;

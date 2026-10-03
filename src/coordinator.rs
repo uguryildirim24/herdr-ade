@@ -909,7 +909,12 @@ impl ContextCursor {
                     line
                 };
                 let mut rows = BTreeMap::new();
-                rows.insert("outcome".into(), format!("{}: {}", plan.kind, plan.does));
+                rows.insert(
+                    "outcome".into(),
+                    format!("{} {}", plan.what_you_get, plan.does)
+                        .trim()
+                        .to_string(),
+                );
                 for step in &plan.steps {
                     rows.insert(step.id.clone(), describe(step));
                     for subtask in &step.subtasks {

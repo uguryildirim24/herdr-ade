@@ -12,7 +12,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
 
-use crate::contracts::{Plan, PlanStep, StepState, plan_kind_sentence};
+use crate::contracts::{Plan, PlanStep, StepState};
 use crate::paths::Ctx;
 use crate::project::{Project, write_atomic};
 use crate::thread;
@@ -21,26 +21,10 @@ pub(crate) fn plan_path(project: &Project) -> PathBuf {
     project.record_file("plan.toml")
 }
 
-fn lock_path(project: &Project) -> PathBuf {
-    project.state_dir().join("plan.lock")
-}
-
-struct PlanLock {
-    _file: File,
-}
-
-/// The plan writer lock, `<project>/.plan.lock`. Separate from the project
-/// lock so a refresh called from a thread or review mutation cannot deadlock.
-fn plan_lock(project: &Project) -> Result<PlanLock> {
-    let path = lock_path(project);
-    let file = File::options()
-        .create(true)
-        .truncate(false)
-        .write(true)
-        .open(&path)
-        .with_context(|| format!("could not open {}", path.display()))?;
-    file.lock()?;
-    Ok(PlanLock { _file: file })
+/// The plan writer lock, `<project>/.state/plan.lock`. Separate from the
+/// project lock so a refresh from a thread or review mutation cannot deadlock.
+fn plan_lock(project: &Project) -> Result<File> {
+    crate::project::lock_file(&project.state_dir().join("plan.lock"))
 }
 
 pub(crate) fn load(project: &Project) -> Result<Option<Plan>> {
@@ -60,7 +44,7 @@ pub(crate) fn load(project: &Project) -> Result<Option<Plan>> {
 /// parent directory flushed (SPEC-talk §6.5).
 fn write(project: &Project, plan: &Plan) -> Result<()> {
     let text = toml::to_string(plan)?;
-    let path = project.record_file_for_write("plan.toml")?;
+    let path = project.record_file("plan.toml");
     write_atomic(&path, text.as_bytes())?;
     sync_dir(project.state_dir().as_path())?;
     Ok(())
@@ -95,31 +79,10 @@ fn check_task_refs(project: &Project, tasks: &[String]) -> Result<()> {
     Ok(())
 }
 
-/// The whole candidate card, including preserved text and generated
-/// sentences. Refuses invalid language and duplicate identifiers before writing.
-fn plan_kind_error(kind: &str) -> String {
-    format!(
-        "plan_kind: `{kind}` is not a result kind (possible values: {})",
-        crate::contracts::PLAN_KINDS
-            .iter()
-            .map(|(name, _)| *name)
-            .collect::<Vec<_>>()
-            .join(", ")
-    )
-}
-
-fn validate(_project: &Project, plan: &Plan) -> Result<()> {
+/// Checks the candidate card's schema, identifiers and dependencies.
+fn validate(plan: &Plan) -> Result<()> {
     if plan.schema != 1 {
         bail!("plan_schema: expected schema 1, got {}", plan.schema);
-    }
-    if !plan.kind.is_empty() {
-        let sentence =
-            plan_kind_sentence(&plan.kind).with_context(|| plan_kind_error(&plan.kind))?;
-        if plan.what_you_get != sentence {
-            bail!("plan_result: what_you_get must be \"{sentence}\"");
-        }
-    } else if !plan.what_you_get.is_empty() {
-        bail!("plan_result: what_you_get is set without a result kind");
     }
     let mut ids = BTreeSet::new();
     for step in &plan.steps {
@@ -234,7 +197,7 @@ fn with_plan<T>(
     // particular, adding or removing a binding must not leave a stale state
     // until a later `plan sync`.
     project_states(project, &mut plan);
-    validate(project, &plan)?;
+    validate(&plan)?;
     if plan == before {
         crate::project::refresh_page(project)?;
         return Ok((plan, extra));
@@ -252,22 +215,20 @@ fn project_goal(project: &Project) -> String {
         .unwrap_or_default()
 }
 
-/// `ha plan set --kind <kind> --does "<sentence>" [--expect <revision>]`.
+/// `ha plan set --does "<outcome>" [--expect <revision>]`.
 /// Preserves the steps and refreshes the goal from `PROJECT.md`.
 pub(crate) fn set(
     ctx: &Ctx,
     slug: &str,
-    kind: &str,
     does: &str,
     expect: impl Into<Option<u64>>,
 ) -> Result<Plan> {
     let project = Project::load(&ctx.root, slug)?;
-    let sentence = plan_kind_sentence(kind).with_context(|| plan_kind_error(kind))?;
     let does = does.trim().to_string();
     let goal = project_goal(&project);
     let (plan, ()) = with_plan(&project, expect, |plan| {
-        plan.kind = kind.to_string();
-        plan.what_you_get = sentence.to_string();
+        plan.kind.clear();
+        plan.what_you_get.clear();
         plan.does = does.clone();
         plan.goal = goal.clone();
         Ok(())
@@ -601,8 +562,6 @@ pub(crate) fn show(ctx: &Ctx, slug: &str, json: bool) -> Result<String> {
                 "revision": 0,
                 "next_step": 0,
                 "goal": project_goal(&project),
-                "kind": "",
-                "what_you_get": "",
                 "does": "",
                 "steps": [],
             }),
@@ -618,14 +577,16 @@ pub(crate) fn show(ctx: &Ctx, slug: &str, json: bool) -> Result<String> {
         out.push_str("goal: differs from PROJECT.md; run `plan set` to copy it again\n");
     }
     out.push_str(&format!("goal: {}\n", plan.goal));
-    if plan.kind.is_empty() {
-        out.push_str("what you get at the end: not written down yet\n");
-    } else {
-        out.push_str(&format!(
-            "what you get at the end: {} {}\n",
-            plan.what_you_get, plan.does
-        ));
-    }
+    let outcome = format!("{} {}", plan.what_you_get, plan.does);
+    let outcome = outcome.trim();
+    out.push_str(&format!(
+        "what you get at the end: {}\n",
+        if outcome.is_empty() {
+            "not written down yet"
+        } else {
+            outcome
+        }
+    ));
     out.push_str("steps:\n");
     if plan.steps.is_empty() {
         out.push_str("  (none)\n");
@@ -1139,14 +1100,7 @@ mod tests {
     #[test]
     fn omitted_expect_uses_locked_revision_and_json_shows_it() {
         let fx = fixture();
-        set(
-            &fx.world.ctx(),
-            "demo",
-            "screen",
-            "It shows the result.",
-            None,
-        )
-        .unwrap();
+        set(&fx.world.ctx(), "demo", "It shows the result.", None).unwrap();
         let plan = step_add(
             &fx.world.ctx(),
             "demo",
@@ -1160,40 +1114,17 @@ mod tests {
         let json: serde_json::Value =
             serde_json::from_str(&show(&fx.world.ctx(), "demo", true).unwrap()).unwrap();
         assert_eq!(json["revision"], 2);
-        assert!(
-            set(
-                &fx.world.ctx(),
-                "demo",
-                "command",
-                "It runs the task.",
-                Some(0)
-            )
-            .is_err()
-        );
+        assert!(set(&fx.world.ctx(), "demo", "It runs the task.", Some(0)).is_err());
     }
 
     #[test]
     fn a_stale_expect_fails_unchanged_and_cannot_break_the_old_file() {
         let fx = fixture();
-        set(
-            &fx.world.ctx(),
-            "demo",
-            "screen",
-            "It shows pretend trades.",
-            0,
-        )
-        .unwrap();
+        set(&fx.world.ctx(), "demo", "It shows pretend trades.", 0).unwrap();
         let before = std::fs::read_to_string(plan_path(&fx.project)).unwrap();
         let e = format!(
             "{:#}",
-            set(
-                &fx.world.ctx(),
-                "demo",
-                "command",
-                "It prints the lines.",
-                9
-            )
-            .unwrap_err()
+            set(&fx.world.ctx(), "demo", "It prints the lines.", 9).unwrap_err()
         );
         assert!(e.starts_with("plan_revision_stale"), "{e}");
         assert_eq!(
@@ -1215,7 +1146,7 @@ mod tests {
     fn one_of_two_required_threads_is_not_done() {
         let fx = fixture();
         let ctx = fx.world.ctx();
-        set(&ctx, "demo", "screen", "It shows pretend trades.", 0).unwrap();
+        set(&ctx, "demo", "It shows pretend trades.", 0).unwrap();
         let (a, _) = fx.lane(1);
         let (b, _) = fx.lane(2);
         add(&fx, "Needs two lanes.", 1);
@@ -1246,6 +1177,35 @@ mod tests {
     }
 
     #[test]
+    fn authored_outcomes_replace_historical_prose_without_changing_steps() {
+        let fx = fixture();
+        let ctx = fx.world.ctx();
+        let (lane, _) = fx.lane(1);
+        add(&fx, "Compare red.md and blue.md", 0);
+        let old = link_historical_threads(&fx, vec![lane], 1);
+        let old = with_plan(&fx.project, old.revision, |plan| {
+            plan.kind = "unlisted historical kind".into();
+            plan.what_you_get = "Compare files (Rolf, 2026-09-25).".into();
+            Ok(())
+        })
+        .unwrap()
+        .0;
+        assert!(
+            show(&ctx, "demo", false)
+                .unwrap()
+                .contains(&old.what_you_get)
+        );
+        let outcome =
+            "Compare red.md and blue.md: show differences; keep names (Rolf, 2026-09-25).";
+        let changed = set(&ctx, "demo", outcome, old.revision).unwrap();
+        assert_eq!(changed.steps, old.steps);
+        assert_eq!(changed.does, outcome);
+        assert!(changed.kind.is_empty() && changed.what_you_get.is_empty());
+        assert!(show(&ctx, "demo", false).unwrap().contains(outcome));
+        assert_eq!(load(&fx.project).unwrap().unwrap(), changed);
+    }
+
+    #[test]
     fn a_plan_without_subtasks_reads_exactly_as_before() {
         // Schema 1 before subtasks and prerequisite edges existed.
         let plan: Plan = toml::from_str(
@@ -1253,6 +1213,9 @@ mod tests {
         )
         .unwrap();
         assert_eq!(plan.revision, 3);
+        assert_eq!(plan.kind, "screen");
+        assert_eq!(plan.what_you_get, "A screen you open.");
+        assert_eq!(plan.does, "It shows pretend trades.");
         assert_eq!(all_steps(&plan).count(), 2);
         assert_eq!(
             all_steps(&plan)
@@ -1719,7 +1682,7 @@ mod tests {
     fn subtask_states_come_from_their_own_work() {
         let fx = fixture();
         let ctx = fx.world.ctx();
-        set(&ctx, "demo", "screen", "It shows pretend trades.", 0).unwrap();
+        set(&ctx, "demo", "It shows pretend trades.", 0).unwrap();
         let (lane, sha) = fx.lane(1);
         add(&fx, "Land the lane", 1);
         subtask_add(&ctx, "demo", "s-1", "The lane's part", vec![], vec![], 2).unwrap();
