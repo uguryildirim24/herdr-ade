@@ -164,7 +164,7 @@ pub(crate) struct Tab {
     pub(crate) label: String,
 }
 
-#[derive(Debug, Clone, Deserialize, PartialEq, Default)]
+#[derive(Debug, Clone, serde::Serialize, Deserialize, PartialEq, Default)]
 pub(crate) struct Pane {
     pub(crate) pane_id: String,
     pub(crate) tab_id: String,
@@ -173,7 +173,7 @@ pub(crate) struct Pane {
     pub(crate) cwd: String,
 }
 
-#[derive(Debug, Clone, Deserialize, PartialEq, Default)]
+#[derive(Debug, Clone, serde::Serialize, Deserialize, PartialEq, Default)]
 pub(crate) struct Agent {
     pub(crate) pane_id: String,
     pub(crate) tab_id: String,
@@ -193,7 +193,7 @@ pub(crate) struct Agent {
     pub(crate) agent_session: Option<AgentSession>,
 }
 
-#[derive(Debug, Clone, Deserialize, PartialEq, Default)]
+#[derive(Debug, Clone, serde::Serialize, Deserialize, PartialEq, Default)]
 pub(crate) struct AgentSession {
     #[serde(default, alias = "value")]
     pub(crate) id: String,

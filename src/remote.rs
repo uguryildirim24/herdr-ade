@@ -189,39 +189,13 @@ pub(crate) fn optional_machine_profile(
             session: String::new(),
         }));
     }
-    let found = saved_machines(runner, herdr_bin)?
-        .into_iter()
-        .find(|m| m.label == machine || m.id == machine);
-    let Some(found) = found else {
-        let configured = configured_machine_declarations(config_dir)?;
-        let declared = configured.into_iter().find_map(|(id, mut row)| {
-            if row.id.is_empty() {
-                row.id = id.clone();
-            }
-            if row.label.is_empty() {
-                row.label = id;
-            }
-            (row.id == machine || row.label == machine).then_some(row)
-        });
-        return Ok(declared.map(|row| MachineProfile {
-            id: row.id,
-            label: row.label,
-            target: row.target,
-            session: row.session,
-        }));
-    };
-    if !found.enabled {
-        bail!("machine_disabled: `{}` is disabled", found.label);
+    if let Some(profile) = saved_profile(&saved_machines(runner, herdr_bin)?, machine)? {
+        return Ok(Some(profile));
     }
-    if found.id.is_empty() || found.target.is_empty() || found.session.is_empty() {
-        bail!("machine_profile_invalid: `{machine}` is incomplete");
-    }
-    Ok(Some(MachineProfile {
-        id: found.id,
-        label: found.label,
-        target: found.target,
-        session: found.session,
-    }))
+    Ok(declared_profile(
+        &configured_machine_declarations(config_dir)?,
+        machine,
+    ))
 }
 
 fn saved_machines(runner: &dyn Runner, herdr_bin: &str) -> Result<Vec<SavedMachine>> {
@@ -233,38 +207,102 @@ fn saved_machines(runner: &dyn Runner, herdr_bin: &str) -> Result<Vec<SavedMachi
         .context("machine_list_invalid: herdr returned invalid JSON")
 }
 
-/// Names of every enabled saved machine. An explicit `--machine` may place
-/// work on any one of these, even when no current thread uses it.
-pub(crate) fn registered_machine_names(
+fn saved_profile(saved: &[SavedMachine], machine: &str) -> Result<Option<MachineProfile>> {
+    let Some(found) = saved
+        .iter()
+        .find(|row| row.label == machine || row.id == machine)
+    else {
+        return Ok(None);
+    };
+    if !found.enabled {
+        bail!("machine_disabled: `{}` is disabled", found.label);
+    }
+    if found.id.is_empty() || found.target.is_empty() || found.session.is_empty() {
+        bail!("machine_profile_invalid: `{machine}` is incomplete");
+    }
+    Ok(Some(MachineProfile {
+        id: found.id.clone(),
+        label: found.label.clone(),
+        target: found.target.clone(),
+        session: found.session.clone(),
+    }))
+}
+
+fn declared_profile(
+    rows: &BTreeMap<String, MachineDeclaration>,
+    machine: &str,
+) -> Option<MachineProfile> {
+    rows.iter().find_map(|(key, row)| {
+        let id = if row.id.is_empty() { key } else { &row.id };
+        let label = if row.label.is_empty() {
+            key
+        } else {
+            &row.label
+        };
+        (id == machine || label == machine).then(|| MachineProfile {
+            id: id.clone(),
+            label: label.clone(),
+            target: row.target.clone(),
+            session: row.session.clone(),
+        })
+    })
+}
+
+/// Doctor resolves its registry once, including explicitly requested routes.
+/// Placement and diagnostics share the same profile decisions.
+pub(crate) fn doctor_profiles(
     runner: &dyn Runner,
     herdr_bin: &str,
     config_dir: &Path,
-) -> Result<Vec<String>> {
-    let mut names: Vec<String> = saved_machines(runner, herdr_bin)?
-        .into_iter()
+    requested: &std::collections::BTreeSet<String>,
+) -> Result<BTreeMap<String, Result<MachineProfile>>> {
+    let saved = saved_machines(runner, herdr_bin)?;
+    let declared = configured_machine_declarations(config_dir)?;
+    let mut names: Vec<String> = saved
+        .iter()
         .filter(|machine| machine.enabled)
         .map(|machine| {
             if !machine.label.is_empty() {
-                Ok(machine.label)
+                Ok(machine.label.clone())
             } else if !machine.id.is_empty() {
-                Ok(machine.id)
+                Ok(machine.id.clone())
             } else {
                 bail!("machine_profile_invalid: an enabled saved machine has no id or label")
             }
         })
         .collect::<Result<_>>()?;
-    names.extend(
-        configured_machine_declarations(config_dir)?
-            .into_iter()
-            .map(
-                |(id, row)| {
-                    if row.label.is_empty() { id } else { row.label }
-                },
-            ),
-    );
+    names.extend(declared.iter().map(|(id, row)| {
+        if row.label.is_empty() {
+            id.clone()
+        } else {
+            row.label.clone()
+        }
+    }));
+    names.extend(requested.iter().cloned());
     names.sort();
     names.dedup();
-    Ok(names)
+    Ok(names
+        .into_iter()
+        .map(|name| {
+            let profile = if name.is_empty() || name == MACHINE_LOCAL {
+                Ok(MachineProfile {
+                    id: MACHINE_LOCAL.into(),
+                    label: MACHINE_LOCAL.into(),
+                    target: String::new(),
+                    session: String::new(),
+                })
+            } else {
+                saved_profile(&saved, &name).and_then(|found| {
+                    found
+                        .or_else(|| declared_profile(&declared, &name))
+                        .with_context(|| {
+                            format!("unknown_machine: `{name}` is not a saved profile")
+                        })
+                })
+            };
+            (name, profile)
+        })
+        .collect())
 }
 
 /// The Mac→box row whose `mac` path is `mac_path` (SPEC-remote §4.1). The box

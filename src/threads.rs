@@ -7298,6 +7298,9 @@ mod tests {
             |cmd| cmd.program == "ssh",
             |cmd| {
                 let script = cmd.args.last().cloned().unwrap_or_default();
+                if script.contains("HERDR_ADE_DOCTOR_INPUT") {
+                    return Ok(crate::testkit::diagnostic_output(cmd, 99_999_999, None));
+                }
                 if script.contains("getconf _NPROCESSORS_ONLN") {
                     return Ok(ok("1.0 16\n"));
                 }
@@ -7710,18 +7713,18 @@ mod tests {
 
     #[test]
     fn box_disk_floor_refuses_before_creating_work_and_recovers() {
-        use crate::runner::fake::ok;
         let (fx, _remote) = box_fixture();
         write_config(&fx, &lane_config());
         let free = std::rc::Rc::new(std::cell::Cell::new(5_u64));
         let current = free.clone();
         fx.world.runner.on_fn(
-            |cmd| cmd.program == "ssh" && cmd.display().contains("disk_free_kb"),
-            move |_| {
-                Ok(ok(&format!(
-                    "disk_free_kb\t{}\n",
-                    current.get() * 1_000_000
-                )))
+            |cmd| cmd.program == "ssh" && cmd.display().contains("HERDR_ADE_DOCTOR_INPUT"),
+            move |cmd| {
+                Ok(crate::testkit::diagnostic_output(
+                    cmd,
+                    current.get() * 1_000_000,
+                    None,
+                ))
             },
         );
         stub_box(&fx);
@@ -7949,7 +7952,6 @@ mod tests {
 
     #[test]
     fn lane_waits_for_provider_and_starts_on_next_pass_without_routing_retry() {
-        use crate::runner::fake::{fail, ok};
         let (fx, _remote) = box_fixture();
         write_config(
             &fx,
@@ -7967,17 +7969,13 @@ mod tests {
         let ready = std::rc::Rc::new(std::cell::Cell::new(false));
         let state = ready.clone();
         fx.world.runner.on_fn(
-            |cmd| {
-                cmd.program == "ssh"
-                    && cmd.display().contains("herdr-pi")
-                    && cmd.display().contains(" check ")
-            },
-            move |_| {
-                if state.get() {
-                    Ok(ok("ok"))
-                } else {
-                    Ok(fail(1, "provider readiness probe timed out"))
-                }
+            |cmd| cmd.program == "ssh" && cmd.display().contains("HERDR_ADE_DOCTOR_INPUT"),
+            move |cmd| {
+                Ok(crate::testkit::diagnostic_output(
+                    cmd,
+                    99_999_999,
+                    (!state.get()).then_some("provider readiness probe timed out"),
+                ))
             },
         );
         stub_box(&fx);
@@ -8001,14 +7999,14 @@ mod tests {
             t.provider_wait_started = waiting.provider_wait_started.clone();
         })
         .unwrap();
-        let before = fx.world.runner.count("herdr-pi check");
+        let before = fx.world.runner.count("HERDR_ADE_DOCTOR_INPUT");
         crate::ticker::resume_provider_starts(
             &fx.world.ctx(),
             &fx.project,
             &mut std::collections::BTreeMap::new(),
             |error| panic!("{error:#}"),
         );
-        assert_eq!(fx.world.runner.count("herdr-pi check") - before, 0);
+        assert_eq!(fx.world.runner.count("HERDR_ADE_DOCTOR_INPUT") - before, 0);
         // The observation survives another pass, not merely its local map.
         thread::update(&fx.project, &other.id, |t| t.status = Status::Resolved).unwrap();
         ready.set(true);
@@ -8848,11 +8846,17 @@ mod tests {
             |cmd| {
                 cmd.program == "ssh"
                     && cmd
-                        .args
-                        .last()
-                        .is_some_and(|script| script.contains("command -v claude"))
+                        .stdin
+                        .as_ref()
+                        .is_some_and(|input| input.contains("\"kind\":\"claude\""))
             },
-            |_| Ok(crate::runner::fake::fail(1, "Usage limit reached")),
+            |cmd| {
+                Ok(crate::testkit::diagnostic_output(
+                    cmd,
+                    99_999_999,
+                    Some("Usage limit reached"),
+                ))
+            },
         );
         stub_box(&fx);
         let waiting = start(
@@ -8886,9 +8890,9 @@ mod tests {
             |cmd| {
                 cmd.program == "ssh"
                     && cmd
-                        .args
-                        .last()
-                        .is_some_and(|script| script.contains("command -v claude"))
+                        .stdin
+                        .as_ref()
+                        .is_some_and(|input| input.contains("\"kind\":\"claude\""))
             },
             |_| Ok(crate::runner::fake::fail(255, "connection refused")),
         );

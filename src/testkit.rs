@@ -7,6 +7,68 @@ use crate::runner::{RealRunner, Runner};
 use crate::scenarios::World;
 use crate::thread::{self, Kind, Status, sha256_hex};
 
+/// Structured target facts for remote diagnostic fixtures. No host `df` runs.
+pub fn diagnostic_output(
+    cmd: &crate::runner::Cmd,
+    free_kb: u64,
+    refusal: Option<&str>,
+) -> crate::runner::Output {
+    use crate::pi::doctor::{FailureEvidence, Row};
+    let input: serde_json::Value = serde_json::from_str(cmd.stdin.as_deref().unwrap()).unwrap();
+    let mut rows = Vec::new();
+    if let Some(disk) = input["disk"].as_array() {
+        let free = free_kb as f64 * 1024.0 / 1_000_000_000.0;
+        rows.push(if free >= disk[1].as_f64().unwrap() {
+            Row::ok("disk", format!("{free:.1} GB free"))
+        } else {
+            Row::fail(
+                "disk",
+                format!(
+                    "disk_low: {free:.1} GB free under {}",
+                    disk[0].as_str().unwrap()
+                ),
+            )
+        });
+    }
+    for native in input["natives"].as_array().unwrap() {
+        rows.push(Row::ok(
+            format!("recipe {}", native[0].as_str().unwrap()),
+            "selected model ready",
+        ));
+    }
+    for pair in input["models"].as_array().unwrap() {
+        let label = format!(
+            "provider {}/{}",
+            pair[0].as_str().unwrap(),
+            pair[1].as_str().unwrap()
+        );
+        let label = input["pi_ids"][&label]
+            .as_array()
+            .map_or(label.clone(), |ids| {
+                format!(
+                    "recipe {} ({label})",
+                    ids.iter()
+                        .map(|id| id.as_str().unwrap())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                )
+            });
+        rows.push(Row::ok(label, "login ready"));
+    }
+    if let Some(detail) = refusal
+        && let Some(row) = rows.iter_mut().find(|row| row.label != "disk")
+    {
+        row.level = crate::pi::doctor::Level::Fail;
+        row.detail = format!("pi_not_ready: {detail}");
+        row.evidence = if crate::pi::doctor::positive_sign_in_evidence(detail) {
+            FailureEvidence::Provider
+        } else {
+            FailureEvidence::Unknown
+        };
+    }
+    ok(&serde_json::json!({"rows": rows, "snapshot": {"panes": null, "agents": null, "builds": null, "build_error": null}}).to_string())
+}
+
 pub struct Fx {
     pub world: World,
     pub project: Project,

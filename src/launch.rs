@@ -564,10 +564,9 @@ pub struct DoctorRow {
     pub label: String,
     pub detail: String,
 }
-pub fn doctor_rows(ctx: &Ctx) -> Result<Vec<DoctorRow>> {
-    let config = parse_launch_config(&ctx.config_dir)?;
-    let valid = validate_recipe_reachability(&config)
-        .and_then(|_| validate_config(&config, &agent_kinds(ctx.env, ctx.runner)?));
+pub fn doctor_rows(ctx: &Ctx, config: &LaunchConfig) -> Result<Vec<DoctorRow>> {
+    let valid = validate_recipe_reachability(config)
+        .and_then(|_| validate_config(config, &agent_kinds(ctx.env, ctx.runner)?));
     Ok(vec![DoctorRow {
         ok: Some(valid.is_ok()),
         label: "recipes and routing".into(),

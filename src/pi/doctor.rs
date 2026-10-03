@@ -64,20 +64,20 @@ pub(crate) fn configured_deepseek_models(config_dir: &Path) -> Result<Vec<String
     Ok(models.into_iter().collect())
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub(crate) enum Level {
     Ok,
     Warn,
     Fail,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub(crate) enum FailureEvidence {
     Unknown,
     Provider,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub(crate) struct Row {
     pub(crate) level: Level,
     pub(crate) label: String,
@@ -137,6 +137,18 @@ pub(crate) fn healthy(rows: &[Row]) -> bool {
     !rows.iter().any(|r| r.level == Level::Fail)
 }
 
+pub(crate) fn failure_evidence<'a>(mut failures: impl Iterator<Item = &'a Row>) -> FailureEvidence {
+    match failures.next() {
+        Some(first)
+            if first.evidence == FailureEvidence::Provider
+                && failures.all(|row| row.evidence == FailureEvidence::Provider) =>
+        {
+            FailureEvidence::Provider
+        }
+        _ => FailureEvidence::Unknown,
+    }
+}
+
 /// Run every row from the process environment (A1 wires this into
 /// `herdr-ade doctor`). `Err` only when the environment cannot be read.
 pub(crate) fn doctor_rows() -> Result<(Vec<Row>, bool)> {
@@ -164,7 +176,7 @@ pub(crate) fn doctor_rows_with(
     env: &Env,
     layout: &Layout,
     runner: &dyn sh::Runner,
-    providers: &[&str],
+    deepseek_models: &[String],
 ) -> Vec<Row> {
     let mut rows = Vec::new();
 
@@ -244,15 +256,17 @@ pub(crate) fn doctor_rows_with(
 
     // pin: the prefix's package.json must hold the exact range, not a caret.
     match pinned_range(layout) {
-        Some(range) if range == PI_VERSION => rows.push(Row::ok(
-            "pin",
-            format!("{range} in {}", layout.package_json().display()),
-        )),
+        Some(range) if range == PI_VERSION && install::is_installed_exactly(layout) => {
+            rows.push(Row::ok(
+                "pin",
+                format!("{range} in {}", layout.package_json().display()),
+            ))
+        }
         Some(range) => rows.push(Row::fail(
             "pin",
             format!(
-                "{range} in {}; the pin is exact 0.99.1",
-                layout.package_json().display()
+                "prefix pin {range}, installed {}; expected exactly {PI_VERSION}",
+                install::installed_version(layout).unwrap_or_else(|| "missing".into())
             ),
         )),
         None => {
@@ -365,9 +379,7 @@ pub(crate) fn doctor_rows_with(
 
     // deepseek compaction: the shared models.json must lower the opencode-go
     // DeepSeek window so pi compacts near 372k tokens.
-    let deepseek_models = configured_deepseek_models(&env.config_dir());
-    match deepseek_models.and_then(|models| provider::missing_overrides(&layout.models(), &models))
-    {
+    match provider::missing_overrides(&layout.models(), deepseek_models) {
         Ok(missing) if missing.is_empty() => rows.push(Row::ok(
             "deepseek compaction",
             format!("contextWindow {}", provider::DEEPSEEK_CONTEXT_WINDOW),
@@ -421,27 +433,6 @@ pub(crate) fn doctor_rows_with(
         ));
     }
 
-    // each enabled provider: a login or a named missing-login failure.
-    if layout.wrapper().is_file() {
-        for provider in providers {
-            match auth_check(runner, layout, provider) {
-                Ok(()) => rows.push(Row::ok(format!("provider {provider}"), "login ready")),
-                Err(error) if error.evidence == FailureEvidence::Provider => {
-                    rows.push(Row::provider_fail(
-                        format!("provider {provider} login"),
-                        error.detail,
-                    ));
-                }
-                Err(error) => rows.push(Row::fail(
-                    format!("provider {provider} readiness"),
-                    error.detail,
-                )),
-            }
-        }
-    } else {
-        rows.push(Row::fail("providers", "no wrapper; run `herdr-pi setup`"));
-    }
-
     // ~/.pi: existence only, never read further.
     if env.home.join(".pi").exists() {
         rows.push(Row::ok(
@@ -473,6 +464,7 @@ pub(crate) struct CheckReport {
 }
 
 impl CheckReport {
+    #[cfg(test)]
     pub(crate) fn failures(&self) -> Vec<&Row> {
         self.rows
             .iter()
@@ -480,28 +472,11 @@ impl CheckReport {
             .collect()
     }
 
-    pub(crate) fn error_text(&self) -> String {
-        let mut text = format!("pi is not ready for `{}`", self.provider);
-        for row in self.failures() {
-            text.push_str(&format!("; {}: {}", row.label, row.detail));
-        }
-        text
-    }
-
     /// A provider class requires positive provider evidence and no competing
     /// local/setup failure. Missing binaries, malformed local output and
     /// timeouts therefore stay unknown.
     pub(crate) fn failure_evidence(&self) -> FailureEvidence {
-        let failures = self.failures();
-        if !failures.is_empty()
-            && failures
-                .iter()
-                .all(|row| row.evidence == FailureEvidence::Provider)
-        {
-            FailureEvidence::Provider
-        } else {
-            FailureEvidence::Unknown
-        }
+        failure_evidence(self.rows.iter().filter(|row| row.level == Level::Fail))
     }
 
     /// The shape `herdr-pi check <provider>` prints and A1 records.
@@ -534,6 +509,10 @@ impl CheckReport {
             "ok": self.ok,
             "provider": self.provider,
             "checks": rows,
+            "failure_class": if self.ok { "none" } else { match self.failure_evidence() {
+                FailureEvidence::Provider => "provider",
+                FailureEvidence::Unknown => "unknown",
+            } },
         })
     }
 }
@@ -545,96 +524,26 @@ pub(crate) fn check_report_model(
     provider: &str,
     model: Option<&str>,
 ) -> CheckReport {
-    let mut rows = Vec::new();
-
+    let deepseek: Vec<_> = model
+        .filter(|model| provider == super::provider::PROVIDER_ID && model.starts_with("deepseek"))
+        .map(str::to_string)
+        .into_iter()
+        .collect();
+    let mut rows = doctor_rows_with(env, layout, runner, &deepseek);
     if let Err(error) = check_provider_allowed(provider) {
         rows.push(Row::fail("provider", format!("{error:#}")));
-    }
-
-    if layout.agent().is_dir() {
-        rows.push(Row::ok("pi folder", layout.agent().display().to_string()));
-    } else {
-        rows.push(Row::fail(
-            "pi folder",
-            format!("{} is missing", layout.agent().display()),
-        ));
-    }
-
-    match folder::read_settings(layout) {
-        Ok(state) if state.trust_never => {
-            rows.push(Row::ok("settings trust", "defaultProjectTrust: never"));
-        }
-        Ok(_) => rows.push(Row::fail(
-            "settings trust",
-            format!(
-                "{} must set defaultProjectTrust: \"never\"",
-                layout.settings().display()
-            ),
-        )),
-        Err(error) => rows.push(Row::fail("settings", format!("{error:#}"))),
-    }
-
-    match folder::trust_has_true(layout) {
-        Ok(false) => rows.push(Row::ok("trust.json", "no true entry")),
-        Ok(true) => rows.push(Row::fail("trust.json", "a true entry is present")),
-        Err(error) => rows.push(Row::fail("trust.json", format!("{error:#}"))),
-    }
-
-    if install::is_installed_exactly(layout) {
-        rows.push(Row::ok(
-            "pin",
-            format!("{PI_VERSION} in {}", layout.npm().display()),
-        ));
-    } else {
-        let found = install::installed_version(layout).unwrap_or_else(|| "missing".into());
-        rows.push(Row::fail(
-            "pin",
-            format!("installed pi is {found}, pinned {PI_VERSION}"),
-        ));
-    }
-
-    rows.push(wrapper_path_row(runner, env, layout));
-
-    if install::guard_ok(layout) {
-        rows.push(Row::ok("guard", "current extension installed"));
-    } else {
-        rows.push(Row::fail(
-            "guard",
-            "extensions/herdr-pi-guard.ts is missing or stale",
-        ));
-    }
-
-    match runner.run(
-        &sh::Cmd::new(env.herdr_bin(), sh::SHORT)
-            .own_group()
-            .args(["integration", "status"])
-            .env("PI_CODING_AGENT_DIR", layout.agent().display().to_string()),
-    ) {
-        Ok(output) if output.success() && output.stdout.contains("pi: current") => {
-            rows.push(Row::ok("herdr extension", "pi: current"));
-        }
-        Ok(output) => rows.push(Row::fail(
-            "herdr extension",
-            format!("herdr integration status: {}", output.error_text()),
-        )),
-        Err(error) => rows.push(Row::fail("herdr extension", format!("{error:#}"))),
-    }
-
-    if check_provider_allowed(provider).is_ok() {
-        if layout.wrapper().is_file() {
-            match auth_check_model(runner, layout, provider, model) {
-                Ok(()) => rows.push(Row::ok("login", format!("{provider} ready"))),
-                Err(error) if error.evidence == FailureEvidence::Provider => {
-                    rows.push(Row::provider_fail("login", error.detail));
-                }
-                Err(error) => rows.push(Row::fail("readiness", error.detail)),
-            }
+    } else if layout.wrapper().is_file() {
+        let result = auth_check_model(runner, layout, provider, model);
+        let label = if result
+            .as_ref()
+            .err()
+            .is_some_and(|error| error.evidence == FailureEvidence::Unknown)
+        {
+            "readiness"
         } else {
-            rows.push(Row::fail(
-                "login",
-                format!("no wrapper at {}", layout.wrapper().display()),
-            ));
-        }
+            "login"
+        };
+        rows.push(auth_row(label.into(), result));
     }
 
     let ok = healthy(&rows);
@@ -652,29 +561,32 @@ pub(crate) fn doctor_rows_with_models(
     runner: &dyn sh::Runner,
     models: &[(&str, &str)],
 ) -> Vec<Row> {
-    let mut rows = doctor_rows_with(env, layout, runner, &[]);
-    if !layout.wrapper().is_file() {
-        return rows;
-    }
-    for (provider_id, model) in models {
-        rows.push(provider_row(runner, layout, provider_id, model));
+    let deepseek: Vec<_> = models
+        .iter()
+        .filter(|(p, m)| *p == provider::PROVIDER_ID && m.starts_with("deepseek"))
+        .map(|(_, m)| m.to_string())
+        .collect();
+    let mut rows = doctor_rows_with(env, layout, runner, &deepseek);
+    if layout.wrapper().is_file() {
+        rows.extend(provider_rows(runner, layout, models));
+    } else {
+        rows.extend(models.iter().map(|(p, m)| {
+            Row::fail(
+                format!("provider {p}/{m}"),
+                "no wrapper; run `herdr-pi setup`",
+            )
+        }));
     }
     rows
 }
 
-pub(crate) fn provider_row(
-    runner: &dyn sh::Runner,
-    layout: &Layout,
-    provider_id: &str,
-    model: &str,
-) -> Row {
-    let label = format!("provider {provider_id}/{model}");
-    match auth_check_model(runner, layout, provider_id, Some(model)) {
+fn auth_row(label: String, result: AuthResult) -> Row {
+    match result {
         Ok(()) => Row::ok(label, "login ready"),
         Err(error) if error.evidence == FailureEvidence::Provider => {
-            Row::provider_fail(format!("{label} login"), error.detail)
+            Row::provider_fail(label, error.detail)
         }
-        Err(error) => Row::fail(format!("{label} readiness"), error.detail),
+        Err(error) => Row::fail(label, error.detail),
     }
 }
 
@@ -700,6 +612,7 @@ fn provider_auth(detail: impl Into<String>) -> AuthFailure {
     }
 }
 
+#[cfg(test)]
 fn auth_check(runner: &dyn sh::Runner, layout: &Layout, provider: &str) -> AuthResult {
     auth_check_model(runner, layout, provider, None)
 }
@@ -710,41 +623,98 @@ fn auth_check_model(
     provider: &str,
     model: Option<&str>,
 ) -> AuthResult {
-    let key = match model {
-        Some(model) => {
-            use sha2::{Digest, Sha256};
-            let digest = Sha256::digest(format!("{provider}\0{model}").as_bytes());
-            format!("model-{:x}", digest)[..22].to_string()
-        }
-        None => provider.to_string(),
-    };
-    if let Some(cached) = read_cached_probe(layout, &key) {
-        return cached;
-    }
-    let result = auth_check_uncached(runner, layout, provider, model);
-    write_cached_probe(layout, &key, provider, &result);
-    result
+    auth_checks(runner, layout, &[(provider, model)]).remove(0)
 }
 
-fn auth_check_uncached(
+fn provider_rows(runner: &dyn sh::Runner, layout: &Layout, models: &[(&str, &str)]) -> Vec<Row> {
+    let inputs: Vec<_> = models.iter().map(|(p, m)| (*p, Some(*m))).collect();
+    models
+        .iter()
+        .zip(auth_checks(runner, layout, &inputs))
+        .map(|((p, m), result)| auth_row(format!("provider {p}/{m}"), result))
+        .collect()
+}
+
+/// Both production and scripted runners use the batching seam, in two phases:
+/// auth refresh, then one live model call. A failure never causes a second call.
+fn auth_checks(
     runner: &dyn sh::Runner,
+    layout: &Layout,
+    inputs: &[(&str, Option<&str>)],
+) -> Vec<AuthResult> {
+    let keys: Vec<_> = inputs
+        .iter()
+        .map(|(p, m)| match m {
+            Some(m) => format!(
+                "model-{}",
+                &crate::thread::sha256_hex(format!("{p}\0{m}").as_bytes())[..16]
+            ),
+            None => p.to_string(),
+        })
+        .collect();
+    let mut results: Vec<_> = keys
+        .iter()
+        .map(|key| read_cached_probe(layout, key))
+        .collect();
+    let pending: Vec<_> = results
+        .iter()
+        .enumerate()
+        .filter_map(|(i, result)| result.is_none().then_some(i))
+        .collect();
+    let auth: Vec<_> = pending
+        .iter()
+        .map(|&i| {
+            sh::Cmd::new(layout.wrapper().display().to_string(), sh::SHORT)
+                .own_group()
+                .args(["auth", "check", "--provider", inputs[i].0, "--json"])
+                .env("PI_CODING_AGENT_DIR", layout.agent().display().to_string())
+        })
+        .collect();
+    let mut live = Vec::new();
+    let mut live_ids = Vec::new();
+    for (&i, output) in pending.iter().zip(runner.run_parallel(&auth)) {
+        match output
+            .map_err(|error| {
+                unknown_auth(format!("provider readiness check could not run: {error:#}"))
+            })
+            .and_then(|output| live_command(layout, inputs[i].0, inputs[i].1, &output))
+        {
+            Ok(command) => {
+                live_ids.push(i);
+                live.push(command);
+            }
+            Err(error) => results[i] = Some(Err(error)),
+        }
+    }
+    for (i, output) in live_ids.into_iter().zip(runner.run_parallel(&live)) {
+        results[i] = Some(
+            output
+                .map_err(|error| {
+                    unknown_auth(format!("provider readiness probe could not run: {error:#}"))
+                })
+                .and_then(|output| live_result(inputs[i].0, &output)),
+        );
+    }
+    for i in pending {
+        write_cached_probe(
+            layout,
+            &keys[i],
+            inputs[i].0,
+            results[i].as_ref().expect("probe result"),
+        );
+    }
+    results
+        .into_iter()
+        .map(|result| result.expect("probe result"))
+        .collect()
+}
+
+fn live_command(
     layout: &Layout,
     provider: &str,
     selected_model: Option<&str>,
-) -> AuthResult {
-    // Let pi refresh an expired OAuth token. This is still only a credential
-    // check; the print-mode call below is what proves the provider will serve
-    // a model now.
-    let output = runner
-        .run(
-            &sh::Cmd::new(layout.wrapper().display().to_string(), sh::SHORT)
-                .own_group()
-                .args(["auth", "check", "--provider", provider, "--json"])
-                .env("PI_CODING_AGENT_DIR", layout.agent().display().to_string()),
-        )
-        .map_err(|error| {
-            unknown_auth(format!("provider readiness check could not run: {error:#}"))
-        })?;
+    output: &sh::Output,
+) -> std::result::Result<sh::Cmd, AuthFailure> {
     if output.timed_out || output.code.is_none() {
         return Err(unknown_auth(
             "provider readiness check timed out or was terminated by a signal",
@@ -790,39 +760,40 @@ fn auth_check_uncached(
     } else {
         "off"
     };
-    let live = runner
-        .run(
-            &sh::Cmd::new(layout.wrapper().display().to_string(), LIVE_PROBE_TIMEOUT)
-                .own_group()
-                .args([
-                    "--provider",
-                    provider,
-                    "--model",
-                    model,
-                    "--thinking",
-                    thinking,
-                    "--no-tools",
-                    "--no-skills",
-                    "--no-extensions",
-                    "--no-prompt-templates",
-                    "--no-themes",
-                    "--no-context-files",
-                    "--no-session",
-                    "--system-prompt",
-                    "Reply only OK.",
-                    "--print",
-                    "Reply OK.",
-                ])
-                .env("PI_CODING_AGENT_DIR", layout.agent().display().to_string()),
-        )
-        .map_err(|error| {
-            unknown_auth(format!("provider readiness probe could not run: {error:#}"))
-        })?;
+    Ok(
+        sh::Cmd::new(layout.wrapper().display().to_string(), LIVE_PROBE_TIMEOUT)
+            .own_group()
+            .args([
+                "--provider",
+                provider,
+                "--model",
+                model,
+                "--thinking",
+                thinking,
+                "--no-tools",
+                "--no-skills",
+                "--no-extensions",
+                "--no-prompt-templates",
+                "--no-themes",
+                "--no-context-files",
+                "--no-session",
+                "--system-prompt",
+                "Reply only OK.",
+                "--print",
+                "Reply OK.",
+            ])
+            .env("PI_CODING_AGENT_DIR", layout.agent().display().to_string()),
+    )
+}
+
+fn live_result(provider: &str, live: &sh::Output) -> AuthResult {
     if live.success() {
         return Ok(());
     }
-    if live.timed_out {
-        return Err(unknown_auth("provider readiness probe timed out"));
+    if live.timed_out || live.code.is_none() {
+        return Err(unknown_auth(
+            "provider readiness probe timed out or was terminated",
+        ));
     }
     let error_text = live.error_text();
     let detail = error_text
@@ -873,88 +844,85 @@ fn probe_model(provider: &str) -> Result<&'static str> {
     }
 }
 
-fn probe_cache_path(layout: &Layout, provider: &str) -> PathBuf {
-    layout.root.join(format!("readiness-{provider}.json"))
+fn probe_cache_path(layout: &Layout, key: &str) -> PathBuf {
+    layout.root.join(format!("readiness-{key}.json"))
 }
 
-fn read_cached_probe(layout: &Layout, provider: &str) -> Option<AuthResult> {
-    let value: Value =
-        serde_json::from_slice(&std::fs::read(probe_cache_path(layout, provider)).ok()?).ok()?;
-    let checked = value.get("checked_unix")?.as_u64()?;
+#[derive(serde::Serialize, serde::Deserialize)]
+struct CachedObservation {
+    checked_unix: u64,
+    row: Row,
+}
+
+/// Native and pi probes use the same typed cache. Unknown evidence is never
+/// persisted or upgraded; labels come from the current selected probe plan.
+pub(crate) fn cached_row(path: &Path, label: String) -> Option<Row> {
+    let mut cached: CachedObservation = serde_json::from_slice(&std::fs::read(path).ok()?).ok()?;
     let now = SystemTime::now().duration_since(UNIX_EPOCH).ok()?.as_secs();
-    if now.saturating_sub(checked) > READINESS_CACHE_TTL.as_secs() {
+    if now.saturating_sub(cached.checked_unix) > READINESS_CACHE_TTL.as_secs()
+        || (cached.row.level != Level::Ok && cached.row.evidence != FailureEvidence::Provider)
+    {
         return None;
     }
-    if value.get("ok")?.as_bool()? {
-        Some(Ok(()))
-    } else {
-        let evidence = match value.get("failure_class")?.as_str()? {
-            "provider" => FailureEvidence::Provider,
-            "unknown" => FailureEvidence::Unknown,
-            _ => return None,
-        };
-        Some(Err(AuthFailure {
-            evidence,
-            detail: value.get("detail")?.as_str()?.to_string(),
-        }))
+    cached.row.label = label;
+    Some(cached.row)
+}
+
+pub(crate) fn cache_row(path: &Path, row: Row) {
+    if row.level != Level::Ok && row.evidence != FailureEvidence::Provider {
+        let _ = std::fs::remove_file(path);
+        return;
     }
+    let Some(parent) = path.parent() else {
+        return;
+    };
+    if std::fs::create_dir_all(parent).is_err() {
+        return;
+    }
+    let Ok(checked_unix) = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|time| time.as_secs())
+    else {
+        return;
+    };
+    let Ok(bytes) = serde_json::to_vec(&CachedObservation { checked_unix, row }) else {
+        return;
+    };
+    let staged = path.with_extension(format!("tmp-{}", std::process::id()));
+    if std::fs::write(&staged, bytes).is_ok() {
+        let _ = std::fs::rename(&staged, path);
+    }
+    let _ = std::fs::remove_file(staged);
+}
+
+fn read_cached_probe(layout: &Layout, key: &str) -> Option<AuthResult> {
+    cached_row(&probe_cache_path(layout, key), String::new()).map(|row| {
+        if row.level == Level::Ok {
+            Ok(())
+        } else {
+            Err(AuthFailure {
+                evidence: row.evidence,
+                detail: row.detail,
+            })
+        }
+    })
 }
 
 fn write_cached_probe(layout: &Layout, key: &str, provider: &str, result: &AuthResult) {
     if !layout.root.is_dir() {
         return;
     }
-    // Unknown output might be local diagnostics or unrecognized provider
-    // output. Keep neither beside credentials; rerun it and preserve the text
-    // in the immediate result instead of inventing a login remedy.
-    if result
-        .as_ref()
-        .err()
-        .is_some_and(|error| error.evidence == FailureEvidence::Unknown)
-    {
-        let _ = std::fs::remove_file(probe_cache_path(layout, key));
-        return;
-    }
-    let checked = match SystemTime::now().duration_since(UNIX_EPOCH) {
-        Ok(value) => value.as_secs(),
-        Err(_) => return,
-    };
-    // Cache only the answer and a generated provider remedy. Provider output
-    // itself never becomes a credential-adjacent file.
-    let detail = result.as_ref().err().map(|error| {
-        if error.evidence == FailureEvidence::Provider {
-            if error.detail.starts_with("missing sign-in:") {
-                format!("missing sign-in for {provider} (run `herdr-pi login {provider}`)")
-            } else {
-                format!(
-                    "stored sign-in no longer works for {provider} (run `herdr-pi login {provider}`)"
-                )
-            }
+    let mut row = auth_row(String::new(), result.clone());
+    // Provider output never becomes a credential-adjacent file.
+    if row.evidence == FailureEvidence::Provider {
+        let reason = if row.detail.starts_with("missing sign-in:") {
+            "missing sign-in"
         } else {
-            unreachable!("unknown failures return before cache serialization")
-        }
-    });
-    let failure_class = result.as_ref().err().map(|error| match error.evidence {
-        FailureEvidence::Provider => "provider",
-        FailureEvidence::Unknown => "unknown",
-    });
-    let bytes = match serde_json::to_vec(&serde_json::json!({
-        "checked_unix": checked,
-        "ok": result.is_ok(),
-        "failure_class": failure_class,
-        "detail": detail,
-    })) {
-        Ok(bytes) => bytes,
-        Err(_) => return,
-    };
-    let path = probe_cache_path(layout, key);
-    let staged = layout
-        .root
-        .join(format!(".readiness-{key}-{}", std::process::id()));
-    if std::fs::write(&staged, bytes).is_ok() {
-        let _ = std::fs::rename(&staged, path);
+            "stored sign-in no longer works"
+        };
+        row.detail = format!("{reason} for {provider} (run `herdr-pi login {provider}`)");
     }
-    let _ = std::fs::remove_file(staged);
+    cache_row(&probe_cache_path(layout, key), row);
 }
 
 fn wrapper_path_row(runner: &dyn sh::Runner, env: &Env, layout: &Layout) -> Row {
@@ -1242,6 +1210,103 @@ args = ["--provider=opencode-go", "--model=deepseek-custom", "--thinking=low", "
         assert!(
             text.iter().any(|l| l.contains("[FAIL] trust.json")),
             "{text:?}"
+        );
+    }
+
+    #[test]
+    fn model_probes_use_runner_batches_with_exact_identities_and_deadlines() {
+        struct Batched {
+            runner: FakeRunner,
+            batches: std::cell::RefCell<Vec<Vec<sh::Cmd>>>,
+        }
+        impl sh::Runner for Batched {
+            fn run(&self, cmd: &sh::Cmd) -> Result<sh::Output> {
+                self.runner.run(cmd)
+            }
+            fn run_parallel(&self, commands: &[sh::Cmd]) -> Vec<Result<sh::Output>> {
+                self.batches.borrow_mut().push(commands.to_vec());
+                self.runner.run_parallel(commands)
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let layout = installed_layout(dir.path());
+        let env = Env::for_test(dir.path(), &[]);
+        link_into(&env, &layout);
+        let runner = Batched {
+            runner: scripted(&env),
+            batches: Default::default(),
+        };
+        runner.runner.on("auth check", ok(r#"{"status":"ready"}"#));
+        let models = [
+            ("openai-codex", "gpt-6.1-sol"),
+            ("openai-codex", "gpt-5.6-sol"),
+        ];
+        let rows = doctor_rows_with_models(&env, &layout, &runner, &models);
+        for (_, model) in models {
+            assert!(
+                rows.iter()
+                    .any(|row| row.label == format!("provider openai-codex/{model}")
+                        && row.level == Level::Ok)
+            );
+        }
+        let batches = runner.batches.borrow();
+        assert_eq!(batches.len(), 2);
+        assert!(batches[0].iter().all(|cmd| cmd.timeout == sh::SHORT));
+        assert_eq!(batches[0].len(), 2);
+        assert_eq!(batches[1].len(), 2);
+        assert!(
+            batches[1]
+                .iter()
+                .all(|cmd| cmd.timeout == LIVE_PROBE_TIMEOUT && cmd.own_group)
+        );
+        for (command, (_, model)) in batches[1].iter().zip(models) {
+            assert!(
+                command
+                    .args
+                    .windows(2)
+                    .any(|pair| pair == ["--model", model])
+            );
+        }
+    }
+
+    #[test]
+    fn check_and_doctor_share_setup_and_refuse_an_installed_version_mismatch() {
+        let dir = tempfile::tempdir().unwrap();
+        let layout = installed_layout(dir.path());
+        let env = Env::for_test(dir.path(), &[]);
+        link_into(&env, &layout);
+        std::fs::write(layout.package_json(), r#"{"version":"wrong"}"#).unwrap();
+        let runner = scripted(&env);
+        runner.on("auth check", ok(r#"{"status":"ready"}"#));
+        let doctor = doctor_rows_with_models(&env, &layout, &runner, &[("kimi-coding", "k3")]);
+        let check = check_report_model(&env, &layout, &runner, "kimi-coding", Some("k3"));
+        assert!(!check.ok);
+        let setup: Vec<_> = doctor
+            .into_iter()
+            .filter(|row| !row.label.starts_with("provider "))
+            .collect();
+        let check_setup: Vec<_> = check
+            .rows
+            .into_iter()
+            .filter(|row| row.label != "login" && row.label != "readiness")
+            .collect();
+        assert_eq!(setup, check_setup);
+        assert!(
+            setup
+                .iter()
+                .any(|row| row.label == "pin" && row.level == Level::Fail)
+        );
+    }
+
+    #[test]
+    fn signaled_model_output_cannot_establish_provider_failure() {
+        let output = sh::Output {
+            stderr: "unauthorized".into(),
+            ..Default::default()
+        };
+        assert_eq!(
+            live_result("kimi-coding", &output).unwrap_err().evidence,
+            FailureEvidence::Unknown
         );
     }
 

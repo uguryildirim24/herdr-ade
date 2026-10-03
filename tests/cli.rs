@@ -87,6 +87,66 @@ fn ticker_status_reports_the_installed_image_and_actual_lock_holder() {
 }
 
 #[test]
+fn doctor_transport_runs_selected_probes_without_loading_policy_or_waking_state() {
+    let home = tempfile::tempdir().unwrap();
+    let root = home.path().join("root");
+    std::fs::create_dir_all(root.join("broken-project")).unwrap();
+    std::fs::write(
+        root.join("broken-project/PROJECT.md"),
+        "private project content",
+    )
+    .unwrap();
+    let config = home.path().join(".config/herdr-ade");
+    std::fs::create_dir_all(&config).unwrap();
+    std::fs::write(config.join("config.toml"), "invalid policy = [").unwrap();
+    let marker = home.path().join("model-calls");
+    let input = serde_json::json!({
+        "natives": [["selected-recipe", {"kind":"fixture", "cache_key":"fixture-model", "program":"/bin/sh",
+            "args":["-c", format!("echo run >> '{}'; printf 'original local failure' >&2; exit 1", marker.display())]}, 1000]],
+        "models": [], "pi_ids": {}, "disk": null, "snapshot": null
+    });
+    let mut child = Command::new(BIN)
+        .env_clear()
+        .env("HOME", home.path())
+        .env("HERDR_ADE_DOCTOR_INPUT", "1")
+        .args(["--root", root.to_str().unwrap(), "doctor"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(input.to_string().as_bytes())
+        .unwrap();
+    let output = child.wait_with_output().unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let text = String::from_utf8(output.stdout).unwrap();
+    let report: serde_json::Value = serde_json::from_str(text.lines().last().unwrap()).unwrap();
+    assert_eq!(report["rows"][0]["label"], "recipe selected-recipe");
+    assert_eq!(report["rows"][0]["evidence"], "Unknown");
+    assert!(
+        report["rows"][0]["detail"]
+            .as_str()
+            .unwrap()
+            .contains("original local failure")
+    );
+    assert!(!text.contains("private project content"));
+    assert_eq!(std::fs::read_to_string(marker).unwrap(), "run\n");
+    assert_eq!(
+        std::fs::read_dir(root).unwrap().count(),
+        1,
+        "no awake, ticker, policy or project state writes"
+    );
+}
+
+#[test]
 fn internal_install_check_reports_only_counts_and_readability_without_writes() {
     let home = tempfile::tempdir().unwrap();
     let root = home.path().join("root");
