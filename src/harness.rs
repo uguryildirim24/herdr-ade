@@ -1914,29 +1914,31 @@ mod tests {
 
     #[test]
     fn install_visits_both_declared_boxes_even_when_first_build_fails() {
-        let root = tempfile::tempdir().unwrap();
-        let config_dir = root.path().join("config");
-        std::fs::create_dir_all(&config_dir).unwrap();
-        std::fs::write(config_dir.join("RULES.md"), "worker rules").unwrap();
-        let repo = root.path().join("fork");
-        std::fs::create_dir_all(repo.join("target/release")).unwrap();
-        std::fs::write(repo.join("Cargo.toml"), "[package]\nname = \"herdr\"\n").unwrap();
-        std::fs::write(repo.join("target/release/herdr"), "binary").unwrap();
-        let config = format!(
-            "[harness]\nrepos = [{{ path = '{}', box_path = '/generic/fork' }}]\n",
-            repo.display()
-        );
-        let machines = ["alpha", "beta"].iter().map(|label| format!(
+        // Separate installs must not reuse a lock briefly inherited by a
+        // concurrently forked child from another test.
+        for fail_first in [true, false] {
+            let root = tempfile::tempdir().unwrap();
+            let config_dir = root.path().join("config");
+            std::fs::create_dir_all(&config_dir).unwrap();
+            std::fs::write(config_dir.join("RULES.md"), "worker rules").unwrap();
+            let repo = root.path().join("fork");
+            std::fs::create_dir_all(repo.join("target/release")).unwrap();
+            std::fs::write(repo.join("Cargo.toml"), "[package]\nname = \"herdr\"\n").unwrap();
+            std::fs::write(repo.join("target/release/herdr"), "binary").unwrap();
+            let config = format!(
+                "[harness]\nrepos = [{{ path = '{}', box_path = '/generic/fork' }}]\n",
+                repo.display()
+            );
+            let machines = ["alpha", "beta"].iter().map(|label| format!(
             "\n[machines.{label}]\ntarget = '{label}'\nsession = 'default'\nhome = '/home/{label}'\nroot = '/home/{label}/ade'\nworktrees = '/home/{label}/work'\nbuild = '/home/{label}/build'\npath = '/home/{label}/bin:/usr/bin:/bin'\nade_bin = '/home/{label}/bin/herdr-ade'\npi_bin = '/home/{label}/bin/herdr-pi'\nrepos = [{{ path = '{}', box_path = '/home/{label}/fork' }}]\n",
             repo.display()
         )).collect::<String>();
-        std::fs::write(
-            config_dir.join("config.toml"),
-            format!("{config}{machines}"),
-        )
-        .unwrap();
-        let env = crate::paths::Env::for_test(root.path(), &[]);
-        for fail_first in [true, false] {
+            std::fs::write(
+                config_dir.join("config.toml"),
+                format!("{config}{machines}"),
+            )
+            .unwrap();
+            let env = crate::paths::Env::for_test(root.path(), &[]);
             let runner = FakeRunner::new();
             runner.on("machine list --json", ok("[]"));
             runner.on_fn(
