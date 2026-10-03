@@ -527,63 +527,6 @@ fn changes(lane: &Thread, event: &crate::contracts::Event) -> Option<bool> {
     }
 }
 
-/// Carry pre-tree-rule cached classifications forward once per machine. Old
-/// seal events are immutable; the matching thread cache is their correction.
-pub(crate) fn reclassify_old_changes(ctx: &Ctx, mut log: impl FnMut(&str)) -> Result<()> {
-    let marker = ctx.root.join(".change-reclass-v1.json");
-    if marker.exists() {
-        return Ok(());
-    }
-    for slug in project::list_slugs(&ctx.root) {
-        let project = Project::load(&ctx.root, &slug)?;
-        let events = crate::events::checked(&project)?;
-        let (lanes, errors) = thread::list_with_errors(&project);
-        if let Some(error) = errors.into_iter().next() {
-            return Err(error);
-        }
-        for lane in lanes
-            .into_iter()
-            .filter(|lane| lane.has_changes == Some(true))
-        {
-            let Some(event) = events.iter().find(|event| {
-                event.id == lane.changes_seal
-                    && event.thread == lane.id
-                    && event.payload.done.is_some()
-            }) else {
-                continue;
-            };
-            if lane.base.is_empty() || lane.repo.is_empty() {
-                continue;
-            }
-            let sha = &event.payload.done.as_ref().expect("sealed done").sha;
-            let git = Git::new(ctx.runner, &lane.repo);
-            match git.trees_differ(&lane.base, sha) {
-                Ok(false) => {
-                    thread::update(&project, &lane.id, |record| {
-                        if record.changes_seal == event.id && record.has_changes == Some(true) {
-                            record.has_changes = Some(false);
-                            // A pre-tree-rule classifier may also have inferred
-                            // a historical landing and install from ancestry.
-                            // Those are not evidence of a changed tree.
-                            if record.merged_review.is_empty() {
-                                record.merged_sha.clear();
-                                record.installed_sha.clear();
-                                record.historical_install_required = false;
-                            }
-                        }
-                    })?;
-                }
-                Ok(true) => {}
-                Err(error) => log(&format!(
-                    "one-time change reclassification: {slug}/{} skipped (objects unavailable locally): {error:#}",
-                    lane.id
-                )),
-            }
-        }
-    }
-    project::write_json(&marker, &true)
-}
-
 /// No git here: used by the ticker to decide whether a review can start.
 fn pending(
     project: &Project,
@@ -1145,15 +1088,12 @@ fn advance(ctx: &Ctx, project: &Project, review: &mut Review) -> Result<()> {
             }
             return Ok(());
         }
-        // Recheck a historical refusal caused by the old exact gate-list check.
         let Some(event) = sealed(&events, &reviewer).filter(|e| {
             e.id != review.reviewer_after
                 && (e.id != review.checked_event
                     || review.verdict.is_some()
                         && review.verdict_event.is_empty()
-                        && review.attention.is_empty()
-                    || review.attention
-                        == "verdict must report each path-selected gate, in order, with exit 0")
+                        && review.attention.is_empty())
         }) else {
             return Ok(());
         };

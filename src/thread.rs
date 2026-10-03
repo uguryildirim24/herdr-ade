@@ -98,10 +98,6 @@ pub(crate) struct Thread {
     /// A placement blocked by provider readiness; empty outside the one-hour wait.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub(crate) provider_wait_started: String,
-    /// A historical unsubmitted box start has been reclaimed once. Prevent a
-    /// later timed-out start from resetting the bounded launch counter again.
-    #[serde(default)]
-    pub(crate) startup_recovery_used: bool,
     /// Submission time of an agent start awaiting readiness after an early
     /// `agent_not_ready`. A blocked startup is not a failed attempt yet.
     #[serde(skip_serializing_if = "String::is_empty")]
