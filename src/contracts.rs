@@ -1,4 +1,4 @@
-//! Shared ADE record types. Every field is named in SPEC-ADE; none is added.
+//! Shared ADE record types. Optional additions keep historical state readable.
 
 use serde::{Deserialize, Serialize};
 
@@ -281,6 +281,22 @@ pub(crate) struct Op {
     pub(crate) has_changes: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) published_ref: Option<String>,
+}
+
+/// A semantic judgment of one required criterion, tied to an immutable seal.
+/// Missing evidence or an explicitly partial result is not established.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub(crate) struct CriterionEvidence {
+    pub(crate) thread: String,
+    pub(crate) event: String,
+    pub(crate) criterion: usize,
+    /// Echo the judged intent so editing task acceptance invalidates old proof.
+    #[serde(default)]
+    pub(crate) condition: String,
+    #[serde(default)]
+    pub(crate) established: bool,
+    #[serde(default)]
+    pub(crate) evidence: String,
 }
 
 /// A coordinator's explicit acceptance of a resolved lane's stored report.

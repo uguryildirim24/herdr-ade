@@ -353,11 +353,12 @@ pub(crate) fn record(project: &Project, disposition: Disposition, evidence: &str
                 if task.authority.is_empty()
                     || task.acceptance.is_empty()
                     || !task.dropped.is_empty()
-                    || !crate::task::view_with_evidence(project, task, &all)
+                    || !crate::task::view_with_evidence(project, task.clone(), &all)
                         .terminal_with_evidence(project, &all)
                 {
                     bail!("goal_check: {id} has no terminal acceptance-bearing evidence");
                 }
+                crate::task::require_accepted(project, &task, &all)?;
             }
             if snapshot.unfinished || !snapshot.exhausted {
                 bail!("goal_check: unfinished work still needs an action or explicit wait");

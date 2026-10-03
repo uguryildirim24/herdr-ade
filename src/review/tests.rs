@@ -99,9 +99,34 @@ fn seal_verdict(
         gates,
         gates_note: String::new(),
     };
+    #[derive(Serialize)]
+    struct AcceptanceRows {
+        #[serde(skip_serializing_if = "Vec::is_empty")]
+        acceptance: Vec<crate::contracts::CriterionEvidence>,
+    }
+    let tasks = crate::task::list_with_errors(&fx.project).0;
+    let mut acceptance = Vec::new();
+    for member in &review.members {
+        for task in tasks
+            .iter()
+            .filter(|task| task.attempts.last() == Some(&member.thread))
+        {
+            for criterion in 1..=task.acceptance.len() {
+                acceptance.push(crate::contracts::CriterionEvidence {
+                    thread: member.thread.clone(),
+                    event: member.event.clone(),
+                    criterion,
+                    condition: task.acceptance[criterion - 1].clone(),
+                    established: true,
+                    evidence: format!("artifact {}: observed behavior", member.artifact),
+                });
+            }
+        }
+    }
     let report = format!(
-        "+++\n{}+++\n\nChecked the complete pile.\n",
-        toml::to_string(&verdict).unwrap()
+        "+++\n{}{}+++\n\nChecked the complete pile.\n",
+        toml::to_string(&verdict).unwrap(),
+        toml::to_string(&AcceptanceRows { acceptance }).unwrap()
     );
     fx.seal_done(
         review.reviewer.as_deref().unwrap(),
@@ -111,6 +136,46 @@ fn seal_verdict(
         &report,
     );
 }
+#[test]
+fn packet_carries_original_acceptance_and_durable_evidence_not_rewritten_intent() {
+    let fx = configured();
+    let (id, _) = lane(&fx, 1);
+    let original = "# Original request\nRead every source.\nAcceptance: exhaustive coverage, preserve existing behavior.\n";
+    let hash = thread::store_artifact(&fx.project, original.as_bytes()).unwrap();
+    thread::update(&fx.project, &id, |lane| {
+        lane.launch.brief_hash = hash.clone()
+    })
+    .unwrap();
+    let mut record = job(&fx, &id);
+    record.acceptance = vec!["Later rewritten intent".into()];
+    record.installed.push(crate::task::Evidence {
+        at: "then".into(),
+        command: "ha harness install".into(),
+        acceptance: vec![],
+        machine: Some("oci".into()),
+        build: Some("build-sha".into()),
+    });
+    std::fs::write(
+        fx.project
+            .record_dir_for_write("tasks")
+            .unwrap()
+            .join(format!("{}.toml", record.id)),
+        toml::to_string(&record).unwrap(),
+    )
+    .unwrap();
+    let review = prepared(&fx);
+    let packet = task(&fx.project, &review);
+    assert!(packet.contains(original));
+    assert!(packet.contains(&hash));
+    assert!(packet.contains(&review.members[0].event));
+    assert!(packet.contains(&review.members[0].artifact));
+    assert!(packet.contains("Installation (not acceptance)"));
+    assert!(packet.contains("build-sha"));
+    assert!(!packet.contains("Later rewritten intent"));
+    thread::update(&fx.project, &id, |lane| lane.launch.brief_hash.clear()).unwrap();
+    assert!(task(&fx.project, &review).contains("Original brief/acceptance: not established"));
+}
+
 #[test]
 fn idle_reviewer_warns_once_and_a_new_verdict_lands() {
     let fx = configured();
@@ -1707,7 +1772,7 @@ fn old_fork_with_docs_only_changes_does_not_select_main_code_gates() {
 }
 
 #[test]
-fn gates_are_selected_from_pile_and_reviewer_fix_paths_and_failures_refuse() {
+fn gates_are_observed_from_pile_and_reviewer_fix_paths_not_declared_exits() {
     let fx = configured();
     lane(&fx, 1);
     let mut review = prepared(&fx);
@@ -1747,7 +1812,19 @@ fn gates_are_selected_from_pile_and_reviewer_fix_paths_and_failures_refuse() {
         advance(&fx.world.ctx(), &fx.project, &mut review)
             .unwrap_err()
             .to_string()
-            .contains("candidate-selected gate")
+            .contains("not established")
+    );
+    let passing = std::rc::Rc::new(std::cell::Cell::new(false));
+    let observed = passing.clone();
+    fx.world.runner.on_fn(
+        |cmd| cmd.program == "sh",
+        move |cmd| {
+            if !observed.get() && cmd.args.iter().any(|arg| arg.contains("docs-gate")) {
+                Ok(crate::runner::fake::fail(1, "checker broke"))
+            } else {
+                Ok(crate::runner::fake::ok("code passed"))
+            }
+        },
     );
     let mut gates = only_code;
     gates.push(GateRun {
@@ -1763,11 +1840,618 @@ fn gates_are_selected_from_pile_and_reviewer_fix_paths_and_failures_refuse() {
         gates.clone(),
         2,
     );
-    assert!(advance(&fx.world.ctx(), &fx.project, &mut review).is_err());
-    gates[1].exit = 0;
-    seal_verdict(&fx, &review, &candidate, "MERGE", BTreeMap::new(), gates, 3);
+    assert!(
+        advance(&fx.world.ctx(), &fx.project, &mut review)
+            .unwrap_err()
+            .to_string()
+            .contains("not established")
+    );
+    passing.set(true);
+    // No declarations at all: the two real ADE observations suffice.
+    seal_verdict(
+        &fx,
+        &review,
+        &candidate,
+        "MERGE",
+        BTreeMap::new(),
+        vec![],
+        3,
+    );
     advance(&fx.world.ctx(), &fx.project, &mut review).unwrap();
     assert_eq!(review.phase, Phase::Complete);
+}
+
+fn criterion_reason(lane: &str, event: &str, condition: &str, established: bool) -> String {
+    format!(
+        "[[acceptance]]\nthread = {lane:?}\nevent = {event:?}\ncriterion = 1\ncondition = {condition:?}\nestablished = {established}\nevidence = \"immutable report artifact and inspected source coverage\""
+    )
+}
+
+#[test]
+fn partial_no_change_research_cannot_unlock_dependents_but_evidenced_no_change_can() {
+    let fx = configured();
+    let (id, _) = lane(&fx, 1);
+    let lane = thread::load(&fx.project, &id).unwrap();
+    git(
+        Path::new(&lane.worktree_path),
+        &["reset", "--hard", &lane.base],
+    );
+    let partial = fx.seal_done(
+        &id,
+        1,
+        2,
+        &lane.base,
+        "Polished ledger: S1 complete; S2 complete (appendix not inspected).\n",
+    );
+    thread::update(&fx.project, &id, |lane| {
+        lane.changes_seal = partial.clone();
+        lane.has_changes = Some(false);
+        lane.status = Status::Resolved;
+    })
+    .unwrap();
+    let task = job(&fx, &id);
+    let mut build = task.clone();
+    build.id = "job-0002".into();
+    build.attempts.clear();
+    std::fs::write(
+        fx.project
+            .record_dir_for_write("tasks")
+            .unwrap()
+            .join("job-0002.toml"),
+        toml::to_string(&build).unwrap(),
+    )
+    .unwrap();
+    let mut plan = crate::contracts::Plan {
+        does: "Exhaustive evidence before implementation".into(),
+        steps: vec![
+            crate::contracts::PlanStep {
+                id: "s-1".into(),
+                tasks: vec![task.id.clone()],
+                ..Default::default()
+            },
+            crate::contracts::PlanStep {
+                id: "s-2".into(),
+                tasks: vec![build.id.clone()],
+                after: vec!["s-1".into()],
+                ..Default::default()
+            },
+        ],
+        ..Default::default()
+    };
+    project::write_atomic(
+        &fx.project.state_dir().join("plan.toml"),
+        toml::to_string(&plan).unwrap().as_bytes(),
+    )
+    .unwrap();
+    crate::plan::project_states(&fx.project, &mut plan);
+    assert_eq!(
+        plan.steps[0].state,
+        crate::contracts::StepState::Done,
+        "finish counts do not become an acceptance ladder"
+    );
+    assert!(
+        crate::plan::check_prerequisites(&fx.project, &build.id)
+            .unwrap_err()
+            .to_string()
+            .contains("acceptance not established")
+    );
+    crate::threads::attest(
+        &fx.world.ctx(),
+        "demo",
+        &id,
+        &criterion_reason(&id, &partial, &task.acceptance[0], false),
+    )
+    .unwrap();
+    assert!(
+        crate::task::load(&fx.project, &task.id)
+            .unwrap()
+            .acceptance_review
+            .is_some()
+    );
+    assert!(crate::plan::check_prerequisites(&fx.project, &build.id).is_err());
+    // The useful no-change outcome is allowed once independently evidenced;
+    // no commit, merge, gate or live install is invented for report-only work.
+    let complete = fx.seal_done(
+        &id,
+        1,
+        3,
+        &lane.base,
+        "Full source and appendix inspected; exhaustive ledger with durable references.\n",
+    );
+    thread::update(&fx.project, &id, |lane| {
+        lane.changes_seal = complete.clone()
+    })
+    .unwrap();
+    assert!(
+        crate::plan::check_prerequisites(&fx.project, &build.id).is_err(),
+        "old judgment cannot accept a new seal"
+    );
+    crate::threads::attest(
+        &fx.world.ctx(),
+        "demo",
+        &id,
+        &criterion_reason(&id, &complete, &task.acceptance[0], true),
+    )
+    .unwrap();
+    crate::plan::check_prerequisites(&fx.project, &build.id).unwrap();
+    assert!(
+        thread::load(&fx.project, &id)
+            .unwrap()
+            .merged_sha
+            .is_empty()
+    );
+    assert!(list(&fx.project).unwrap().is_empty());
+    let mut rewritten = crate::task::load(&fx.project, &task.id).unwrap();
+    rewritten.acceptance[0] = "A newly requested outcome".into();
+    std::fs::write(
+        fx.project
+            .record_dir_for_write("tasks")
+            .unwrap()
+            .join("job-0001.toml"),
+        toml::to_string(&rewritten).unwrap(),
+    )
+    .unwrap();
+    assert!(
+        crate::plan::check_prerequisites(&fx.project, &build.id).is_err(),
+        "old acceptance cannot cover new intent"
+    );
+}
+
+#[test]
+fn an_existing_independent_critic_can_establish_no_change_acceptance() {
+    let fx = configured();
+    let id = fx.thread("research");
+    let task = job(&fx, &id);
+    let event = fx.seal_done(&id, 1, 1, "base", "Full cited evidence");
+    thread::update(&fx.project, &id, |lane| {
+        lane.changes_seal = event.clone();
+        lane.has_changes = Some(false);
+    })
+    .unwrap();
+    let critic = fx.thread("requested critique");
+    thread::update(&fx.project, &critic, |lane| lane.role = "critic".into()).unwrap();
+    let snapshot = crate::task::EvidenceSnapshot::load(&fx.project);
+    assert!(crate::task::require_accepted(&fx.project, &task, &snapshot).is_err());
+    let reason = criterion_reason(&id, &event, &task.acceptance[0], true);
+    fx.seal_done(
+        &critic,
+        1,
+        1,
+        "base",
+        &format!("+++\nverdict = \"FAIL\"\n{reason}\n+++\nMissing coverage"),
+    );
+    assert!(
+        crate::task::require_accepted(
+            &fx.project,
+            &task,
+            &crate::task::EvidenceSnapshot::load(&fx.project)
+        )
+        .is_err()
+    );
+    fx.seal_done(
+        &critic,
+        1,
+        2,
+        "base",
+        &format!("+++\nverdict = \"PASS\"\n{reason}\n+++\nEvery source inspected"),
+    );
+    crate::task::require_accepted(
+        &fx.project,
+        &task,
+        &crate::task::EvidenceSnapshot::load(&fx.project),
+    )
+    .unwrap();
+}
+
+#[test]
+fn required_criterion_rows_missing_partial_or_empty_cannot_merge_despite_passing_gates() {
+    let fx = configured();
+    let (id, _) = lane(&fx, 1);
+    let task = job(&fx, &id);
+    let mut review = prepared(&fx);
+    review.gates = vec![project::Gate {
+        command: "true".into(),
+        ..Default::default()
+    }];
+    fx.world.runner.on_fn(
+        |cmd| cmd.program == "sh",
+        |cmd| crate::runner::Runner::run(&crate::runner::RealRunner, cmd),
+    );
+    let candidate = git(&fx.repo, &["rev-parse", &review.candidate_branch]);
+    let partial = criterion_reason(&id, &review.members[0].event, &task.acceptance[0], false);
+    let empty = criterion_reason(&id, &review.members[0].event, &task.acceptance[0], true).replace(
+        "immutable report artifact and inspected source coverage",
+        "",
+    );
+    for (n, acceptance) in [(1, String::new()), (2, partial), (3, empty)] {
+        let report = format!(
+            "+++\nreview = {:?}\nverdict = \"MERGE\"\ncandidate = {candidate:?}\n{acceptance}\n+++\nAll gates passed!\n",
+            review.id
+        );
+        fx.seal_done(
+            review.reviewer.as_deref().unwrap(),
+            1,
+            n,
+            &candidate,
+            &report,
+        );
+        assert!(
+            advance(&fx.world.ctx(), &fx.project, &mut review)
+                .unwrap_err()
+                .to_string()
+                .contains("acceptance not established")
+        );
+        assert!(!review.fast_forward);
+    }
+    seal_verdict(
+        &fx,
+        &review,
+        &candidate,
+        "MERGE",
+        BTreeMap::new(),
+        vec![],
+        4,
+    );
+    advance(&fx.world.ctx(), &fx.project, &mut review).unwrap();
+    crate::task::require_accepted(
+        &fx.project,
+        &task,
+        &crate::task::EvidenceSnapshot::load(&fx.project),
+    )
+    .unwrap();
+}
+
+fn receipts(project: &Project, review: &Review) -> Vec<GateReceipt> {
+    let mut records = Vec::new();
+    for entry in std::fs::read_dir(dir(project).join(&review.id)).unwrap() {
+        let path = entry.unwrap().path().join("receipt.toml");
+        if path.is_file() {
+            records.push(toml::from_str(&std::fs::read_to_string(path).unwrap()).unwrap());
+        }
+    }
+    records
+}
+
+#[test]
+fn landing_retry_cannot_use_declared_exits_or_missing_logs_as_execution_proof() {
+    let fx = configured();
+    lane(&fx, 1);
+    let mut review = prepared(&fx);
+    review.gates = vec![project::Gate {
+        command: "printf proof".into(),
+        ..Default::default()
+    }];
+    let candidate = git(&fx.repo, &["rev-parse", &review.candidate_branch]);
+    seal_verdict(
+        &fx,
+        &review,
+        &candidate,
+        "MERGE",
+        BTreeMap::new(),
+        vec![GateRun {
+            command: "printf proof".into(),
+            exit: 0,
+        }],
+        1,
+    );
+    let events = crate::events::checked(&fx.project).unwrap();
+    let reviewer = thread::load(&fx.project, review.reviewer.as_deref().unwrap()).unwrap();
+    let event = sealed(&events, &reviewer).unwrap();
+    // Simulate an old cached landing verdict whose only proof was exit=0.
+    review.verdict_event = event.id.clone();
+    review.verdict = Some(Verdict {
+        verdict: "MERGE".into(),
+        review: review.id.clone(),
+        candidate: candidate.clone(),
+        without: BTreeMap::new(),
+        gates: vec![],
+        gates_note: String::new(),
+    });
+    review.phase = Phase::Landing;
+    assert!(
+        land_with_install(&fx.world.ctx(), &fx.project, &mut review, || Ok(
+            String::new()
+        ))
+        .unwrap_err()
+        .to_string()
+        .contains("not established")
+    );
+    fx.world.runner.on_fn(
+        |cmd| cmd.program == "sh",
+        |cmd| crate::runner::Runner::run(&crate::runner::RealRunner, cmd),
+    );
+    let git = Git::new(&fx.world.runner, &review.repo);
+    review.verdict = Some(verdict(&fx.world.ctx(), &fx.project, &review, event, &git).unwrap());
+    let receipt = receipts(&fx.project, &review).pop().unwrap();
+    std::fs::remove_file(fx.project.state_dir().join(receipt.stdout)).unwrap();
+    assert!(
+        land_with_install(&fx.world.ctx(), &fx.project, &mut review, || Ok(
+            String::new()
+        ))
+        .unwrap_err()
+        .to_string()
+        .contains("not established")
+    );
+    assert!(!review.fast_forward);
+    // Same candidate but a new seal needs fresh observed proof.
+    seal_verdict(
+        &fx,
+        &review,
+        &candidate,
+        "MERGE",
+        BTreeMap::new(),
+        vec![],
+        2,
+    );
+    let fresh_events = crate::events::checked(&fx.project).unwrap();
+    review.verdict_event = sealed(&fresh_events, &reviewer).unwrap().id.clone();
+    assert!(verify_gate_receipts(&fx.world.ctx(), &fx.project, &review, &candidate, &git).is_err());
+    save(&fx.project, &review).unwrap();
+    let resumed = retry(&fx.world.ctx(), "demo", None).unwrap().unwrap();
+    assert!(resumed.fast_forward);
+    assert_eq!(resumed.phase, Phase::Complete);
+    assert!(
+        receipts(&fx.project, &resumed)
+            .iter()
+            .any(|receipt| receipt.event == resumed.verdict_event && receipt.exit == Some(0))
+    );
+}
+
+#[test]
+fn incomplete_capture_with_exit_zero_is_not_a_passing_receipt() {
+    struct Incomplete;
+    impl crate::runner::Runner for Incomplete {
+        fn run(&self, cmd: &crate::runner::Cmd) -> Result<crate::runner::Output> {
+            crate::runner::Runner::run(&crate::runner::RealRunner, cmd)
+        }
+        fn capture(
+            &self,
+            _: &crate::runner::Cmd,
+            _: Option<&crate::runner::OutputLogs>,
+        ) -> Result<crate::runner::Capture> {
+            Ok(crate::runner::Capture {
+                output: crate::runner::fake::ok("a valid-looking prefix"),
+                stdout: crate::runner::StreamEvidence {
+                    complete: false,
+                    error: Some("pipe/log failed".into()),
+                    ..Default::default()
+                },
+                stderr: crate::runner::StreamEvidence {
+                    complete: true,
+                    ..Default::default()
+                },
+            })
+        }
+    }
+    let fx = configured();
+    lane(&fx, 1);
+    let mut review = prepared(&fx);
+    review.gates = vec![project::Gate {
+        command: "checker".into(),
+        ..Default::default()
+    }];
+    let candidate = git(&fx.repo, &["rev-parse", &review.candidate_branch]);
+    let mut ctx = fx.world.ctx();
+    ctx.runner = &Incomplete;
+    let git = Git::new(ctx.runner, &review.repo);
+    assert!(
+        observed_gates(&ctx, &fx.project, &review, &candidate, &git)
+            .unwrap_err()
+            .to_string()
+            .contains("not established")
+    );
+    let receipt = receipts(&fx.project, &review).pop().unwrap();
+    assert_eq!(receipt.exit, Some(0));
+    assert!(!receipt.complete && receipt.error.contains("pipe/log failed"));
+}
+
+#[test]
+fn passing_receipt_records_environment_candidate_and_full_logs_and_invalidates_on_change() {
+    let fx = configured();
+    lane(&fx, 1);
+    let mut review = prepared(&fx);
+    let gate = project::Gate {
+        command: "test \"$RECEIPT_ENV\" = observed && test -f src/lane1.rs && printf 'behavior proved\\n'".into(),
+        env: BTreeMap::from([("RECEIPT_ENV".into(), "observed".into())]),
+        ..Default::default()
+    };
+    review.gates = vec![gate.clone()];
+    let candidate = git(&fx.repo, &["rev-parse", &review.candidate_branch]);
+    let mut ctx = fx.world.ctx();
+    ctx.runner = &crate::runner::RealRunner;
+    let git = Git::new(ctx.runner, &review.repo);
+    let runs = observed_gates(&ctx, &fx.project, &review, &candidate, &git).unwrap();
+    assert_eq!(
+        runs,
+        vec![GateRun {
+            command: gate.command.clone(),
+            exit: 0
+        }]
+    );
+    let receipt = receipts(&fx.project, &review).pop().unwrap();
+    assert_eq!(receipt.environment.get("RECEIPT_ENV").unwrap(), "observed");
+    assert_eq!(receipt.machine, "local");
+    assert_eq!(receipt.candidate, candidate);
+    assert_eq!(receipt.exit, Some(0));
+    assert!(receipt.complete && receipt.error.is_empty());
+    assert_eq!(
+        std::fs::read_to_string(fx.project.state_dir().join(&receipt.stdout)).unwrap(),
+        "behavior proved\n"
+    );
+    let cmd = gate_command(&gate, &candidate, &receipt.cwd, &receipt.environment, None);
+    assert!(receipt.matches(&fx.project, &review, &candidate, &cmd, "local"));
+    let changed = commit_file(
+        Path::new(&receipt.cwd),
+        "docs/next.md",
+        "changed",
+        "new candidate",
+    );
+    assert!(!receipt.matches(&fx.project, &review, &changed, &cmd, "local"));
+    assert!(
+        observed_gates(&ctx, &fx.project, &review, &candidate, &git)
+            .unwrap_err()
+            .to_string()
+            .contains("not established")
+    );
+    observed_gates(&ctx, &fx.project, &review, &changed, &git).unwrap();
+    assert!(
+        receipts(&fx.project, &review)
+            .iter()
+            .any(|r| r.candidate == changed && r.exit == Some(0))
+    );
+    std::fs::write(fx.project.state_dir().join(&receipt.stdout), "fabricated").unwrap();
+    assert!(!receipt.matches(&fx.project, &review, &candidate, &cmd, "local"));
+}
+
+#[test]
+fn gate_free_and_allowlist_exclusions_are_visible_not_silently_broadened() {
+    let fx = configured();
+    lane(&fx, 1);
+    let mut review = prepared(&fx);
+    let candidate = git(&fx.repo, &["rev-parse", &review.candidate_branch]);
+    let git = Git::new(&fx.world.runner, &review.repo);
+    review.gates = vec![project::Gate {
+        command: "never run".into(),
+        paths: Some(vec!["old/**".into()]),
+        ..Default::default()
+    }];
+    assert!(
+        observed_gates(&fx.world.ctx(), &fx.project, &review, &candidate, &git)
+            .unwrap()
+            .is_empty()
+    );
+    let selection_path = dir(&fx.project)
+        .join(&review.id)
+        .join(format!("{candidate}-selection.toml"));
+    let selection: toml::Value =
+        toml::from_str(&std::fs::read_to_string(&selection_path).unwrap()).unwrap();
+    assert!(selection["selected"].as_array().unwrap().is_empty());
+    assert_eq!(
+        selection["not_selected"][0]["paths"][0].as_str(),
+        Some("old/**")
+    );
+    assert_eq!(selection["changed_paths"][0].as_str(), Some("src/lane1.rs"));
+    review.gates.clear();
+    review.gates_note = "no gates declared".into();
+    observed_gates(&fx.world.ctx(), &fx.project, &review, &candidate, &git).unwrap();
+    assert!(
+        std::fs::read_to_string(selection_path)
+            .unwrap()
+            .contains("no gates declared")
+    );
+    assert_eq!(fx.world.runner.count("sh -c"), 0);
+}
+
+#[test]
+fn checker_timeout_and_spawn_errors_are_unknown_not_pass_or_work_failure() {
+    let fx = configured();
+    lane(&fx, 1);
+    let mut review = prepared(&fx);
+    review.gates = vec![project::Gate {
+        command: "checker".into(),
+        ..Default::default()
+    }];
+    let candidate = git(&fx.repo, &["rev-parse", &review.candidate_branch]);
+    let git = Git::new(&fx.world.runner, &review.repo);
+    let failure =
+        observed_gates(&fx.world.ctx(), &fx.project, &review, &candidate, &git).unwrap_err();
+    assert!(failure.to_string().contains("not established"));
+    assert!(
+        receipts(&fx.project, &review)[0]
+            .error
+            .contains("FakeRunner")
+    );
+    fx.world.runner.on_fn(
+        |cmd| cmd.program == "sh",
+        |_| Ok(crate::runner::fake::timeout()),
+    );
+    assert!(observed_gates(&fx.world.ctx(), &fx.project, &review, &candidate, &git).is_err());
+    assert!(
+        receipts(&fx.project, &review)
+            .iter()
+            .any(|r| r.timed_out && !r.complete && r.exit.is_none())
+    );
+    assert!(!review.fast_forward);
+}
+
+#[test]
+fn receipt_capture_keeps_full_large_logs_instead_of_treating_clipping_as_pass() {
+    let fx = configured();
+    lane(&fx, 1);
+    let mut review = prepared(&fx);
+    review.gates = vec![project::Gate {
+        command: "head -c 2097152 /dev/zero".into(),
+        ..Default::default()
+    }];
+    let candidate = git(&fx.repo, &["rev-parse", &review.candidate_branch]);
+    let mut ctx = fx.world.ctx();
+    ctx.runner = &crate::runner::RealRunner;
+    let git = Git::new(ctx.runner, &review.repo);
+    observed_gates(&ctx, &fx.project, &review, &candidate, &git).unwrap();
+    let receipt = receipts(&fx.project, &review).pop().unwrap();
+    assert!(receipt.complete);
+    assert_eq!(
+        std::fs::metadata(fx.project.state_dir().join(receipt.stdout))
+            .unwrap()
+            .len(),
+        2097152
+    );
+}
+
+#[test]
+fn remote_gate_command_uses_saved_target_checkout_and_environment() {
+    let gate = project::Gate {
+        command: "test \"$VALUE\" = 'a b'".into(),
+        ..Default::default()
+    };
+    let environment = BTreeMap::from([
+        ("PATH".into(), "/box/bin".into()),
+        ("VALUE".into(), "a b".into()),
+    ]);
+    let command = gate_command(
+        &gate,
+        "sealed-sha",
+        "/box/work tree",
+        &environment,
+        Some("saved-box"),
+    );
+    assert_eq!(command.program, "ssh");
+    assert!(command.own_group);
+    assert!(command.args.contains(&"saved-box".into()));
+    assert!(command.env.is_empty());
+    // Execute the generated SSH payload locally, using a small fake git, to
+    // prove quoting and remote cwd/env behavior rather than matching prose.
+    let temp = tempfile::tempdir().unwrap();
+    let bin = temp.path().join("bin");
+    std::fs::create_dir(&bin).unwrap();
+    let fake_git = bin.join("git");
+    std::fs::write(
+        &fake_git,
+        "#!/bin/sh\ncase \"$1\" in rev-parse) echo sealed-sha;; status) exit 0;; esac\n",
+    )
+    .unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&fake_git, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let environment = BTreeMap::from([
+        ("PATH".into(), format!("{}:/bin:/usr/bin", bin.display())),
+        ("VALUE".into(), "a b".into()),
+    ]);
+    let command = gate_command(
+        &gate,
+        "sealed-sha",
+        temp.path().to_str().unwrap(),
+        &environment,
+        Some("saved-box"),
+    );
+    let output = std::process::Command::new("sh")
+        .args(["-c", command.args.last().unwrap()])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
 }
 
 #[test]

@@ -11,6 +11,7 @@ use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 
 use crate::contracts::FailureClass;
+use crate::paths::Ctx;
 use crate::project::{self, Project, write_atomic};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -57,6 +58,16 @@ pub(crate) struct Evidence {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub(crate) struct AcceptanceReview {
+    pub(crate) coordinator: String,
+    pub(crate) at: String,
+    pub(crate) event: String,
+    pub(crate) artifact: String,
+    pub(crate) conditions: Vec<String>,
+    pub(crate) criteria: Vec<crate::contracts::CriterionEvidence>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(default)]
 pub(crate) struct Task {
     pub(crate) schema: u32,
@@ -79,6 +90,9 @@ pub(crate) struct Task {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) repo: Option<String>,
     pub(crate) installed: Vec<Evidence>,
+    /// Semantic acceptance is neither a finish seal nor installation proof.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) acceptance_review: Option<AcceptanceReview>,
     pub(crate) created: String,
 }
 
@@ -98,6 +112,7 @@ impl Default for Task {
             plan_step: None,
             repo: None,
             installed: Vec::new(),
+            acceptance_review: None,
             created: String::new(),
         }
     }
@@ -614,13 +629,19 @@ pub(crate) fn view_with_evidence(
         };
         return view;
     }
-    if crate::review::sealed(&evidence.events, &lane).is_some() {
+    if let Some(seal) = crate::review::sealed(&evidence.events, &lane) {
         view.state = State::Finished;
         view.next = if crate::review::lane_done(project, &lane, &evidence.events) {
             "none".into()
         } else {
             "review the repository pile".into()
         };
+        if crate::review::changes(&lane, seal) == Some(false)
+            && require_accepted(project, &view.record, evidence).is_err()
+        {
+            view.next =
+                "judge required acceptance through coordinator/critic (not established)".into();
+        }
         return view;
     }
     view.state = State::Working;
@@ -656,6 +677,202 @@ pub(crate) fn view_with_evidence(
         };
     }
     view
+}
+
+/// The common report format for the existing reviewer and optional critic.
+/// Producer claims alone are not acceptance; callers must identify the judge.
+pub(crate) fn report_criteria(text: &str) -> Result<Vec<crate::contracts::CriterionEvidence>> {
+    #[derive(Deserialize)]
+    struct Criteria {
+        #[serde(default)]
+        acceptance: Vec<crate::contracts::CriterionEvidence>,
+    }
+    let front = text
+        .strip_prefix("+++\n")
+        .and_then(|text| text.split_once("\n+++").map(|(front, _)| front));
+    match front {
+        Some(front) => Ok(toml::from_str::<Criteria>(front)?.acceptance),
+        None => Ok(Vec::new()),
+    }
+}
+
+pub(crate) fn criteria_established(
+    task: &Task,
+    lane: &str,
+    event: &str,
+    criteria: &[crate::contracts::CriterionEvidence],
+) -> bool {
+    !task.acceptance.is_empty()
+        && task
+            .acceptance
+            .iter()
+            .enumerate()
+            .all(|(index, condition)| {
+                let criterion = index + 1;
+                if task.withdrawn.iter().any(|row| row.acceptance == criterion) {
+                    return true;
+                }
+                let mut rows = criteria.iter().filter(|row| {
+                    row.thread == lane && row.event == event && row.criterion == criterion
+                });
+                let Some(row) = rows.next() else {
+                    return false;
+                };
+                rows.next().is_none()
+                    && row.condition == *condition
+                    && row.established
+                    && !row.evidence.trim().is_empty()
+            })
+}
+
+pub(crate) fn require_accepted(
+    project: &Project,
+    task: &Task,
+    snapshot: &EvidenceSnapshot,
+) -> Result<()> {
+    if !snapshot.readable() {
+        bail!("acceptance not established: unreadable seal evidence");
+    }
+    let id = task
+        .attempts
+        .last()
+        .context("acceptance not established: no attempt")?;
+    let lane = crate::thread::load(project, id)?;
+    let event = crate::review::sealed(snapshot.events(), &lane)
+        .context("acceptance not established: no current seal")?;
+    let done = event.payload.done.as_ref().expect("done seal");
+    // Named historical consumer: pre-pile merged/installed records retain
+    // their accepted delivery semantics. No-change equality is not that fact.
+    if !lane.merged_sha.is_empty() && lane.merged_review.is_empty() {
+        return Ok(());
+    }
+    let accepted = task.acceptance_review.as_ref().is_some_and(|review| {
+        review.event == event.id
+            && review.artifact == done.artifact
+            && review.conditions == task.acceptance
+            && !review.coordinator.is_empty()
+            && criteria_established(task, id, &event.id, &review.criteria)
+    });
+    if accepted {
+        return Ok(());
+    }
+    // A landed pile's independent reviewer judges the member, not the member's
+    // own report. Read that exact sealed verdict, never today's draft.
+    if let Some(review) = crate::review::lane_review(project, &lane)? {
+        let seal = crate::events::load(project, &review.verdict_event)?;
+        let judged = seal
+            .payload
+            .done
+            .context("acceptance not established: reviewer seal missing")?;
+        let text = String::from_utf8(crate::thread::artifact(project, &judged.artifact)?)?;
+        let criteria = report_criteria(&text)?;
+        if criteria_established(task, id, &event.id, &criteria) {
+            return Ok(());
+        }
+    }
+    // Reuse an existing critic when one was requested. No compulsory second
+    // judge, and a critic's PASS without criterion evidence is not enough.
+    for critic in crate::thread::list(project)
+        .into_iter()
+        .filter(|critic| critic.role == "critic" && critic.id != lane.id)
+    {
+        let Some(seal) = crate::review::sealed(snapshot.events(), &critic) else {
+            continue;
+        };
+        let judged = seal.payload.done.as_ref().expect("critic done");
+        let text = String::from_utf8(crate::thread::artifact(project, &judged.artifact)?)?;
+        if crate::lane::critic_verdict(&text).as_deref() == Some("PASS")
+            && criteria_established(task, id, &event.id, &report_criteria(&text)?)
+        {
+            return Ok(());
+        }
+    }
+    bail!(
+        "acceptance not established: {} needs independent evidence for every required criterion; a finish seal, partial report or installation is not acceptance",
+        task.id
+    )
+}
+
+/// Extend the existing coordinator `thread attest` path to an already-finished
+/// no-change deliverable. The reason carries the same criterion rows as a
+/// reviewer/critic report, so an explicit partial judgment remains durable.
+pub(crate) fn attest_finished(
+    ctx: &Ctx,
+    project: &Project,
+    lane: &crate::thread::Thread,
+    reason: &str,
+) -> Result<Option<crate::threads::AttestOutcome>> {
+    let allocation = project.lock()?;
+    let snapshot = EvidenceSnapshot::load(project);
+    let Some(event) = crate::review::sealed(snapshot.events(), lane) else {
+        return Ok(None);
+    };
+    let done = event.payload.done.as_ref().expect("done");
+    if crate::review::changes(lane, event) != Some(false) {
+        return Ok(None);
+    }
+    let criteria = report_criteria(&format!("+++\n{reason}\n+++"))?;
+    let coordinator = project
+        .coordinator()
+        .filter(|row| !row.pane_id.is_empty())
+        .context("acceptance not established: coordinator missing")?;
+    let coordinator_name = if coordinator.agent_name.is_empty() {
+        coordinator.pane_id
+    } else {
+        coordinator.agent_name
+    };
+    let (tasks, errors) = list_with_errors(project);
+    if !errors.is_empty() {
+        bail!("acceptance not established: unreadable task records");
+    }
+    let tasks: Vec<_> = tasks
+        .into_iter()
+        .filter(|task| task.attempts.last() == Some(&lane.id))
+        .collect();
+    if tasks.is_empty() {
+        bail!("acceptance not established: bind the deliverable to a request-backed task first");
+    }
+    for task in &tasks {
+        if task.acceptance.is_empty()
+            || (1..=task.acceptance.len()).any(|criterion| {
+                !task.withdrawn.iter().any(|row| row.acceptance == criterion)
+                    && criteria
+                        .iter()
+                        .filter(|row| {
+                            row.thread == lane.id
+                                && row.event == event.id
+                                && row.criterion == criterion
+                        })
+                        .count()
+                        != 1
+            })
+        {
+            bail!(
+                "acceptance not established: --reason needs one [[acceptance]] row for every required criterion, with thread, event, criterion, condition, established and evidence"
+            );
+        }
+    }
+    for mut task in tasks {
+        task.acceptance_review = Some(AcceptanceReview {
+            coordinator: coordinator_name.clone(),
+            at: project::now(),
+            event: event.id.clone(),
+            artifact: done.artifact.clone(),
+            conditions: task.acceptance.clone(),
+            criteria: criteria.clone(),
+        });
+        write(project, &task)?;
+    }
+    drop(allocation);
+    crate::plan::refresh(ctx, project)?;
+    Ok(Some(crate::threads::AttestOutcome {
+        thread: lane.id.clone(),
+        event: event.id.clone(),
+        artifact: done.artifact.clone(),
+        sha: Some(done.sha.clone()),
+        coordinator: coordinator_name,
+        reason: reason.into(),
+    }))
 }
 
 pub(crate) fn attestation(project: &Project, task: &Task) -> Option<crate::contracts::Attestation> {
@@ -707,6 +924,24 @@ pub(crate) fn render(_project: &Project, view: &View) -> String {
     }
     if !task.attempts.is_empty() {
         text.push_str(&format!("  attempts: {}\n", task.attempts.join(", ")));
+    }
+    if let Some(review) = &task.acceptance_review {
+        text.push_str(&format!(
+            "  acceptance judgment snapshot: {} at {}; seal {}, report {}\n",
+            review.coordinator, review.at, review.event, review.artifact
+        ));
+        for row in &review.criteria {
+            text.push_str(&format!(
+                "    criterion {}: {} — {}\n",
+                row.criterion,
+                if row.established && !row.evidence.trim().is_empty() {
+                    "evidenced"
+                } else {
+                    "not established"
+                },
+                row.evidence
+            ));
+        }
     }
     for note in &task.notes {
         text.push_str(&format!("  note {}: {}\n", note.at, note.text));

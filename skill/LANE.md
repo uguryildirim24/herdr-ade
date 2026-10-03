@@ -22,6 +22,10 @@ This seals a `work_failed` event. The harness follows the matched routing rule's
 
 ## Finish
 
+Map each original required criterion to durable artifact/behavior evidence or **not established** in your report, including the actual requested journey and behavior that must stay. Research coverage must distinguish complete, partial and unavailable scope. A valid no-change result needs no empty commit or live install, but Git equality does not establish acceptance: a dependent launch and final goal closure need the existing independent coordinator/critic judgment. Finished, accepted, merged and installed remain separate facts.
+
+For a resolved, sealed no-change task, the coordinator can use the existing `ha thread attest <project> <thread> --reason '<TOML>'` path. Its reason contains one `[[acceptance]]` row per required criterion, with `thread`, exact source `event`, one-based `criterion`, exact `condition`, `established = true/false`, and durable `evidence`. Partial judgments are saved but do not unlock work. An already-requested critic can instead supply those rows in its PASS/FAIL report against the source seal; no extra critic is compulsory. Producer claims alone do not count.
+
 Run `ha done` only when acceptance is met. Use `ha waiting "<what is missing>"` for missing input, or `ha failed "<what failed, what you tried, and the evidence>"` for a failed approach.
 
 Commit repository changes if any; leave runtime deliverables untracked. Write the report at the path named by your brief, inside the recorded git folder. No empty commit is needed: `ha done` uses that report and the recorded checkout's exact HEAD. Explicit `--report '<path>'` and `--sha <commit-sha>` override these defaults with the same validation.

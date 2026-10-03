@@ -69,7 +69,7 @@ fn unlisted_harness_repo_selects_all_four_harness_gates() {
     let reviewer = thread::load(&fx.project, review.reviewer.as_deref().unwrap()).unwrap();
     let event = sealed(&events, &reviewer).unwrap();
     let git = Git::new(&fx.world.runner, fx.repo.to_str().unwrap());
-    assert!(verdict(&fx.project, &review, event, &git).is_err());
+    assert!(verdict(&fx.world.ctx(), &fx.project, &review, event, &git).is_err());
     let runs = four_gates()
         .into_iter()
         .map(|gate| GateRun {
@@ -79,14 +79,18 @@ fn unlisted_harness_repo_selects_all_four_harness_gates() {
         .collect();
     seal_verdict(&fx, &review, &candidate, "MERGE", BTreeMap::new(), runs, 2);
     let events = crate::events::checked(&fx.project).unwrap();
+    // A polished declaration still has no matching execution evidence.
     assert!(
         verdict(
+            &fx.world.ctx(),
             &fx.project,
             &review,
             sealed(&events, &reviewer).unwrap(),
             &git
         )
-        .is_ok()
+        .unwrap_err()
+        .to_string()
+        .contains("not established")
     );
 }
 

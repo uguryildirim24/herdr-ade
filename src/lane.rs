@@ -441,7 +441,7 @@ pub(crate) fn skill_text(role: &str) -> String {
         "coordinator" => include_str!("../skill/COORDINATOR.md").into(),
         "reviewer" => include_str!("../skill/REVIEWER.md").into(),
         "critic" => format!(
-            "{}\n## Critic verdict\n\nStart your report with TOML front matter:\n+++\nverdict = \"PASS\" # or \"FAIL\"\n+++\nA FAIL keeps the check open. Explain what needs correction in the report.\n",
+            "{}\n## Critic verdict\n\nStart your report with TOML front matter:\n+++\nverdict = \"PASS\" # or \"FAIL\"\n+++\nA FAIL keeps the check open. Explain what needs correction in the report. When judging another deliverable's acceptance, include one [[acceptance]] row per required criterion: thread, exact source event, one-based criterion, exact condition, established = true/false, and durable evidence. PASS without those rows does not establish the source task's acceptance; partial coverage stays not established.\n",
             include_str!("../skill/LANE.md")
         ),
         _ => include_str!("../skill/LANE.md").into(),
