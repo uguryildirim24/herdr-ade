@@ -77,20 +77,8 @@ title = "Continue as a project"
 placement = "popup"
 command = ["target/release/herdr-ade", "pane", "adopt"]
 
-[[actions]]
-id = "pi-doctor"
-title = "Pi: check setup"
-contexts = ["workspace"]
-command = ["target/release/herdr-pi", "doctor"]
-
-[[actions]]
-id = "pi-setup"
-title = "Pi: install the pinned pi"
-contexts = ["workspace"]
-command = ["target/release/herdr-pi", "setup"]
-
-[[actions]]
-id = "pi-login"
-title = "Pi: open a login pane"
-contexts = ["workspace"]
-command = ["target/release/herdr-pi", "login"]
+[[panes]]
+id = "rundown"
+title = "Rundown"
+placement = "tab"
+command = ["target/release/herdr-rundown"]

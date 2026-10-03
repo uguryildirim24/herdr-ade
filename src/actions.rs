@@ -235,8 +235,11 @@ pub(crate) fn run_pane(ctx: &Ctx, id: &str) -> Result<()> {
             if name.is_empty() {
                 bail!("no name given");
             }
-            let goal = ask("Goal (one line, optional)", "")?;
-            let project = project::create(&ctx.root, &name, &goal, Vec::new())?;
+            let repo = project::parse_repo_arg(&ask("Repository", "")?);
+            if repo.path.is_empty() {
+                bail!("no repository given");
+            }
+            let project = project::create(&ctx.root, &name, "", vec![repo])?;
             println!("created `{}` at {}", project.slug, project.dir().display());
             run_on_slug(ctx, "open", &project.slug)
         })(),

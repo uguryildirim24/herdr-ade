@@ -1,7 +1,8 @@
 //! End-to-end checks of the built binary with a scrubbed environment.
 
+use std::io::Write;
 use std::path::Path;
-use std::process::Command;
+use std::process::{Command, Stdio};
 
 const BIN: &str = env!("CARGO_BIN_EXE_herdr-ade");
 
@@ -12,6 +13,58 @@ fn hp(home: &Path, args: &[&str]) -> std::process::Output {
         .args(args)
         .output()
         .unwrap()
+}
+
+#[test]
+fn new_project_popup_lists_the_repository_like_the_cli_and_leaves_the_goal_for_chat() {
+    for repository in [".", "/srv/app@box", ""] {
+        let home = tempfile::tempdir().unwrap();
+        let root = home.path().join("root");
+        let mut popup = Command::new(BIN)
+            .env_clear()
+            .env("HOME", home.path())
+            .current_dir(home.path())
+            .args(["--root", root.to_str().unwrap(), "pane", "new"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        writeln!(popup.stdin.take().unwrap(), "Menu\n{repository}\n").unwrap();
+        let output = popup.wait_with_output().unwrap();
+        let text = String::from_utf8(output.stdout).unwrap();
+        assert!(text.contains("Name: Repository:"), "{text}");
+        assert!(!text.contains("Goal"), "{text}");
+        if repository.is_empty() {
+            assert!(text.contains("no repository given"), "{text}");
+            assert!(!root.join("menu").exists());
+            continue;
+        }
+        // The popup cannot open a coordinator in this scrubbed environment,
+        // but its project must already have the same repository as `new --repo`.
+        let cli = Command::new(BIN)
+            .env_clear()
+            .env("HOME", home.path())
+            .current_dir(home.path())
+            .args([
+                "--root",
+                root.to_str().unwrap(),
+                "new",
+                "Cli",
+                "--repo",
+                repository,
+            ])
+            .output()
+            .unwrap();
+        assert!(cli.status.success(), "{:?}", cli.stderr);
+        let settings = |slug| {
+            let page = std::fs::read_to_string(root.join(slug).join("PROJECT.md")).unwrap();
+            toml::from_str::<toml::Value>(page.split("+++\n").nth(1).unwrap()).unwrap()
+        };
+        let menu = settings("menu");
+        assert_eq!(menu["repos"], settings("cli")["repos"]);
+        assert_eq!(menu["goal"].as_str(), Some(""));
+    }
 }
 
 #[test]
