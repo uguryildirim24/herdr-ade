@@ -24,12 +24,6 @@ contexts = ["workspace"]
 command = ["target/release/herdr-ade", "action", "open"]
 
 [[actions]]
-id = "overview"
-title = "Projects: overview"
-contexts = ["workspace"]
-command = ["target/release/herdr-ade", "action", "overview"]
-
-[[actions]]
 id = "adopt-workspace"
 title = "Projects: continue this workspace as a project"
 contexts = ["workspace"]
@@ -52,12 +46,6 @@ id = "doctor"
 title = "Projects: check setup"
 contexts = ["workspace"]
 command = ["target/release/herdr-ade", "action", "doctor"]
-
-[[panes]]
-id = "overview"
-title = "Project overview"
-placement = "popup"
-command = ["target/release/herdr-ade", "pane", "overview"]
 
 [[panes]]
 id = "new"

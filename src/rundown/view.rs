@@ -1,8 +1,8 @@
 //! The Rundown tab's picture: the plan card turned into a calm to-do list.
 //! Pure: JSON in, styled lines out, so the look is tested without a terminal.
 //!
-//! Only the plan card feeds it (`ha --json plan show`). Step labels are shown
-//! as written, cut only to fit the width.
+//! The shared project view feeds it (`ha --json overview`). Step counts are
+//! planning facts; current process activity is a separate explanation.
 
 use serde::Deserialize;
 use serde_json::Value;
@@ -13,7 +13,7 @@ pub(crate) enum Mark {
     #[serde(rename = "done")]
     Done,
     #[serde(rename = "running")]
-    Now,
+    Started,
     #[serde(rename = "left")]
     Later,
 }
@@ -26,6 +26,13 @@ pub(crate) struct Step {
     /// One level only: a subtask's own list is always empty.
     #[serde(default)]
     pub(crate) subtasks: Vec<Step>,
+    #[serde(default)]
+    failed_check_hold: Option<Hold>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+struct Hold {
+    message: String,
 }
 
 #[derive(Deserialize)]
@@ -50,14 +57,25 @@ pub(crate) struct Card {
     /// Authored outcome, cut only to fit the panel.
     pub(crate) about: String,
     pub(crate) steps: Vec<Step>,
+    pub(crate) work: String,
+    pub(crate) needs_you: String,
+    pub(crate) actions: Vec<String>,
+}
+
+#[derive(Deserialize)]
+struct ProjectView {
+    plan: PlanView,
+    work: String,
+    needs_you: String,
+    actions: Vec<String>,
 }
 
 impl Card {
-    /// Builds the card from `ha --json plan show` output: the whole reply or
-    /// just its `data.result`.
-    pub(crate) fn from_plan(title: &str, reply: &Value) -> serde_json::Result<Card> {
-        let plan: PlanView =
+    /// Builds the card from the existing overview command's typed result.
+    pub(crate) fn from_view(title: &str, reply: &Value) -> serde_json::Result<Card> {
+        let view: ProjectView =
             serde_json::from_value(reply.pointer("/data/result").unwrap_or(reply).clone())?;
+        let plan = view.plan;
         let about = [plan.does, plan.goal, plan.what_you_get]
             .into_iter()
             .find(|text| !text.is_empty())
@@ -66,6 +84,9 @@ impl Card {
             title: title.trim().to_string(),
             about,
             steps: plan.steps,
+            work: view.work,
+            needs_you: view.needs_you,
+            actions: view.actions,
         })
     }
 
@@ -85,7 +106,6 @@ const TEXT: Rgb = Rgb(205, 214, 244);
 const QUIET: Rgb = Rgb(147, 153, 178);
 const FAINT: Rgb = Rgb(88, 91, 112);
 const FRAME: Rgb = Rgb(69, 71, 90);
-const SURFACE: Rgb = Rgb(36, 39, 58);
 const TRACK: Rgb = Rgb(49, 50, 68);
 const INK: Rgb = Rgb(30, 30, 46);
 const GREEN: Rgb = Rgb(166, 227, 161);
@@ -118,111 +138,100 @@ const MAX_PANEL: usize = 76;
 /// Space between the panel's frame and what is inside it.
 const PAD: usize = 3;
 
-/// The styled lines for a `width` × `height` pane: one framed panel with the
-/// project's name and what it is, a progress bar, and the steps as a
-/// to-do list joined by a thin line. `note` is a quiet line under the panel
-/// (for example when the last refresh failed).
+/// Reserve the current-work and error slots before spending space on history.
 pub(crate) fn render(card: &Card, width: usize, height: usize, note: &str) -> Vec<String> {
-    // Too narrow for the frame and its progress count: show just the name
-    // rather than printing a frame wider than the terminal.
-    if width < 28 {
-        return vec![cut(
-            if card.title.is_empty() {
-                "Rundown"
-            } else {
-                &card.title
-            },
-            width,
-        )];
-    }
-    let mut panel = width.saturating_sub(4).clamp(28, MAX_PANEL);
-    // Equal margins left and right, including at 29 and 31 columns.
-    if (width - panel) % 2 == 1 {
-        panel -= 1;
-    }
-    let inner = panel - 2 - PAD * 2;
-    let indent = " ".repeat(width.saturating_sub(panel) / 2);
-
+    let framed = width >= 28 && (height == 0 || height >= 10);
+    let panel = width.saturating_sub(4).min(MAX_PANEL);
+    let inner = if framed {
+        panel.saturating_sub(2 + PAD * 2)
+    } else {
+        width
+    };
+    let room = if height == 0 {
+        usize::MAX
+    } else {
+        height.saturating_sub(if framed { 2 } else { 0 })
+    };
     let title = if card.title.is_empty() {
         "Rundown"
     } else {
         &card.title
     };
-    let about = cut(&card.about, inner);
-    let mut header = vec![String::new(), shine(&cut(title, inner))];
-    if !about.is_empty() {
-        header.push(format!("{}{about}", QUIET.fg()));
+    let mut content = vec![shine(&cut(title, inner))];
+    if !note.is_empty() {
+        content.push(format!("{}{}{RESET}", AMBER.fg(), cut(note, inner)));
     }
-    header.push(String::new());
-    let mut body = vec![String::new()];
-    if card.steps.is_empty() {
-        body.push(format!("{}No steps yet{RESET}", QUIET.fg()));
-        body.push(String::new());
-    } else {
-        body.push(progress(card, inner));
-        body.push(String::new());
-        body.push(String::new());
-        // A blank line (carrying the joining line) between steps while the
-        // pane has the height; a short pane packs them. Subtasks sit right
-        // under their step, the joining line running past them.
-        let fixed = header.len() + body.len() + 3 + usize::from(!note.is_empty());
-        let subtasks: usize = card.steps.iter().map(|s| s.subtasks.len()).sum();
-        let spaced = height == 0 || fixed + card.steps.len() * 2 - 1 + subtasks <= height;
-        let joint = |step: &Step| {
-            if step.mark == Mark::Done {
-                GREEN.toward(INK, 0.45)
-            } else {
-                FAINT
-            }
-        };
-        for (i, step) in card.steps.iter().enumerate() {
-            if spaced && i > 0 {
-                body.push(format!(" {}│{RESET}", joint(&card.steps[i - 1]).fg()));
-            }
-            body.push(row(step, inner));
-            let joined = spaced && i + 1 < card.steps.len();
-            for sub in &step.subtasks {
-                body.push(sub_row(sub, inner, joined.then_some(joint(step))));
-            }
-        }
-        body.push(String::new());
-    }
-
-    let rule = "─".repeat(panel - 2);
-    let frame = FRAME.fg();
-    let mut lines = vec![format!("{indent}{frame}╭{rule}╮{RESET}")];
-    let pad = " ".repeat(PAD);
-    let band = SURFACE.bg();
-    for content in header {
-        let fill = " ".repeat(inner.saturating_sub(len(&visible(&content))));
-        lines.push(format!(
-            "{indent}{frame}│{band}{pad}{content}{band}{fill}{pad}{RESET}{frame}│{RESET}"
+    if !card.needs_you.is_empty() {
+        content.push(format!(
+            "{}{}{RESET}",
+            AMBER.fg(),
+            cut(&format!("Needs you: {}", card.needs_you), inner)
         ));
     }
-    for content in body {
-        let fill = " ".repeat(inner.saturating_sub(len(&visible(&content))));
+    content.push(format!("{}{}{RESET}", TEXT.fg(), cut(&card.work, inner)));
+    content.push(progress(card, inner));
+    if !card.about.is_empty() && content.len() + 2 < room {
+        content.push(format!("{}{}{RESET}", QUIET.fg(), cut(&card.about, inner)));
+    }
+    let mut work: Vec<_> = card
+        .actions
+        .iter()
+        .map(|a| format!("{}{}{RESET}", TEXT.fg(), cut(a, inner)))
+        .collect();
+    let mut steps: Vec<_> = card
+        .steps
+        .iter()
+        .flat_map(|s| std::iter::once((s, false)).chain(s.subtasks.iter().map(|sub| (sub, true))))
+        .collect();
+    let step_count = steps.len();
+    if content.len() + work.len() + steps.len() > room {
+        steps.sort_by_key(|(s, _)| s.mark == Mark::Done);
+    }
+    work.extend(steps.into_iter().map(|(s, sub)| {
+        if sub {
+            sub_row(s, inner)
+        } else {
+            row(s, inner)
+        }
+    }));
+    let available = room.saturating_sub(content.len());
+    let shown = if work.len() > available {
+        available.saturating_sub(1)
+    } else {
+        work.len()
+    };
+    content.extend(work.iter().take(shown).cloned());
+    if shown < work.len() && available > 0 {
+        let omitted_steps = step_count.saturating_sub(shown.saturating_sub(card.actions.len()));
+        let omitted_work = card.actions.len().saturating_sub(shown);
+        let label = if omitted_work == 0 {
+            format!("{omitted_steps} more steps")
+        } else {
+            format!("{omitted_steps} more steps · {omitted_work} work items")
+        };
+        content.push(format!("{}{}{RESET}", QUIET.fg(), cut(&label, inner)));
+    }
+    content.truncate(room);
+    if !framed {
+        return content;
+    }
+    let indent = " ".repeat(width.saturating_sub(panel) / 2);
+    let rule = "─".repeat(panel - 2);
+    let frame = FRAME.fg();
+    let pad = " ".repeat(PAD);
+    let mut lines = vec![format!("{indent}{frame}╭{rule}╮{RESET}")];
+    for line in content {
+        let fill = " ".repeat(inner.saturating_sub(len(&visible(&line))));
         lines.push(format!(
-            "{indent}{frame}│{RESET}{pad}{content}{fill}{pad}{frame}│{RESET}"
+            "{indent}{frame}│{RESET}{pad}{line}{fill}{pad}{frame}│{RESET}"
         ));
     }
     lines.push(format!("{indent}{frame}╰{rule}╯{RESET}"));
-    let frame_lines = lines.len();
-    if !note.is_empty() {
-        lines.push(format!(
-            "{indent}   {}{}{RESET}",
-            QUIET.fg(),
-            cut(note, panel - 3)
-        ));
-    }
-    // The frame sits in the middle of the pane; the note hangs below it, so
-    // the frame never moves when the note comes and goes.
-    if height > frame_lines {
-        let top = (height - frame_lines) / 2;
-        lines.splice(0..0, std::iter::repeat_n(String::new(), top));
-    }
-    if height > 0 && lines.len() > height {
-        lines.truncate(height.saturating_sub(1));
-        lines.push(format!("{indent}   {}…{RESET}", QUIET.fg()));
+    if height > lines.len() {
+        lines.splice(
+            0..0,
+            std::iter::repeat_n(String::new(), (height - lines.len()) / 2),
+        );
     }
     lines
 }
@@ -250,14 +259,18 @@ const LATER: char = '◌';
 /// step gets a star, the one under way a filled ring, and one still to do
 /// an empty dotted circle.
 fn row(step: &Step, width: usize) -> String {
-    let text = cut(&step.text, width.saturating_sub(5));
+    let label = step.failed_check_hold.as_ref().map_or_else(
+        || step.text.clone(),
+        |hold| format!("{} — {}", step.text, hold.message),
+    );
+    let text = cut(&label, width.saturating_sub(5));
     match step.mark {
         Mark::Done => format!(
             "{}  {}{text}{RESET}",
             tile(GREEN, INK, true, DONE),
             QUIET.fg()
         ),
-        Mark::Now => format!(
+        Mark::Started => format!(
             "{}  {BOLD}{}{text}{RESET}",
             tile(AMBER, INK, true, NOW),
             AMBER.fg()
@@ -270,17 +283,17 @@ fn row(step: &Step, width: usize) -> String {
     }
 }
 
-/// One subtask, under its step's words: the same mark without its box, so
-/// it reads smaller. `line` carries the joining line down to the next step.
-fn sub_row(sub: &Step, width: usize, line: Option<Rgb>) -> String {
-    let lead = match line {
-        Some(color) => format!(" {}│{RESET}   ", color.fg()),
-        None => " ".repeat(5),
-    };
-    let text = cut(&sub.text, width.saturating_sub(8));
+/// One subtask: the same mark without its box, so it reads smaller.
+fn sub_row(sub: &Step, width: usize) -> String {
+    let lead = " ".repeat(5);
+    let label = sub.failed_check_hold.as_ref().map_or_else(
+        || sub.text.clone(),
+        |hold| format!("{} — {}", sub.text, hold.message),
+    );
+    let text = cut(&label, width.saturating_sub(8));
     let (mark, color, words) = match sub.mark {
         Mark::Done => (DONE, GREEN, QUIET),
-        Mark::Now => (NOW, AMBER, AMBER),
+        Mark::Started => (NOW, AMBER, AMBER),
         Mark::Later => (LATER, FAINT, TEXT),
     };
     format!(
@@ -331,11 +344,12 @@ fn len(text: &str) -> usize {
 /// `text` on one line of at most `width` characters: cut at a word boundary
 /// and ended with "…" when it is too long.
 fn cut(text: &str, width: usize) -> String {
+    let text = text.split_whitespace().collect::<Vec<_>>().join(" ");
     if width == 0 {
         return String::new();
     }
-    if len(text) <= width {
-        return text.to_string();
+    if len(&text) <= width {
+        return text;
     }
     let room = width - 1;
     let mut out = String::new();
@@ -382,6 +396,13 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    fn from_plan(title: &str, plan: &Value) -> serde_json::Result<Card> {
+        Card::from_view(
+            title,
+            &json!({"plan":plan, "work":"2 running · 1 waiting", "needs_you":"", "actions":[]}),
+        )
+    }
+
     fn screen(card: &Card, width: usize) -> String {
         render(card, width, 0, "")
             .iter()
@@ -397,8 +418,8 @@ mod tests {
         let plan = json!({"schema": 1, "revision": 4, "kind": "screen",
             "what_you_get": "A screen you open.", "goal": "A shorter goal",
             "does": outcome, "steps": []});
-        let reply = json!({"data": {"result": plan}});
-        let card = Card::from_plan("Demo", &reply).unwrap();
+        let reply = json!({"data": {"result": {"plan":plan, "work":"2 running · 1 waiting", "needs_you":"", "actions":[]}}});
+        let card = Card::from_view("Demo", &reply).unwrap();
         assert_eq!(card.about, outcome);
         assert!(screen(&card, 40).contains(&cut(outcome, 28)));
         for reply in [
@@ -408,14 +429,47 @@ mod tests {
             json!({"schema": 1, "revision": 4, "steps": [{}]}),
             json!({"schema": 1, "revision": 4, "steps": "wrong"}),
         ] {
-            assert!(Card::from_plan("Demo", &reply).is_err(), "{reply}");
+            assert!(Card::from_view("Demo", &reply).is_err(), "{reply}");
         }
         let old = json!({"schema": 1, "revision": 3, "kind": "screen",
             "what_you_get": "A screen you open.", "steps": []});
-        assert_eq!(
-            Card::from_plan("Demo", &old).unwrap().about,
-            "A screen you open."
-        );
+        assert_eq!(from_plan("Demo", &old).unwrap().about, "A screen you open.");
+    }
+
+    #[test]
+    fn short_and_narrow_panes_keep_unfinished_work_counts_and_real_errors_visible() {
+        let history: Vec<_> = (0..25)
+            .map(|n| json!({"state":"done", "text":format!("Finished detail {n}")}))
+            .collect();
+        let plan = json!({"schema":1, "revision":1, "goal":"An outcome", "steps":[
+            {"state":"done", "text":"Finished step", "subtasks":history},
+            {"state":"running", "text":"Unfinished", "failed_check_hold":{"message":"held by failed check: permission denied"}},
+        ]});
+        let mut card = from_plan("Demo", &plan).unwrap();
+        card.needs_you = "browser login".into();
+        for width in [22, 40, 80] {
+            let lines = render(&card, width, 12, "Read failed: permission denied");
+            let text = lines
+                .iter()
+                .map(|l| visible(l))
+                .collect::<Vec<_>>()
+                .join("\n");
+            assert!(lines.len() <= 12);
+            assert!(lines.iter().all(|l| len(&visible(l)) <= width));
+            for required in [
+                "Unfinished",
+                "1 of 2",
+                "Needs you:",
+                "Read failed",
+                "more steps",
+            ] {
+                assert!(text.contains(required), "{width}: {required}: {text}");
+            }
+        }
+        let text = screen(&card, 80);
+        assert!(text.contains("held by failed check: permission denied"));
+        assert_eq!(card.count(Mark::Done), 1);
+        assert_eq!(card.steps[0].subtasks.len(), 25);
     }
 
     #[test]
@@ -431,7 +485,7 @@ mod tests {
                 {"id": "s-8", "state": "left", "text": ""},
             ]},
         ]});
-        let card = Card::from_plan("Demo", &plan).unwrap();
+        let card = from_plan("Demo", &plan).unwrap();
         let steps = plan["steps"].as_array().unwrap();
         assert_eq!(card.steps.len(), steps.len());
         assert_eq!(

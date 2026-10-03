@@ -115,14 +115,6 @@ pub(crate) fn run_action(ctx: &Ctx, id: &str) -> Result<()> {
     };
     match id {
         "new" => open_pane(ctx, "new", &base),
-        "overview" => open_pane(
-            ctx,
-            "overview",
-            &Handoff {
-                slug: current_slug(ctx).unwrap_or_default(),
-                ..base
-            },
-        ),
         "open" | "pause" | "resume" => match current_slug(ctx) {
             Some(slug) => run_on_slug(ctx, id, &slug),
             None => open_pane(
@@ -221,14 +213,6 @@ fn hold_open() {
 pub(crate) fn run_pane(ctx: &Ctx, id: &str) -> Result<()> {
     let handoff = read_handoff(ctx);
     let result = match id {
-        "overview" => {
-            return overview::run(
-                ctx,
-                Some(handoff.slug.as_str()).filter(|s| !s.is_empty()),
-                false,
-                true,
-            );
-        }
         "new" => (|| {
             println!("New project\n");
             let name = ask("Name", "")?;

@@ -58,6 +58,7 @@ mod pi;
 mod pi_ade;
 mod plan;
 mod project;
+mod project_view;
 mod prompt;
 mod refusal;
 mod remote;

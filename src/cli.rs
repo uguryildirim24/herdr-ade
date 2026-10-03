@@ -102,16 +102,13 @@ enum Command {
         #[arg(long, value_name = "PATH|-")]
         note_file: Option<String>,
     },
-    /// Print threads grouped by what needs you
+    /// Technical read of current project work, waits and review actions
     Overview {
         #[arg(value_name = "PROJECT")]
         slug: String,
         /// Include resolved thread history
         #[arg(long)]
         history: bool,
-        /// Wait for Enter before exiting (only when on a terminal; used by the popup)
-        #[arg(long)]
-        wait: bool,
     },
     /// Inbox items
     Inbox {
@@ -1237,11 +1234,7 @@ fn dispatch_with_start(
         Command::Handoff { slug, note_file } => {
             crate::handoff::print(&ctx, &slug, note_file.as_deref())
         }
-        Command::Overview {
-            slug,
-            history,
-            wait,
-        } => overview::run(&ctx, Some(&slug), history, wait),
+        Command::Overview { slug, history } => overview::run(&ctx, &slug, history),
         Command::Inbox { command } => match command {
             InboxCommand::List { slug } => {
                 let project = Project::load(&ctx.root, &slug)?;

@@ -75,11 +75,17 @@ impl Fixture {
     }
 
     fn wait(&self) {
+        self.wait_number(1);
+    }
+
+    fn wait_number(&self, n: usize) {
+        let thread = format!("t-{n:04}");
+        let event = format!("{thread}-1-1");
         self.write(
-            ".state/threads/t-0001.toml",
-            "id = 't-0001'\nstatus = 'open'\nattempt = 1\ntitle = 'fixture lane'\n",
+            &format!(".state/threads/{thread}.toml"),
+            format!("id = '{thread}'\nstatus = 'open'\nattempt = 1\ntitle = 'fixture lane'\n"),
         );
-        self.write(".state/events/t-0001-1-1.toml", "id = 't-0001-1-1'\nop = 't-0001-1-1'\nthread = 't-0001'\nattempt = 1\ncreated = '2026-10-02T00:00:00Z'\n[recipient]\npane = 'w1:p1'\ncoordinator_attempt = 1\n[payload.waiting]\ntext = 'fixture waiting reason'\n");
+        self.write(&format!(".state/events/{event}.toml"), format!("id = '{event}'\nop = '{event}'\nthread = '{thread}'\nattempt = 1\ncreated = '2026-10-02T00:00:00Z'\n[recipient]\npane = 'w1:p1'\ncoordinator_attempt = 1\n[payload.waiting]\ntext = 'fixture waiting reason'\n"));
     }
 }
 
@@ -115,19 +121,28 @@ fn overflow_is_shown_exactly_once_across_successive_reads() {
 }
 
 #[test]
-fn an_event_behind_plan_changes_is_acknowledged_only_when_rendered() {
+fn events_precede_plan_history_and_overflow_is_acknowledged_only_when_rendered() {
     let fixture = Fixture::new();
     fixture.read();
     fixture.plan(21);
-    fixture.wait();
+    for n in 1..=21 {
+        fixture.wait_number(n);
+    }
     let receipt = fixture
         .project
-        .join(".state/deliveries/t-0001-1-1/00000001.json");
+        .join(".state/deliveries/t-0021-1-1/00000001.json");
     let first = fixture.read();
-    assert!(!first.contains("fixture waiting reason"), "{first}");
+    assert!(first.contains("fixture waiting reason"), "{first}");
+    assert!(!first.contains("- Plan s-001:"), "{first}");
+    assert!(
+        fixture
+            .project
+            .join(".state/deliveries/t-0001-1-1/00000001.json")
+            .exists()
+    );
     assert!(!receipt.exists());
     let second = fixture.read();
-    assert!(second.contains("- Event t-0001-1-1:"), "{second}");
+    assert!(second.contains("- Event t-0021-1-1:"), "{second}");
     assert!(second.contains("fixture waiting reason"));
     assert!(
         std::fs::read_to_string(&receipt)
@@ -135,7 +150,7 @@ fn an_event_behind_plan_changes_is_acknowledged_only_when_rendered() {
             .contains("acknowledged")
     );
     let receipts = std::fs::read(&receipt).unwrap();
-    assert!(!fixture.read().contains("fixture waiting reason"));
+    assert!(!fixture.read().contains("- Event t-0021-1-1:"));
     assert_eq!(std::fs::read(&receipt).unwrap(), receipts);
 }
 
@@ -168,10 +183,17 @@ fn a_failing_writer_consumes_nothing_in_text_or_json() {
                 .join(".state/deliveries/t-0001-1-1")
                 .exists()
         );
-        assert!(fixture.read().contains("- Plan s-001:"));
+        let replay = fixture.read();
+        for row in [
+            "- Plan s-001:",
+            "unread inbox message",
+            "fixture waiting reason",
+        ] {
+            assert!(replay.contains(row), "{replay}");
+        }
         let second = fixture.read();
-        assert!(second.contains("unread inbox message"), "{second}");
-        assert!(second.contains("fixture waiting reason"), "{second}");
+        assert!(!second.contains("unread inbox message"), "{second}");
+        assert!(!second.contains("fixture waiting reason"), "{second}");
     }
 }
 
@@ -210,16 +232,19 @@ fn failed_receipts_leave_the_cursor_replayable() {
 }
 
 #[test]
-fn changed_standing_instructions_show_the_words_and_remain_unread_in_overflow() {
+fn changed_standing_instructions_show_the_words_before_historical_overflow() {
     let fixture = Fixture::new();
     fixture.read();
     fixture.plan(21);
     fixture.write(".state/notes.jsonl", "{\"schema\":1,\"id\":\"n-fixture\",\"kind\":\"instruction\",\"at\":\"2026-10-02T00:00:00Z\",\"request\":\"q-fixture\",\"text\":\"Keep the fixture instruction visible.\"}\n");
     let first = fixture.read();
-    assert!(!first.contains("Keep the fixture instruction visible."));
+    assert!(
+        first.contains("Keep the fixture instruction visible."),
+        "{first}"
+    );
     let second = fixture.read();
     assert!(
-        second.contains("Keep the fixture instruction visible."),
+        !second.contains("Keep the fixture instruction visible."),
         "{second}"
     );
     assert!(

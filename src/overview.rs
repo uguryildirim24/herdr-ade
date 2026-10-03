@@ -1,14 +1,12 @@
 //! The text overview, and how commands without a slug find their project.
 
-use std::fmt::Write as _;
-use std::io::{BufRead, IsTerminal, Write as _};
+use std::io::{BufRead, Write as _};
 
 use anyhow::{Result, bail};
 
 use crate::paths::Ctx;
 use crate::project::{self, Project, Status};
-use crate::thread::{self, Group};
-use crate::threads::{self, Row};
+use crate::thread;
 
 /// The project a herdr workspace belongs to: the coordinator's workspace or a
 /// local thread's recorded workspace, and only among projects whose recorded
@@ -34,30 +32,6 @@ pub(crate) fn project_for_workspace(ctx: &Ctx, workspace_id: &str, socket: &str)
                     && t.workspace_id == workspace_id
             })
     })
-}
-
-pub(crate) enum Resolved {
-    Slug(String),
-    /// Nothing resolved and there is no terminal to ask on.
-    All,
-}
-
-/// An explicit slug, else the current herdr workspace, else a numbered picker
-/// when on a terminal, else every project.
-fn resolve_slug(ctx: &Ctx, slug: Option<&str>) -> Result<Resolved> {
-    if let Some(slug) = slug {
-        project::validate_slug(slug)?;
-        return Ok(Resolved::Slug(slug.to_string()));
-    }
-    let workspace = ctx.env.var("HERDR_WORKSPACE_ID").unwrap_or("");
-    let socket = ctx.env.var("HERDR_SOCKET_PATH").unwrap_or("");
-    if let Some(slug) = project_for_workspace(ctx, workspace, socket) {
-        return Ok(Resolved::Slug(slug));
-    }
-    if std::io::stdin().is_terminal() && std::io::stdout().is_terminal() {
-        return pick(ctx).map(Resolved::Slug);
-    }
-    Ok(Resolved::All)
 }
 
 fn visible_slugs(ctx: &Ctx) -> Vec<String> {
@@ -89,91 +63,29 @@ pub(crate) fn pick(ctx: &Ctx) -> Result<String> {
     }
 }
 
-/// Threads grouped by state, in the one display order.
-pub(crate) fn render(project: &Project, rows: &[Row]) -> String {
-    let mut out = String::new();
-    let goal = project
-        .read_project_md()
-        .map(|(s, _)| s.goal)
-        .unwrap_or_default();
-    let _ = write!(out, "{} ({})", project.slug, project.status());
-    if !goal.is_empty() {
-        let _ = write!(out, " — {goal}");
-    }
-    let _ = writeln!(out);
-    if rows.is_empty() {
-        let _ = writeln!(out, "\n  no threads yet");
-    }
-    for group in Group::DISPLAY_ORDER {
-        let members: Vec<&Row> = rows.iter().filter(|r| r.group == group).collect();
-        if members.is_empty() {
-            continue;
-        }
-        let _ = writeln!(out, "\n{} ({})", group.label(), members.len());
-        for row in members {
-            let t = &row.thread;
-            let place = if !t.machine.is_empty() {
-                format!("{}@{}", t.branch, t.machine)
-            } else if !t.branch.is_empty() {
-                t.branch.clone()
-            } else if t.kind == thread::Kind::Tab {
-                "tab".to_string()
-            } else {
-                "-".to_string()
-            };
-            let _ = writeln!(out, "  {}  {}  [{}]  {}", t.id, t.title, row.note, place);
-            if group == Group::WaitingOnYou {
-                if !t.error.is_empty() && !row.note.contains(&t.error) {
-                    let _ = writeln!(out, "          {}", t.error);
-                }
-                if t.recovery_pending {
-                    let _ = writeln!(out, "          automatic retry selected; wait for startup");
-                } else if t.status == thread::Status::Failed
-                    && let Some(notice) = t
-                        .start_notices
-                        .iter()
-                        .rev()
-                        .find(|n| n.line.contains(" — next: "))
-                {
-                    let _ = writeln!(out, "          {}", notice.line);
-                }
-            }
-        }
-    }
-    out
-}
-
-fn rows_for_overview(mut rows: Vec<Row>, include_history: bool) -> Vec<Row> {
-    if !include_history {
-        rows.retain(|row| row.group != Group::Resolved);
-    }
-    rows
-}
-
-pub(crate) fn run(ctx: &Ctx, slug: Option<&str>, include_history: bool, wait: bool) -> Result<()> {
-    let slugs = match resolve_slug(ctx, slug)? {
-        Resolved::Slug(slug) => vec![slug],
-        Resolved::All => visible_slugs(ctx),
-    };
-    if slugs.is_empty() {
-        println!("there are no projects in {}", ctx.root.display());
-    }
-    for (index, slug) in slugs.iter().enumerate() {
-        let project = Project::load(&ctx.root, slug)?;
-        if index > 0 {
-            println!();
-        }
-        let rows = rows_for_overview(threads::rows(ctx, &project), include_history);
-        print!("{}", render(&project, &rows));
-    }
-    // Only a popup wants to be held open; an agent calling this never waits.
-    if wait && std::io::stdout().is_terminal() && std::io::stdin().is_terminal() {
-        print!("\nPress Enter to close ");
-        std::io::stdout().flush()?;
-        let mut line = String::new();
-        let _ = std::io::stdin().lock().read_line(&mut line);
-    }
-    Ok(())
+/// Technical read of the same current actions that feed Rundown and context.
+pub(crate) fn run(ctx: &Ctx, slug: &str, include_history: bool) -> Result<()> {
+    let project = Project::load(&ctx.root, slug)?;
+    let view =
+        crate::project_view::View::load(ctx, &project, include_history.then_some(usize::MAX))?;
+    let text = format!(
+        "{} ({})\n{}",
+        project.slug,
+        project.status(),
+        view.render(&[
+            "Goal and what Rolf gets",
+            "Current work",
+            "Seals",
+            "Pile reviews",
+            "Open tasks"
+        ])
+    );
+    crate::output::success(
+        None,
+        &serde_json::json!({"result":view.rundown()}),
+        &text,
+        "",
+    )
 }
 
 #[cfg(test)]
@@ -198,18 +110,20 @@ mod tests {
                 submitted: false,
             });
         });
-        let rendered = render(
+        let view = crate::project_view::View::capture(
             &project,
-            &[Row {
+            &project::Settings::default(),
+            Some(vec![crate::threads::Row {
                 thread: lane.clone(),
-                group: Group::WaitingOnYou,
+                group: crate::thread::Group::WaitingOnYou,
                 note: "process gone".into(),
-            }],
+            }]),
+            None,
         );
+        let rendered = view.render(&[]);
         assert!(rendered.contains("Needs attention"), "{rendered}");
         assert!(rendered.contains("process disappeared"), "{rendered}");
         assert!(rendered.contains("ha thread retry demo"), "{rendered}");
-        assert!(!rendered.contains("dead:pane"), "{rendered}");
         assert!(!rendered.contains("needs you"), "{rendered}");
 
         // Notices survive retries. A later live input wait must not reuse
@@ -218,16 +132,133 @@ mod tests {
         retried.status = thread::Status::Open;
         retried.attempt += 1;
         retried.error.clear();
-        let rendered = render(
+        let view = crate::project_view::View::capture(
             &project,
-            &[Row {
+            &project::Settings::default(),
+            Some(vec![crate::threads::Row {
                 thread: retried,
-                group: Group::WaitingOnYou,
+                group: crate::thread::Group::WaitingOnYou,
                 note: "blocked".into(),
-            }],
+            }]),
+            None,
         );
+        let rendered = view.render(&[]);
         assert!(rendered.contains("blocked"), "{rendered}");
         assert!(!rendered.contains("ha thread retry"), "{rendered}");
+    }
+
+    #[test]
+    fn sealed_wait_survives_a_gone_process_and_rundown_includes_unlinked_work() {
+        let fx = crate::testkit::fixture();
+        let waiting = fx.thread("Browser access");
+        fx.seal_waiting(&waiting, 1, 1, "Rolf, please log in to continue.");
+        let working = fx.thread("Unlinked running work");
+        let rows = vec![
+            crate::threads::Row {
+                thread: crate::thread::load(&fx.project, &waiting).unwrap(),
+                group: crate::thread::Group::WaitingOnYou,
+                note: "process gone: pane is absent".into(),
+            },
+            crate::threads::Row {
+                thread: crate::thread::load(&fx.project, &working).unwrap(),
+                group: crate::thread::Group::Working,
+                note: "working".into(),
+            },
+        ];
+        let view = crate::project_view::View::capture(
+            &fx.project,
+            &project::Settings::default(),
+            Some(rows.clone()),
+            None,
+        );
+        let text = view.render(&["Current work"]);
+        assert!(text.contains("waiting seal retained"));
+        assert!(text.contains("process absent"));
+        assert!(text.contains("retry with a continuation reason"));
+        assert!(!text.contains("needs you in pane"));
+        let card = view.rundown();
+        assert!(
+            card["work"]
+                .as_str()
+                .unwrap()
+                .starts_with("1 running · 1 waiting")
+        );
+        assert!(
+            card["needs_you"]
+                .as_str()
+                .unwrap()
+                .contains("please log in")
+        );
+        assert!(
+            card["actions"]
+                .to_string()
+                .contains("Unlinked running work")
+        );
+        assert_eq!(crate::plan::counts(&fx.project).unwrap(), (0, 0));
+
+        // Connection failure is not proof of death; neither retry nor a pane
+        // direction is fabricated. Answering removes the personal request.
+        let mut unknown = rows;
+        unknown[0].note = "session unreachable".into();
+        let view = crate::project_view::View::capture(
+            &fx.project,
+            &project::Settings::default(),
+            Some(unknown.clone()),
+            None,
+        );
+        assert!(view.render(&["Current work"]).contains("process unknown"));
+        assert!(!view.render(&["Current work"]).contains("ha thread retry"));
+        unknown[0].thread.machine = "oci".into();
+        unknown[0].thread.last_observed = project::now();
+        unknown[0].thread.observation_error = "connection lost".into();
+        unknown[0].note = "no agent; last checked earlier; latest check failed".into();
+        let view = crate::project_view::View::capture(
+            &fx.project,
+            &project::Settings::default(),
+            Some(unknown.clone()),
+            None,
+        );
+        assert!(view.render(&["Current work"]).contains("process unknown"));
+        assert!(!view.render(&["Current work"]).contains("ha thread retry"));
+        let event = crate::events::list(&fx.project).pop().unwrap();
+        crate::thread::update(&fx.project, &waiting, |t| {
+            t.answered_waiting_event = event.id.clone()
+        })
+        .unwrap();
+        unknown[0].thread = crate::thread::load(&fx.project, &waiting).unwrap();
+        let view = crate::project_view::View::capture(
+            &fx.project,
+            &project::Settings::default(),
+            Some(unknown),
+            None,
+        );
+        assert!(view.needs_you.is_empty());
+
+        // A seal wins over stale process activity, but not over landing facts.
+        fx.seal_done(&working, 1, 1, "change-sha", "Finished.");
+        crate::thread::update(&fx.project, &working, |t| {
+            t.merged_sha = "change-sha".into();
+            t.historical_install_required = true;
+        })
+        .unwrap();
+        let view = crate::project_view::View::capture(
+            &fx.project,
+            &project::Settings::default(),
+            Some(vec![crate::threads::Row {
+                thread: crate::thread::load(&fx.project, &working).unwrap(),
+                group: crate::thread::Group::Working,
+                note: "working".into(),
+            }]),
+            None,
+        );
+        let caption = view.rundown()["work"].as_str().unwrap().to_string();
+        assert!(caption.starts_with("0 running · 0 waiting"));
+        assert!(caption.contains("1 awaiting installation"));
+        assert!(!caption.contains("awaiting review"));
+        assert!(
+            view.render(&["Current work"])
+                .contains("merged; awaiting installation")
+        );
     }
 
     #[test]
