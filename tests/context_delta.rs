@@ -175,6 +175,40 @@ fn a_failing_writer_consumes_nothing_in_text_or_json() {
 }
 
 #[test]
+fn failed_receipts_leave_the_cursor_replayable() {
+    let fixture = Fixture::new();
+    fixture.read();
+    let cursor = fixture.project.join(".state/context-cursor.json");
+    let before = std::fs::read(&cursor).unwrap();
+    fixture.wait();
+    fixture.write(".state/inbox/i-fixture.md", "+++\nid = 'i-fixture'\nkind = 'courier-delivery'\nevent = 't-0001-1-1'\nsummary = 'receipt replay'\n+++\n");
+    // Interrupt receipt persistence after output and inbox-seen persistence.
+    fixture.write(".state/deliveries", "blocked");
+    let failed = fixture.command().output().unwrap();
+    assert!(!failed.status.success());
+    assert!(String::from_utf8_lossy(&failed.stdout).contains("receipt replay"));
+    assert!(fixture.project.join(".state/inbox-seen.json").exists());
+    assert_eq!(std::fs::read(&cursor).unwrap(), before);
+    std::fs::remove_file(fixture.project.join(".state/deliveries")).unwrap();
+    assert!(fixture.read().contains("receipt replay"));
+    let receipt = fixture
+        .project
+        .join(".state/deliveries/t-0001-1-1/00000001.json");
+    assert!(
+        std::fs::read_to_string(&receipt)
+            .unwrap()
+            .contains("acknowledged")
+    );
+    assert!(!fixture.read().contains("receipt replay"));
+    assert_eq!(
+        std::fs::read_dir(receipt.parent().unwrap())
+            .unwrap()
+            .count(),
+        1
+    );
+}
+
+#[test]
 fn changed_standing_instructions_show_the_words_and_remain_unread_in_overflow() {
     let fixture = Fixture::new();
     fixture.read();

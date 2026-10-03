@@ -110,11 +110,8 @@ fn records<T: serde::de::DeserializeOwned>(project: &Project, kind: &str) -> Res
     Ok(rows)
 }
 
-pub(crate) fn read(project: &Project) -> Vec<Note> {
-    records(project, "notes").unwrap_or_else(|error| {
-        eprintln!("{error:#}");
-        Vec::new()
-    })
+pub(crate) fn read(project: &Project) -> Result<Vec<Note>> {
+    records(project, "notes")
 }
 
 /// Reserve even the id of a historical interrupted append. If the write died
@@ -143,7 +140,15 @@ fn note_number(id: &str) -> Option<u64> {
 }
 
 pub(crate) fn rows(project: &Project) -> Vec<Row> {
-    let mut rows: Vec<Row> = read(project)
+    rows_checked(project).unwrap_or_else(|error| {
+        // Unknown retirement history cannot make any old instruction active.
+        eprintln!("{error:#}");
+        Vec::new()
+    })
+}
+
+fn rows_checked(project: &Project) -> Result<Vec<Row>> {
+    let mut rows: Vec<Row> = read(project)?
         .into_iter()
         .map(|note| Row {
             id: note.id,
@@ -155,7 +160,7 @@ pub(crate) fn rows(project: &Project) -> Vec<Row> {
             tasks: note.tasks,
         })
         .collect();
-    for retirement in retirements(project) {
+    for retirement in retirements(project)? {
         rows.push(Row {
             id: format!("retired:{}", retirement.id),
             kind: "retirement".into(),
@@ -205,14 +210,11 @@ pub(crate) fn rows(project: &Project) -> Vec<Row> {
             });
         }
     }
-    rows
+    Ok(rows)
 }
 
-fn retirements(project: &Project) -> Vec<Retirement> {
-    records(project, "retirements").unwrap_or_else(|error| {
-        eprintln!("{error:#}");
-        Vec::new()
-    })
+fn retirements(project: &Project) -> Result<Vec<Retirement>> {
+    records(project, "retirements")
 }
 
 pub(crate) fn validate_basis(project: &Project, text: &str) -> Result<String> {
@@ -224,11 +226,7 @@ pub(crate) fn validate_basis(project: &Project, text: &str) -> Result<String> {
             return Ok(crate::prompt::resolve_request(project, text)?.basis());
         }
         AuthorityRef::Ask { id, revision } => {
-            if crate::ask::latest_revision(project, id) != *revision {
-                bail!("ask revision is not current");
-            }
-            let answer =
-                crate::ask::answer_of(project, id, *revision).context("ask is not answered")?;
+            let answer = crate::ask::answered_revision(project, id, *revision)?;
             if answer.not_understood || answer.choice == 0 {
                 bail!("a no answer authorizes nothing");
             }
@@ -431,6 +429,102 @@ mod tests {
     use crate::testkit::fixture;
 
     #[test]
+    fn corrupt_retirement_never_reactivates_an_instruction() {
+        for historical in [false, true] {
+            let fx = fixture();
+            crate::prompt::record_test_request(&fx.project, "q-1", "Retire the instruction.")
+                .unwrap();
+            let note = add(
+                &fx.project,
+                Kind::Instruction,
+                "Obsolete instruction.",
+                "q-1",
+                None,
+                vec![],
+            )
+            .unwrap();
+            assert!(active_rows(&fx.project).iter().any(|row| row.id == note.id));
+            let retirement = retire(&fx.project, &note.id, "q-1", "Obsolete.").unwrap();
+            let mut path = fx
+                .project
+                .record_dir("retirements")
+                .join(format!("{}.json", note.id));
+            if historical {
+                std::fs::remove_file(&path).unwrap();
+                path = fx.project.record_file("retirements.jsonl");
+                std::fs::write(
+                    &path,
+                    format!("{}\n", serde_json::to_string(&retirement).unwrap()),
+                )
+                .unwrap();
+            }
+            assert!(!active_rows(&fx.project).iter().any(|row| row.id == note.id));
+            std::fs::write(&path, "{broken\n").unwrap();
+            assert!(
+                active_rows(&fx.project).is_empty(),
+                "corruption is not absent retirement history"
+            );
+        }
+    }
+
+    #[test]
+    fn ask_authority_validates_paths_and_requires_the_matching_revision() {
+        let fx = fixture();
+        let ask = crate::contracts::Ask {
+            id: "a-1".into(),
+            revision: 1,
+            ..Default::default()
+        };
+        let answer = crate::ask::Answer {
+            id: "a-1".into(),
+            revision: 1,
+            choice: 1,
+            text: "yes".into(),
+            not_understood: false,
+            answered: project::now(),
+            by: "Rolf".into(),
+        };
+        let dir = fx.project.record_dir_for_write("asks").unwrap().join("a-1");
+        std::fs::create_dir(&dir).unwrap();
+        std::fs::write(dir.join("r1.toml"), toml::to_string(&ask).unwrap()).unwrap();
+        std::fs::write(
+            dir.join("r1.answer.toml"),
+            toml::to_string(&answer).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            validate_basis(&fx.project, "ask:a-1@1").unwrap(),
+            "ask:a-1@1"
+        );
+        // Even plausible records outside asks must not authorize a path escape.
+        let escaped = fx.project.record_dir("escaped");
+        std::fs::create_dir(&escaped).unwrap();
+        std::fs::write(escaped.join("r1.toml"), toml::to_string(&ask).unwrap()).unwrap();
+        std::fs::write(
+            escaped.join("r1.answer.toml"),
+            toml::to_string(&answer).unwrap(),
+        )
+        .unwrap();
+        assert!(validate_basis(&fx.project, "ask:../escaped@1").is_err());
+        for bad in ["", "a/b", "/tmp/a-1", "a-1..", "a-x"] {
+            assert!(validate_basis(&fx.project, &format!("ask:{bad}@1")).is_err());
+        }
+        std::fs::write(dir.join("r1.toml"), "").unwrap();
+        assert!(validate_basis(&fx.project, "ask:a-1@1").is_err());
+        std::fs::write(dir.join("r1.toml"), toml::to_string(&ask).unwrap()).unwrap();
+        std::fs::write(
+            dir.join("r1.answer.toml"),
+            toml::to_string(&crate::ask::Answer {
+                revision: 2,
+                ..answer
+            })
+            .unwrap(),
+        )
+        .unwrap();
+        assert!(validate_basis(&fx.project, "ask:a-1@1").is_err());
+    }
+
+    #[test]
     fn interrupted_append_then_add_replace_and_retire_preserves_records_and_ids() {
         for (tail, expected) in [
             (r#"{"schema":1,"id":"n-0010","text":"torn"#, "n-0011"),
@@ -497,7 +591,7 @@ mod tests {
                 vec![],
             )
             .unwrap();
-            let notes = read(&fx.project);
+            let notes = read(&fx.project).unwrap();
             assert_eq!(notes.len(), 4);
             assert_eq!(
                 notes
@@ -510,7 +604,7 @@ mod tests {
             for note in [&historical, &added, &replaced, &again] {
                 assert!(notes.contains(note));
             }
-            let retirements = retirements(&fx.project);
+            let retirements = retirements(&fx.project).unwrap();
             assert_eq!(retirements.len(), 2);
             assert!(retirements.iter().any(|row| row.id == retired.id));
             assert!(

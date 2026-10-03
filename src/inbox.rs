@@ -3,7 +3,7 @@
 use std::collections::BTreeSet;
 use std::path::PathBuf;
 
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 
 use crate::project::{self, Project};
@@ -28,13 +28,18 @@ pub(crate) fn inbox_dir(project: &Project) -> PathBuf {
 }
 
 fn parse(text: &str) -> Option<Item> {
+    let item = parse_record(text)?;
+    (!removed_kind(&item.kind)).then_some(item)
+}
+
+fn parse_record(text: &str) -> Option<Item> {
     let rest = text.strip_prefix("+++\n")?;
     let (front, body) = rest
         .split_once("\n+++\n")
         .or_else(|| Some((rest.strip_suffix("\n+++")?, "")))?;
     let mut item: Item = toml::from_str(front).ok()?;
     item.body = body.trim_matches('\n').to_string();
-    (!removed_kind(&item.kind)).then_some(item)
+    Some(item)
 }
 
 /// Old projections are ignored on read; no migration or replacement files.
@@ -186,6 +191,24 @@ pub(crate) fn prune_done(project: &Project, days: u64) {
     };
     let limit = std::time::Duration::from_secs(days * 24 * 3600);
     for entry in entries.flatten() {
+        // The archive is the durable handling authority. Replay a receipt
+        // lost after rename, and never prune that authority before it succeeds.
+        let receipt = (|| -> Result<()> {
+            let text = std::fs::read_to_string(entry.path())?;
+            let item = parse_record(&text).context("invalid archived inbox item")?;
+            if !item.event.is_empty() {
+                crate::events::append_delivery(
+                    project,
+                    &item.event,
+                    crate::contracts::DeliveryState::Handled,
+                )?;
+            }
+            Ok(())
+        })();
+        if let Err(error) = receipt {
+            eprintln!("{}: {error:#}", entry.path().display());
+            continue;
+        }
         let old = entry
             .metadata()
             .and_then(|m| m.modified())
@@ -459,6 +482,41 @@ mod tests {
                 "{bad}"
             );
         }
+    }
+
+    #[test]
+    fn archived_event_replays_handled_before_pruning() {
+        let fx = crate::testkit::fixture();
+        let lane = fx.thread("Waiting lane");
+        let event_id = fx.seal_waiting(&lane, 1, 1, "wait");
+        let event = crate::events::load(&fx.project, &event_id).unwrap();
+        let id = write_event(&fx.project, &event, "courier-delivery", "wait").unwrap();
+        let done = inbox_dir(&fx.project).join("done");
+        std::fs::create_dir_all(&done).unwrap();
+        let archived = done.join(format!("{id}.md"));
+        // Model a crash between the archival rename and the Handled append.
+        std::fs::rename(inbox_dir(&fx.project).join(format!("{id}.md")), &archived).unwrap();
+        let deliveries = fx.project.record_dir("deliveries");
+        std::fs::write(&deliveries, "blocked").unwrap();
+        prune_done(&fx.project, 0);
+        assert!(
+            archived.exists(),
+            "failed reconciliation must preserve its authority"
+        );
+        std::fs::remove_file(&deliveries).unwrap();
+        prune_done(&fx.project, 1);
+        assert!(archived.exists());
+        assert_eq!(
+            crate::events::states(&fx.project, &event_id).unwrap(),
+            vec![crate::contracts::DeliveryState::Handled]
+        );
+        prune_done(&fx.project, 1);
+        assert_eq!(
+            crate::events::states(&fx.project, &event_id).unwrap().len(),
+            1
+        );
+        prune_done(&fx.project, 0);
+        assert!(!archived.exists());
     }
 
     #[test]
