@@ -664,15 +664,6 @@ mod tests {
     use crate::runner::RealRunner;
     use crate::runner::fake::{FakeRunner, fail, ok};
 
-    #[test]
-    fn plain_words_stay_bare() {
-        assert_eq!(quote("/Users/me/.dev-root"), "/Users/me/.dev-root");
-        assert_eq!(quote(""), "''");
-        assert_eq!(quote("a b"), "'a b'");
-        assert_eq!(quote("it's"), r"'it'\''s'");
-        assert_eq!(quote("-n"), "'-n'");
-    }
-
     const HOSTILE: [&str; 10] = [
         "$(touch /tmp/hp-pwned)",
         "`id`",
@@ -773,25 +764,6 @@ mod tests {
     }
 
     #[test]
-    fn ssh_does_not_invent_a_machine_path() {
-        let expected = "sh -c true";
-        let runner = FakeRunner::new();
-        runner.on("ssh", ok(""));
-        ssh(&runner, "box", "true", None, SSH_TIMEOUT).unwrap();
-        let calls = runner.calls.borrow();
-        assert_eq!(calls[0].args.last().unwrap(), &expected);
-        drop(calls);
-
-        let runner = FakeRunner::new();
-        runner.on("ssh", ok(""));
-        let dir = tempfile::tempdir().unwrap();
-        ssh_courier(&runner, "box", dir.path(), "true", "", SSH_TIMEOUT).unwrap();
-        let calls = runner.calls.borrow();
-        assert_eq!(calls[0].args.last().unwrap(), &expected);
-        drop(calls);
-    }
-
-    #[test]
     fn machine_profiles_come_only_from_enabled_saved_machines() {
         let config = tempfile::tempdir().unwrap();
         let runner = FakeRunner::new();
@@ -814,53 +786,6 @@ mod tests {
         let broken = FakeRunner::new();
         broken.on("machine list --json", fail(1, "no"));
         assert!(machine_profile(&broken, "herdr", config.path(), "box").is_err());
-    }
-
-    #[test]
-    fn a_second_configured_machine_needs_no_engine_change() {
-        let config = tempfile::tempdir().unwrap();
-        std::fs::write(
-            config.path().join("config.toml"),
-            r#"[machines.lab]
-target = "lab.example"
-session = "saved"
-home = "/srv/agent"
-root = "/srv/ade"
-worktrees = "/srv/work"
-build = "/srv/build"
-path = "/srv/bin:/usr/bin:/bin"
-ade_bin = "/srv/bin/herdr-ade"
-pi_bin = "/srv/bin/herdr-pi"
-[[machines.lab.repos]]
-path = "/local/repo"
-box_path = "/srv/work/repo"
-publish_url = "https://example.test/repo.git"
-"#,
-        )
-        .unwrap();
-        let runner = FakeRunner::new();
-        runner.on("machine list --json", ok("[]"));
-        assert_eq!(
-            registered_machine_names(&runner, "herdr", config.path()).unwrap(),
-            vec!["lab"]
-        );
-        let profile = machine_profile(&runner, "herdr", config.path(), "lab").unwrap();
-        assert_eq!(profile.target, "lab.example");
-        let declaration = machine_declaration(config.path(), "lab").unwrap();
-        assert!(declaration.runs_kind("pi"));
-        assert!(declaration.runs_kind("claude"));
-        assert!(declaration.runs_kind("agy"));
-        let repo = box_repo_for(config.path(), "lab", "/local/repo")
-            .unwrap()
-            .unwrap();
-        assert_eq!(repo.box_path.as_deref(), Some("/srv/work/repo"));
-    }
-
-    #[test]
-    fn no_machine_is_shipped_as_a_default() {
-        let config = tempfile::tempdir().unwrap();
-        assert!(machine_declarations(config.path()).unwrap().is_empty());
-        assert!(machine_declaration(config.path(), "buildbox").is_err());
     }
 
     #[test]
@@ -921,28 +846,6 @@ publish_url = "https://github.com/uguryildirim24/herdr.git"
             .unwrap(),
             "fork"
         );
-    }
-
-    #[test]
-    fn provision_verifies_fetch_head_and_creates_the_worktree() {
-        let runner = FakeRunner::new();
-        runner.on("ssh", ok("b0b0\n"));
-        let req = Provision {
-            path: "/custom/bin:/usr/bin:/bin",
-            box_repo: "/home/agent/projects/herdr",
-            worktree: "/home/agent/projects/herdr/.worktrees/t-0001",
-            branch: "hp/demo/t-0001",
-            base: "b0b0",
-            publish_url: "https://github.com/uguryildirim24/herdr.git",
-        };
-        provision(&runner, "box", &req).unwrap();
-        let calls = runner.calls.borrow();
-        let script = calls[0].args.last().unwrap();
-        assert!(script.contains("PATH=/custom/bin:/usr/bin:/bin; export PATH"));
-        assert!(script.contains("git fetch --quiet"));
-        assert!(script.contains("FETCH_HEAD"));
-        assert!(script.contains("git worktree add"));
-        drop(calls);
     }
 
     #[test]

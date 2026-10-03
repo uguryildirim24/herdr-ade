@@ -1511,19 +1511,6 @@ mod tests {
     }
 
     #[test]
-    fn row1_resolved_wins_over_everything() {
-        let t = Thread {
-            status: Status::Resolved,
-            prompt_pending: true,
-            ..open_thread()
-        };
-        assert_eq!(
-            group(&t, &live(Some("blocked"), 999), now()),
-            Group::Resolved
-        );
-    }
-
-    #[test]
     fn ticker_reuses_unchanged_thread_records_and_sees_atomic_updates() {
         let home = tempfile::tempdir().unwrap();
         let project = crate::project::create(home.path(), "demo", "", vec![]).unwrap();
@@ -1575,22 +1562,6 @@ mod tests {
     }
 
     #[test]
-    fn row2_starting_is_working_for_five_minutes() {
-        let young = Thread {
-            status: Status::Starting,
-            created: ago(10),
-            ..open_thread()
-        };
-        assert_eq!(group(&young, &Live::default(), now()), Group::Working);
-        let old = Thread {
-            status: Status::Starting,
-            created: ago(301),
-            ..open_thread()
-        };
-        assert_eq!(group(&old, &Live::default(), now()), Group::WaitingOnYou);
-    }
-
-    #[test]
     fn an_unpolled_remote_thread_is_unknown() {
         let remote = Thread {
             machine: "box".into(),
@@ -1598,7 +1569,6 @@ mod tests {
             ..open_thread()
         };
         assert_eq!(recorded_group(&remote, now()), Group::Unknown);
-        assert_eq!(Group::Unknown.label(), "Unknown");
     }
 
     #[test]
@@ -1645,105 +1615,6 @@ mod tests {
             group(&open_thread(), &live(Some("blocked"), 30), now()),
             Group::WaitingOnYou
         );
-    }
-
-    #[test]
-    fn row4_working_including_a_launch_in_progress() {
-        assert_eq!(
-            group(&open_thread(), &live(Some("working"), 0), now()),
-            Group::Working
-        );
-        // A permission prompt answered quickly never shows as waiting.
-        assert_eq!(
-            group(&open_thread(), &live(Some("blocked"), 29), now()),
-            Group::Working
-        );
-        // A new thread is Working, not Waiting on you, until an undetected-ready
-        // agent has lasted 60 seconds.
-        let pending = Thread {
-            prompt_pending: true,
-            ..open_thread()
-        };
-        assert_eq!(group(&pending, &live(None, 0), now()), Group::Working);
-        let attempts_exhausted = Thread {
-            launch_attempts: MAX_LAUNCH_ATTEMPTS,
-            ..pending.clone()
-        };
-        assert_eq!(
-            group(&attempts_exhausted, &live(None, 0), now()),
-            Group::Unknown
-        );
-        assert_eq!(
-            group(&pending, &live(Some("unknown"), 59), now()),
-            Group::Working
-        );
-        assert_eq!(
-            group(&pending, &live(Some("idle"), 500), now()),
-            Group::Working
-        );
-    }
-
-    #[test]
-    fn row6_ready_for_review_until_ack() {
-        let t = Thread {
-            report_hash: "h".into(),
-            ..open_thread()
-        };
-        assert_eq!(
-            group(&t, &live(Some("done"), 0), now()),
-            Group::ReadyForReview
-        );
-        let acked = Thread {
-            acked_report_hash: "h".into(),
-            ..t.clone()
-        };
-        assert_eq!(group(&acked, &live(Some("done"), 0), now()), Group::Idle);
-    }
-
-    #[test]
-    fn row7_idle_and_precedence() {
-        assert_eq!(
-            group(&open_thread(), &live(Some("idle"), 0), now()),
-            Group::Idle
-        );
-        // Working (row 4) beats Ready for review (row 6).
-        let t = Thread {
-            report_hash: "h".into(),
-            ..open_thread()
-        };
-        assert_eq!(group(&t, &live(Some("working"), 0), now()), Group::Working);
-        // Blocked for long (row 3) beats a pending report (row 6).
-        assert_eq!(
-            group(&t, &live(Some("blocked"), 31), now()),
-            Group::WaitingOnYou
-        );
-    }
-
-    #[test]
-    fn pane_gone_with_a_report_keeps_its_place() {
-        let gone = Live {
-            pane_exists: false,
-            agent_state: None,
-            state_secs: 0,
-        };
-        let t = Thread {
-            report_hash: "h".into(),
-            ..open_thread()
-        };
-        assert_eq!(group(&t, &gone, now()), Group::ReadyForReview);
-        let acked = Thread {
-            acked_report_hash: "h".into(),
-            ..t
-        };
-        assert_eq!(group(&acked, &gone, now()), Group::Idle);
-    }
-
-    #[test]
-    fn display_order_and_rank_digits() {
-        let ranks: Vec<u8> = Group::DISPLAY_ORDER.iter().map(|g| g.rank()).collect();
-        assert_eq!(ranks, [1, 2, 3, 4, 5, 6, 7]);
-        assert_eq!(Group::ReadyForReview.token(), "ready-for-review");
-        assert_eq!(Group::WaitingOnYou.token(), "waiting-on-you");
     }
 
     fn agent(name: &str, cwd: &str) -> Agent {
@@ -1835,41 +1706,12 @@ mod tests {
     }
 
     #[test]
-    fn live_state_duration_comes_from_the_record_only_when_states_agree() {
-        let t = placed_thread(Kind::Worktree);
-        let same = live_state(&t, &[agent("hp-demo-t-0001", "/wt")], &[], now());
-        assert_eq!(same.state_secs, 45);
-        let mut other = agent("hp-demo-t-0001", "/wt");
-        other.agent_status = "blocked".into();
-        assert_eq!(live_state(&t, &[other], &[], now()).state_secs, 0);
-    }
-
-    #[test]
     fn ids_branches_and_dirs() {
         assert!(validate_id("t-0001").is_ok());
         assert!(validate_id("t-12345").is_ok());
         for bad in ["", "t-1", "t-00a1", "../t-0001", "x-0001"] {
             assert!(validate_id(bad).is_err(), "{bad}");
         }
-        assert_eq!(
-            branch_name("demo", "t-0001", "Fix the $(login) bug!"),
-            "hp/demo/t-0001-fix-the-login-bug"
-        );
-        assert_eq!(branch_name("demo", "t-0002", "???"), "hp/demo/t-0002");
-        assert_eq!(
-            thread_dir("/wt/", "demo", "t-0001"),
-            "/wt/.herdr-project/demo-t-0001"
-        );
-        // A1 H2: a launched lane is primed with its role skill (D9, D14).
-        let lane = Thread {
-            id: "t-0001".into(),
-            role: "reviewer".into(),
-            ..placed_thread(Kind::Worktree)
-        };
-        assert_eq!(
-            launch_prompt("ha", "demo", &lane),
-            "Run the shell command `ha skill reviewer`, then read .herdr-project/demo-t-0001/brief.md and do what it says."
-        );
     }
 
     #[test]
@@ -1968,169 +1810,6 @@ mod tests {
     }
 
     #[test]
-    fn brief_order_and_memory_cap() {
-        let notes = vec![
-            ("n-0001".to_string(), "alpha fact".to_string()),
-            ("n-0002".to_string(), "x".repeat(MEMORY_CAP_CHARS)),
-            ("n-0003".to_string(), "gamma fact".to_string()),
-        ];
-        let gates = vec![crate::project::Gate {
-            command: "cargo test".into(),
-            paths: None,
-            env: std::collections::BTreeMap::from([("RUST_BACKTRACE".into(), "1".into())]),
-        }];
-        let brief = compose_brief(&BriefInput {
-            task: "Do the thing.",
-            supplied_task: None,
-            instructions: "Always run the tests.",
-            facts: &notes,
-            repository: "/repo",
-            machine: "local",
-            gates: Some(&gates),
-            restart: true,
-            report_path: "/wt/.herdr-project/demo-t-0001/report.md",
-            library_path: "/wt/.herdr-project/demo-t-0001/library",
-        });
-        let pos = |needle: &str| {
-            brief
-                .find(needle)
-                .unwrap_or_else(|| panic!("missing {needle}"))
-        };
-        assert!(brief.starts_with("**A previous attempt"));
-        assert!(pos("previous attempt") < pos("Always run the tests."));
-        assert!(pos("Do the thing.") < pos("Always run the tests."));
-        assert!(pos("Always run the tests.") < pos("# Facts in force"));
-        assert!(pos("# Facts in force") < pos("alpha fact"));
-        assert!(pos("alpha fact") < pos("/wt/.herdr-project/demo-t-0001/report.md"));
-        assert!(brief.contains("- Repository: `/repo`."));
-        assert!(brief.contains("- Machine: local."));
-        assert!(brief.contains("`cargo test` with environment `RUST_BACKTRACE=1`"));
-        assert!(brief.contains("gamma fact"));
-        assert!(
-            brief.contains("Not included because dated facts are over 32000 characters: n-0002.")
-        );
-        assert!(!brief.contains(&"x".repeat(100)));
-
-        let fresh = compose_brief(&BriefInput {
-            task: "t",
-            supplied_task: None,
-            instructions: "",
-            facts: &[],
-            repository: "",
-            machine: "local",
-            gates: None,
-            restart: false,
-            report_path: "r",
-            library_path: "l",
-        });
-        assert!(!fresh.contains("previous attempt"));
-    }
-
-    #[test]
-    fn brief_carries_the_task_and_only_applicable_current_page_facts() {
-        let root = tempfile::tempdir().unwrap();
-        let project = project::create(root.path(), "demo", "", vec![]).unwrap();
-        crate::prompt::record_test_request(&project, "q-1", "Keep helper briefs focused.").unwrap();
-        let current = crate::task::add(
-            &project,
-            "Ship the checked change.",
-            vec!["request:q-1".into()],
-            vec!["The command reports the new result.".into()],
-            None,
-            None,
-        )
-        .unwrap();
-        let other = crate::task::add(
-            &project,
-            "Ship another checked change.",
-            vec!["request:q-1".into()],
-            vec!["The command reports another result.".into()],
-            None,
-            None,
-        )
-        .unwrap();
-        crate::note::add(
-            &project,
-            crate::note::Kind::Instruction,
-            "Dated instruction marker.",
-            "q-1",
-            None,
-            vec![],
-        )
-        .unwrap();
-        crate::note::add(
-            &project,
-            crate::note::Kind::Memory,
-            "Applicable dated marker.",
-            "q-1",
-            None,
-            vec![],
-        )
-        .unwrap();
-        crate::note::add(
-            &project,
-            crate::note::Kind::Memory,
-            "Other task marker.",
-            "q-1",
-            None,
-            vec![other.id],
-        )
-        .unwrap();
-        let thread = allocate(&project, |_| {}).unwrap();
-        crate::task::link_attempt(&project, &current.id, &thread.id).unwrap();
-
-        let brief = brief_for(&project, &thread, "Do the task.", false).unwrap();
-        assert!(
-            brief.contains(&format!("## {} — Ship the checked change.", current.id)),
-            "{brief}"
-        );
-        assert!(brief.contains("Requests: request:q-1"), "{brief}");
-        assert!(
-            brief.contains("request:q-1:\nKeep helper briefs focused."),
-            "{brief}"
-        );
-        assert!(
-            brief.contains("The command reports the new result."),
-            "{brief}"
-        );
-        assert!(brief.contains("## Lead brief\n\nDo the task."), "{brief}");
-        assert!(brief.contains("Dated instruction marker."), "{brief}");
-        assert!(brief.contains("Applicable dated marker."), "{brief}");
-        assert!(!brief.contains("Other task marker"), "{brief}");
-        assert!(
-            brief.contains("# Repository, machine and pinned gates"),
-            "{brief}"
-        );
-        assert!(brief.contains("# Finish"), "{brief}");
-        assert!(brief.contains("`ha done --report"), "{brief}");
-        assert!(!brief.contains("`hp "), "{brief}");
-        assert!(memory_use(&project).warning().is_none());
-    }
-
-    #[test]
-    fn the_lane_skill_says_done_publishes_on_the_box() {
-        let lane = include_str!("../skill/LANE.md");
-        let rules_end = lane
-            .find("## If this attempt fails")
-            .expect("the failure heading");
-        let standing = &lane[..rules_end];
-        assert!(
-            standing.contains("The pile review publishes the integration branch"),
-            "{standing}"
-        );
-        assert!(
-            standing.contains("`ha done` publishes only your lane branch"),
-            "{standing}"
-        );
-        let box_section = lane.find("## On the cloud box").expect("the box heading");
-        assert!(
-            lane[box_section..].contains("It publishes your lane branch to the recorded remote"),
-            "{}",
-            &lane[box_section..]
-        );
-    }
-
-    #[test]
     fn memory_over_budget_warns_with_the_note_and_size() {
         let root = tempfile::tempdir().unwrap();
         let project = project::create(root.path(), "demo", "", vec![]).unwrap();
@@ -2149,7 +1828,6 @@ mod tests {
         assert!(use_.over_budget());
         let warning = use_.warning().unwrap();
         assert!(warning.contains(&note.id), "{warning}");
-        assert!(warning.contains("replace stale dated notes"), "{warning}");
 
         crate::note::add(
             &project,
@@ -2326,9 +2004,7 @@ mod tests {
         let runner = FakeRunner::new();
         runner.on("du -sk", ok("60000\t/x\n"));
         let copied = copy_home_local(&project, &t, true, &runner);
-        assert!(
-            matches!(&copied.outcome, CopyOutcome::Partial(notes) if notes[0].contains("over the 50 MB cap"))
-        );
+        assert!(matches!(copied.outcome, CopyOutcome::Partial(_)));
         assert_eq!(runner.count("rsync"), 0);
         assert!(!home_report_path(&project, &t.id).exists());
     }

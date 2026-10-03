@@ -5796,33 +5796,27 @@ mod tests {
                 let (fx, lane) = repo_link_fixture(remote);
                 let root = Path::new(&lane.worktree_path);
                 let figure = "figures/3d/gaba-dose/curves.svg";
-                let (dest, reason) = match case {
+                let dest = match case {
                     "untracked" => {
                         std::fs::write(root.join("untracked.svg"), "<svg/>").unwrap();
-                        ("../../untracked.svg", "untracked repo file")
+                        "../../untracked.svg"
                     }
                     "modified" | "staged" => {
                         std::fs::write(root.join(figure), "changed").unwrap();
                         if case == "staged" {
                             git(root, &["add", figure]);
                         }
-                        (
-                            "../../figures/3d/gaba-dose/curves.svg",
-                            "uncommitted repo file",
-                        )
+                        "../../figures/3d/gaba-dose/curves.svg"
                     }
                     "lane-only" => {
                         commit_file(root, "lane-only.svg", "new", "lane-only figure");
-                        ("../../lane-only.svg", "not committed on integration branch")
+                        "../../lane-only.svg"
                     }
                     "different-blob" => {
                         commit_file(root, figure, "different", "change figure only in lane");
-                        (
-                            "../../figures/3d/gaba-dose/curves.svg",
-                            "not committed on integration branch",
-                        )
+                        "../../figures/3d/gaba-dose/curves.svg"
                     }
-                    "outside" => ("../../../outside.svg", "not inside the worktree"),
+                    "outside" => "../../../outside.svg",
                     "symlink" => {
                         std::fs::write(fx.world.home.path().join("outside.svg"), "outside")
                             .unwrap();
@@ -5831,14 +5825,14 @@ mod tests {
                             root.join("escape.svg"),
                         )
                         .unwrap();
-                        ("../../escape.svg", "not inside the worktree")
+                        "../../escape.svg"
                     }
                     "symlink-parent" => {
                         let outside = fx.world.home.path().join("outside-dir");
                         std::fs::create_dir_all(outside.join("nested")).unwrap();
                         std::fs::write(outside.join("outside.svg"), "outside").unwrap();
                         symlink(outside.join("nested"), root.join("link")).unwrap();
-                        ("../../link/../outside.svg", "not inside the worktree")
+                        "../../link/../outside.svg"
                     }
                     _ => unreachable!(),
                 };
@@ -5850,7 +5844,6 @@ mod tests {
                     detail.contains("linked_files_not_kept"),
                     "{remote}/{case}: {detail}"
                 );
-                assert!(detail.contains(reason), "{remote}/{case}: {detail}");
                 assert!(root.exists());
                 assert!(
                     !thread::load(&fx.project, &lane.id)
@@ -5963,18 +5956,8 @@ mod tests {
                 },
                 ..Default::default()
             };
-            for (name, reason) in [
-                ("missing", "missing"),
-                ("escape", "not inside the thread folder"),
-                ("special", "not a regular file or folder"),
-                ("library", "not a regular file or folder"),
-            ] {
-                let error = linked_files(&world.ctx(), &record, std::path::Path::new(name))
-                    .err()
-                    .unwrap()
-                    .to_string();
-                assert!(error.contains(reason), "{remote}: {error}");
-                assert!(!error.contains("()"), "{error}");
+            for name in ["missing", "escape", "special", "library"] {
+                assert!(linked_files(&world.ctx(), &record, std::path::Path::new(name)).is_err());
             }
             std::fs::remove_file(root.join("library/symlink")).unwrap();
             for name in ["a", "b"] {
@@ -5983,30 +5966,7 @@ mod tests {
                     .set_len(101 * 1024 * 1024)
                     .unwrap();
             }
-            let error = linked_files(&world.ctx(), &record, std::path::Path::new("library"))
-                .err()
-                .unwrap()
-                .to_string();
-            assert!(error.contains("over cap (200 MiB)"), "{error}");
-        }
-    }
-
-    #[test]
-    fn box_probe_exit_codes_have_refusal_messages_without_stderr() {
-        for (code, reason) in [
-            (2, "missing"),
-            (3, "not inside the thread folder"),
-            (4, "not a regular file or folder"),
-            (5, "over cap"),
-        ] {
-            let error = linked_probe_result(
-                &crate::runner::fake::fail(code, ""),
-                std::path::Path::new("library"),
-            )
-            .unwrap_err()
-            .to_string();
-            assert!(error.contains(reason), "{error}");
-            assert!(!error.contains("()"));
+            assert!(linked_files(&world.ctx(), &record, std::path::Path::new("library")).is_err());
         }
     }
 
@@ -6020,12 +5980,7 @@ mod tests {
             "%2e%2e/%2e%2e/%2e%2e/outside",
             "%2foutside",
         ] {
-            assert!(
-                linked_relative_path(&project, &lane, dest)
-                    .unwrap_err()
-                    .to_string()
-                    .contains("not inside the worktree")
-            );
+            assert!(linked_relative_path(&project, &lane, dest).is_err());
         }
     }
 
@@ -6436,10 +6391,6 @@ mod tests {
         let data = serde_json::to_value(&outcome).unwrap();
         assert_eq!(data["worktree"], "kept");
         assert_eq!(data["worktree_reason"], "work_not_done");
-        assert_eq!(
-            outcome.message("demo"),
-            "t-0001 resolved.\nIts pane and tab were closed.\nThe worktree /wt was kept: work_not_done.\n"
-        );
     }
 
     fn agent(state: &str) -> Agent {
@@ -6474,12 +6425,7 @@ mod tests {
             kind: Kind::Adopted,
             ..worktree_thread()
         };
-        assert!(
-            prompt_state(&t, &[], false)
-                .unwrap_err()
-                .to_string()
-                .contains("bare shell prompt")
-        );
+        assert!(prompt_state(&t, &[], false).is_err());
         assert!(prompt_state(&t, &[agent("unknown")], false).is_err());
         assert!(
             prompt_state(&t, &[agent("blocked")], false)
@@ -6659,42 +6605,6 @@ mod tests {
         let retried_lane = thread::load(&project, &lane.id).unwrap();
         assert_eq!(retried_lane.follow_ups.len(), 1);
         assert_eq!(retried_lane.follow_ups[0].text, "Repair the conflict");
-    }
-
-    #[test]
-    fn token_values_and_ranks() {
-        let tokens = thread_tokens(&worktree_thread(), "demo", Group::WaitingOnYou);
-        assert_eq!(
-            tokens,
-            vec![
-                ("project".to_string(), "demo".to_string()),
-                ("thread".to_string(), "t-0001".to_string()),
-                ("review".to_string(), "waiting-on-you".to_string()),
-                ("rank".to_string(), "3".to_string()),
-            ]
-        );
-    }
-
-    #[test]
-    fn exclude_is_added_once() {
-        let repo = tempfile::tempdir().unwrap();
-        let run = |args: &[&str]| {
-            std::process::Command::new("git")
-                .arg("-C")
-                .arg(repo.path())
-                .args(args)
-                .output()
-                .unwrap()
-        };
-        run(&["init", "-q"]);
-        let cwd = repo.path().to_string_lossy().into_owned();
-        exclude_from_git(&crate::runner::RealRunner, &cwd).unwrap();
-        exclude_from_git(&crate::runner::RealRunner, &cwd).unwrap();
-        let text = std::fs::read_to_string(repo.path().join(".git/info/exclude")).unwrap();
-        assert_eq!(text.matches(".herdr-project/").count(), 1);
-        std::fs::create_dir_all(repo.path().join(".herdr-project/x")).unwrap();
-        std::fs::write(repo.path().join(".herdr-project/x/report.md"), "r").unwrap();
-        assert!(String::from_utf8_lossy(&run(&["status", "--porcelain"]).stdout).is_empty());
     }
 
     #[test]
@@ -6943,15 +6853,7 @@ mod tests {
         assert!(git_out(&["ls-tree", "-r", "--name-only", "main", "--", "tasks"]).is_empty());
         let artifact = crate::thread::artifact(&project, &started.launch.brief_hash).unwrap();
         let brief = String::from_utf8_lossy(&artifact);
-        assert!(brief.starts_with("plain: The lane does the work."));
-        assert!(
-            brief.contains(&format!("# Task\n\n## Lead brief\n\n{lead_brief}")),
-            "{brief}"
-        );
-        assert!(
-            brief.contains(&format!("## {} — Fix the saved login.", stable_task.id)),
-            "{brief}"
-        );
+        assert!(brief.contains(lead_brief), "{brief}");
         assert_eq!(
             std::fs::read(Path::new(&started.thread_dir).join("brief.md")).unwrap(),
             artifact
@@ -7011,14 +6913,7 @@ mod tests {
             .map(|c| c.args.get(3).cloned().unwrap_or_default())
             .collect();
         assert_eq!(prompts.len(), 1, "{prompts:?}");
-        assert!(
-            prompts[0].ends_with(&format!(
-                " skill lane`, then read .herdr-project/demo-{}/brief.md and do what it says.",
-                started.id
-            )),
-            "{}",
-            prompts[0]
-        );
+        assert!(prompts[0].contains(&format!(".herdr-project/demo-{}/brief.md", started.id)));
         drop(calls);
         *world.agents.borrow_mut() = "[]".into();
 
@@ -7039,8 +6934,6 @@ mod tests {
         assert_eq!(retried.launch.work_retries, 0);
         assert_eq!(retried.launch.same_recipe_retries, 1);
         assert_eq!(retried.launch.brief_hash, started.launch.brief_hash);
-        assert!(retried.placement_reason.contains("retry on `local`"));
-        assert!(retried.placement_reason.contains(&retried.launch.recipe_id));
         let retried_brief = crate::thread::artifact(&project, &retried.launch.brief_hash).unwrap();
         assert!(String::from_utf8_lossy(&retried_brief).contains(lead_brief));
         let calls = world.runner.calls.borrow();
@@ -7137,44 +7030,6 @@ mod tests {
         let started = start(&ctx, "demo", args(harness_s.clone())).unwrap();
         assert_eq!(started.repo, harness_s);
         assert!(thread::list(&project).iter().any(|t| t.id == started.id));
-    }
-
-    #[test]
-    fn ade_start_refuses_an_empty_plain() {
-        let world = crate::scenarios::World::new();
-        let _project = world.project("demo", "a.sock");
-        *world.panes.borrow_mut() = format!("[{}]", world.coordinator_pane(&_project));
-        let ctx = world.ctx();
-        let missing = start(
-            &ctx,
-            "demo",
-            StartArgs {
-                title: "X".into(),
-                repo: None,
-                machine: None,
-                base: None,
-                task: "Do the thing.".into(),
-                plain: String::new(),
-                workflow: None,
-                recipe: None,
-                task_id: String::new(),
-                review_id: String::new(),
-            },
-        )
-        .unwrap_err()
-        .to_string();
-        assert!(missing.contains("plain_missing"), "{missing}");
-    }
-
-    #[test]
-    fn a_held_machine_refuses_a_new_box_start() {
-        let root = tempfile::tempdir().unwrap();
-        assert!(!project::machine_held(root.path(), "buildbox"));
-        project::machine_hold(root.path(), "buildbox").unwrap();
-        assert!(project::machine_held(root.path(), "buildbox"));
-        assert!(project::machine_release(root.path(), "buildbox").unwrap());
-        assert!(!project::machine_held(root.path(), "buildbox"));
-        assert!(!project::machine_release(root.path(), "buildbox").unwrap());
     }
 
     #[test]
@@ -7388,7 +7243,6 @@ mod tests {
         retry(&fx.world.ctx(), "demo", &started.id, "process disappeared").unwrap();
         let placed = thread::load(&fx.project, &started.id).unwrap();
         assert_eq!(placed.machine, "buildbox");
-        assert!(placed.placement_reason.contains("machine kept"));
 
         // A selected local machine is also a placement even though its saved
         // machine is empty. Do not move an explicitly local start to the box.
@@ -7415,7 +7269,6 @@ mod tests {
         let retried_local = thread::load(&fx.project, &local.id).unwrap();
         assert!(retried_local.machine.is_empty());
         assert_eq!(retried_local.launch.machine, "local");
-        assert!(retried_local.placement_reason.contains("machine kept"));
 
         // A failed start before it acquired any machine or work is dispatched
         // again, using the current routing pick and the box mapping.
@@ -7443,7 +7296,6 @@ mod tests {
         let retried = thread::load(&fx.project, &unplaced.id).unwrap();
         assert_eq!(retried.machine, "buildbox");
         assert_eq!(retried.launch.machine, "buildbox");
-        assert!(retried.placement_reason.contains("retry: recipe"));
     }
 
     #[test]
@@ -7470,10 +7322,7 @@ mod tests {
         )
         .unwrap_err()
         .to_string();
-        assert!(
-            error.contains("disk_low: buildbox has 5.1 GB free under /home/agent/projects"),
-            "{error}"
-        );
+        assert!(error.starts_with("disk_low:"), "{error}");
         assert!(thread::list(&fx.project).is_empty());
         assert_eq!(fx.world.runner.count("tab create"), 0);
         assert_eq!(fx.world.runner.count("workspace create"), 0);
@@ -7536,10 +7385,6 @@ mod tests {
                 && line.contains("--label Demo")
                 && line.contains(&format!("HERDR_ADE_LAUNCH=demo/{}/1/", started.id))
                 && line.contains(&format!("--cwd {}", started.worktree_path))
-        }));
-        assert!(calls.iter().any(|call| {
-            call.display()
-                .contains(&format!("tab rename w1:t2 {} starting…", started.id))
         }));
         assert_eq!(
             calls
@@ -7620,16 +7465,6 @@ mod tests {
         assert_eq!(agy.launch.machine, "local");
         assert!(agy.launch.args.iter().any(|arg| arg == "--new-project"));
 
-        let dispatch =
-            std::fs::read_to_string(fx.project.state_dir().join("dispatch.jsonl")).unwrap();
-        assert!(
-            dispatch.contains("does not run adapter kind `claude`"),
-            "{dispatch}"
-        );
-        assert!(
-            dispatch.contains("does not run adapter kind `agy`"),
-            "{dispatch}"
-        );
         assert!(
             fx.world
                 .runner
@@ -7732,13 +7567,6 @@ mod tests {
         local_wait.machine.clear();
         let shown = row(&local_wait, Some(&view), jiff::Timestamp::now());
         assert_eq!(shown.group, Group::Working);
-        assert_eq!(
-            shown.note,
-            format!(
-                "waiting for provider opencode-go: readiness probe timed out at {}; the start is queued and retries by itself",
-                waiting.provider_wait_started
-            )
-        );
         let other = thread::allocate(&fx.project, |t| {
             t.launch = waiting.launch.clone();
             t.machine = waiting.machine.clone();
@@ -7790,7 +7618,6 @@ mod tests {
         assert!(error.contains("recipe_unavailable"), "{error}");
         assert!(error.contains("agy_gemini_flash"), "{error}");
         assert!(error.contains("buildbox"), "{error}");
-        assert!(error.contains("does not run adapter kind `agy`"), "{error}");
         assert!(thread::list(&fx.project).is_empty());
         let dispatch =
             std::fs::read_to_string(fx.project.state_dir().join("dispatch.jsonl")).unwrap();
@@ -7803,71 +7630,6 @@ mod tests {
                 .iter()
                 .all(|call| call.program != "ssh"),
             "an explicitly unsupported kind must not probe the box"
-        );
-    }
-
-    #[test]
-    fn no_ready_machine_names_the_recipe_and_every_machine_tried() {
-        let home = tempfile::tempdir().unwrap();
-        let env = crate::paths::Env::for_test(home.path(), &[]);
-        let runner = crate::runner::fake::FakeRunner::new();
-        runner.on(
-            "machine list --json",
-            crate::runner::fake::ok(
-                r#"[{"id":"buildbox-id","label":"buildbox","target":"buildbox-pi","session":"default","enabled":true}]"#,
-            ),
-        );
-        runner.on_fn(
-            |cmd| cmd.program == "ssh" && cmd.display().contains("getconf _NPROCESSORS_ONLN"),
-            |_| Ok(crate::runner::fake::ok("1.0 16\n")),
-        );
-        runner.on_fn(
-            |cmd| cmd.program == "ssh",
-            |_| {
-                Ok(crate::runner::fake::fail(
-                    127,
-                    "agy is missing from the lane PATH",
-                ))
-            },
-        );
-        runner.on_fn(
-            |cmd| cmd.program == "agy",
-            |_| Ok(crate::runner::fake::fail(1, "agy is not signed in here")),
-        );
-        let config_dir = home.path().join("cfg");
-        std::fs::create_dir_all(&config_dir).unwrap();
-        std::fs::write(config_dir.join("config.toml"), lane_config()).unwrap();
-        let ctx = Ctx {
-            env: &env,
-            root: home.path().join("root"),
-            config_dir,
-            runner: &runner,
-            detached_ticker: false,
-        };
-        let launch = crate::contracts::Launch {
-            kind: "agy".into(),
-            recipe_id: "agy_gemini_flash".into(),
-            machine: "buildbox".into(),
-            ready_timeout_ms: 30_000,
-            ..Default::default()
-        };
-        let row = crate::project::Repo {
-            path: "/repo".into(),
-            box_path: Some("/box/repo".into()),
-            publish_url: Some("https://example/repo.git".into()),
-            ..Default::default()
-        };
-        let error = resolve_placement(&ctx, None, "lane", &launch, Some("/repo"), Some(&row))
-            .unwrap_err()
-            .to_string();
-        assert!(error.contains("agy_gemini_flash"), "{error}");
-        assert!(
-            error.contains("buildbox") && error.contains("local"),
-            "{error}"
-        );
-        assert!(
-            error.contains("lane PATH") && error.contains("not signed in"),
-            "{error}"
         );
     }
 

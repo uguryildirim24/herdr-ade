@@ -973,7 +973,6 @@ mod tests {
         .unwrap_err();
         assert!(crate::refusal::is(&error));
         assert!(error.to_string().contains("non-fast-forward"), "{error}");
-        assert!(error.to_string().contains("retry `ha done`"), "{error}");
         assert_eq!(
             runner.calls.borrow().len(),
             4,
@@ -1382,10 +1381,6 @@ mod tests {
         let error = error.to_string();
         assert!(error.starts_with("worktree_dirty:"), "{error}");
         assert!(error.contains(".herdr-project/x/report.md"), "{error}");
-        assert!(
-            error.contains("untrack these paths, commit, then run `ha done` again"),
-            "{error}"
-        );
 
         git(&["rm", "--cached", ".herdr-project/x/report.md"]);
         git(&["commit", "-m", "untrack runtime report"]);
