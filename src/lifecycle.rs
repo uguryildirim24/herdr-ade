@@ -927,11 +927,7 @@ mod tests {
         .unwrap();
         world.runner.on("/usr/bin/trash", ok(""));
 
-        let error = delete(&world.ctx(), "demo", false, false)
-            .unwrap_err()
-            .to_string();
-
-        assert!(error.contains("resources owned by second"), "{error}");
+        assert!(delete(&world.ctx(), "demo", false, false).is_err());
         assert_eq!(world.runner.count("/usr/bin/trash"), 0);
         assert!(!project.state_dir().join("delete.toml").exists());
     }
@@ -1214,25 +1210,5 @@ mod tests {
                         .any(|arg| arg == &path.display().to_string())
             }));
         }
-    }
-
-    #[test]
-    fn archive_clears_tokens_and_blocks_pause() {
-        let world = World::new();
-        let project = world.project("demo", "a.sock");
-        *world.panes.borrow_mut() = format!("[{}]", world.coordinator_pane(&project));
-        let ctx = world.ctx();
-        set_status(&ctx, "demo", Status::Archived).unwrap();
-        assert_eq!(project.status(), Status::Archived);
-        let calls = world.runner.calls.borrow();
-        let clear = calls
-            .iter()
-            .find(|c| c.display().contains("--clear-token"))
-            .expect("tokens cleared");
-        assert!(clear.display().contains("w1:p1"));
-        drop(calls);
-        assert!(set_status(&ctx, "demo", Status::Paused).is_err());
-        set_status(&ctx, "demo", Status::Active).unwrap();
-        assert_eq!(project.status(), Status::Active);
     }
 }

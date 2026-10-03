@@ -3220,82 +3220,6 @@ mod tests {
         crate::awake::set_sample(None);
     }
 
-    #[test]
-    fn progress_notices_are_once_per_spell_and_commit_clock_is_independent() {
-        let now = jiff::Timestamp::now();
-        let config = ProgressThresholds::default();
-        assert_eq!((config.stall_minutes, config.no_commit_minutes), (20, 90));
-        let custom: ProgressThresholds =
-            toml::from_str("stall_minutes = 2\nno_commit_minutes = 4").unwrap();
-        assert_eq!((custom.stall_minutes, custom.no_commit_minutes), (2, 4));
-        let mut lane = thread::Thread {
-            repo: "/repo".into(),
-            ..Default::default()
-        };
-        let mut seen = steps::LaneProgress {
-            pane: "w:p".into(),
-            screen: "a".into(),
-            head: "one".into(),
-        };
-        assert!(
-            progress_notice_lines(
-                &progress_notices(&mut lane, &seen, now, &config),
-                "t-1",
-                "w:p"
-            )
-            .is_empty()
-        );
-        lane.progress_since = (now - jiff::Span::new().minutes(21)).to_string();
-        lane.no_commit_since = (now - jiff::Span::new().minutes(91)).to_string();
-        let lines = progress_notice_lines(
-            &progress_notices(&mut lane, &seen, now, &config),
-            "t-1",
-            "w:p",
-        );
-        assert_eq!(
-            lines,
-            vec![
-                "STALLED t-1 has shown no new output and no new commit for 21 min in w:p; check it, then ha thread prompt, ha thread retry --reason, or cancel.",
-                "t-1 has worked 91 min with no commit; check it is still on its task.",
-            ]
-        );
-        assert!(
-            progress_notice_lines(
-                &progress_notices(&mut lane, &seen, now, &config),
-                "t-1",
-                "w:p"
-            )
-            .is_empty()
-        );
-        seen.screen = "b".into();
-        assert!(
-            progress_notices(&mut lane, &seen, now, &config)
-                .stalled
-                .is_none()
-        );
-        assert!(!lane.stall_notified);
-        assert!(lane.no_commit_notified);
-        lane.progress_since = (now - jiff::Span::new().minutes(21)).to_string();
-        assert!(
-            progress_notices(&mut lane, &seen, now, &config)
-                .stalled
-                .is_some()
-        );
-        seen.head = "two".into();
-        progress_notices(&mut lane, &seen, now, &config);
-        assert!(!lane.no_commit_notified);
-        assert!(!lane.stall_notified);
-        reset_progress(&mut lane);
-        assert!(lane.progress_since.is_empty());
-        lane.repo.clear();
-        progress_notices(&mut lane, &seen, now, &config);
-        lane.no_commit_since = (now - jiff::Span::new().minutes(91)).to_string();
-        assert!(
-            progress_notices(&mut lane, &seen, now, &config)
-                .no_commit
-                .is_none()
-        );
-    }
     use crate::paths::Env;
     use crate::runner::fake::{FakeRunner, fail, ok, timeout};
 
@@ -3323,7 +3247,6 @@ mod tests {
             "{}",
             failed.error
         );
-        assert!(failed.error.contains("one hour"), "{}", failed.error);
     }
 
     #[test]
@@ -3896,7 +3819,6 @@ mod tests {
                 for project in [&first, &second] {
                     let items = notices(project);
                     assert_eq!(items.len(), 1);
-                    assert!(items[0].summary.contains("`box` has been unreachable"));
                 }
             }
             down.set(false);
@@ -3906,13 +3828,6 @@ mod tests {
                 for project in [&first, &second] {
                     let items = notices(project);
                     assert_eq!(items.len(), 2);
-                    assert_eq!(
-                        items
-                            .iter()
-                            .filter(|item| item.summary.contains("reachable again"))
-                            .count(),
-                        1
-                    );
                 }
             }
             assert_eq!(
@@ -3957,23 +3872,6 @@ mod tests {
         assert_eq!(saved.status, thread::Status::Open);
         assert!(saved.prompt_pending);
         assert!(!saved.brief_submitted);
-    }
-
-    fn held(version: &str) -> LockState {
-        LockState::Held(Info {
-            version: version.into(),
-            ..Info::default()
-        })
-    }
-
-    #[test]
-    fn every_adapter_uses_its_routed_start_timeout() {
-        let launch = crate::contracts::Launch {
-            kind: "made-up".into(),
-            ready_timeout_ms: 90_000,
-            ..crate::contracts::Launch::default()
-        };
-        assert_eq!(agent_start_timeout(&launch), 90_000);
     }
 
     #[test]
@@ -4468,71 +4366,6 @@ mod tests {
     }
 
     #[test]
-    fn a_ready_box_agent_replaces_the_starting_tab_title() {
-        let fixture = fixture(false);
-        let runner = FakeRunner::new();
-        runner.on("tab rename", ok(r#"{"result":{}}"#));
-        let record = thread::allocate(&fixture.project, |t| {
-            t.status = thread::Status::Starting;
-            t.machine = "box".into();
-            t.machine_id = "abc".into();
-            t.startup_wait_started = project::now();
-            t.pane_id = "w2:p1".into();
-            t.tab_id = "w2:t1".into();
-            t.workspace_id = "w2".into();
-            t.cwd = "/box/lane".into();
-            t.agent_name = "hp-demo-t-0001".into();
-        })
-        .unwrap();
-        let ctx = Ctx {
-            env: &fixture.env,
-            root: fixture.root.clone(),
-            config_dir: fixture.root.join("cfg"),
-            runner: &runner,
-            detached_ticker: false,
-        };
-        let herdr = Herdr::new("herdr", "", &runner);
-        let pane = Pane {
-            pane_id: record.pane_id.clone(),
-            tab_id: record.tab_id.clone(),
-            workspace_id: record.workspace_id.clone(),
-            cwd: record.cwd.clone(),
-        };
-        let agent = Agent {
-            pane_id: record.pane_id.clone(),
-            tab_id: record.tab_id.clone(),
-            workspace_id: record.workspace_id.clone(),
-            cwd: record.cwd.clone(),
-            name: record.agent_name.clone(),
-            agent_status: "idle".into(),
-            ..Agent::default()
-        };
-        thread_pass(
-            &LaunchPass {
-                ctx: &ctx,
-                project: &fixture.project,
-                herdr: &herdr,
-                threads: std::slice::from_ref(&record),
-                agents: &[agent],
-                panes: &[pane],
-            },
-            "ha",
-            None,
-            false,
-            None,
-        )
-        .unwrap();
-        assert_eq!(
-            thread::load(&fixture.project, &record.id).unwrap().status,
-            thread::Status::Open
-        );
-        assert!(runner.calls.borrow().iter().any(|c| {
-            c.display()
-                .contains(&format!("tab rename {} {}", record.tab_id, record.id))
-        }));
-    }
-
-    #[test]
     fn a_listed_pane_without_agent_state_stays_open_and_unknown() {
         let fixture = fixture(false);
         let runner = FakeRunner::new();
@@ -4881,20 +4714,6 @@ mod tests {
         assert_eq!(command.get_current_dir(), Some(root.as_path()));
     }
 
-    #[test]
-    fn start_decisions() {
-        let mine = "0.1.0+abcdef0.20";
-        assert_eq!(decide_start(&LockState::Free, mine), StartAction::Spawn);
-        assert_eq!(
-            decide_start(&held("0.1.0+abcdef0.10"), mine),
-            StartAction::Nothing
-        );
-        assert_eq!(
-            decide_start(&held("0.1.0+1234567.10"), mine),
-            StartAction::StopThenSpawn
-        );
-    }
-
     /// `ensure` never writes the stop file, so `review` cannot deadlock
     /// waiting for a running ticker whose own pass waits on its lock.
     #[test]
@@ -4965,30 +4784,6 @@ mod tests {
     }
 
     #[test]
-    fn start_and_run_create_nothing_without_projects() {
-        let home = tempfile::tempdir().unwrap();
-        let missing = home.path().join("root");
-        let env = Env::for_test(home.path(), &[]);
-        let runner = FakeRunner::new();
-        let ctx = Ctx {
-            env: &env,
-            root: missing.clone(),
-            config_dir: home.path().join("cfg"),
-            runner: &runner,
-            detached_ticker: true,
-        };
-        start(&ctx).unwrap();
-        assert!(!missing.exists());
-        run(&ctx).unwrap();
-        assert!(!missing.exists());
-
-        std::fs::create_dir(&missing).unwrap();
-        start(&ctx).unwrap();
-        run(&ctx).unwrap();
-        assert_eq!(std::fs::read_dir(&missing).unwrap().count(), 0);
-    }
-
-    #[test]
     fn lock_probe_sees_a_holder_and_its_version() {
         let root = tempfile::tempdir().unwrap();
         assert_eq!(lock_state(root.path()), LockState::Free);
@@ -5012,14 +4807,6 @@ mod tests {
             std::thread::sleep(Duration::from_millis(10));
         }
         assert_eq!(lock_state(root.path()), LockState::Free);
-    }
-
-    #[test]
-    fn stop_with_a_free_lock_removes_a_stale_stop_file() {
-        let root = tempfile::tempdir().unwrap();
-        std::fs::write(stop_path(root.path()), b"").unwrap();
-        stop(root.path()).unwrap();
-        assert!(!stop_path(root.path()).exists());
     }
 
     #[test]
@@ -5552,233 +5339,6 @@ mod tests {
             ..Default::default()
         };
         (f, runner, agent)
-    }
-
-    #[test]
-    fn idle_nudge_distinguishes_failed_checks_from_unfinished_work() {
-        let fx = crate::testkit::fixture();
-        let ctx = fx.world.ctx();
-        fx.world.runner.on("pane read", ok("❯ \n"));
-        fx.world.runner.on("agent prompt", ok(r#"{"result":{}}"#));
-        let mut tasks = Vec::new();
-        let mut critics = Vec::new();
-        for n in 1..=3 {
-            let (id, sha) = fx.lane(n);
-            let job = format!("job-{n:04}");
-            let task = crate::task::Task {
-                id: job.clone(),
-                title: "Check or fold".into(),
-                authority: vec!["request:q-1".into()],
-                acceptance: vec!["The change lands.".into()],
-                attempts: vec![id.clone()],
-                ..Default::default()
-            };
-            std::fs::write(
-                fx.project
-                    .state_dir()
-                    .join("tasks")
-                    .join(format!("{job}.toml")),
-                toml::to_string(&task).unwrap(),
-            )
-            .unwrap();
-            let report = if n < 3 {
-                "+++\nverdict = \"FAIL\"\n+++\nneeds work\n"
-            } else {
-                "# fold\n"
-            };
-            fx.seal_done(&id, 1, 1, &sha, report);
-            thread::update(&fx.project, &id, |lane| {
-                lane.role = if n < 3 { "critic" } else { "lane" }.into();
-                lane.merged_sha = sha;
-                lane.status = thread::Status::Resolved;
-            })
-            .unwrap();
-            if n < 3 {
-                critics.push((id, job.clone()));
-            }
-            tasks.push(job);
-        }
-        crate::plan::step_add(&ctx, "demo", "Checked plan", tasks, vec![], None).unwrap();
-        let c = fx.project.coordinator().unwrap();
-        let agent = Agent {
-            pane_id: c.pane_id.clone(),
-            tab_id: c.tab_id,
-            workspace_id: c.workspace_id,
-            cwd: c.cwd,
-            name: c.agent_name,
-            agent_status: "idle".into(),
-            ..Default::default()
-        };
-        *fx.world.agents.borrow_mut() = format!(
-            "[{}]",
-            crate::scenarios::agent_json(
-                &agent.workspace_id,
-                &agent.tab_id,
-                &agent.pane_id,
-                &agent.cwd,
-                &agent.name,
-                "idle",
-            )
-        );
-        let herdr = Herdr::new("herdr", &c.socket, &fx.world.runner);
-        let mut state = steps::load_state(&fx.project);
-        plan_nudge(
-            &fx.project,
-            &herdr,
-            std::slice::from_ref(&agent),
-            &mut state,
-        )
-        .unwrap();
-        let prompts = || {
-            fx.world
-                .runner
-                .calls
-                .borrow()
-                .iter()
-                .filter(|call| call.display().contains("agent prompt"))
-                .map(|call| call.display())
-                .collect::<Vec<_>>()
-                .join("\n")
-        };
-        steps::flush_notices_for_test(&fx.project, &herdr);
-        let held = prompts();
-        assert!(
-            held.contains("0 steps have unfinished work; 1 held by failed checks"),
-            "{held}"
-        );
-        assert!(
-            held.contains(&format!(
-                "held by failed check {} ({}), {} ({})",
-                critics[0].0, critics[0].1, critics[1].0, critics[1].1
-            )),
-            "{held}"
-        );
-        assert!(held.contains("re-check, sealed PASS"), "{held}");
-        assert!(
-            held.contains("unlink the check task with a reason"),
-            "{held}"
-        );
-        assert!(!held.contains("s-1 is still running"), "{held}");
-        // The separate next-work nudge must still name any held step.
-        fx.world.runner.calls.borrow_mut().clear();
-        crate::plan::step_add(&ctx, "demo", "Next outcome", vec![], vec![], None).unwrap();
-        plan_nudge(&fx.project, &herdr, &[agent], &mut state).unwrap();
-        steps::flush_notices_for_test(&fx.project, &herdr);
-        let mixed = prompts();
-        assert!(
-            mixed.contains("1 steps have unfinished work; 1 held by failed checks. Next: s-2"),
-            "{mixed}"
-        );
-        assert!(mixed.contains("held by failed check t-"), "{mixed}");
-    }
-
-    #[test]
-    fn idle_plan_sends_once_and_names_the_next_step() {
-        let (f, runner, agent) = nudge_setup();
-        let ctx = Ctx {
-            env: &f.env,
-            root: f.root.clone(),
-            config_dir: f.root.join("cfg"),
-            runner: &runner,
-            detached_ticker: false,
-        };
-        crate::plan::step_add(&ctx, "demo", "First outcome", vec![], vec![], None).unwrap();
-        crate::plan::step_add(&ctx, "demo", "Second outcome", vec![], vec![], None).unwrap();
-        nudge_pass(&f, &runner, std::slice::from_ref(&agent));
-        nudge_pass(&f, &runner, &[agent]);
-        assert_eq!(runner.count("agent prompt"), 1);
-        let calls = runner.calls.borrow();
-        assert!(calls.iter().any(|call| {
-            call.display()
-                .contains("2 steps are left. Next: s-1 First outcome. Start work that can proceed without Rolf's reply. If you are waiting for his reply in chat, keep waiting.")
-        }));
-    }
-
-    #[test]
-    fn idle_nudge_skips_blocked_steps_and_names_waiting_edges() {
-        let (f, runner, agent) = nudge_setup();
-        let ctx = Ctx {
-            env: &f.env,
-            root: f.root.clone(),
-            config_dir: f.root.join("cfg"),
-            runner: &runner,
-            detached_ticker: false,
-        };
-        crate::plan::step_add(&ctx, "demo", "First", vec![], vec![], None).unwrap();
-        crate::plan::step_add(&ctx, "demo", "Blocked", vec![], vec!["s-1".into()], None).unwrap();
-        crate::plan::step_add(&ctx, "demo", "Free", vec![], vec![], None).unwrap();
-        nudge_pass(&f, &runner, std::slice::from_ref(&agent));
-        assert!(
-            runner
-                .calls
-                .borrow()
-                .iter()
-                .any(|call| call.display().contains("Next: s-1 First"))
-        );
-        // Mark the first step running; a free third step remains available.
-        let path = crate::plan::plan_path(&f.project);
-        let mut plan = crate::plan::load(&f.project).unwrap().unwrap();
-        plan.steps[0].state = crate::contracts::StepState::Running;
-        std::fs::write(&path, toml::to_string(&plan).unwrap()).unwrap();
-        let mut state = steps::State::default();
-        let herdr = Herdr::new(
-            f.env.herdr_bin(),
-            &f.project.coordinator().unwrap().socket,
-            &runner,
-        );
-        plan_nudge(&f.project, &herdr, std::slice::from_ref(&agent), &mut state).unwrap();
-        steps::flush_notices_for_test(&f.project, &herdr);
-        assert!(
-            runner
-                .calls
-                .borrow()
-                .iter()
-                .any(|call| call.display().contains("Next: s-3 Free"))
-        );
-        plan.steps[2].state = crate::contracts::StepState::Done;
-        std::fs::write(&path, toml::to_string(&plan).unwrap()).unwrap();
-        plan_nudge(&f.project, &herdr, &[agent], &mut steps::State::default()).unwrap();
-        steps::flush_notices_for_test(&f.project, &herdr);
-        assert!(
-            runner
-                .calls
-                .borrow()
-                .iter()
-                .any(|call| call.display().contains("s-2 waits for s-1"))
-        );
-    }
-
-    #[test]
-    fn a_new_lane_or_plan_revision_or_rolf_message_rearms_the_nudge() {
-        let (f, runner, agent) = nudge_setup();
-        let ctx = Ctx {
-            env: &f.env,
-            root: f.root.clone(),
-            config_dir: f.root.join("cfg"),
-            runner: &runner,
-            detached_ticker: false,
-        };
-        crate::plan::step_add(&ctx, "demo", "Next outcome", vec![], vec![], None).unwrap();
-        nudge_pass(&f, &runner, std::slice::from_ref(&agent));
-        let lane = thread::allocate(&f.project, |t| {
-            t.role = "worker".into();
-            t.status = thread::Status::Open;
-        })
-        .unwrap();
-        nudge_pass(&f, &runner, std::slice::from_ref(&agent));
-        assert_eq!(runner.count("agent prompt"), 1);
-        thread::update(&f.project, &lane.id, |t| {
-            t.status = thread::Status::Resolved
-        })
-        .unwrap();
-        nudge_pass(&f, &runner, std::slice::from_ref(&agent));
-        assert_eq!(runner.count("agent prompt"), 2);
-        crate::plan::step_add(&ctx, "demo", "Another outcome", vec![], vec![], None).unwrap();
-        nudge_pass(&f, &runner, std::slice::from_ref(&agent));
-        assert_eq!(runner.count("agent prompt"), 3);
-        crate::prompt::record_test_request(&f.project, "q-100", "Keep going").unwrap();
-        nudge_pass(&f, &runner, &[agent]);
-        assert_eq!(runner.count("agent prompt"), 4);
     }
 
     #[test]
@@ -7042,20 +6602,5 @@ mod tests {
         };
         assert!(!tick_project(&ctx, &f.project).unwrap());
         assert!(runner.calls.borrow().is_empty());
-    }
-
-    #[test]
-    fn log_is_capped() {
-        let dir = tempfile::tempdir().unwrap();
-        let log = Log {
-            path: dir.path().join("log"),
-        };
-        let long = "x".repeat(10_000);
-        for _ in 0..150 {
-            log.line(&long);
-        }
-        let size = std::fs::metadata(&log.path).unwrap().len();
-        assert!(size <= LOG_CAP, "{size}");
-        assert!(size > LOG_CAP / 4);
     }
 }

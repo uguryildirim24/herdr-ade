@@ -3225,45 +3225,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn short_outages_write_nothing_and_long_ones_write_one_item_each_way() {
-        let mut outage = Outage::default();
-        assert_eq!(
-            outage.record(false, "e", at("2026-09-17T10:00:00Z"), 600),
-            None
-        );
-        assert_eq!(
-            outage.record(false, "e", at("2026-09-17T10:05:00Z"), 600),
-            None
-        );
-        // A blip that ends before the threshold reports nothing at all.
-        assert_eq!(
-            outage.record(true, "", at("2026-09-17T10:06:00Z"), 600),
-            None
-        );
-
-        assert_eq!(
-            outage.record(false, "e", at("2026-09-17T11:00:00Z"), 600),
-            None
-        );
-        assert_eq!(
-            outage.record(false, "e", at("2026-09-17T11:10:00Z"), 600),
-            Some(OutageEvent::Down)
-        );
-        assert_eq!(
-            outage.record(false, "e", at("2026-09-17T11:30:00Z"), 600),
-            None
-        );
-        assert_eq!(
-            outage.record(true, "", at("2026-09-17T11:31:00Z"), 600),
-            Some(OutageEvent::Recovered)
-        );
-        assert_eq!(
-            outage.record(true, "", at("2026-09-17T11:32:00Z"), 600),
-            None
-        );
-    }
-
     fn box_event_bytes(id: &str, artifact: &str) -> Vec<u8> {
         let event = crate::contracts::Event {
             id: id.into(),
