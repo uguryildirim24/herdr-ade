@@ -1,4 +1,4 @@
-//! `doctor`: what is installed, where things resolve, and whether it fits.
+//! `doctor`: readiness and retained bindings for ADE-owned work.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
@@ -63,9 +63,9 @@ impl<'a> Timings<'a> {
     fn remote_phases(&self, label: &str, snapshot: &str) {
         let facts = parse_facts(snapshot);
         for (phase, commands) in [
-            ("facts", "host, disk"),
+            ("facts", "disk, ADE configuration"),
             ("readiness", "provider probes, command -v"),
-            ("herdr", "workspace list, agent list, tab list"),
+            ("herdr", "pane list, agent list"),
             ("builds", "find"),
         ] {
             if let Some(ms) = facts
@@ -680,24 +680,27 @@ fn run_with_trace(
 ) -> Result<DoctorOutcome> {
     // Provider probes are independent of both the box and local checks.
     let setup_start = Instant::now();
-    let pi_models =
-        crate::pi::doctor::configured_routed_models(&ctx.config_dir).unwrap_or_default();
+    let pi_models = crate::pi::doctor::configured_routed_models(&ctx.config_dir);
     if let Some(timings) = timings {
         timings.command(
             "pi routed model inventory (file walk)",
             setup_start.elapsed(),
         );
     }
-    let pi_worker = ctx.runner.is_real().then(|| {
-        let root = ctx.root.clone();
-        let models = pi_models.clone();
-        std::thread::spawn(move || {
-            let start = Instant::now();
-            let result =
-                crate::pi_ade::doctor_rows_with(&crate::runner::RealRunner, &root, &models);
-            (result, start.elapsed())
-        })
-    });
+    let pi_worker = pi_models
+        .as_ref()
+        .ok()
+        .filter(|models| !models.is_empty() && ctx.runner.is_real())
+        .map(|models| {
+            let root = ctx.root.clone();
+            let models = models.clone();
+            std::thread::spawn(move || {
+                let start = Instant::now();
+                let result =
+                    crate::pi_ade::doctor_rows_with(&crate::runner::RealRunner, &root, &models);
+                (result, start.elapsed())
+            })
+        });
     let (mut text, mut healthy, mut checks) = report_with_checks(
         ctx.env,
         &ctx.root,
@@ -722,7 +725,11 @@ fn run_with_trace(
         }
         result
     } else {
-        let result = crate::pi_ade::doctor_rows_with(ctx.runner, &ctx.root, &pi_models);
+        let result = match &pi_models {
+            Ok(models) if models.is_empty() => Ok((Vec::new(), true)),
+            Ok(models) => crate::pi_ade::doctor_rows_with(ctx.runner, &ctx.root, models),
+            Err(error) => Err(anyhow::anyhow!("pi recipe selection unknown: {error:#}")),
+        };
         if let Some(timings) = timings {
             let commands = timings.command_time().saturating_sub(command_start);
             timings.command(
@@ -795,7 +802,6 @@ fn report(
 type BoxSnapshot = (Vec<(Option<bool>, String, String)>, String, Duration);
 
 fn prefetch_box_snapshots(
-    env: &Env,
     root: &Path,
     config_dir: &Path,
     bin: &str,
@@ -806,13 +812,6 @@ fn prefetch_box_snapshots(
     if let Ok(machines) = machines_to_check(root, config_dir, &runner, bin)
         && let Ok(config) = crate::launch::parse_launch_config(config_dir)
     {
-        let ctx = Ctx {
-            env,
-            root: root.to_path_buf(),
-            config_dir: config_dir.to_path_buf(),
-            runner: &runner,
-            detached_ticker: false,
-        };
         for machine in machines {
             if let Ok(profile) = crate::remote::machine_profile(&runner, bin, config_dir, &machine)
                 && !profile.is_local()
@@ -826,7 +825,7 @@ fn prefetch_box_snapshots(
                     &profile,
                     &config.recipes,
                     config.doctor.min_free_disk_gb,
-                    Some((&ctx, &mut snapshot)),
+                    Some(&mut snapshot),
                 );
                 result.insert(profile.id, (rows, snapshot, start.elapsed()));
             }
@@ -851,8 +850,7 @@ fn report_with_checks(
         let root = root.to_path_buf();
         let config = config_dir.to_path_buf();
         let bin = env.herdr_bin();
-        let env = env.clone();
-        std::thread::spawn(move || prefetch_box_snapshots(&env, &root, &config, &bin))
+        std::thread::spawn(move || prefetch_box_snapshots(&root, &config, &bin))
     });
     let stable_runner = crate::runner::CwdRunner::new(runner, root);
     let runner: &dyn Runner = &stable_runner;
@@ -975,39 +973,18 @@ fn report_with_checks(
                     if reachable { "" } else { "; not reachable" }
                 ),
             );
-            if reachable {
-                let herdr = Herdr::new(&bin, &found.socket, runner);
-                check_workspace_leaks(&mut out, &mut check, root, "local", "this machine", &herdr);
-            }
         }
         Err(error) => check(&mut out, Some(false), "session", format!("{error:#}")),
     }
 
-    for (tool, args, required) in [
-        ("git", vec!["--version"], true),
-        ("ssh", vec!["-V"], true),
-        ("rsync", vec!["--version"], false),
-        ("gh", vec!["--version"], false),
-    ] {
-        let result = runner.run(&Cmd::new(tool, TOOL_TIMEOUT).args(args));
-        match result {
-            Ok(o) if o.success() => {
-                let text = if o.stdout.trim().is_empty() {
-                    &o.stderr
-                } else {
-                    &o.stdout
-                };
-                let line = text.lines().next().unwrap_or("").trim().to_string();
-                check(&mut out, Some(true), tool, line);
-            }
-            Ok(o) => check(&mut out, required.then_some(false), tool, o.error_text()),
-            Err(error) => check(
-                &mut out,
-                required.then_some(false),
-                tool,
-                format!("{error:#}"),
-            ),
+    // Git is part of ADE's branch/publish contract. SSH and provider tools
+    // are exercised only by the selected placements and adapter probes below.
+    match runner.run(&Cmd::new("git", TOOL_TIMEOUT).args(["--version"])) {
+        Ok(output) if output.success() => {
+            check(&mut out, Some(true), "git", output.stdout.trim().into())
         }
+        Ok(output) => check(&mut out, Some(false), "git", output.error_text()),
+        Err(error) => check(&mut out, Some(false), "git", format!("{error:#}")),
     }
     let doctor_config = match crate::launch::doctor_config(config_dir) {
         Ok(config) => config,
@@ -1109,6 +1086,14 @@ fn report_with_checks(
             }
         }
     }
+    check_lane_bindings(
+        &mut out,
+        &mut check,
+        root,
+        ("local", "local"),
+        (&bin, runner),
+        None,
+    );
     for slug in project::list_slugs(root) {
         let Ok(project) = project::Project::load(root, &slug) else {
             continue;
@@ -1363,7 +1348,7 @@ fn report_with_checks(
                                     &profile,
                                     &config.recipes,
                                     config.doctor.min_free_disk_gb,
-                                    Some((&ctx, &mut snapshot)),
+                                    Some(&mut snapshot),
                                 );
                                 (rows, snapshot, start.elapsed())
                             });
@@ -1383,23 +1368,14 @@ fn report_with_checks(
                             for (ok, label, detail) in box_rows {
                                 check(&mut out, ok, &label, detail);
                             }
-                            let herdr = Herdr::new(&bin, "", runner).on_machine(&profile.id);
-                            check_workspace_leaks_with_snapshot(
+                            check_lane_bindings(
                                 &mut out,
                                 &mut check,
                                 root,
-                                &profile.id,
-                                &format!("machine {}", profile.label),
-                                &herdr,
+                                (&profile.id, &profile.label),
+                                (&bin, runner),
                                 Some(&box_snapshot),
                             );
-                            let ctx = Ctx {
-                                env,
-                                root: root.to_path_buf(),
-                                config_dir: config_dir.to_path_buf(),
-                                runner,
-                                detached_ticker: false,
-                            };
                             let (builds, errors) =
                                 finished_build_folders_with_snapshot(&ctx, &profile, &box_snapshot);
                             check(
@@ -1665,235 +1641,158 @@ fn snapshot_list<T: serde::de::DeserializeOwned>(
         .with_context(|| format!("box herdr {key} reply changed"))
 }
 
-fn check_workspace_leaks(
+/// Records, not labels or an absent agent, establish ADE ownership.
+fn check_lane_bindings(
     out: &mut String,
     check: &mut impl FnMut(&mut String, Option<bool>, &str, String),
     root: &Path,
-    machine: &str,
-    display: &str,
-    herdr: &Herdr<'_>,
-) {
-    check_workspace_leaks_with_snapshot(out, check, root, machine, display, herdr, None)
-}
-
-fn check_workspace_leaks_with_snapshot(
-    out: &mut String,
-    check: &mut impl FnMut(&mut String, Option<bool>, &str, String),
-    root: &Path,
-    machine: &str,
-    display: &str,
-    herdr: &Herdr<'_>,
+    machine: (&str, &str),
+    endpoint: (&str, &dyn Runner),
     snapshot: Option<&str>,
 ) {
-    let workspaces = match snapshot.map_or_else(
-        || {
-            herdr
-                .workspace_list()
-                .map_err(|error| anyhow::anyhow!("{error}"))
-        },
-        |text| snapshot_list(text, "herdr_workspaces", "workspaces"),
-    ) {
-        Ok(workspaces) => workspaces,
-        Err(error) => {
+    let (bin, runner) = endpoint;
+    let (machine, machine_label) = machine;
+    for slug in project::list_slugs(root) {
+        let Ok(project) = project::Project::load(root, &slug) else {
+            continue;
+        };
+        let (threads, errors) = crate::thread::list_with_errors(&project);
+        for error in errors {
             check(
                 out,
-                Some(false),
-                &format!("{display} workspaces"),
-                format!("could not list workspaces: {error}"),
+                None,
+                &format!("project {slug} lanes"),
+                format!("ownership unknown: {error:#}"),
             );
-            return;
         }
-    };
-    let agents = match snapshot.map_or_else(
-        || {
-            herdr
-                .agent_list()
-                .map_err(|error| anyhow::anyhow!("{error}"))
-        },
-        |text| snapshot_list(text, "herdr_agents", "agents"),
-    ) {
-        Ok(agents) => agents,
-        Err(error) => {
-            check(
-                out,
-                Some(false),
-                &format!("{display} workspaces"),
-                format!("could not list agents: {error}"),
-            );
-            return;
-        }
-    };
-    let open_threads: Vec<_> = project::list_slugs(root)
-        .into_iter()
-        .filter_map(|slug| project::Project::load(root, &slug).ok())
-        .flat_map(|project| crate::thread::list(&project))
-        .filter(|thread| {
-            matches!(
-                thread.status,
-                crate::thread::Status::Starting | crate::thread::Status::Open
-            ) && if machine == "local" {
-                !thread.is_remote()
+        let record = project.coordinator();
+        let mut by_socket: BTreeMap<String, Vec<_>> = BTreeMap::new();
+        for lane in threads.iter().filter(|lane| {
+            !lane.pane_id.is_empty()
+                && if machine == "local" {
+                    !lane.is_remote()
+                } else {
+                    lane.is_remote()
+                        && (lane.machine_route() == machine
+                            || (lane.machine_id.is_empty() && lane.machine == machine_label))
+                }
+        }) {
+            // Historical lanes have no identity socket; the retained project
+            // binding supplies it. A closed coordinator cannot hide modern lanes.
+            let socket = if machine != "local" {
+                String::new()
+            } else if !lane.identity.socket.is_empty() {
+                lane.identity.socket.clone()
             } else {
-                thread.is_remote() && thread.machine_route() == machine
+                record
+                    .as_ref()
+                    .map(|record| record.socket.clone())
+                    .unwrap_or_default()
+            };
+            by_socket.entry(socket).or_default().push(lane);
+        }
+        for (socket, lanes) in by_socket {
+            if machine == "local" && socket.is_empty() {
+                check(
+                    out,
+                    None,
+                    &format!("project {slug} lanes"),
+                    "retained lane socket unavailable; bindings unknown".into(),
+                );
+                continue;
             }
-        })
-        .collect();
-    let open: BTreeSet<String> = open_threads
-        .iter()
-        .map(|thread| thread.workspace_id.clone())
-        .filter(|workspace| !workspace.is_empty())
-        .collect();
-    let default_shell = default_shell_workspaces(&workspaces, &agents);
-    let labels: BTreeSet<String> = project::list_slugs(root)
-        .into_iter()
-        .filter_map(|slug| project::Project::load(root, &slug).ok())
-        .filter_map(|project| {
-            project
-                .read_project_md()
-                .ok()
-                .map(|(settings, _)| project::display_name(&settings.name, &project.slug))
-        })
-        .collect();
-    let mut duplicate_labels = Vec::new();
-    let mut project_workspaces = BTreeSet::new();
-    for label in labels {
-        let matching: Vec<_> = workspaces
-            .iter()
-            .filter(|workspace| workspace.label == label)
-            .collect();
-        if matching.len() > 1 {
-            duplicate_labels.push(format!("{label} ({})", matching.len()));
-        }
-        project_workspaces.extend(
-            matching
-                .into_iter()
-                .filter(|workspace| !default_shell.contains(&workspace.workspace_id))
-                .map(|workspace| workspace.workspace_id.clone()),
-        );
-    }
-    let leaked: Vec<_> = workspaces
-        .iter()
-        .filter(|workspace| !default_shell.contains(&workspace.workspace_id))
-        // A saved project's box workspace may intentionally hold a shell.
-        // Its individual unowned tabs are advisory below; duplicate project
-        // labels still fail because ownership is ambiguous.
-        .filter(|workspace| {
-            machine == "local" || !project_workspaces.contains(&workspace.workspace_id)
-        })
-        .filter(|workspace| {
-            !open.contains(&workspace.workspace_id)
-                && !agents
-                    .iter()
-                    .any(|agent| agent.workspace_id == workspace.workspace_id)
-        })
-        .collect();
-    let ids = leaked
-        .iter()
-        .map(|workspace| workspace.workspace_id.as_str())
-        .collect::<Vec<_>>()
-        .join(", ");
-    check(
-        out,
-        Some(leaked.is_empty()),
-        &format!("{display} workspaces"),
-        if leaked.is_empty() {
-            format!(
-                "{} total; no unowned agentless workspaces",
-                workspaces.len()
-            )
-        } else {
-            format!(
-                "{} of {} hold no agent and belong to no open lane: {ids}",
-                leaked.len(),
-                workspaces.len()
-            )
-        },
-    );
-
-    if machine == "local" {
-        return;
-    }
-    let tabs = match snapshot.map_or_else(
-        || herdr.tab_list().map_err(|error| anyhow::anyhow!("{error}")),
-        |text| snapshot_list(text, "herdr_tabs", "tabs"),
-    ) {
-        Ok(tabs) => tabs,
-        Err(error) => {
-            check(
-                out,
-                Some(false),
-                &format!("{display} project tabs"),
-                format!("could not list tabs: {error}"),
+            let herdr = Herdr::new(bin, socket, runner).on_machine(if machine == "local" {
+                ""
+            } else {
+                machine
+            });
+            let panes = snapshot.map_or_else(
+                || herdr.pane_list().map_err(anyhow::Error::from),
+                |text| snapshot_list(text, "herdr_panes", "panes"),
             );
-            return;
-        }
-    };
-    let open_tabs: BTreeSet<_> = open_threads
-        .iter()
-        .map(|thread| thread.tab_id.clone())
-        .filter(|tab| !tab.is_empty())
-        .collect();
-    let orphan_tabs: Vec<_> = tabs
-        .iter()
-        .filter(|tab| project_workspaces.contains(&tab.workspace_id))
-        .filter(|tab| {
-            !open_tabs.contains(&tab.tab_id)
-                && !agents.iter().any(|agent| agent.tab_id == tab.tab_id)
-        })
-        .map(|tab| tab.tab_id.as_str())
-        .collect();
-    let status = if duplicate_labels.is_empty() {
-        orphan_tabs.is_empty().then_some(true)
-    } else {
-        Some(false)
-    };
-    let detail = if duplicate_labels.is_empty() && orphan_tabs.is_empty() {
-        format!(
-            "{} project workspaces; every tab has an agent or an open lane",
-            project_workspaces.len()
-        )
-    } else {
-        format!(
-            "duplicate labels: {}; unowned shell tabs left open: {}",
-            if duplicate_labels.is_empty() {
-                "none".to_string()
-            } else {
-                duplicate_labels.join(", ")
-            },
-            if orphan_tabs.is_empty() {
-                "none".to_string()
-            } else {
-                orphan_tabs.join(", ")
-            }
-        )
-    };
-    check(out, status, &format!("{display} project tabs"), detail);
-}
-
-/// The machine's own home shell: the workspace the client hides while the
-/// machine has another workspace (fork `is_default_shell_space`): label `~`, no
-/// agent, one tab holding one pane. `herdr workspace list` does not expose the
-/// fork's `custom_label` bit, so a workspace hand-labelled exactly `~` is
-/// indistinguishable here and is also skipped.
-fn default_shell_workspaces(
-    workspaces: &[herdr::Workspace],
-    agents: &[herdr::Agent],
-) -> BTreeSet<String> {
-    if workspaces.len() <= 1 {
-        return BTreeSet::new();
-    }
-    workspaces
-        .iter()
-        .filter(|workspace| {
-            workspace.label == "~"
-                && workspace.tab_count == 1
-                && workspace.pane_count == 1
-                && !agents
+            let agents = snapshot.map_or_else(
+                || herdr.agent_list().map_err(anyhow::Error::from),
+                |text| snapshot_list(text, "herdr_agents", "agents"),
+            );
+            for lane in lanes {
+                let label = format!("project {slug} lane {}", lane.id);
+                let (Ok(panes), Ok(agents)) = (&panes, &agents) else {
+                    check(
+                        out,
+                        None,
+                        &label,
+                        format!(
+                            "binding unknown; panes: {:?}; agents: {:?}",
+                            panes.as_ref().err(),
+                            agents.as_ref().err()
+                        ),
+                    );
+                    continue;
+                };
+                let pane = panes
                     .iter()
-                    .any(|agent| agent.workspace_id == workspace.workspace_id)
-        })
-        .map(|workspace| workspace.workspace_id.clone())
-        .collect()
+                    .any(|pane| crate::thread::pane_matches(lane, pane));
+                let agent = agents
+                    .iter()
+                    .find(|agent| crate::thread::agent_matches(lane, agent));
+                let (mut status, mut detail) = if lane
+                    .retirement
+                    .as_ref()
+                    .is_some_and(|request| request.keep_pane)
+                {
+                    (None, "pane intentionally retained")
+                } else if lane.status == crate::thread::Status::Resolved {
+                    (
+                        Some(agent.is_none()),
+                        if agent.is_some() {
+                            "resolved lane still has its bound agent"
+                        } else {
+                            "resolved; no bound agent remains"
+                        },
+                    )
+                } else if !crate::thread::can_check_gone(lane, jiff::Timestamp::now()) {
+                    (
+                        None,
+                        "placement or intentional pane closure; binding not required yet",
+                    )
+                } else {
+                    (
+                        Some(pane && agent.is_some()),
+                        if !pane {
+                            "recorded pane binding is gone or changed"
+                        } else if agent.is_none() {
+                            "recorded agent binding is gone or changed"
+                        } else {
+                            "pane and agent bindings match"
+                        },
+                    )
+                };
+                if status == Some(true)
+                    && lane.status != crate::thread::Status::Resolved
+                    && crate::thread::process_bound_to_pane(lane)
+                {
+                    match herdr.pane_process_info(&lane.pane_id) {
+                        Ok(info)
+                            if info.pane_id == lane.pane_id
+                                && crate::thread::identity_verifies(
+                                    lane,
+                                    agent.unwrap(),
+                                    &info.identities(),
+                                ) => {}
+                        Ok(info) if info.agent_gone(&lane.pane_id) => {
+                            status = Some(false);
+                            detail = "bound agent process has exited";
+                        }
+                        _ => {
+                            status = None;
+                            detail = "pane and agent match; bound process identity unknown";
+                        }
+                    }
+                }
+                check(out, status, &label, detail.into());
+            }
+        }
+    }
 }
 
 fn machines_to_check(
@@ -1945,10 +1844,8 @@ fn machines_to_check(
     Ok(machines)
 }
 
-/// One saved machine's box rows (SPEC-remote §§2–3, R11): boot service,
-/// server, host, listeners, repository mapping, Git identity and GitHub
-/// reach, enabled recipes' readiness, and live CPU/RAM/disk capacity with the
-/// configured free-space gate. One read-only SSH call.
+/// ADE repository mapping, Git identity, selected adapter readiness and the
+/// configured disk floor. One read-only SSH snapshot.
 #[cfg(test)]
 fn box_rows(
     runner: &dyn Runner,
@@ -1967,7 +1864,7 @@ fn box_rows_with_snapshot(
     profile: &crate::contracts::MachineProfile,
     recipes: &BTreeMap<String, crate::contracts::Recipe>,
     min_free_disk_gb: f64,
-    snapshot: Option<(&Ctx<'_>, &mut String)>,
+    snapshot: Option<&mut String>,
 ) -> Vec<(Option<bool>, String, String)> {
     let label = &profile.label;
     if profile.target.is_empty() {
@@ -2053,17 +1950,9 @@ fn box_rows_with_snapshot(
          PATH={path}; export PATH\n\
          printf 'doctor_active\\tfacts\\n'\n\
          doctor_start=$(date +%s%3N)\n\
-         printf 'host\\t%s\\n' \"$(hostname 2>/dev/null || true)\"\n\
-         printf 'boot\\t%s\\n' \"$(systemctl --user is-enabled herdr.service 2>/dev/null || echo unknown)\"\n\
          herdr_bin=$(command -v herdr 2>/dev/null || true)\n\
          printf 'server\\t%s\\n' \"$(\"$herdr_bin\" --version 2>/dev/null | head -n1 || echo missing)\"\n\
-         printf 'tailscale\\t%s\\n' \"$(tailscale ip -4 2>/dev/null | head -n1 || true)\"\n\
-         printf 'nproc\\t%s\\n' \"$(nproc 2>/dev/null || echo 0)\"\n\
-         printf 'mem_avail_kb\\t%s\\n' \"$(awk '/MemAvailable/{{print $2}}' /proc/meminfo 2>/dev/null || echo 0)\"\n\
          printf 'df_free\\t%s\\n' \"$(df -B1 --output=avail / 2>/dev/null | tail -n1 | tr -d ' ')\"\n\
-         printf 'listeners\\t%s\\n' \"$(ss -tln 2>/dev/null | tail -n +2 | wc -l | tr -d ' ')\"\n\
-         printf 'git_name\\t%s\\n' \"$(git config --global user.name 2>/dev/null || true)\"\n\
-         printf 'git_email\\t%s\\n' \"$(git config --global user.email 2>/dev/null || true)\"\n\
          printf 'rules\\t%s\\n' \"$(sha256sum {home}/.config/herdr-ade/RULES.md 2>/dev/null | cut -d' ' -f1 || true)\"\n\
 ",
         path = crate::remote::quote(&machine_paths.path),
@@ -2078,13 +1967,15 @@ fn box_rows_with_snapshot(
         script.push_str(&box_native_probe_script(probe, true, &machine_paths));
         script.push_str(") & doctor_jobs=\"$doctor_jobs $!\"\n");
     }
-    // The lane shell receives this exact PATH. Check the first pi hit and
-    // required executables in the same box invocation as the other facts.
-    script.push_str("printf 'pane_pi\\t%s\\n' \"$(command -v pi 2>/dev/null || true)\"\n");
-    for tool in ["cargo", "just", "node"]
-        .into_iter()
-        .chain(natives.values().map(|probe| probe.program.as_str()))
-    {
+    // Require only executables owned by selected adapters.
+    if !providers.is_empty() {
+        script.push_str("printf 'pane_pi\\t%s\\n' \"$(command -v pi 2>/dev/null || true)\"\n");
+    }
+    let required_tools: BTreeSet<_> = natives
+        .values()
+        .map(|probe| probe.program.as_str())
+        .collect();
+    for tool in &required_tools {
         script.push_str(&format!(
             "printf 'pane_tool_{tool}\\t%s\\n' \"$(command -v {tool} 2>/dev/null || true)\"\n",
             tool = crate::remote::quote(tool),
@@ -2114,11 +2005,7 @@ fn box_rows_with_snapshot(
     if snapshot.is_some() {
         script.push_str("doctor_now=$(date +%s%3N); printf 'doctor_phase_readiness\\t%s\\n' \"$((doctor_now-doctor_start))\"; doctor_start=$doctor_now\n");
 
-        for (key, command) in [
-            ("workspaces", "workspace list"),
-            ("agents", "agent list"),
-            ("tabs", "tab list"),
-        ] {
+        for (key, command) in [("panes", "pane list"), ("agents", "agent list")] {
             script.push_str(&format!(
                 "printf 'doctor_active\\therdr {key}\\n'; printf 'herdr_{key}\\t%s\\n' \"$(HERDR_SESSION={session} \"$herdr_bin\" {command} 2>/dev/null | tr '\\n\\t' '  ')\"\n",
                 session = crate::remote::quote(&profile.session),
@@ -2137,7 +2024,7 @@ fn box_rows_with_snapshot(
         Duration::from_secs(15),
     ) {
         Ok(out) if out.success() => {
-            if let Some((_, snapshot)) = snapshot {
+            if let Some(snapshot) = snapshot {
                 *snapshot = out.stdout.clone();
             }
             parse_facts(&out.stdout)
@@ -2167,11 +2054,6 @@ fn box_rows_with_snapshot(
     };
     let fact = |key: &str| facts.get(key).cloned().unwrap_or_default();
     rows.push((
-        env_bool(&fact("boot"), &["enabled"]),
-        format!("box {label} boot"),
-        format!("systemd user unit herdr.service: {}", fact("boot")),
-    ));
-    rows.push((
         if fact("server").starts_with("herdr") {
             Some(true)
         } else {
@@ -2179,24 +2061,6 @@ fn box_rows_with_snapshot(
         },
         format!("box {label} server"),
         format!("{} (from machine PATH)", fact("server")),
-    ));
-    let tailscale = fact("tailscale");
-    rows.push((
-        if tailscale.is_empty() {
-            None
-        } else {
-            Some(true)
-        },
-        format!("box {label} host"),
-        format!("{} (Tailscale {tailscale})", fact("host")),
-    ));
-    rows.push((
-        Some(true),
-        format!("box {label} listeners"),
-        format!(
-            "{} non-loopback TCP listeners (check `ss -tln`)",
-            fact("listeners")
-        ),
     ));
     for repo in &repos {
         let Some(box_path) = &repo.box_path else {
@@ -2210,16 +2074,6 @@ fn box_rows_with_snapshot(
             format!("clone {value}"),
         ));
     }
-    let git = format!("{} <{}>", fact("git_name"), fact("git_email"));
-    rows.push((
-        if fact("git_name").is_empty() || fact("git_email").is_empty() {
-            Some(false)
-        } else {
-            Some(true)
-        },
-        format!("box {label} git"),
-        git,
-    ));
     for probe in natives.values() {
         let kind = &probe.kind;
         let value = fact(&format!("login_{kind}"));
@@ -2235,42 +2089,42 @@ fn box_rows_with_snapshot(
             },
         ));
     }
-    let pi = fact("pane_pi");
-    let wrapper = Path::new(&machine_paths.pi_bin)
-        .parent()
-        .map(|dir| dir.join("pi").to_string_lossy().into_owned())
-        .unwrap_or_default();
-    rows.push((
-        Some(pi == wrapper),
-        format!("box {label} wrapper"),
-        if pi.is_empty() {
-            "the lane PATH did not resolve `pi`".into()
-        } else {
-            format!("`command -v pi` first hit: {pi}")
-        },
-    ));
-    let required_tools: Vec<&str> = ["cargo", "just", "node"]
-        .into_iter()
-        .chain(natives.values().map(|probe| probe.program.as_str()))
-        .collect();
+    if !providers.is_empty() {
+        let pi = fact("pane_pi");
+        let wrapper = Path::new(&machine_paths.pi_bin)
+            .parent()
+            .map(|dir| dir.join("pi").to_string_lossy().into_owned())
+            .unwrap_or_default();
+        rows.push((
+            Some(pi == wrapper),
+            format!("box {label} wrapper"),
+            if pi.is_empty() {
+                "the lane PATH did not resolve `pi`".into()
+            } else {
+                format!("`command -v pi` first hit: {pi}")
+            },
+        ));
+    }
     let missing: Vec<_> = required_tools
         .iter()
         .filter(|tool| fact(&format!("pane_tool_{tool}")).is_empty())
         .copied()
         .collect();
-    rows.push((
-        Some(missing.is_empty()),
-        format!("box {label} tools"),
-        if missing.is_empty() {
-            required_tools
-                .iter()
-                .map(|tool| fact(&format!("pane_tool_{tool}")))
-                .collect::<Vec<_>>()
-                .join(" ")
-        } else {
-            format!("the lane PATH cannot find: {}", missing.join(" "))
-        },
-    ));
+    if !required_tools.is_empty() {
+        rows.push((
+            Some(missing.is_empty()),
+            format!("box {label} tools"),
+            if missing.is_empty() {
+                required_tools
+                    .iter()
+                    .map(|tool| fact(&format!("pane_tool_{tool}")))
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            } else {
+                format!("the lane PATH cannot find: {}", missing.join(" "))
+            },
+        ));
+    }
     for (provider, model) in providers {
         let value = fact(&format!("pi_{provider}/{model}"));
         rows.push((
@@ -2279,33 +2133,16 @@ fn box_rows_with_snapshot(
             format!("herdr-pi check {provider} --model {model}: {value}"),
         ));
     }
-    let nproc = fact("nproc").parse::<u64>().ok();
-    let mem_gb = fact("mem_avail_kb")
-        .parse::<u64>()
-        .ok()
-        .map(|kb| kb as f64 / 1_000_000.0);
     let disk_gb = fact("df_free")
         .parse::<u64>()
         .ok()
         .map(|bytes| bytes as f64 / 1_000_000_000.0);
-    let fits = nproc.zip(mem_gb).zip(disk_gb).map(|((cpu, memory), disk)| {
-        cpu.saturating_sub(1)
-            .min((memory / 4.0) as u64)
-            .min((disk / 5.0) as u64)
-    });
     rows.push((
         disk_gb.map(|disk| disk >= min_free_disk_gb),
-        format!("box {label} capacity"),
-        format!(
-            "{} OCPU, {} GB RAM free, {} GB disk free; {}; fails below {} GB free",
-            nproc.map_or_else(|| "unknown".into(), |value| value.to_string()),
-            mem_gb.map_or_else(|| "unknown".into(), |value| format!("{value:.1}")),
-            disk_gb.map_or_else(|| "unknown".into(), |value| format!("{value:.1}")),
-            fits.map_or_else(
-                || "additional lane capacity unknown".into(),
-                |value| format!("about {value} more lane(s) fit")
-            ),
-            display_gb(min_free_disk_gb)
+        format!("box {label} disk"),
+        disk_gb.map_or_else(
+            || "free space unknown".into(),
+            |disk| disk_detail(disk, min_free_disk_gb),
         ),
     ));
     let rules = fact("rules");
@@ -2450,24 +2287,11 @@ recipe = "claude_fable_xhigh"
         runner.on("session list --json", ok(r#"{"sessions":[]}"#));
         runner.on("git --version", ok("git version 2.50.0\n"));
         runner.on("df -Pk /", ok("Filesystem 1024-blocks Used Available Capacity Mounted on\n/dev/disk 200000000 1000000 199000000 1% /\n"));
-        runner.on("ssh -V", ok(""));
-        runner.on("rsync --version", ok("rsync 3\n"));
-        runner.on("gh --version", ok("gh version 2\n"));
         runner.on_fn(
             |cmd| cmd.program == "gh" && cmd.args == ["auth", "status"],
             |_| Ok(fail(1, "not logged in")),
         );
         runner.on("machine list --json", ok(machines));
-        for (command, reply) in [
-            ("workspace list", r#"{"result":{"workspaces":[]}}"#),
-            ("tab list", r#"{"result":{"tabs":[]}}"#),
-            ("agent list", r#"{"result":{"agents":[]}}"#),
-        ] {
-            runner.on_fn(
-                move |cmd| cmd.program == "herdr" && cmd.display().contains(command),
-                move |_| Ok(ok(reply)),
-            );
-        }
         runner
     }
 
@@ -2478,20 +2302,7 @@ recipe = "claude_fable_xhigh"
     /// Like `runner_with_herdr`, but the local session answers `pane list` and
     /// `agent list` with the given JSON, so a project row can be read.
     fn runner_with_project(version: &str, panes: &str, agents: &str) -> FakeRunner {
-        let runner = FakeRunner::new();
-        runner.on("herdr --version", ok(version));
-        runner.on("session list --json", ok(r#"{"sessions":[]}"#));
-        runner.on("git --version", ok("git version 2.50.0\n"));
-        runner.on("df -Pk /", ok("Filesystem 1024-blocks Used Available Capacity Mounted on\n/dev/disk 200000000 1000000 199000000 1% /\n"));
-        runner.on("ssh -V", ok(""));
-        runner.on("rsync --version", ok("rsync 3\n"));
-        runner.on("gh --version", ok("gh version 2\n"));
-        runner.on_fn(
-            |cmd| cmd.program == "gh" && cmd.args == ["auth", "status"],
-            |_| Ok(fail(1, "not logged in")),
-        );
-        runner.on("machine list --json", ok("[]"));
-        runner.on("workspace list", ok(r#"{"result":{"workspaces":[]}}"#));
+        let runner = runner_with_herdr(version);
         runner.on("pane list", ok(panes));
         runner.on("agent list", ok(agents));
         runner
@@ -2717,155 +2528,220 @@ recipe = "claude_fable_xhigh"
         ));
     }
 
+    const LANE_PANES: &str = r#"{"result":{"panes":[{"workspace_id":"w3","tab_id":"w3:t1","pane_id":"w3:p1","cwd":"/lane"}]}}"#;
+    const LANE_AGENTS: &str = r#"{"result":{"agents":[{"workspace_id":"w3","tab_id":"w3:t1","pane_id":"w3:p1","cwd":"/lane","name":"hp-demo-t-0001"}]}}"#;
+
+    fn bound_lane(project: &project::Project) -> crate::thread::Thread {
+        crate::thread::allocate(project, |lane| {
+            lane.status = crate::thread::Status::Open;
+            lane.machine = "buildbox".into();
+            lane.machine_id = "abc".into();
+            lane.workspace_id = "w3".into();
+            lane.tab_id = "w3:t1".into();
+            lane.pane_id = "w3:p1".into();
+            lane.cwd = "/lane".into();
+            lane.agent_name = "hp-demo-t-0001".into();
+        })
+        .unwrap()
+    }
+
+    fn lane_rows(
+        root: &Path,
+        runner: &FakeRunner,
+        snapshot: Option<&str>,
+    ) -> Vec<(Option<bool>, String)> {
+        let mut rows = Vec::new();
+        check_lane_bindings(
+            &mut String::new(),
+            &mut |_, status, _, detail| rows.push((status, detail)),
+            root,
+            ("abc", "buildbox"),
+            ("herdr", runner),
+            snapshot,
+        );
+        assert_eq!(runner.count("workspace list"), 0);
+        assert_eq!(runner.count("tab list"), 0);
+        assert_eq!(runner.count("workspace close"), 0);
+        assert_eq!(runner.count("tab close"), 0);
+        rows
+    }
+
     #[test]
-    fn agentless_workspaces_without_an_open_lane_fail_the_doctor_row() {
+    fn unrelated_agentless_shells_and_duplicate_labels_are_not_diagnosed() {
         let home = tempfile::tempdir().unwrap();
-        let root = home.path().join("root");
-        let project = project::create(&root, "demo", "", vec![]).unwrap();
-        crate::thread::allocate(&project, |thread| {
-            thread.status = crate::thread::Status::Open;
-            thread.machine = "buildbox".into();
-            thread.machine_id = "abc".into();
-            thread.workspace_id = "w3".into();
+        let project = project::create(home.path(), "demo", "", vec![]).unwrap();
+        bound_lane(&project);
+        let runner = FakeRunner::new();
+        runner.on("workspace list", ok(r#"{"result":{"workspaces":[{"workspace_id":"w1","label":"~"},{"workspace_id":"w2","label":"Demo"},{"workspace_id":"w3","label":"Demo"}]}}"#));
+        runner.on(
+            "tab list",
+            ok(r#"{"result":{"tabs":[{"workspace_id":"w3","tab_id":"w3:shell"}]}}"#),
+        );
+        runner.on("pane list", ok(LANE_PANES));
+        runner.on("agent list", ok(LANE_AGENTS));
+        let rows = lane_rows(home.path(), &runner, None);
+        assert_eq!(rows[0].0, Some(true), "{rows:?}");
+        crate::thread::update(&project, "t-0001", |lane| lane.machine_id.clear()).unwrap();
+        assert_eq!(
+            lane_rows(home.path(), &runner, None)[0].0,
+            Some(true),
+            "old label-only machine records still bind"
+        );
+    }
+
+    #[test]
+    fn owned_lane_binding_failures_stay_loud_even_with_a_closed_coordinator() {
+        for (panes, agents) in [
+            (LANE_PANES.replace("/lane", "/other"), LANE_AGENTS.into()),
+            (
+                LANE_PANES.into(),
+                LANE_AGENTS.replace("hp-demo-t-0001", "someone-else"),
+            ),
+            (r#"{"result":{"panes":[]}}"#.into(), LANE_AGENTS.into()),
+        ] {
+            let home = tempfile::tempdir().unwrap();
+            let project = project::create(home.path(), "demo", "", vec![]).unwrap();
+            bound_lane(&project);
+            let runner = FakeRunner::new();
+            let snapshot = format!("herdr_panes\t{panes}\nherdr_agents\t{agents}\n");
+            assert_eq!(
+                lane_rows(home.path(), &runner, Some(&snapshot))[0].0,
+                Some(false)
+            );
+        }
+    }
+
+    #[test]
+    fn only_a_resolved_lanes_exact_bound_agent_is_a_leftover() {
+        let home = tempfile::tempdir().unwrap();
+        let project = project::create(home.path(), "demo", "", vec![]).unwrap();
+        let lane = bound_lane(&project);
+        crate::thread::update(&project, &lane.id, |lane| {
+            lane.status = crate::thread::Status::Resolved
         })
         .unwrap();
         let runner = FakeRunner::new();
-        runner.on(
-            "workspace list",
-            ok(r#"{"result":{"workspaces":[{"workspace_id":"w1"},{"workspace_id":"w2"},{"workspace_id":"w3"}]}}"#),
-        );
+        runner.on("pane list", ok(LANE_PANES));
+        runner.on("agent list", ok(LANE_AGENTS));
+        assert_eq!(lane_rows(home.path(), &runner, None)[0].0, Some(false));
+        let runner = FakeRunner::new();
+        runner.on("pane list", ok(LANE_PANES));
         runner.on(
             "agent list",
-            ok(r#"{"result":{"agents":[{"workspace_id":"w2","tab_id":"w2:t1","pane_id":"w2:p1"}]}}"#),
+            ok(&LANE_AGENTS.replace("hp-demo-t-0001", "someone-else")),
         );
-        runner.on("tab list", ok(r#"{"result":{"tabs":[]}}"#));
-        let herdr = Herdr::new("herdr", "", &runner).on_machine("abc");
-        let mut text = String::new();
-        let mut healthy = true;
-        let mut check = |out: &mut String, ok: Option<bool>, label: &str, detail: String| {
-            healthy &= ok != Some(false);
-            let _ = writeln!(out, "{label}: {detail}");
-        };
-
-        check_workspace_leaks(
-            &mut text,
-            &mut check,
-            &root,
-            "abc",
-            "machine buildbox",
-            &herdr,
-        );
-
-        assert!(!healthy);
-        assert!(text.contains("w1"), "{text}");
+        assert_eq!(lane_rows(home.path(), &runner, None)[0].0, Some(true));
     }
 
     #[test]
-    fn a_machines_own_home_workspace_is_not_a_leak() {
+    fn missing_lane_observations_and_intentional_closure_are_unknown_not_success() {
         let home = tempfile::tempdir().unwrap();
-        let root = home.path().join("root");
-        project::create(&root, "demo", "", vec![]).unwrap();
+        let project = project::create(home.path(), "demo", "", vec![]).unwrap();
+        let lane = bound_lane(&project);
         let runner = FakeRunner::new();
-        runner.on(
-            "workspace list",
-            ok(r#"{"result":{"workspaces":[{"workspace_id":"w1","label":"~","tab_count":1,"pane_count":1},{"workspace_id":"w2"}]}}"#),
-        );
+        assert_eq!(lane_rows(home.path(), &runner, Some(""))[0].0, None);
+        crate::thread::update(&project, &lane.id, |lane| lane.parked = true).unwrap();
+        runner.on("pane list", ok(r#"{"result":{"panes":[]}}"#));
         runner.on("agent list", ok(r#"{"result":{"agents":[]}}"#));
-        runner.on("tab list", ok(r#"{"result":{"tabs":[]}}"#));
-        let herdr = Herdr::new("herdr", "", &runner).on_machine("abc");
-        let mut text = String::new();
-        let mut healthy = true;
-        let mut check = |out: &mut String, ok: Option<bool>, label: &str, detail: String| {
-            healthy &= ok != Some(false);
-            let _ = writeln!(out, "{label}: {detail}");
-        };
-
-        check_workspace_leaks(
-            &mut text,
-            &mut check,
-            &root,
-            "abc",
-            "machine buildbox",
-            &herdr,
+        assert_eq!(lane_rows(home.path(), &runner, None)[0].0, None);
+        std::fs::write(
+            project.state_dir().join("threads/t-0099.toml"),
+            "status = [",
+        )
+        .unwrap();
+        let rows = lane_rows(home.path(), &runner, None);
+        assert!(
+            rows.iter()
+                .any(|row| row.0.is_none() && row.1.contains("ownership unknown")),
+            "{rows:?}"
         );
-
-        assert!(!healthy);
-        assert!(text.contains("w2"), "{text}");
     }
 
     #[test]
-    fn duplicate_project_workspaces_and_unowned_shell_tabs_fail_doctor() {
-        let home = tempfile::tempdir().unwrap();
-        let root = home.path().join("root");
-        project::create(&root, "demo", "", vec![]).unwrap();
-        let runner = FakeRunner::new();
-        runner.on(
-            "workspace list",
-            ok(r#"{"result":{"workspaces":[{"workspace_id":"w1","label":"Demo"},{"workspace_id":"w2","label":"Demo"}]}}"#),
-        );
-        runner.on("agent list", ok(r#"{"result":{"agents":[]}}"#));
-        runner.on(
-            "tab list",
-            ok(r#"{"result":{"tabs":[{"workspace_id":"w1","tab_id":"w1:t1","label":"shell"}]}}"#),
-        );
-        let herdr = Herdr::new("herdr", "", &runner).on_machine("abc");
-        let mut text = String::new();
-        let mut healthy = true;
-        let mut check = |out: &mut String, ok: Option<bool>, label: &str, detail: String| {
-            healthy &= ok != Some(false);
-            let _ = writeln!(out, "{label}: {detail}");
-        };
-
-        check_workspace_leaks(
-            &mut text,
-            &mut check,
-            &root,
-            "abc",
-            "machine buildbox",
-            &herdr,
-        );
-
-        assert!(!healthy);
-        assert!(text.contains("Demo"), "{text}");
-        assert!(text.contains("w1:t1"), "{text}");
-        assert_eq!(runner.count("tab close"), 0);
-    }
-
-    #[test]
-    fn an_unowned_shell_tab_is_advisory_and_left_open() {
-        let home = tempfile::tempdir().unwrap();
-        let root = home.path().join("root");
-        project::create(&root, "demo", "", vec![]).unwrap();
-        let runner = FakeRunner::new();
-        runner.on(
-            "workspace list",
-            ok(r#"{"result":{"workspaces":[{"workspace_id":"w1","label":"Demo"}]}}"#),
-        );
-        runner.on("agent list", ok(r#"{"result":{"agents":[]}}"#));
-        runner.on(
-            "tab list",
-            ok(r#"{"result":{"tabs":[{"workspace_id":"w1","tab_id":"w1:t1"}]}}"#),
-        );
-        let herdr = Herdr::new("herdr", "", &runner).on_machine("abc");
-        let mut text = String::new();
-        let mut healthy = true;
-        let mut check = |out: &mut String, ok: Option<bool>, label: &str, detail: String| {
-            healthy &= ok != Some(false);
-            let _ = writeln!(out, "{label}: {detail}");
-        };
-
-        check_workspace_leaks(
-            &mut text,
-            &mut check,
-            &root,
-            "abc",
-            "machine buildbox",
-            &herdr,
-        );
-
-        assert!(healthy, "{text}");
-        assert!(text.contains("w1:t1"), "{text}");
-        assert_eq!(runner.count("tab close"), 0);
+    fn local_lanes_use_the_retained_socket_and_known_process_evidence() {
+        for (process, expected) in [
+            (
+                r#"{"pane_id":"w3:p1","foreground_processes":[{"pid":42,"name":"pi"}]}"#,
+                Some(true),
+            ),
+            (
+                r#"{"pane_id":"w3:p1","foreground_processes":[{"pid":9,"name":"bash"}]}"#,
+                Some(false),
+            ),
+            (
+                r#"{"pane_id":"w3:p1","foreground_processes":[{"pid":9,"name":"tool"}]}"#,
+                None,
+            ),
+            (r#"{"pane_id":"other","foreground_processes":[]}"#, None),
+        ] {
+            let home = tempfile::tempdir().unwrap();
+            let root = home.path().join("root");
+            let project = opened_project(home.path(), &root, "w1:p1", "coordinator");
+            let lane = bound_lane(&project);
+            crate::thread::update(&project, &lane.id, |lane| {
+                lane.machine.clear();
+                lane.machine_id.clear();
+                lane.identity = crate::contracts::IdentityBinding {
+                    socket: home
+                        .path()
+                        .join("retained.sock")
+                        .to_string_lossy()
+                        .into_owned(),
+                    pane_id: lane.pane_id.clone(),
+                    tab_id: lane.tab_id.clone(),
+                    workspace_id: lane.workspace_id.clone(),
+                    process: Some(crate::contracts::ProcessIdentity {
+                        pid: 42,
+                        argv0: "pi".into(),
+                    }),
+                    ..Default::default()
+                };
+            })
+            .unwrap();
+            let runner = FakeRunner::new();
+            runner.on("pane list", ok(LANE_PANES));
+            runner.on("agent list", ok(LANE_AGENTS));
+            runner.on(
+                "pane process-info",
+                ok(&format!(r#"{{"result":{{"process_info":{process}}}}}"#)),
+            );
+            let mut rows = Vec::new();
+            check_lane_bindings(
+                &mut String::new(),
+                &mut |_, status, _, detail| rows.push((status, detail)),
+                &root,
+                ("local", "local"),
+                ("herdr", &runner),
+                None,
+            );
+            assert_eq!(rows[0].0, expected, "{rows:?}");
+            let socket = home
+                .path()
+                .join("retained.sock")
+                .to_string_lossy()
+                .into_owned();
+            assert!(runner.calls.borrow().iter().all(|call| {
+                call.env
+                    .contains(&("HERDR_SOCKET_PATH".into(), socket.clone()))
+            }));
+            project
+                .update_coordinator(|record| record.socket.clear())
+                .unwrap();
+            let mut statuses = Vec::new();
+            check_lane_bindings(
+                &mut String::new(),
+                &mut |_, status, _, _| statuses.push(status),
+                &root,
+                ("local", "local"),
+                ("herdr", &runner),
+                None,
+            );
+            assert_eq!(
+                statuses,
+                [expected],
+                "closed coordinator still observes its lane"
+            );
+        }
     }
 
     #[test]
@@ -2920,6 +2796,9 @@ recipe = "claude_fable_xhigh"
             "only the parent CLI check runs; recipe validation is skipped"
         );
         assert_eq!(runner.count("machine list"), 0);
+        for command in ["ssh -V", "rsync --version", "gh --version"] {
+            assert_eq!(runner.count(command), 0, "unused tool {command}");
+        }
     }
 
     #[test]
@@ -2971,7 +2850,6 @@ recipe = "claude_fable_xhigh"
             ok("[possible values: pi, claude, agy]"),
         );
         runner.on("ssh", ok(&box_facts()));
-        probe_fakes(&runner);
 
         let (text, _) = report(
             &env,
@@ -2981,7 +2859,7 @@ recipe = "claude_fable_xhigh"
             &runner,
         );
         assert!(text.contains("buildbox-id"), "{text}");
-        assert!(text.contains("[ok  ] box buildbox capacity"), "{text}");
+        assert!(text.contains("[ok  ] box buildbox disk"), "{text}");
         assert_eq!(
             runner
                 .calls
@@ -3121,9 +2999,6 @@ recipe = "claude_fable_xhigh"
         runner.on("session list --json", ok(r#"{"sessions":[]}"#));
         runner.on("git --version", ok("git version 2.50.0\n"));
         runner.on("df -Pk /", fail(1, "df failed"));
-        runner.on("ssh -V", ok(""));
-        runner.on("rsync --version", ok("rsync 3\n"));
-        runner.on("gh --version", ok("gh version 2\n"));
 
         let (text, healthy, checks) = report_with_checks(
             &env,
@@ -3187,7 +3062,6 @@ recipe = "claude_fable_xhigh"
             ok("[possible values: pi, claude, agy]"),
         );
         runner.on("ssh", ok(&box_facts()));
-        probe_fakes(&runner);
         let (text, _) = report(
             &env,
             &home.path().join("root"),
@@ -3333,7 +3207,6 @@ recipe = "claude_fable_xhigh"
         let config = machine_config(&["unknown", "pi"]);
         let runner = FakeRunner::new();
         runner.on("ssh", ok(&box_facts()));
-        probe_fakes(&runner);
         let recipes = BTreeMap::from([
             (
                 "unknown".into(),
@@ -3378,28 +3251,15 @@ recipe = "claude_fable_xhigh"
 
     fn box_facts() -> String {
         let mut lines: Vec<String> = [
-            "host\tremote-host",
-            "boot\tenabled",
             "server\therdr 0.9.1",
-            "tailscale\t100.64.0.1",
-            "nproc\t16",
-            "mem_avail_kb\t40000000",
             "df_free\t100000000000",
-            "listeners\t2",
-            "git_name\tuguryildirim24",
-            "git_email\trolf@example.com",
-            "gh\tok",
             "rules\tabc",
             "pane_pi\t/home/agent/.local/bin/pi",
-            "pane_tool_cargo\t/home/agent/.cargo/bin/cargo",
-            "pane_tool_just\t/home/agent/.cargo/bin/just",
-            "pane_tool_node\t/usr/local/bin/node",
             "pane_tool_claude\t/home/agent/.local/bin/claude",
             "pane_tool_codex\t/home/agent/.local/bin/codex",
             "pane_tool_agy\t/home/agent/.local/bin/agy",
-            "herdr_workspaces\t{\"result\":{\"workspaces\":[]}}",
+            "herdr_panes\t{\"result\":{\"panes\":[]}}",
             "herdr_agents\t{\"result\":{\"agents\":[]}}",
-            "herdr_tabs\t{\"result\":{\"tabs\":[]}}",
             "login_claude\tok",
             "login_codex\tok",
             "login_agy\tok",
@@ -3418,19 +3278,6 @@ recipe = "claude_fable_xhigh"
         }
         lines.extend(["__HERDR_BUILDS__".into(), "__HERDR_BUILDS_DONE__".into()]);
         lines.join("\n") + "\n"
-    }
-
-    fn probe_fakes(runner: &FakeRunner) {
-        runner.on(
-            "workspace create",
-            ok(r#"{"result":{"root_pane":{"workspace_id":"w9","tab_id":"w9:t1","pane_id":"w9:p1","cwd":"/home/agent"}}}"#),
-        );
-        runner.on("pane run", ok(r#"{"result":{}}"#));
-        runner.on(
-            "pane read",
-            ok("@@pi /home/agent/.local/bin/pi\n@@cmd\n/home/agent/.cargo/bin/cargo\n/home/agent/.cargo/bin/just\n/home/agent/.local/bin/claude\n/home/agent/.local/bin/codex\n/home/agent/.local/bin/agy\n/usr/local/bin/node\n@@done\n"),
-        );
-        runner.on("workspace close", ok(r#"{"result":{}}"#));
     }
 
     fn box_profile() -> crate::contracts::MachineProfile {
@@ -3457,16 +3304,6 @@ recipe = "claude_fable_xhigh"
                 "pane_tool_claude\t",
             );
         runner.on("ssh", ok(&facts));
-        runner.on(
-            "workspace create",
-            ok(r#"{"result":{"root_pane":{"workspace_id":"w9","tab_id":"w9:t1","pane_id":"w9:p1","cwd":"/home/agent"}}}"#),
-        );
-        runner.on("pane run", ok(r#"{"result":{}}"#));
-        runner.on(
-            "pane read",
-            ok("@@pi /home/agent/.local/bin/pi\n@@cmd\n/home/agent/.cargo/bin/cargo\n/home/agent/.cargo/bin/just\n/usr/local/bin/node\n@@done\n"),
-        );
-        runner.on("workspace close", ok(r#"{"result":{}}"#));
         let rows = box_rows(
             &runner,
             "herdr",
@@ -3484,6 +3321,140 @@ recipe = "claude_fable_xhigh"
         assert_eq!(find("box buildbox tools").0, Some(false));
         assert!(find("box buildbox tools").2.contains("agy claude"));
         assert!(!find("box buildbox tools").2.contains("codex"));
+    }
+
+    #[test]
+    fn native_only_routes_do_not_run_local_pi_setup_checks() {
+        let fx = crate::testkit::fixture();
+        let config = fx.world.ctx().config_dir.clone();
+        write_routing_config(&config);
+        let path = config.join("config.toml");
+        let mut settings: toml::Value =
+            toml::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        settings["routing"] = toml::Value::Table(toml::Table::from_iter([
+            (
+                "default".into(),
+                toml::Value::String("agy_gemini_flash".into()),
+            ),
+            ("retries".into(), toml::Value::Integer(1)),
+        ]));
+        std::fs::write(&path, toml::to_string(&settings).unwrap()).unwrap();
+        let outcome = run(&fx.world.ctx(), &SessionFlags::default()).unwrap();
+        for label in [
+            "node",
+            "npm",
+            "pi version",
+            "wrapper on PATH",
+            "pi folder",
+            "providers",
+        ] {
+            assert!(
+                !outcome.checks.iter().any(|row| row.label == label),
+                "{label}: {}",
+                outcome.message
+            );
+        }
+        assert!(
+            !fx.world
+                .runner
+                .calls
+                .borrow()
+                .iter()
+                .any(|call| call.program == "/bin/bash")
+        );
+        std::fs::write(path, "[routing]\ndefault = 'absent'\n").unwrap();
+        let outcome = run(&fx.world.ctx(), &SessionFlags::default()).unwrap();
+        assert!(!outcome.healthy);
+        assert!(outcome.checks.iter().any(
+            |row| row.status == "failed" && row.detail.contains("pi recipe selection unknown")
+        ));
+    }
+
+    #[test]
+    fn selected_adapters_need_only_their_own_executables_not_host_inventory() {
+        for kinds in [vec!["claude"], vec!["pi"]] {
+            let config = machine_config(&kinds);
+            let runner = FakeRunner::new();
+            let facts = if kinds == ["claude"] {
+                box_facts().replace("pane_pi\t/home/agent/.local/bin/pi", "pane_pi\t")
+            } else {
+                box_facts().replace(
+                    "pane_tool_claude\t/home/agent/.local/bin/claude",
+                    "pane_tool_claude\t",
+                )
+            };
+            runner.on("ssh", ok(&facts));
+            let rows = box_rows(
+                &runner,
+                "herdr",
+                config.path(),
+                &box_profile(),
+                &default_recipes(),
+                12.0,
+            );
+            assert!(
+                rows.iter().all(|row| row.0 != Some(false)),
+                "{kinds:?}: {rows:?}"
+            );
+            assert_eq!(
+                rows.iter().any(|row| row.1.ends_with(" wrapper")),
+                kinds == ["pi"]
+            );
+            assert_eq!(
+                rows.iter().any(|row| row.1.ends_with(" tools")),
+                kinds == ["claude"]
+            );
+            let calls = runner.calls.borrow();
+            let script = calls
+                .iter()
+                .find(|call| call.program == "ssh")
+                .unwrap()
+                .args
+                .join(" ");
+            for removed in [
+                "systemctl",
+                "tailscale",
+                "nproc",
+                "/proc/meminfo",
+                "ss -tln",
+                "command -v cargo",
+                "command -v just",
+                "command -v node",
+                "workspace list",
+                "tab list",
+            ] {
+                assert!(!script.contains(removed), "{removed}: {script}");
+            }
+            assert!(!script.contains("git config --global"));
+            assert!(!script.contains(if kinds == ["pi"] {
+                "command -v claude"
+            } else {
+                "command -v pi"
+            }));
+            assert!(!rows.iter().any(|row| {
+                [" boot", " host", " listeners", " capacity"]
+                    .iter()
+                    .any(|suffix| row.1.ends_with(suffix))
+            }));
+        }
+    }
+
+    #[test]
+    fn box_disk_floor_still_fails_and_missing_space_stays_unknown() {
+        for (bytes, expected) in [
+            ("1000000000", Some(false)),
+            ("100000000000", Some(true)),
+            ("unknown", None),
+        ] {
+            let runner = FakeRunner::new();
+            runner.on(
+                "ssh",
+                ok(&box_facts().replace("df_free\t100000000000", &format!("df_free\t{bytes}"))),
+            );
+            let row = find_row(&runner, "box buildbox disk");
+            assert_eq!(row.0, expected, "{row:?}");
+            assert!(!row.2.contains("lane(s) fit"));
+        }
     }
 
     #[test]
