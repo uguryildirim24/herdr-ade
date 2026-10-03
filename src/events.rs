@@ -3,15 +3,14 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::File;
-use std::io::Write as _;
 use std::path::PathBuf;
 
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 
 use crate::contracts::{DeliveryLine, DeliveryState, Event, EventPayload};
 use crate::project::{self, Project};
+use crate::thread::sha256_hex as hash_bytes;
 
 pub(crate) fn dir(project: &Project) -> PathBuf {
     project.record_dir("events")
@@ -181,7 +180,7 @@ pub(crate) fn import_box_event(
                 done.artifact
             );
         }
-        write_artifact_create_only(project, &done.artifact, bytes)?;
+        store_artifact(project, bytes)?;
         artifact_hash = done.artifact.clone();
     }
 
@@ -220,42 +219,14 @@ fn write_import_create_only(project: &Project, source: &ImportSource) -> Result<
         .with_context(|| format!("import_conflict: {}", path.display()))
 }
 
-/// Content-addressed artifact write; a retry with the same bytes is a no-op.
-fn write_artifact_create_only(project: &Project, hash: &str, bytes: &[u8]) -> Result<()> {
-    let dir = artifact_dir(project);
-    std::fs::create_dir_all(&dir)?;
-    let path = dir.join(hash);
-    if path.exists() {
-        if std::fs::read(&path)? == bytes {
-            return Ok(());
-        }
-        bail!("artifact_conflict: {} has different bytes", path.display());
-    }
-    let tmp = dir.join(format!(".{hash}.{}.tmp", std::process::id()));
-    {
-        let mut file = File::create(&tmp)?;
-        file.write_all(bytes)?;
-        file.sync_all()?;
-    }
-    match std::fs::rename(&tmp, &path) {
-        Ok(()) => {}
-        Err(error) if path.exists() && std::fs::read(&path)? == bytes => {
-            let _ = std::fs::remove_file(&tmp);
-            let _ = error;
-        }
-        Err(error) => {
-            let _ = std::fs::remove_file(&tmp);
-            return Err(error.into());
-        }
-    }
-    File::open(&dir)?.sync_all()?;
-    Ok(())
-}
-
-/// Store report bytes under their own hash and return that artifact name.
+/// One immutable artifact store for briefs, operations and imported reports.
+/// Publish complete bytes create-only, after file sync, then sync the directory.
 pub(crate) fn store_artifact(project: &Project, bytes: &[u8]) -> Result<String> {
     let hash = hash_bytes(bytes);
-    write_artifact_create_only(project, &hash, bytes)?;
+    std::fs::create_dir_all(artifact_dir(project))?;
+    let path = artifact_path(project, &hash);
+    project::write_create_only(&path, bytes)
+        .with_context(|| format!("artifact_conflict: {}", path.display()))?;
     Ok(hash)
 }
 
@@ -306,10 +277,6 @@ pub(crate) fn save_remote_state(
     }
     let _lock = project.lock()?;
     project::write_json(&path, state)
-}
-
-fn hash_bytes(bytes: &[u8]) -> String {
-    format!("{:x}", Sha256::digest(bytes))
 }
 
 /// Canonical bytes used both for the create-if-absent write and the X2b
@@ -835,6 +802,61 @@ mod tests {
     }
 
     #[test]
+    fn artifact_store_keeps_historical_names_and_never_replaces_existing_bytes() {
+        let (_root, project, _) = fixture();
+        let hash = "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad";
+        std::fs::create_dir_all(artifact_dir(&project)).unwrap();
+        let path = artifact_path(&project, hash);
+        std::fs::write(&path, b"abc").unwrap();
+        let witness = project.state_dir().join("same-inode");
+        std::fs::hard_link(&path, &witness).unwrap();
+        assert_eq!(store_artifact(&project, b"abc").unwrap(), hash);
+        assert_eq!(
+            crate::thread::store_artifact(&project, b"abc").unwrap(),
+            hash
+        );
+        assert_eq!(crate::thread::artifact(&project, hash).unwrap(), b"abc");
+        // A replay must not replace the historical inode. Corrupt it through
+        // the witness and require both callers to refuse, leaving it intact.
+        std::fs::write(&witness, b"corrupt").unwrap();
+        assert!(
+            store_artifact(&project, b"abc")
+                .unwrap_err()
+                .to_string()
+                .starts_with("artifact_conflict:")
+        );
+        assert!(crate::thread::store_artifact(&project, b"abc").is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), b"corrupt");
+    }
+
+    #[test]
+    fn concurrent_artifact_replays_publish_complete_bytes_despite_crash_leftovers() {
+        let (_root, project, _) = fixture();
+        let bytes = vec![b'x'; 128 * 1024];
+        let hash = hash_bytes(&bytes);
+        std::fs::create_dir_all(artifact_dir(&project)).unwrap();
+        let stale = artifact_dir(&project).join(format!(".{hash}.{}.tmp", std::process::id()));
+        std::fs::write(&stale, b"old interrupted write").unwrap();
+        std::thread::scope(|scope| {
+            let handles: Vec<_> = (0..8)
+                .map(|_| scope.spawn(|| store_artifact(&project, &bytes).unwrap()))
+                .collect();
+            for handle in handles {
+                assert_eq!(handle.join().unwrap(), hash);
+            }
+        });
+        assert_eq!(
+            std::fs::read(artifact_path(&project, &hash)).unwrap(),
+            bytes
+        );
+        assert_eq!(std::fs::read(&stale).unwrap(), b"old interrupted write");
+        assert_eq!(
+            std::fs::read_dir(artifact_dir(&project)).unwrap().count(),
+            2
+        );
+    }
+
+    #[test]
     fn historical_event_without_usage_loads_and_new_usage_is_one_optional_table() {
         // Real adeherdr event t-0058-1-1, sealed before usage existed.
         let old = r#"id = "t-0058-1-1"
@@ -992,7 +1014,7 @@ artifact = "ff2346a2702021221a52567a733cc60301ac507dc2da3c6a0629e2c6ca58f75b"
     fn box_import_is_create_only_hash_checked_and_preserves_the_report_path() {
         let (_root, project, _event) = fixture();
         let report = b"report body";
-        let hash = format!("{:x}", Sha256::digest(report));
+        let hash = hash_bytes(report);
         let event = box_event(&hash);
         let box_bytes = bytes(&event).unwrap();
 

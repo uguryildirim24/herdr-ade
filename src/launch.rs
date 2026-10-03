@@ -189,47 +189,6 @@ pub fn authorize_coordinator_recipe(project: &Project, basis: &str) -> Result<St
         })
 }
 
-/// Validate a coordinator's one-off lane recipe before creating the lane.
-pub fn validate_explicit_recipe(
-    ctx: &Ctx,
-    project: &Project,
-    task_id: &str,
-    task_text: &str,
-    workflow: &str,
-    recipe_id: &str,
-) -> Result<()> {
-    let config = parse_launch_config(&ctx.config_dir)?;
-    validate_config(&config, &agent_kinds(ctx.env, ctx.runner)?)?;
-    let recipe = config
-        .recipes
-        .get(recipe_id)
-        .with_context(|| format!("routing_recipe_unknown: {recipe_id}"))?;
-    if !recipe.enabled {
-        return Err(crate::refusal::error(
-            format!("routing_recipe_disabled: {recipe_id}"),
-            format!(
-                "ha thread start {} --job {task_id} --task-file <file>",
-                project.slug
-            ),
-        ));
-    }
-    let work = work_contract(task_text, workflow)?;
-    if let Some(capability) = &work.capability
-        && !recipe.capabilities.contains(capability)
-    {
-        return Err(crate::refusal::error(
-            format!(
-                "routing_capability_missing: recipe `{recipe_id}` does not declare `{capability}`"
-            ),
-            format!(
-                "ha thread start {} --job {task_id} --task-file <file>",
-                project.slug
-            ),
-        ));
-    }
-    Ok(())
-}
-
 /// Optional task front matter describes the deliverable or a hard runtime
 /// requirement, not a model preference. URLs in the body never trigger a rule.
 #[derive(Debug, Default, Deserialize)]
@@ -268,6 +227,8 @@ pub fn work_contract(task: &str, workflow: &str) -> Result<crate::routing::WorkC
 #[derive(Debug, Default)]
 pub struct ResolveInput<'a> {
     pub task: &'a str,
+    /// Stable job identity for specific initial-selection refusals.
+    pub task_id: Option<&'a str>,
     /// Selects skill text and an ordered routing rule.
     pub workflow: &'a str,
     /// One recipe the coordinator chose for this lane. Ordinary starts leave this empty.
@@ -308,52 +269,7 @@ pub fn resolve_failure(
     input: &ResolveInput<'_>,
     class: crate::contracts::FailureClass,
 ) -> Result<Launch> {
-    use crate::contracts::FailureClass;
-    let previous = input.previous.context("recovery_previous_missing")?;
-    if work_contract(input.task, input.workflow)?.once {
-        return Err(crate::refusal::error(
-            format!(
-                "recovery_exhausted: {} runs once; attempt {} ended ({}) and is not retried automatically",
-                job_noun(input.workflow),
-                previous.attempt.max(1),
-                class.plain()
-            ),
-            crate::threads::retry_command(&project.slug, "<thread>"),
-        ));
-    }
-    match class {
-        FailureClass::Unknown => Err(crate::refusal::error(
-            "recovery_unknown: waiting for the coordinator",
-            "wait for the coordinator to classify the failure; a classified failure event clears this refusal",
-        )),
-        FailureClass::WorkFailed if previous.routing_rule == "explicit" => {
-            let config = parse_launch_config(&ctx.config_dir)?;
-            validate_config(&config, &agent_kinds(ctx.env, ctx.runner)?)?;
-            let recovery = previous.work_retries.saturating_add(1);
-            if recovery > config.routing.retries {
-                return Err(crate::refusal::error(
-                    format!(
-                        "recovery_exhausted: the explicit lane recipe allowed {} retries; waiting for the coordinator",
-                        config.routing.retries
-                    ),
-                    crate::threads::retry_command(&project.slug, "<thread>"),
-                ));
-            }
-            let mut same = previous.clone();
-            same.work_retries = recovery;
-            dispatch(
-                project,
-                json!({"kind":"recovery", "class":class, "recipe":same.recipe_id,
-                    "explicit_retry":recovery, "failure":input.failure,
-                    "policy_hash":config.policy_hash}),
-            )?;
-            Ok(same)
-        }
-        FailureClass::WorkFailed => resolve_launch(ctx, project, input),
-        FailureClass::Provider | FailureClass::LostConnection | FailureClass::ProcessGone => {
-            same_recipe_retry(ctx, project, input, class, "recovery", true)
-        }
-    }
+    same_recipe_retry(ctx, project, input, class, "recovery", true)
 }
 
 /// A coordinator's explicit retry keeps the recipe and records the reason,
@@ -376,27 +292,67 @@ fn same_recipe_retry(
     dispatch_kind: &str,
     automatic: bool,
 ) -> Result<Launch> {
+    use crate::contracts::FailureClass;
     let previous = input.previous.context("recovery_previous_missing")?;
-    let config = parse_launch_config(&ctx.config_dir)?;
-    validate_config(&config, &agent_kinds(ctx.env, ctx.runner)?)?;
     let work = work_contract(input.task, input.workflow)?;
-    let recovery = previous.same_recipe_retries.saturating_add(1);
-    let retries = config.routing.retry_limit(&work);
-    if automatic && recovery > retries {
+    if automatic && work.once {
         return Err(crate::refusal::error(
             format!(
-                "recovery_exhausted: {} allowed {retries} same-recipe retries; waiting for the coordinator",
+                "recovery_exhausted: {} runs once; attempt {} ended ({}) and is not retried automatically",
+                job_noun(input.workflow),
+                previous.attempt.max(1),
                 class.plain()
             ),
             crate::threads::retry_command(&project.slug, "<thread>"),
         ));
     }
+    if automatic && class == FailureClass::Unknown {
+        return Err(crate::refusal::error(
+            "recovery_unknown: waiting for the coordinator",
+            "wait for the coordinator to classify the failure; a classified failure event clears this refusal",
+        ));
+    }
+    if input
+        .failure
+        .is_none_or(|failure| failure.trim().is_empty())
+    {
+        bail!("recovery_failure_missing");
+    }
+    // Recovery uses only the editable retry policy, not today's recipe selection
+    // or this machine's kinds. Placement checks the stored launch where it runs.
+    let config = recipe_catalog(&ctx.config_dir)?;
     let mut same = previous.clone();
-    same.same_recipe_retries = recovery;
+    let work_failed = class == FailureClass::WorkFailed;
+    let counter = if work_failed {
+        &mut same.work_retries
+    } else {
+        &mut same.same_recipe_retries
+    };
+    let recovery = counter.saturating_add(1);
+    let retries = if work_failed && previous.routing_rule == "explicit" {
+        config.routing.retries
+    } else {
+        config.routing.retry_limit(&work)
+    };
+    if automatic && recovery > retries {
+        return Err(crate::refusal::error(
+            format!(
+                "recovery_exhausted: {} allowed {retries} same-recipe retries; waiting for the coordinator",
+                if work_failed {
+                    previous.routing_rule.as_str()
+                } else {
+                    class.plain()
+                }
+            ),
+            crate::threads::retry_command(&project.slug, "<thread>"),
+        ));
+    }
+    *counter = recovery;
     dispatch(
         project,
         json!({"kind":dispatch_kind, "class":class, "recipe":same.recipe_id,
-            "same_recipe_retry":recovery, "failure":input.failure,
+            "work_retry":same.work_retries, "same_recipe_retry":same.same_recipe_retries,
+            "rule":same.routing_rule, "failure":input.failure,
             "policy_hash":config.policy_hash}),
     )?;
     Ok(same)
@@ -416,93 +372,58 @@ fn resolve(ctx: &Ctx, project: &Project, input: &ResolveInput) -> Result<Launch>
     validate_config(&config, &agent_kinds(ctx.env, ctx.runner)?)?;
     let work = work_contract(input.task, input.workflow)?;
     let hash = crate::thread::sha256_hex(input.task.as_bytes());
-    let recovery = input
-        .previous
-        .map_or(0, |previous| previous.work_retries.saturating_add(1));
-    if input.previous.is_some()
-        && input
-            .failure
-            .is_none_or(|failure| failure.trim().is_empty())
-    {
-        bail!("recovery_failure_missing");
-    }
     let selected = match (input.project_recipe, input.recipe) {
-        (Some(recipe), None) => {
-            if input.previous.is_some() {
-                bail!(
-                    "recipe_override_recovery: a project recipe is chosen only when its coordinator starts"
-                );
-            }
-            crate::routing::Selection {
-                recipe: recipe.to_string(),
-                rule: "project".into(),
-                pinned: true,
-            }
-        }
-        (None, Some(recipe)) => {
-            if input.previous.is_some() {
-                bail!(
-                    "recipe_override_recovery: a one-off recipe is chosen only when the lane starts"
-                );
-            }
-            crate::routing::Selection {
-                recipe: recipe.to_string(),
-                rule: "explicit".into(),
-                pinned: true,
-            }
-        }
-        (None, None) => {
-            let selected = config.routing.select(&hash, &work, recovery)?;
-            if let Some(previous) = input.previous {
-                crate::routing::Selection {
-                    recipe: previous.recipe_id.clone(),
-                    rule: previous.routing_rule.clone(),
-                    pinned: selected.pinned,
-                }
-            } else {
-                selected
-            }
-        }
+        (Some(recipe), None) => crate::routing::Selection {
+            recipe: recipe.to_string(),
+            rule: "project".into(),
+            pinned: true,
+        },
+        (None, Some(recipe)) => crate::routing::Selection {
+            recipe: recipe.to_string(),
+            rule: "explicit".into(),
+            pinned: true,
+        },
+        (None, None) => config.routing.select(&hash, &work, 0)?,
         (Some(_), Some(_)) => bail!("recipe_choice_ambiguous"),
     };
     let recipe = config
         .recipes
         .get(&selected.recipe)
-        .context("routing_recipe_unknown")?;
-    if let Some(capability) = &work.capability
-        && !recipe.capabilities.contains(capability)
-    {
-        bail!(
-            "routing_capability_missing: recipe `{}` does not declare `{capability}`",
-            selected.recipe
-        );
-    }
+        .with_context(|| format!("routing_recipe_unknown: {}", selected.recipe))?;
+    let retry_start = format!(
+        "ha thread start {} --job {} --task-file <file>",
+        project.slug,
+        input.task_id.unwrap_or("<job>")
+    );
     if !recipe.enabled {
         return Err(crate::refusal::error(
             format!("routing_recipe_disabled: {}", selected.recipe),
+            retry_start,
+        ));
+    }
+    if let Some(capability) = &work.capability
+        && !recipe.capabilities.contains(capability)
+    {
+        return Err(crate::refusal::error(
             format!(
-                "ha thread start {} --job <job> --task-file <file>",
-                project.slug
+                "routing_capability_missing: recipe `{}` does not declare `{capability}`",
+                selected.recipe
             ),
+            retry_start,
         ));
     }
     if parse_launch_config(&ctx.config_dir)?.policy_hash != config.policy_hash {
         return Err(crate::refusal::error(
             "dispatch_policy_changed: config changed during selection; dispatch again",
-            format!(
-                "ha thread start {} --job <job> --task-file <file>",
-                project.slug
-            ),
+            retry_start,
         ));
     }
     dispatch(
         project,
-        json!({"kind": if recovery > 0 { "recovery" } else { "pick" },
+        json!({"kind":"pick",
         "brief_hash": hash, "recipe": selected.recipe, "rule": selected.rule,
         "workflow": input.workflow, "basis": input.recipe_basis,
         "request": input.recipe_request,
-        "previous": input.previous.map(|previous| json!({"recipe":previous.recipe_id,"attempt":previous.attempt})),
-        "failure": input.failure, "recovery": recovery,
         "source_truncation": input.source_truncation,
         "policy_hash": config.policy_hash}),
     )?;
@@ -528,7 +449,6 @@ fn resolve(ctx: &Ctx, project: &Project, input: &ResolveInput) -> Result<Launch>
         policy_hash: config.policy_hash,
         attempt: 1,
         recipe_id: selected.recipe,
-        work_retries: recovery,
         routing_rule: selected.rule,
         recipe_basis: input.recipe_basis.unwrap_or_default().to_string(),
         recipe_request: input.recipe_request.unwrap_or_default().to_string(),
@@ -641,4 +561,106 @@ pub fn pinned_reason(role: &str, plain: &str) -> String {
 
 pub fn usual_reason(role: &str, plain: &str) -> String {
     render(TEMPLATE_USUAL, job_noun(role), plain)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::contracts::FailureClass;
+    use crate::scenarios::World;
+
+    #[test]
+    fn recovery_keeps_the_entire_stored_launch_without_initial_validation() {
+        let world = World::new();
+        let project = world.project("demo", "a.sock");
+        // Today's selection is invalid and the old recipe declaration changed.
+        // Neither may replace or veto a stored launch on another machine.
+        std::fs::write(
+            world.ctx().config_dir.join("config.toml"),
+            "[routing]\ndefault = \"missing\"\nretries = 5\n\n[recipes.test_claude]\nkind = \"missing-kind\"\nenabled = false\nargs = [\"changed\"]\n",
+        )
+        .unwrap();
+        let mut previous = Launch {
+            kind: "claude".into(),
+            args: vec!["--disallowedTools".into(), "Agent".into()],
+            env: vec!["SAVED=1".into()],
+            ready_timeout_ms: 42_000,
+            policy_hash: "original-policy".into(),
+            attempt: 7,
+            brief_hash: "original-brief".into(),
+            skill_hash: "original-skill".into(),
+            recipe_id: "test_claude".into(),
+            recipe_basis: "request:demo/q-choice".into(),
+            recipe_request: "Rolf's original choice".into(),
+            reason: "original selection evidence".into(),
+            source_truncation: Some(json!({"omitted":"diff"})),
+            machine: "box".into(),
+            work_retries: 2,
+            same_recipe_retries: 3,
+            ..Launch::default()
+        };
+        for rule in ["default", "rule[0]", "explicit", "pin", "project", ""] {
+            previous.routing_rule = rule.into();
+            for class in [
+                FailureClass::WorkFailed,
+                FailureClass::Provider,
+                FailureClass::LostConnection,
+                FailureClass::ProcessGone,
+            ] {
+                let input = ResolveInput {
+                    task: "Do the original work.",
+                    workflow: "lane",
+                    previous: Some(&previous),
+                    failure: Some("saved failure evidence"),
+                    ..Default::default()
+                };
+                let mut expected = previous.clone();
+                if class == FailureClass::WorkFailed {
+                    expected.work_retries += 1;
+                } else {
+                    expected.same_recipe_retries += 1;
+                }
+                assert_eq!(
+                    resolve_failure(&world.ctx(), &project, &input, class).unwrap(),
+                    expected
+                );
+            }
+        }
+        assert_eq!(world.runner.count("agent start --help"), 0);
+        let journal = std::fs::read_to_string(project.state_dir().join("dispatch.jsonl")).unwrap();
+        assert!(!journal.contains("\"kind\":\"pick\""));
+    }
+
+    #[test]
+    fn manual_work_retry_bypasses_once_and_budget_but_requires_a_reason() {
+        let world = World::new();
+        let project = world.project("demo", "a.sock");
+        let previous = Launch {
+            work_retries: 8,
+            same_recipe_retries: 4,
+            routing_rule: "explicit".into(),
+            ..Launch::default()
+        };
+        let mut input = ResolveInput {
+            task: "+++\nonce = true\n+++\nRelease once.",
+            workflow: "lane",
+            previous: Some(&previous),
+            failure: Some("verified that the release did not occur"),
+            ..Default::default()
+        };
+        let mut expected = previous.clone();
+        expected.work_retries += 1;
+        assert_eq!(
+            resolve_coordinator_retry(&world.ctx(), &project, &input, FailureClass::WorkFailed)
+                .unwrap(),
+            expected
+        );
+        input.failure = Some(" ");
+        assert_eq!(
+            resolve_coordinator_retry(&world.ctx(), &project, &input, FailureClass::WorkFailed)
+                .unwrap_err()
+                .to_string(),
+            "recovery_failure_missing"
+        );
+    }
 }

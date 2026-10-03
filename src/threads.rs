@@ -258,25 +258,14 @@ pub fn start(ctx: &Ctx, slug: &str, args: StartArgs) -> Result<Thread> {
     let listed = settings.repos.iter().find(|row| {
         std::fs::canonicalize(&row.path).is_ok_and(|path| path.to_string_lossy() == repo)
     });
-    if let Some(recipe) = &args.recipe {
-        crate::launch::validate_explicit_recipe(
-            ctx,
-            &project,
-            &args.task_id,
-            &args.task,
-            role,
-            recipe,
-        )?;
-    }
     let mut launch = crate::launch::resolve_launch(
         ctx,
         &project,
         &crate::launch::ResolveInput {
             task: &args.task,
+            task_id: Some(&args.task_id),
             workflow: role,
             recipe: args.recipe.as_deref(),
-            recipe_basis: None,
-            recipe_request: None,
             ..Default::default()
         },
     )?;

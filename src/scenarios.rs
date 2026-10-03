@@ -1910,27 +1910,43 @@ fn explicit_lane_recipe_still_checks_validity() {
     std::fs::write(&config, text).unwrap();
     let project = world.project("demo", "a.sock");
     let validate = |recipe, task| {
-        crate::launch::validate_explicit_recipe(
+        crate::launch::resolve_launch(
             &world.ctx(),
             &project,
-            "job-1",
-            task,
-            "lane",
-            recipe,
+            &crate::launch::ResolveInput {
+                task,
+                task_id: Some("job-1"),
+                workflow: "lane",
+                recipe: Some(recipe),
+                ..Default::default()
+            },
         )
         .unwrap_err()
-        .to_string()
     };
-    let unknown = validate("not_configured", "Do the work.");
-    assert!(unknown.contains("routing_recipe_unknown"), "{unknown}");
-    assert!(validate("disabled_choice", "Do the work.").contains("routing_recipe_disabled"));
-    assert!(
-        validate(
-            "test_claude",
-            "+++\ncapability = \"not-declared\"\n+++\nDo the work."
-        )
-        .contains("routing_capability_missing")
+    assert_eq!(
+        validate("not_configured", "Do the work.").to_string(),
+        "routing_recipe_unknown: not_configured"
     );
+    for (recipe, task, message) in [
+        (
+            "disabled_choice",
+            "Do the work.",
+            "routing_recipe_disabled: disabled_choice",
+        ),
+        (
+            "test_claude",
+            "+++\ncapability = \"not-declared\"\n+++\nDo the work.",
+            "routing_capability_missing: recipe `test_claude` does not declare `not-declared`",
+        ),
+    ] {
+        let error = validate(recipe, task);
+        assert_eq!(error.to_string(), message);
+        assert_eq!(
+            crate::refusal::next(&error),
+            Some("ha thread start demo --job job-1 --task-file <file>")
+        );
+    }
+    assert_eq!(world.runner.count("agent start --help"), 3);
 }
 
 #[test]
@@ -2129,7 +2145,7 @@ fn provider_retries_do_not_consume_failed_work_retries() {
     .unwrap();
     assert_eq!(first_work.recipe_id, "test_claude");
     assert_eq!(first_work.work_retries, 1);
-    assert_eq!(first_work.same_recipe_retries, 0);
+    assert_eq!(first_work.same_recipe_retries, 1);
     let error = crate::launch::resolve_failure(
         &world.ctx(),
         &project,
