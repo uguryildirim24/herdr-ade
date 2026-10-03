@@ -228,7 +228,6 @@ mod tests {
         );
         for expected in [
             "Goal and what Rolf gets",
-            "Waiting on Rolf",
             "Plan",
             "Task notes in force",
             "Facts in force",

@@ -427,8 +427,8 @@ pub(crate) mod fake {
     }
 
     /// Scenario names in SPEC-ADE §1.3 for the new verbs.
-    pub(crate) const ADE_NEW_VERB_SCENARIOS: [&str; 5] =
-        ["thread_start_parent", "ha_done", "ha_waiting", "ask", "say"];
+    pub(crate) const ADE_NEW_VERB_SCENARIOS: [&str; 4] =
+        ["thread_start_parent", "ha_done", "ha_waiting", "say"];
 
     /// Needle → canned stdout for each new verb's herdr or git call (SPEC-ADE §1.3).
     /// More specific needles come first so FakeRunner's first-match rule is stable.

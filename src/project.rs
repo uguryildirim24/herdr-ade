@@ -930,23 +930,7 @@ pub(crate) fn page_body_with_history(
         out.push_str("What Rolf gets: not written down.\n");
     }
 
-    out.push_str("\n## Waiting on Rolf\n\n");
-    let asks = crate::ask::open_asks(project);
     let events = evidence.events();
-    let mut waiting = Vec::new();
-    for ask in asks {
-        waiting.push(format!(
-            "- `{}` {} Choices: {}\n",
-            ask.id,
-            ask.question.trim(),
-            ask.choices.join(" / ")
-        ));
-    }
-    if waiting.is_empty() {
-        out.push_str("None.\n");
-    } else {
-        out.extend(waiting);
-    }
 
     if crate::prompt::long_input_hold(project) {
         out.push_str("\nAutomated prompts have waited over 30 minutes for text in the coordinator's input line. They remain pending.\n");
@@ -1442,7 +1426,7 @@ mod tests {
     }
 
     #[test]
-    fn lane_waits_belong_to_the_lane_not_waiting_on_rolf() {
+    fn lane_waits_belong_to_the_lane() {
         let root = tempfile::tempdir().unwrap();
         let project = create(root.path(), "demo", "", vec![]).unwrap();
         let lane = crate::thread::allocate(&project, |thread| {
@@ -1471,14 +1455,6 @@ mod tests {
         )
         .unwrap();
         let page = page_body(&project, &Settings::default());
-        let rolf = page
-            .split_once("## Waiting on Rolf\n\n")
-            .unwrap()
-            .1
-            .split_once("\n## Running now")
-            .unwrap()
-            .0;
-        assert_eq!(rolf, "None.\n");
         assert!(page.contains("waiting on coordinator: Coordinator, choose a build"));
     }
 

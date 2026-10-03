@@ -356,8 +356,7 @@ pub(crate) struct DeliveryLine {
     pub(crate) state: DeliveryState,
 }
 
-/// Durable `asks/<ask id>/r<revision>.toml` written before any publication
-/// (SPEC-ADE D17 item 4).
+/// Historical `asks/<ask id>/r<revision>.toml` record.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 pub(crate) struct Ask {
     pub(crate) id: String,
@@ -373,13 +372,6 @@ pub(crate) struct Ask {
     pub(crate) coordinator_binding: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) task: Option<String>,
-}
-
-/// The only values `publish()` accepts (SPEC-ADE D17 item 3, item 35).
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub(crate) enum HumanMessage {
-    Ask { id: String, revision: u32 },
 }
 
 // --------------------------------------------------------------- plan card
@@ -616,7 +608,7 @@ mod tests {
     }
 
     #[test]
-    fn ask_and_human_message_roundtrip() {
+    fn historical_ask_roundtrip() {
         both(&Ask {
             id: "a-1".into(),
             revision: 1,
@@ -628,10 +620,6 @@ mod tests {
             asked: "2026-09-18T00:00:00Z".into(),
             coordinator_binding: "w1:p1".into(),
             task: None,
-        });
-        json_roundtrip(&HumanMessage::Ask {
-            id: "a-1".into(),
-            revision: 1,
         });
     }
 

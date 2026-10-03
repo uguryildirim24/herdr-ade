@@ -2891,16 +2891,7 @@ fn plan_nudge(
         .map(|lane| lane.id.clone())
         .collect();
     lane_ids.sort();
-    let asks = crate::ask::open_asks(project);
-    // Answering an ask re-arms the normal nudge, even without a plan edit.
-    let request = format!(
-        "{}|{}",
-        crate::prompt::latest_request_id(project),
-        asks.iter()
-            .map(|ask| format!("{}:{}", ask.id, ask.revision))
-            .collect::<Vec<_>>()
-            .join(",")
-    );
+    let request = crate::prompt::latest_request_id(project);
     let plan = crate::plan::load(project)?;
     let revision = plan.as_ref().map_or(0, |p| p.revision);
     if state.plan_revision != revision
@@ -2956,65 +2947,10 @@ fn plan_nudge(
     if left.is_empty() {
         return Ok(());
     }
-    // An unbound ask has no plan evidence of independence. Every linked ask
-    // must map to at least one step before any step can be suggested.
-    let tasks = if asks.is_empty() {
-        Vec::new()
-    } else {
-        let (tasks, errors) = crate::task::list_with_errors(project);
-        if !errors.is_empty() {
-            return Ok(());
-        }
-        tasks
-    };
-    let mut ask_steps = std::collections::BTreeSet::new();
-    for ask in &asks {
-        let Some(task_id) = &ask.task else {
-            return Ok(());
-        };
-        let bound: Vec<_> = crate::plan::all_steps(plan)
-            .filter(|step| {
-                step.tasks.contains(task_id)
-                    || tasks.iter().any(|task| {
-                        &task.id == task_id && task.plan_step.as_deref() == Some(&step.id)
-                    })
-            })
-            .map(|step| step.id.clone())
-            .collect();
-        if bound.is_empty() {
-            return Ok(());
-        }
-        for id in bound {
-            ask_steps.insert(id.clone());
-            for parent in &plan.steps {
-                if parent.subtasks.iter().any(|sub| sub.id == id) {
-                    ask_steps.insert(parent.id.clone());
-                }
-            }
-        }
-    }
     let next = left
         .iter()
         .filter(|step| step.state == crate::contracts::StepState::Left)
         .find(|step| {
-            if !ask_steps.is_empty() {
-                // Any direct or transitive --after edge to an ask-bound step
-                // makes this step dependent on Rolf's unanswered call.
-                let mut seen = std::collections::BTreeSet::new();
-                let mut pending = vec![step.id.as_str()];
-                while let Some(id) = pending.pop() {
-                    if !seen.insert(id) {
-                        continue;
-                    }
-                    if ask_steps.contains(id) {
-                        return false;
-                    }
-                    let Some(bound) = crate::plan::all_steps(plan).find(|s| s.id == id) else {
-                        return false;
-                    };
-                    pending.extend(bound.after.iter().map(String::as_str));
-                }
-            }
             // Use the same evidence gate as `thread start` for bound tasks.
             let gate = step
                 .tasks
@@ -3039,9 +2975,6 @@ fn plan_nudge(
             }
             true
         });
-    if !asks.is_empty() && next.is_none() {
-        return Ok(());
-    }
     let holds = crate::plan::failed_check_holds(
         project,
         plan,
@@ -3065,14 +2998,7 @@ fn plan_nudge(
             held_count
         )
     };
-    let mut line = if !asks.is_empty() {
-        let next = next.expect("open asks require an independent step");
-        format!(
-            "{} Rolf has an unanswered ask; independent step {} is ready. Start only work that does not require that answer.",
-            steps::TICKER_PROMPT_PREFIX,
-            next.id
-        )
-    } else if let Some(next) = next {
+    let mut line = if let Some(next) = next {
         format!(
             "{} Nothing is running and {}. Next: {} {}. Start work that can proceed without Rolf's reply. If you are waiting for his reply in chat, keep waiting.",
             steps::TICKER_PROMPT_PREFIX,
@@ -3246,7 +3172,7 @@ fn tick_slow_with_steps(
 
     stop_after_state!("session notice");
     errors.extend(steps::session_notice(project, &mut state, seen.session_lost).err());
-    // D5 recovery and delivery (X1 to X5), then asks (D6, D17, D18).
+    // D5 recovery and delivery (X1 to X5).
     // Reviews ran immediately after courier import. Each takes the project
     // lock only for its own file writes.
     stop_after_state!("ops");
@@ -3255,7 +3181,6 @@ fn tick_slow_with_steps(
             .err()
             .map(|e| e.context("ops")),
     );
-    errors.extend(crate::ask::tick(ctx, project).err());
     errors.extend(crate::threads::park_completed(ctx, project).err());
     stop_after_state!("plan nudge");
     errors.extend(plan_nudge(project, &herdr, &seen.agents, &mut state).err());
@@ -6023,76 +5948,7 @@ mod tests {
     }
 
     #[test]
-    fn an_open_ask_allows_only_independent_steps_and_answer_rearms_normal_nudge() {
-        let (f, runner, agent) = nudge_setup();
-        let ctx = Ctx {
-            env: &f.env,
-            root: f.root.clone(),
-            config_dir: f.root.join("cfg"),
-            runner: &runner,
-            detached_ticker: false,
-        };
-        crate::prompt::record_test_request(&f.project, "q-100", "Go").unwrap();
-        let task = crate::task::add(
-            &f.project,
-            "Call for Rolf",
-            vec!["request:q-100".into()],
-            vec!["Decide".into()],
-            None,
-            None,
-        )
-        .unwrap();
-        crate::plan::step_add(
-            &ctx,
-            "demo",
-            "Ask-tied",
-            vec![task.id.clone()],
-            vec![],
-            None,
-        )
-        .unwrap();
-        crate::plan::step_add(&ctx, "demo", "Dependent", vec![], vec!["s-1".into()], None).unwrap();
-        crate::plan::step_add(&ctx, "demo", "Independent", vec![], vec![], None).unwrap();
-        let ask = crate::ask::ask(
-            &ctx,
-            "demo",
-            crate::ask::NewAsk {
-                question: "Which?".into(),
-                choices: vec!["One".into(), "Two".into()],
-                what: None,
-                means: None,
-                task: Some(task.id),
-            },
-        )
-        .unwrap();
-        nudge_pass(&f, &runner, std::slice::from_ref(&agent));
-        nudge_pass(&f, &runner, std::slice::from_ref(&agent));
-        assert_eq!(runner.count("agent prompt"), 1);
-        let prompts = runner.calls.borrow();
-        let line = prompts
-            .iter()
-            .find(|call| call.display().contains("independent step"))
-            .unwrap()
-            .display();
-        assert!(line.contains("independent step s-3 is ready"));
-        assert!(line.contains("Start only work that does not require that answer"));
-        assert!(!line.contains("s-1"));
-        assert!(!line.contains("s-2"));
-        drop(prompts);
-        crate::ask::answer(&ctx, "demo", &ask.id, ask.revision, 1, "Rolf").unwrap();
-        nudge_pass(&f, &runner, &[agent]);
-        assert_eq!(runner.count("agent prompt"), 2);
-        assert!(
-            runner
-                .calls
-                .borrow()
-                .iter()
-                .any(|call| call.display().contains("Next: s-1 Ask-tied"))
-        );
-    }
-
-    #[test]
-    fn plan_nudge_skips_ask_review_running_done_unbound_and_busy() {
+    fn plan_nudge_skips_review_running_done_unbound_and_busy() {
         let (f, runner, mut agent) = nudge_setup();
         let ctx = Ctx {
             env: &f.env,
@@ -6117,21 +5973,7 @@ mod tests {
             t.status = thread::Status::Resolved
         })
         .unwrap();
-        let ask = crate::ask::ask(
-            &ctx,
-            "demo",
-            crate::ask::NewAsk {
-                question: "Which?".into(),
-                choices: vec!["One".into(), "Two".into()],
-                what: None,
-                means: None,
-                task: None,
-            },
-        )
-        .unwrap();
-        nudge_pass(&f, &runner, std::slice::from_ref(&agent));
         assert_eq!(runner.count("agent prompt"), 0);
-        crate::ask::withdraw(&ctx, "demo", &ask.id, "No longer needed", "Rolf").unwrap();
         let review = crate::review::Review {
             id: "review-1".into(),
             repo: String::new(),

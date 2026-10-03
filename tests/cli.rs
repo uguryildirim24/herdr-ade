@@ -15,78 +15,6 @@ fn hp(home: &Path, args: &[&str]) -> std::process::Output {
 }
 
 #[test]
-fn withdraw_commands_keep_history_and_ask_output_starts_with_id() {
-    let home = tempfile::tempdir().unwrap();
-    let root = home.path().join("root");
-    let run = |args: &[&str]| {
-        Command::new(BIN)
-            .env_clear()
-            .env("HOME", home.path())
-            .env("USER", "rolf")
-            .args(["--root", root.to_str().unwrap()])
-            .args(args)
-            .output()
-            .unwrap()
-    };
-    assert!(run(&["new", "demo"]).status.success());
-    let ask_args = [
-        "ask",
-        "demo",
-        "May I spend\n five dollars on this check?",
-        "--choice",
-        "Keep it running.",
-        "--choice",
-        "Stop it now.",
-    ];
-    let asked = run(&ask_args);
-    assert!(
-        asked.status.success(),
-        "{}",
-        String::from_utf8_lossy(&asked.stderr)
-    );
-    let text = String::from_utf8(asked.stdout).unwrap();
-    assert_eq!(text.lines().count(), 1);
-    assert!(text.starts_with("a-1 revision 1:"));
-    assert!(text.contains("1. Keep it running."));
-    let duplicate = run(&ask_args);
-    assert!(!duplicate.status.success());
-    assert!(String::from_utf8_lossy(&duplicate.stderr).contains("ask_duplicate: `a-1`"));
-    let withdrawn = run(&[
-        "ask",
-        "close",
-        "demo",
-        "a-1",
-        "--withdraw",
-        "No longer needed.",
-    ]);
-    assert!(
-        withdrawn.status.success(),
-        "{}",
-        String::from_utf8_lossy(&withdrawn.stderr)
-    );
-    assert!(root.join("demo/.state/asks/a-1/r1.toml").is_file());
-    let record =
-        std::fs::read_to_string(root.join("demo/.state/asks/a-1/r1.withdrawn.toml")).unwrap();
-    assert!(record.contains("by = \"rolf\""));
-    assert!(run(&ask_args).status.success());
-    assert!(
-        run(&["ask", "close", "demo", "a-2", "--choice", "1",])
-            .status
-            .success()
-    );
-    let refused = run(&[
-        "ask",
-        "close",
-        "demo",
-        "a-2",
-        "--withdraw",
-        "No longer needed.",
-    ]);
-    assert!(!refused.status.success());
-    assert!(String::from_utf8_lossy(&refused.stderr).contains("answered ask cannot be withdrawn"));
-}
-
-#[test]
 fn notes_and_tasks_accept_a_request_from_another_project() {
     let home = tempfile::tempdir().unwrap();
     let root = home.path().join("root");
@@ -425,7 +353,6 @@ fn every_named_verb_returns_a_structured_refusal() {
     let cases: &[&[&str]] = &[
         &["review", "missing"],
         &["thread", "show", "missing", "t-1"],
-        &["ask"],
         &["plan", "show", "missing"],
         &["done", "--report", "report.md", "--sha", "deadbeef"],
         &["thread", "resolve", "missing", "t-1"],

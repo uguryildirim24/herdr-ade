@@ -276,30 +276,6 @@ enum Command {
         #[command(subcommand)]
         command: HarnessCommand,
     },
-    /// Ask Rolf a question with two to four choices he can picture
-    #[command(
-        args_conflicts_with_subcommands = true,
-        allow_missing_positional = true
-    )]
-    Ask {
-        /// Project slug (required when creating a question)
-        #[arg(value_name = "PROJECT")]
-        slug: Option<String>,
-        #[command(subcommand)]
-        command: Option<AskCommand>,
-        question: Option<String>,
-        #[arg(long = "choice", value_name = "SENTENCE")]
-        choices: Vec<String>,
-        /// One sentence: what happened
-        #[arg(long)]
-        what: Option<String>,
-        /// One sentence: what it means for Rolf
-        #[arg(long)]
-        means: Option<String>,
-        /// Drop this ask when the task closes
-        #[arg(long, value_name = "TASK_ID")]
-        task: Option<String>,
-    },
     /// The plan card: goal, end result and steps
     Plan {
         #[command(subcommand)]
@@ -464,96 +440,9 @@ enum PlanStepCommand {
     },
 }
 
-#[derive(Subcommand)]
-enum AskCommand {
-    /// Answer or withdraw an open ask
-    Close {
-        #[arg(value_name = "PROJECT")]
-        slug: String,
-        id: String,
-        /// Choice number (0 means not understood), or exact choice sentence
-        #[arg(long, conflicts_with = "withdraw")]
-        choice: Option<String>,
-        /// Reason for withdrawing instead of answering
-        #[arg(long, conflicts_with = "choice")]
-        withdraw: Option<String>,
-    },
-}
-
 fn run_project_commands(ctx: &Ctx, command: Command) -> Result<()> {
-    use crate::{ask, plan};
+    use crate::plan;
     match command {
-        Command::Ask {
-            slug,
-            command,
-            question,
-            choices,
-            what,
-            means,
-            task,
-        } => match command {
-            Some(AskCommand::Close {
-                slug,
-                id,
-                choice: None,
-                withdraw: Some(reason),
-            }) => {
-                let by = ctx
-                    .env
-                    .var("USER")
-                    .context("USER is required to record who withdrew the ask")?;
-                ask::withdraw(ctx, &slug, &id, &reason, by)?;
-                crate::output::insert("ask", id.clone());
-                println!("{id} withdrawn: {reason}");
-                Ok(())
-            }
-            Some(AskCommand::Close {
-                slug,
-                id,
-                choice: Some(choice),
-                withdraw: None,
-            }) => {
-                let project = crate::project::Project::load(&ctx.root, &slug)?;
-                let revision = ask::latest_revision(&project, &id);
-                let answer = ask::answer_text(ctx, &slug, &id, revision, &choice, "command")?;
-                crate::output::success(
-                    Some("answered"),
-                    &serde_json::json!({ "ask": id, "answer": answer }),
-                    &format!(
-                        "{} revision {}: {} ({})\n",
-                        answer.id, answer.revision, answer.choice, answer.text
-                    ),
-                    "",
-                )
-            }
-            None => {
-                let slug = slug.context("a project slug is required")?;
-                let question = question.context("a question is required")?;
-                let a = ask::ask(
-                    ctx,
-                    &slug,
-                    ask::NewAsk {
-                        question,
-                        choices,
-                        what,
-                        means,
-                        task,
-                    },
-                )?;
-                crate::output::insert("ask", a.id.clone());
-                println!(
-                    "{} revision {}: {}",
-                    a.id,
-                    a.revision,
-                    ask::numbered(&a)
-                        .split_whitespace()
-                        .collect::<Vec<_>>()
-                        .join(" ")
-                );
-                Ok(())
-            }
-            Some(AskCommand::Close { .. }) => anyhow::bail!("pass --choice or --withdraw"),
-        },
         Command::Plan { command } => match command {
             PlanCommand::Show { slug } => {
                 crate::review::classify_old_seals(ctx, &Project::load(&ctx.root, &slug)?, true)?;
@@ -1133,8 +1022,6 @@ fn machine_outcome(command: &str) -> String {
         "thread ack" => "acknowledged",
         "thread list" => "listed",
         "thread show" => "shown",
-        "ask" => "asked",
-        "ask close" => "closed",
         "done" | "waiting" | "failed" => "sealed",
         "doctor" => "healthy",
         "harness install" => "installed",
@@ -1987,9 +1874,7 @@ fn dispatch_with_start(
             }
             Ok(())
         }
-        command @ (Command::Ask { .. } | Command::Plan { .. }) => {
-            run_project_commands(&ctx, command)
-        }
+        command @ Command::Plan { .. } => run_project_commands(&ctx, command),
         Command::Review {
             slug,
             repo,
@@ -2252,18 +2137,6 @@ mod tests {
             ])
             .is_ok()
         );
-        assert!(
-            Cli::try_parse_from([
-                "herdr-ade",
-                "ask",
-                "close",
-                "demo",
-                "a-1",
-                "--choice",
-                "Take the first option."
-            ])
-            .is_ok()
-        );
     }
 
     #[test]
@@ -2313,24 +2186,6 @@ mod tests {
                 "plan", "step", "move", "demo", "s-1", "--before", "s-2", "--expect", "1",
             ],
             &["plan", "sync", "demo"],
-            &[
-                "ask",
-                "demo",
-                "Can this run now?",
-                "--choice",
-                "Run it now.",
-                "--choice",
-                "Wait for later.",
-            ],
-            &[
-                "ask",
-                "close",
-                "demo",
-                "a-1",
-                "--withdraw",
-                "No longer needed.",
-            ],
-            &["ask", "close", "demo", "a-1", "--choice", "1"],
         ];
         for args in cases {
             let mut argv = vec!["herdr-ade"];
@@ -2339,7 +2194,6 @@ mod tests {
         }
 
         let refused_old_forms: &[&[&str]] = &[
-            &["ask", "withdraw", "a-1", "No longer needed."],
             &[
                 "plan",
                 "step",
