@@ -7,7 +7,6 @@ use anyhow::{Context, Result, bail};
 use crate::herdr::{Agent, Herdr};
 use crate::paths::{self, Ctx, SessionFlags};
 use crate::project::{self, Project};
-use crate::runner::Cmd;
 use crate::thread::{self, Kind, Status, Thread};
 use crate::{coordinator, threads, ticker};
 
@@ -52,15 +51,10 @@ pub(crate) fn adoptable_agent(ctx: &Ctx, herdr: &Herdr, socket: &str, pane: &str
 }
 
 fn require_non_git_cwd(ctx: &Ctx, cwd: &str) -> Result<()> {
-    let out = ctx
-        .runner
-        .run(&Cmd::new("git", Duration::from_secs(5)).args([
-            "-C",
-            cwd,
-            "rev-parse",
-            "--show-toplevel",
-        ]))?;
-    if out.success() {
+    if crate::repo::Git::new(ctx.runner, cwd)
+        .with_timeout(Duration::from_secs(5))
+        .is_repository()?
+    {
         bail!("Git-backed adoption is not supported; start a lane with `thread start` instead");
     }
     Ok(())
@@ -312,8 +306,8 @@ pub(crate) fn adopt_workspace(ctx: &Ctx, args: &AdoptWorkspace) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::runner::Runner;
     use crate::runner::fake::ok;
+    use crate::runner::{Cmd, Runner};
     use crate::scenarios::{World, agent_json};
     use std::path::Path;
 

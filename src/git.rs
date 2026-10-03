@@ -8,9 +8,10 @@ use std::fs::File;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result};
 
-use crate::runner::{Cmd, Runner};
+use crate::repo::Git;
+use crate::runner::Runner;
 
 const GIT_TIMEOUT: Duration = Duration::from_secs(20);
 
@@ -20,30 +21,6 @@ pub(crate) struct RepoLock {
     _file: File,
     #[allow(dead_code)]
     pub(crate) common_dir: PathBuf,
-}
-
-fn git(runner: &dyn Runner, repo: &str, args: &[&str], timeout: Duration) -> Result<String> {
-    Ok(git_raw(runner, repo, args, timeout)?.trim().to_string())
-}
-
-// Porcelain status has significant leading spaces and NUL-framed paths.
-fn git_raw(runner: &dyn Runner, repo: &str, args: &[&str], timeout: Duration) -> Result<String> {
-    let out = runner.run(
-        &Cmd::new("git", timeout)
-            .args(["-C", repo])
-            .args(args.iter().copied()),
-    )?;
-    if out.timed_out {
-        bail!(
-            "git {}: timed out; repo activity at timeout: {}",
-            args.join(" "),
-            repo_activity(repo)
-        );
-    }
-    if !out.success() {
-        bail!("git {}: {}", args.join(" "), out.error_text());
-    }
-    Ok(out.stdout)
 }
 
 /// Snapshot the repository without invoking git again: the timed-out git may
@@ -120,12 +97,9 @@ pub(crate) fn repo_activity(repo: &str) -> String {
 
 /// Absolute `git-common-dir` for `repo`.
 pub(crate) fn common_dir(runner: &dyn Runner, repo: &str) -> Result<PathBuf> {
-    let raw = git(
-        runner,
-        repo,
-        &["rev-parse", "--git-common-dir"],
-        Duration::from_secs(5),
-    )?;
+    let raw = Git::new(runner, repo)
+        .with_timeout(Duration::from_secs(5))
+        .run(&["rev-parse", "--git-common-dir"])?;
     let path = PathBuf::from(&raw);
     if path.is_absolute() {
         Ok(path)
@@ -156,7 +130,9 @@ pub(crate) fn lock(runner: &dyn Runner, repo: &str) -> Result<RepoLock> {
 /// `git worktree remove` without `--force`. Callers run ADE's stricter status
 /// inspection first because Git itself permits deletion of ignored files.
 pub(crate) fn worktree_remove(runner: &dyn Runner, repo: &str, path: &str) -> Result<()> {
-    git(runner, repo, &["worktree", "remove", path], GIT_TIMEOUT)?;
+    Git::new(runner, repo)
+        .with_timeout(GIT_TIMEOUT)
+        .run(&["worktree", "remove", path])?;
     Ok(())
 }
 
@@ -164,12 +140,9 @@ pub(crate) fn worktree_remove(runner: &dyn Runner, repo: &str, path: &str) -> Re
 /// immediately makes manual removal idempotent instead of retaining Git's
 /// default grace-period entry.
 pub(crate) fn worktree_prune(runner: &dyn Runner, repo: &str) -> Result<()> {
-    git(
-        runner,
-        repo,
-        &["worktree", "prune", "--expire=now"],
-        GIT_TIMEOUT,
-    )?;
+    Git::new(runner, repo)
+        .with_timeout(GIT_TIMEOUT)
+        .run(&["worktree", "prune", "--expire=now"])?;
     Ok(())
 }
 
@@ -181,89 +154,35 @@ pub(crate) fn worktree_status_with_ignored(
     repo: &str,
     path: &str,
 ) -> Result<String> {
-    git_raw(
-        runner,
-        repo,
-        &[
-            "-C",
-            path,
-            "status",
-            "--porcelain",
-            "--ignored",
-            "--untracked-files=all",
-            "-z",
-        ],
-        GIT_TIMEOUT,
-    )
+    Git::new(runner, repo).with_timeout(GIT_TIMEOUT).stdout(&[
+        "-C",
+        path,
+        "status",
+        "--porcelain",
+        "--ignored",
+        "--untracked-files=all",
+        "-z",
+    ])
 }
 
 /// The branch checked out in the repository's main checkout.
 pub(crate) fn symbolic_head(runner: &dyn Runner, repo: &str) -> Result<String> {
-    git(
-        runner,
-        repo,
-        &["symbolic-ref", "--short", "HEAD"],
-        Duration::from_secs(5),
-    )
+    Git::new(runner, repo)
+        .with_timeout(Duration::from_secs(5))
+        .run(&["symbolic-ref", "--short", "HEAD"])
 }
 
 /// SHA of `refs/heads/<branch>`, or of any ref name passed in.
 pub(crate) fn rev_parse(runner: &dyn Runner, repo: &str, rev: &str) -> Result<String> {
-    git(runner, repo, &["rev-parse", rev], Duration::from_secs(5))
-}
-
-/// A typed ancestry answer: 0 is yes, 1 with empty stderr is no; other exits,
-/// diagnostics on a negative result, signals, timeouts and spawn errors fail.
-/// A normal no is a result, not an error.
-pub(crate) fn is_ancestor(
-    runner: &dyn Runner,
-    repo: &str,
-    ancestor: &str,
-    descendant: &str,
-) -> Result<bool> {
-    let out = runner.run(&Cmd::new("git", GIT_TIMEOUT).args([
-        "-C",
-        repo,
-        "merge-base",
-        "--is-ancestor",
-        ancestor,
-        descendant,
-    ]))?;
-    out.boolean_answer().with_context(|| {
-        format!(
-            "`git merge-base --is-ancestor {ancestor} {descendant}` failed: exit={:?}, {}",
-            out.code,
-            out.error_text()
-        )
-    })
-}
-
-/// Query an optional local branch without conflating an absent ref with a git
-/// error. `for-each-ref` answers absence with empty output; every nonzero exit
-/// still means the query failed. Match the full name (git also lists prefixes).
-pub(crate) fn branch_head(runner: &dyn Runner, repo: &str, branch: &str) -> Result<Option<String>> {
-    // Keep the local-branch namespace even when the supplied name starts
-    // with `refs/`: review and worktree callers use short branch names.
-    let want = format!("refs/heads/{branch}");
-    let rows = git(
-        runner,
-        repo,
-        &["for-each-ref", "--format=%(refname) %(objectname)", &want],
-        Duration::from_secs(5),
-    )?;
-    Ok(rows.lines().find_map(|row| {
-        let (name, sha) = row.split_once(' ')?;
-        (name == want).then(|| sha.to_string())
-    }))
+    Git::new(runner, repo)
+        .with_timeout(Duration::from_secs(5))
+        .run(&["rev-parse", rev])
 }
 
 pub(crate) fn exclude_plugin_paths_locked(runner: &dyn Runner, repo: &str) -> Result<()> {
-    let exclude = git(
-        runner,
-        repo,
-        &["rev-parse", "--git-path", "info/exclude"],
-        Duration::from_secs(5),
-    )?;
+    let exclude = Git::new(runner, repo)
+        .with_timeout(Duration::from_secs(5))
+        .run(&["rev-parse", "--git-path", "info/exclude"])?;
     let path = if Path::new(&exclude).is_absolute() {
         PathBuf::from(&exclude)
     } else {
@@ -291,8 +210,8 @@ pub(crate) fn exclude_plugin_paths_locked(runner: &dyn Runner, repo: &str) -> Re
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::runner::RealRunner;
     use crate::runner::fake::{FakeRunner, fail};
+    use crate::runner::{Cmd, RealRunner};
 
     #[test]
     fn ancestry_errors_are_not_negative_answers() {
@@ -315,12 +234,12 @@ mod tests {
             let fake = FakeRunner::new();
             fake.on("merge-base --is-ancestor", output);
             let runner = fake;
-            assert!(is_ancestor(&runner, "/repo", "a", "b").is_err());
+            assert!(Git::new(&runner, "/repo").is_ancestor("a", "b").is_err());
         }
 
         let fake = FakeRunner::new();
         fake.on_fn(|_| true, |_| Err(anyhow::anyhow!("could not spawn git")));
-        assert!(is_ancestor(&fake, "/repo", "a", "b").is_err());
+        assert!(Git::new(&fake, "/repo").is_ancestor("a", "b").is_err());
     }
 
     #[test]
@@ -336,7 +255,8 @@ mod tests {
                 ..Default::default()
             },
         );
-        let error = branch_head(&fake, &repo.to_string_lossy(), "main")
+        let error = Git::new(&fake, &repo)
+            .branch_head("main")
             .unwrap_err()
             .to_string();
         assert!(
@@ -351,33 +271,19 @@ mod tests {
         let (_dir, repo) = repo_with_commit();
         let root = tempfile::tempdir().unwrap();
         let runner = RealRunner;
-        let repo_s = repo.to_string_lossy();
-        assert!(
-            branch_head(&runner, &repo_s, "cloud-only")
-                .unwrap()
-                .is_none()
-        );
-        assert!(branch_head(&runner, &repo_s, "main").unwrap().is_some());
+        let git = Git::new(&runner, &repo);
+        assert!(git.branch_head("cloud-only").unwrap().is_none());
+        assert!(git.branch_head("main").unwrap().is_some());
         // Callers supply a local branch name, not an arbitrary ref. In
         // particular a tag must not pass integration-branch validation.
-        git(&runner, &repo_s, &["tag", "release"], GIT_TIMEOUT).unwrap();
+        git.run(&["tag", "release"]).unwrap();
         for name in ["refs/tags/release", "refs/heads/main"] {
-            assert!(branch_head(&runner, &repo_s, name).unwrap().is_none());
+            assert!(git.branch_head(name).unwrap().is_none());
         }
         // A prefix match is not the requested branch.
-        git(
-            &runner,
-            &repo_s,
-            &["branch", "cloud-only/child"],
-            GIT_TIMEOUT,
-        )
-        .unwrap();
-        assert!(
-            branch_head(&runner, &repo_s, "cloud-only")
-                .unwrap()
-                .is_none()
-        );
-        assert!(branch_head(&runner, &root.path().to_string_lossy(), "main").is_err());
+        git.run(&["branch", "cloud-only/child"]).unwrap();
+        assert!(git.branch_head("cloud-only").unwrap().is_none());
+        assert!(Git::new(&runner, root.path()).branch_head("main").is_err());
     }
 
     fn repo_with_commit() -> (tempfile::TempDir, PathBuf) {
@@ -423,20 +329,17 @@ mod tests {
         let (_dir, repo) = repo_with_commit();
         let repo_s = repo.to_string_lossy().into_owned();
         let wt = repo.join(".worktrees/t-0001");
-        git(
-            &RealRunner,
-            &repo_s,
-            &[
+        Git::new(&RealRunner, &repo)
+            .with_timeout(GIT_TIMEOUT)
+            .run(&[
                 "worktree",
                 "add",
                 &wt.to_string_lossy(),
                 "-b",
                 "lane/t-0001",
                 "main",
-            ],
-            GIT_TIMEOUT,
-        )
-        .unwrap();
+            ])
+            .unwrap();
         assert!(wt.is_dir());
         assert!(wt.join("README").is_file());
         worktree_remove(&RealRunner, &repo_s, &wt.to_string_lossy()).unwrap();

@@ -1019,36 +1019,22 @@ pub(crate) fn lock(config_dir: &Path) -> Result<InstallLock> {
 }
 
 fn repo_head(ctx: &Ctx, repo: &str) -> Result<String> {
-    let out = ctx.runner.run(&Cmd::new("git", VERSION_TIMEOUT).args([
-        "-C",
-        repo,
-        "rev-parse",
-        "HEAD",
-    ]))?;
-    if !out.success() || out.stdout.trim().is_empty() {
-        bail!(
-            "harness_build_head: could not read HEAD in {repo}: {}",
-            out.error_text()
-        );
+    let head = crate::repo::Git::new(ctx.runner, repo)
+        .with_timeout(VERSION_TIMEOUT)
+        .run(&["rev-parse", "HEAD"])
+        .with_context(|| format!("harness_build_head: could not read HEAD in {repo}"))?;
+    if head.is_empty() {
+        bail!("harness_build_head: empty HEAD in {repo}");
     }
-    Ok(out.stdout.trim().to_string())
+    Ok(head)
 }
 
 fn repo_clean(ctx: &Ctx, repo: &str) -> Result<bool> {
-    let out = ctx.runner.run(&Cmd::new("git", VERSION_TIMEOUT).args([
-        "-C",
-        repo,
-        "status",
-        "--porcelain",
-        "--untracked-files=normal",
-    ]))?;
-    if !out.success() {
-        bail!(
-            "harness_build_status: could not inspect {repo}: {}",
-            out.error_text()
-        );
-    }
-    Ok(out.stdout.trim().is_empty())
+    let status = crate::repo::Git::new(ctx.runner, repo)
+        .with_timeout(VERSION_TIMEOUT)
+        .stdout(&["status", "--porcelain", "--untracked-files=normal"])
+        .with_context(|| format!("harness_build_status: could not inspect {repo}"))?;
+    Ok(status.is_empty())
 }
 
 fn local_process_proofs(ctx: &Ctx, plugin_version: Option<&str>) -> Result<Vec<ProcessProof>> {

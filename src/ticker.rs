@@ -1757,19 +1757,11 @@ pub(crate) fn restore_unchanged_seal(
                 .is_some_and(|line| line.split_whitespace().next() == Some(done.artifact.as_str()))
             && output.stdout.lines().count() == 2
     } else {
-        let git = |args: &[&str]| -> Result<String> {
-            let output = ctx.runner.run(
-                &crate::runner::Cmd::new("git", Duration::from_secs(20))
-                    .args(["-C", folder])
-                    .args(args.iter().copied()),
-            )?;
-            if !output.success() {
-                bail!("git seal check: {}", output.error_text());
-            }
-            Ok(output.stdout.trim().to_string())
-        };
-        git(&["rev-parse", "HEAD"])? == done.sha
-            && git(&["status", "--porcelain", "--untracked-files=all"])?.is_empty()
+        let git = crate::repo::Git::new(ctx.runner, folder).with_timeout(Duration::from_secs(20));
+        git.run(&["rev-parse", "HEAD"])? == done.sha
+            && git
+                .stdout(&["status", "--porcelain", "--untracked-files=all"])?
+                .is_empty()
             && std::fs::read(report).is_ok_and(|bytes| thread::sha256_hex(&bytes) == done.artifact)
     };
     if unchanged {
@@ -2538,18 +2530,10 @@ fn thread_pass(
                             } else {
                                 &t.worktree_path
                             };
-                            ctx.runner
-                                .run(
-                                    &crate::runner::Cmd::new("git", Duration::from_secs(5)).args([
-                                        "-C",
-                                        folder,
-                                        "rev-parse",
-                                        &format!("refs/heads/{}", t.branch),
-                                    ]),
-                                )
+                            crate::repo::Git::new(ctx.runner, folder)
+                                .with_timeout(Duration::from_secs(5))
+                                .run(&["rev-parse", &format!("refs/heads/{}", t.branch)])
                                 .ok()
-                                .filter(|out| out.success())
-                                .map(|out| out.stdout.trim().to_string())
                         }?;
                         Some(steps::LaneProgress {
                             pane: t.pane_id.clone(),

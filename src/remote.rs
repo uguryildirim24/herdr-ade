@@ -310,14 +310,10 @@ pub(crate) fn box_repo_for_route(
 /// second lane's courier calls this to fetch the lane commit (SPEC-remote
 /// §4.3); the start side pushes by URL directly.
 pub(crate) fn remote_for_url(runner: &dyn Runner, repo: &str, url: &str) -> Result<String> {
-    let out = runner.run(&Cmd::new("git", SSH_TIMEOUT).args(["-C", repo, "remote"]))?;
-    if !out.success() {
-        bail!("git remote in {repo}: {}", out.error_text());
-    }
-    for name in out.stdout.lines().map(str::trim).filter(|l| !l.is_empty()) {
-        let got = runner
-            .run(&Cmd::new("git", SSH_TIMEOUT).args(["-C", repo, "remote", "get-url", name]))?;
-        let got = got.stdout.trim().to_string();
+    let git = crate::repo::Git::new(runner, repo).with_timeout(SSH_TIMEOUT);
+    let names = git.run(&["remote"])?;
+    for name in names.lines().map(str::trim).filter(|l| !l.is_empty()) {
+        let got = git.run(&["remote", "get-url", name])?;
         if same_url(&got, url) {
             return Ok(name.to_string());
         }
@@ -872,6 +868,20 @@ publish_url = "https://github.com/uguryildirim24/herdr.git"
             .unwrap(),
             "fork"
         );
+    }
+
+    #[test]
+    fn failed_remote_url_read_cannot_match_its_stdout() {
+        let runner = FakeRunner::new();
+        runner.on(
+            "remote get-url",
+            crate::runner::Output {
+                stdout: "https://github.com/user/repo.git\n".into(),
+                ..crate::runner::fake::fail(128, "config unreadable")
+            },
+        );
+        runner.on("remote", ok("origin\n"));
+        assert!(remote_for_url(&runner, "/repo", "https://github.com/user/repo.git").is_err());
     }
 
     #[test]

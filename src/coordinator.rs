@@ -1172,23 +1172,20 @@ pub(crate) fn digest(ctx: &Ctx, project: &Project, prefix: &str) -> Result<(Stri
 /// tracking with an up-to-date remote. Document names come from that repo's
 /// root, not from ADE's project folder.
 pub(crate) fn repo_snapshot(runner: &dyn crate::runner::Runner, path: &str) -> String {
-    use crate::runner::Cmd;
-    use std::time::Duration;
-
     if !std::path::Path::new(path).is_dir() {
         return format!("{path}: missing or unreadable repository");
     }
-    let output = runner.run(&Cmd::new("git", Duration::from_secs(5)).args([
-        "-C",
-        path,
-        "status",
-        "--porcelain=v1",
-        "--branch",
-        "--ahead-behind",
-        "--untracked-files=normal",
-    ]));
+    let output = crate::repo::Git::new(runner, path)
+        .with_timeout(Duration::from_secs(5))
+        .stdout(&[
+            "status",
+            "--porcelain=v1",
+            "--branch",
+            "--ahead-behind",
+            "--untracked-files=normal",
+        ]);
     let status = match output {
-        Ok(result) if result.success() => result.stdout,
+        Ok(result) => result,
         _ => return format!("{path}: missing or unreadable repository"),
     };
     let mut lines = status.lines();
