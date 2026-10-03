@@ -680,7 +680,17 @@ fn run_with_trace(
 ) -> Result<DoctorOutcome> {
     // Provider probes are independent of both the box and local checks.
     let setup_start = Instant::now();
-    let pi_models = crate::pi::doctor::configured_routed_models(&ctx.config_dir);
+    // Policy-only lane workers deliberately have no routing catalog. Their
+    // selected adapter readiness is checked by the coordinator at placement.
+    let pi_models = if ctx
+        .config_dir
+        .join(crate::harness::BOX_WORKER_MARKER)
+        .is_file()
+    {
+        Ok(Vec::new())
+    } else {
+        crate::pi::doctor::configured_routed_models(&ctx.config_dir)
+    };
     if let Some(timings) = timings {
         timings.command(
             "pi routed model inventory (file walk)",
@@ -1742,14 +1752,21 @@ fn check_lane_bindings(
                 {
                     (None, "pane intentionally retained")
                 } else if lane.status == crate::thread::Status::Resolved {
-                    (
-                        Some(agent.is_none()),
-                        if agent.is_some() {
-                            "resolved lane still has its bound agent"
-                        } else {
-                            "resolved; no bound agent remains"
-                        },
-                    )
+                    if agent.is_none() {
+                        (Some(true), "resolved; no bound agent remains")
+                    } else if lane.cleanup_pending && lane.retirement.is_some() {
+                        (
+                            Some(false),
+                            "resolved lane still has its bound agent pending cleanup",
+                        )
+                    } else {
+                        // Completed retirement clears the request, including
+                        // --keep-pane. A retained agent alone cannot prove a leak.
+                        (
+                            None,
+                            "resolved lane retains its bound agent; retention intent unknown",
+                        )
+                    }
                 } else if !crate::thread::can_check_gone(lane, jiff::Timestamp::now()) {
                     (
                         None,
@@ -1844,8 +1861,8 @@ fn machines_to_check(
     Ok(machines)
 }
 
-/// ADE repository mapping, Git identity, selected adapter readiness and the
-/// configured disk floor. One read-only SSH snapshot.
+/// ADE repository mapping, selected adapter readiness and the configured disk
+/// floor. One read-only SSH snapshot.
 #[cfg(test)]
 fn box_rows(
     runner: &dyn Runner,
@@ -2617,7 +2634,9 @@ recipe = "claude_fable_xhigh"
         let project = project::create(home.path(), "demo", "", vec![]).unwrap();
         let lane = bound_lane(&project);
         crate::thread::update(&project, &lane.id, |lane| {
-            lane.status = crate::thread::Status::Resolved
+            lane.status = crate::thread::Status::Resolved;
+            lane.cleanup_pending = true;
+            lane.retirement = Some(Default::default());
         })
         .unwrap();
         let runner = FakeRunner::new();
@@ -2631,6 +2650,59 @@ recipe = "claude_fable_xhigh"
             ok(&LANE_AGENTS.replace("hp-demo-t-0001", "someone-else")),
         );
         assert_eq!(lane_rows(home.path(), &runner, None)[0].0, Some(true));
+    }
+
+    #[test]
+    fn completed_keep_pane_retirement_does_not_become_a_leftover_failure() {
+        let world = crate::scenarios::World::new();
+        let project = world.project("demo", "a.sock");
+        let lane = world.thread(&project, world.home.path(), |lane| {
+            lane.kind = crate::thread::Kind::Tab;
+            lane.worktree_path.clear();
+            lane.repo.clear();
+        });
+        *world.panes.borrow_mut() = format!(
+            "[{}]",
+            crate::scenarios::pane_json(&lane.workspace_id, &lane.tab_id, &lane.pane_id, &lane.cwd)
+        );
+        *world.agents.borrow_mut() = format!(
+            "[{}]",
+            crate::scenarios::agent_json(
+                &lane.workspace_id,
+                &lane.tab_id,
+                &lane.pane_id,
+                &lane.cwd,
+                &lane.agent_name,
+                "idle",
+            )
+        );
+        crate::threads::resolve(
+            &world.ctx(),
+            "demo",
+            &lane.id,
+            &crate::threads::ResolveArgs {
+                keep_pane: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let resolved = crate::thread::load(&project, &lane.id).unwrap();
+        assert_eq!(resolved.status, crate::thread::Status::Resolved);
+        assert!(resolved.retirement.is_none());
+        assert!(!resolved.cleanup_pending);
+        let mut rows = Vec::new();
+        check_lane_bindings(
+            &mut String::new(),
+            &mut |_, status, _, detail| rows.push((status, detail)),
+            &world.root,
+            ("local", "local"),
+            ("herdr", &world.runner),
+            None,
+        );
+        assert_eq!(rows[0].0, None, "{rows:?}");
+        assert!(rows[0].1.contains("retention intent unknown"), "{rows:?}");
+        assert_eq!(world.runner.count("workspace close"), 0);
+        assert_eq!(world.runner.count("tab close"), 0);
     }
 
     #[test]
@@ -2779,14 +2851,18 @@ recipe = "claude_fable_xhigh"
         .unwrap();
         let runner = runner_with_herdr("herdr 0.9.1\n");
 
-        let (text, _) = report(
-            &env,
-            &home.path().join("root"),
-            &config,
-            &SessionFlags::default(),
-            &runner,
-        );
+        let ctx = Ctx {
+            env: &env,
+            root: home.path().join("root"),
+            config_dir: config,
+            runner: &runner,
+            detached_ticker: false,
+        };
+        let outcome = run(&ctx, &SessionFlags::default()).unwrap();
+        let text = &outcome.message;
 
+        assert!(outcome.healthy, "{text}");
+        assert!(!outcome.checks.iter().any(|row| row.label == "pi"));
         assert!(text.contains("[ok  ] lane worker:"), "{text}");
         assert!(!text.contains("routing_recipe_missing"), "{text}");
         assert!(!text.contains("[FAIL] recipes:"), "{text}");
