@@ -7734,7 +7734,9 @@ mod tests {
             world.runner.on_fn(
                 |cmd| cmd.program == "ssh",
                 move |cmd| {
-                    Ok(if cmd.display().contains("if test -f") {
+                    Ok(if cmd.display().contains("HERDR_ADE_DOCTOR_INPUT") {
+                        crate::testkit::diagnostic_output(cmd, 99_999_999, None)
+                    } else if cmd.display().contains("if test -f") {
                         if reply.get() == "unreachable" {
                             fail(255, "ssh: Connection timed out")
                         } else {

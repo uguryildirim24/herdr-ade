@@ -42,6 +42,7 @@ impl World {
             sessions: Rc::new(RefCell::new("[]".into())),
             home,
         };
+        world.runner.on("df -Pk", ok("Filesystem 1024-blocks Used Available Capacity Mounted on\n/dev/fixture 200000000 1000000 199000000 1% /\n"));
         world.runner.on(
             "agent start --help",
             ok("[possible values: pi, claude, cursor, agy]"),
@@ -1685,9 +1686,9 @@ fn forty_minute_sleep_defers_dark_wakes_and_imports_seals_before_resuming_starts
             } else if cmd
                 .args
                 .last()
-                .is_some_and(|script| script.contains("disk_free_kb"))
+                .is_some_and(|script| script.contains("HERDR_ADE_DOCTOR_INPUT"))
             {
-                ok("disk_free_kb\t99999999\nOK\n")
+                crate::testkit::diagnostic_output(cmd, 99_999_999, None)
             } else {
                 ok(&manifest)
             })
@@ -1765,7 +1766,7 @@ fn forty_minute_sleep_defers_dark_wakes_and_imports_seals_before_resuming_starts
                 && cmd
                     .args
                     .last()
-                    .is_some_and(|script| script.contains("disk_free_kb"))
+                    .is_some_and(|script| script.contains("HERDR_ADE_DOCTOR_INPUT"))
         })
         .unwrap();
     assert!(

@@ -395,6 +395,7 @@ struct DependencyWait {
     detail: String,
     checked_at: i64,
     ready: bool,
+    ready_for: String,
     auth_notified: bool,
 }
 
@@ -471,8 +472,14 @@ pub(crate) fn dependency_ready(
     let path = dependency_path(root, machine, launch);
     let _lock = dependency_lock(&path)?;
     let now = jiff::Timestamp::now().as_second();
+    let ready_for = crate::thread::sha256_hex(&serde_json::to_vec(&(
+        &launch.kind,
+        &launch.args,
+        &launch.env,
+    ))?);
     let mut wait = load_dependency(&path)?;
     if wait.checked_at != 0
+        && (!wait.ready || wait.ready_for == ready_for)
         && (now.saturating_sub(wait.checked_at) < 60
             || wait.evidence.reset_at.is_some_and(|at| at > now))
     {
@@ -501,6 +508,7 @@ pub(crate) fn dependency_ready(
     match &result {
         Ok(()) => {
             wait.evidence = DependencyEvidence::default();
+            wait.ready_for = ready_for;
             wait.detail.clear();
             wait.auth_notified = false;
         }
@@ -651,6 +659,23 @@ mod tests {
             }
         });
         assert_eq!(probes.load(Ordering::SeqCst), 2);
+        // A provider wait may be shared, but one model's success cannot prove
+        // a different selected model is ready. Equivalent recipes still share.
+        let mut other = launch.clone();
+        other
+            .args
+            .extend(["--model".into(), "another-model".into()]);
+        dependency_ready(root.path(), "oci", &other, || {
+            probes.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        })
+        .unwrap();
+        other.recipe_id = "equivalent-recipe".into();
+        dependency_ready(root.path(), "oci", &other, || {
+            bail!("must use the exact cached success")
+        })
+        .unwrap();
+        assert_eq!(probes.load(Ordering::SeqCst), 3);
         assert_eq!((launch.work_retries, launch.same_recipe_retries), (2, 3));
     }
 
