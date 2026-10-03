@@ -88,7 +88,7 @@ impl<'a> Git<'a> {
         let out = self.output(&["rev-parse", "--show-toplevel"])?;
         match out.code {
             Some(0) => Ok(true),
-            Some(128) if out.stderr.contains("fatal: not a git repository") => Ok(false),
+            Some(128) if out.stderr.starts_with("fatal: not a git repository") => Ok(false),
             _ => bail!(
                 "could not inspect repository: exit={:?}, {}",
                 out.code,
@@ -326,6 +326,20 @@ mod tests {
                 Some(false),
             ),
             (fail(128, "fatal: detected dubious ownership"), None),
+            (
+                fail(
+                    128,
+                    "fatal: detected dubious ownership in repository at '/tmp/fatal: not a git repository'",
+                ),
+                None,
+            ),
+            (
+                fail(
+                    128,
+                    "fatal: cannot change to 'fatal: not a git repository': No such file or directory",
+                ),
+                None,
+            ),
             (fail(1, "object database error"), None),
             (timeout(), None),
             (Output::default(), None),
