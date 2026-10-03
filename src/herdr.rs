@@ -655,7 +655,11 @@ impl<'a> Herdr<'a> {
     /// blocked state, including this adapter-owned one.
     pub(crate) fn pane_submit_text(&self, pane: &str, text: &str) -> Result<(), HerdrError> {
         self.call(&["pane", "send-text", pane, text], CALL_TIMEOUT)?;
-        self.call(&["pane", "send-keys", pane, "Enter"], CALL_TIMEOUT)
+        self.pane_send_keys(pane, "Enter")
+    }
+
+    pub(crate) fn pane_send_keys(&self, pane: &str, key: &str) -> Result<(), HerdrError> {
+        self.call(&["pane", "send-keys", pane, key], CALL_TIMEOUT)
             .map(|_| ())
     }
 
