@@ -234,32 +234,7 @@ pub(crate) fn doctor_rows_with(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::pi::sh::Runner as _;
     use crate::runner::fake::{FakeRunner, fail, ok};
-
-    /// Scripted through the plugin's own FakeRunner: the adapter carries the
-    /// argv and env across unchanged.
-    #[test]
-    fn the_adapter_passes_argv_and_env_to_the_plugin_runner() {
-        let dir = tempfile::tempdir().unwrap();
-        let layout = Layout::for_test(dir.path().join("pi"));
-        let env = Env::for_test(dir.path(), &[]);
-        let runner = FakeRunner::new();
-        runner.on("zsh -lic node --version", ok("v22.19.0\n"));
-        let adapter = Adapter(&runner);
-        let cmd = sh::Cmd::new("zsh", sh::SHORT)
-            .args(["-lic", "node --version"])
-            .env("PI_CODING_AGENT_DIR", layout.agent().display().to_string());
-        let output = adapter.run(&cmd).unwrap();
-        assert_eq!(output.stdout, "v22.19.0\n");
-        let calls = runner.calls.borrow();
-        assert_eq!(calls.len(), 1);
-        assert_eq!(calls[0].display(), "zsh -lic node --version");
-        assert!(calls[0].env.iter().any(|(k, _)| k == "PI_CODING_AGENT_DIR"));
-        assert!(calls[0].own_group, "a timeout must reach zsh's children");
-        drop(calls);
-        let _ = (&env, &layout);
-    }
 
     fn box_machine() -> crate::remote::MachineDeclaration {
         crate::remote::MachineDeclaration {

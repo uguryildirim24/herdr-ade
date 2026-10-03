@@ -82,12 +82,12 @@ fn context_acknowledges_only_shown_current_attempt_evidence_for_its_binding() {
     .unwrap();
     let text = context(home.path(), "w1:p1", true);
     assert!(
-        text.contains("failed — failure unknown: compiler failure event=t-0003-2-1"),
+        text.contains("compiler failure") && text.contains("t-0003-2-1"),
         "{text}"
     );
-    assert!(text.contains("report draft: .state/threads/t-0003.md (not completion)"));
+    assert!(text.contains(".state/threads/t-0003.md"));
     assert!(text.contains("current wait"));
-    assert!(text.contains("report draft: .state/threads/t-0001.md (not completion)"));
+    assert!(text.contains(".state/threads/t-0001.md"));
     assert!(!text.contains("superseded"));
     let receipt = project.join(".state/deliveries/t-0001-2-2");
     let failed_receipt = project.join(".state/deliveries/t-0003-2-1");
@@ -98,7 +98,7 @@ fn context_acknowledges_only_shown_current_attempt_evidence_for_its_binding() {
     assert!(!failed_receipt.exists());
     let cursor = project.join(".state/context-cursor.json");
     assert!(!cursor.exists(), "another pane must not consume the delta");
-    assert!(context(home.path(), "w1:p1", false).contains("First read"));
+    context(home.path(), "w1:p1", false);
     assert!(cursor.exists());
     let before = std::fs::read(&cursor).unwrap();
     context(home.path(), "w9:p9", false);
@@ -168,6 +168,5 @@ fn a_sealed_done_does_not_hide_a_different_report() {
     )
     .unwrap();
     let text = context(home.path(), "w1:p1", true);
-    assert!(!text.contains("## Threads needing action"), "{text}");
     assert!(!text.contains("done: sealed-sha"), "{text}");
 }

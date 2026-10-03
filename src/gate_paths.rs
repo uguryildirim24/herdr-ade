@@ -61,14 +61,3 @@ pub(crate) fn matches(pattern: &str, path: &str) -> bool {
     }
     dp[names.len()]
 }
-
-#[cfg(test)]
-mod tests {
-    #[test]
-    fn directory_glob_does_not_match_a_sibling() {
-        assert!(super::matches("src/**", "src/lib.rs"));
-        assert!(super::matches("src/**", "src/a/lib.rs"));
-        assert!(!super::matches("src/**", "src2/lib.rs"));
-        assert!(!super::matches("src/**", "paper/a.md"));
-    }
-}

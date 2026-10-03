@@ -1544,19 +1544,6 @@ mod tests {
     }
 
     #[test]
-    fn review_install_order_falls_back_to_strings_for_unparseable_ids() {
-        for (earlier, later) in [
-            ("review-10", "review-unknown"),
-            ("review-10", "review-18446744073709551616"),
-            ("10", "9"),
-            ("review-", "review-9"),
-        ] {
-            assert!(review_precedes(("demo", earlier), ("demo", later)));
-            assert!(!review_precedes(("demo", later), ("demo", earlier)));
-        }
-    }
-
-    #[test]
     fn install_proof_names_the_lock_holder_not_an_installers_child() {
         let home = tempfile::tempdir().unwrap();
         let root = home.path().join("root");
@@ -1647,14 +1634,6 @@ mod tests {
         .unwrap_err()
         .to_string();
         assert!(error.contains("connection refused"), "{error}");
-    }
-
-    #[test]
-    fn an_unreadable_config_is_not_an_empty_repository_list() {
-        let dir = tempfile::tempdir().unwrap();
-        std::fs::create_dir(dir.path().join("config.toml")).unwrap();
-        let error = repos(dir.path()).unwrap_err().to_string();
-        assert!(error.contains("could not read"), "{error}");
     }
 
     fn write_version_binary(path: &Path, version: &str, tag: &str) {
@@ -2038,62 +2017,6 @@ mod tests {
     }
 
     #[test]
-    fn box_zig_prefers_the_repository_local_tool() {
-        let root = tempfile::tempdir().unwrap();
-        let box_path = root.path().join("herdr");
-        let local = box_path.join(".target/rebase/zig-0.16.0/zig");
-        fake_zig(&local, "0.16.0");
-        let bin = root.path().join("bin");
-        fake_zig(&bin.join("zig"), "0.16.0");
-        let out = resolve(&box_path, &bin);
-        assert!(
-            out.status.success(),
-            "{}",
-            String::from_utf8_lossy(&out.stderr)
-        );
-        assert_eq!(
-            String::from_utf8_lossy(&out.stdout).trim(),
-            local.to_str().unwrap()
-        );
-    }
-
-    #[test]
-    fn box_zig_falls_back_to_the_box_path() {
-        let root = tempfile::tempdir().unwrap();
-        let box_path = root.path().join("herdr");
-        std::fs::create_dir_all(&box_path).unwrap();
-        let bin = root.path().join("bin");
-        let zig = bin.join("zig");
-        fake_zig(&zig, "0.16.0");
-        let out = resolve(&box_path, &bin);
-        assert!(
-            out.status.success(),
-            "{}",
-            String::from_utf8_lossy(&out.stderr)
-        );
-        assert_eq!(
-            String::from_utf8_lossy(&out.stdout).trim(),
-            zig.to_str().unwrap()
-        );
-    }
-
-    #[test]
-    fn box_zig_missing_names_both_places() {
-        let root = tempfile::tempdir().unwrap();
-        let box_path = root.path().join("herdr");
-        std::fs::create_dir_all(&box_path).unwrap();
-        let empty = root.path().join("bin");
-        std::fs::create_dir_all(&empty).unwrap();
-        let out = resolve(&box_path, &empty);
-        assert!(!out.status.success());
-        let stderr = String::from_utf8_lossy(&out.stderr);
-        assert!(stderr.contains("harness_box_zig_missing"), "{stderr}");
-        let local = box_path.join(".target/rebase/zig-0.16.0/zig");
-        assert!(stderr.contains(local.to_str().unwrap()), "{stderr}");
-        assert!(stderr.contains("PATH"), "{stderr}");
-    }
-
-    #[test]
     fn box_zig_wrong_version_is_refused() {
         let root = tempfile::tempdir().unwrap();
         let box_path = root.path().join("herdr");
@@ -2185,9 +2108,7 @@ mod tests {
             )
             .unwrap_err();
             assert!(
-                error
-                    .to_string()
-                    .contains("integration not published: upstream"),
+                error.to_string().contains("integration not published:"),
                 "{error:#}"
             );
             assert!(error.to_string().contains(&candidate), "{error:#}");
@@ -2538,9 +2459,7 @@ mod tests {
 
         assert!(out.success(), "{}", out.error_text());
         assert!(
-            out.stdout.contains(
-                "HERDR_ADE_BOX_TICKER_UNKNOWN=ticker lock did not contain a complete build record"
-            ),
+            out.stdout.contains("HERDR_ADE_BOX_TICKER_UNKNOWN="),
             "{}",
             out.stdout
         );

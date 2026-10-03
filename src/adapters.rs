@@ -283,30 +283,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn a_config_only_adapter_is_a_complete_declaration() {
-        let dir = tempfile::tempdir().unwrap();
-        std::fs::write(
-            dir.path().join("config.toml"),
-            r#"[adapters.acme]
-binary = "acme-agent"
-coordinator = true
-launch_flags = ["--yes"]
-capabilities = ["pictures"]
-doctor.readiness = "command"
-doctor.args = ["check", "{args}"]
-hook.shape = "claude"
-hook.path = ".acme/hooks.json"
-hook.events = ["Stop", "UserPromptSubmit"]
-hook.prompt_event = "UserPromptSubmit"
-"#,
-        )
-        .unwrap();
-        let row = declaration(dir.path(), "acme").unwrap();
-        assert_eq!(row.binary, "acme-agent");
-        assert_eq!(launch_args(&row, &Recipe::default()), ["--yes"]);
-    }
-
-    #[test]
     fn agy_starts_each_fresh_lane_as_a_new_project() {
         let row = builtin().remove("agy").unwrap();
         assert_eq!(

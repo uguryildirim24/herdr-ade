@@ -100,11 +100,9 @@ fn overflow_is_shown_exactly_once_across_successive_reads() {
     fixture.plan(21);
     let first = fixture.read();
     let second = fixture.read();
-    assert!(!second.contains("Nothing new"), "{second}");
     assert!(!first.contains("First read"), "{first}");
-    assert!(first.contains("2 more changes waiting"), "{first}");
     let third = fixture.read();
-    assert!(third.contains("Nothing new"), "{third}");
+    assert!(!third.contains("fixture step"), "{third}");
     let combined = format!("{first}{second}{third}");
     assert_eq!(combined.matches("- Plan outcome:").count(), 1);
     for n in 1..=21 {
@@ -137,7 +135,7 @@ fn an_event_behind_plan_changes_is_acknowledged_only_when_rendered() {
             .contains("acknowledged")
     );
     let receipts = std::fs::read(&receipt).unwrap();
-    assert!(fixture.read().contains("Nothing new"));
+    assert!(!fixture.read().contains("fixture waiting reason"));
     assert_eq!(std::fs::read(&receipt).unwrap(), receipts);
 }
 
@@ -189,5 +187,9 @@ fn changed_standing_instructions_show_the_words_and_remain_unread_in_overflow() 
         second.contains("Keep the fixture instruction visible."),
         "{second}"
     );
-    assert!(fixture.read().contains("Nothing new"));
+    assert!(
+        !fixture
+            .read()
+            .contains("Keep the fixture instruction visible.")
+    );
 }

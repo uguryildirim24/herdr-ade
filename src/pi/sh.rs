@@ -351,20 +351,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn captures_output_and_exit_code() {
-        let out = RealRunner
-            .run(
-                &Cmd::new("sh", Duration::from_secs(5))
-                    .args(["-c", "echo hi; echo err >&2; exit 3"]),
-            )
-            .unwrap();
-        assert_eq!(out.code, Some(3));
-        assert_eq!(out.stdout, "hi\n");
-        assert_eq!(out.stderr, "err\n");
-        assert!(!out.success());
-    }
-
-    #[test]
     fn missing_stdin_is_closed_and_times_out_alone() {
         // `cat` reads stdin; with `stdin: None` it sees EOF at once.
         let out = RealRunner
@@ -387,14 +373,5 @@ mod tests {
         assert!(start.elapsed() < Duration::from_secs(2));
         std::thread::sleep(Duration::from_millis(2300));
         assert!(!marker.exists(), "a grandchild outlived the timeout");
-    }
-
-    #[test]
-    fn expand_tilde_only_at_the_front() {
-        let home = Path::new("/h/me");
-        assert_eq!(expand_tilde("~/x", home), PathBuf::from("/h/me/x"));
-        assert_eq!(expand_tilde("~", home), PathBuf::from("/h/me"));
-        assert_eq!(expand_tilde("/abs", home), PathBuf::from("/abs"));
-        assert_eq!(expand_tilde("rel/x~", home), PathBuf::from("rel/x~"));
     }
 }

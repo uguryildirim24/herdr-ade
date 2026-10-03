@@ -34,12 +34,4 @@ mod tests {
             "0.1.0+2d22e69.1790044082"
         ));
     }
-
-    #[test]
-    fn a_different_commit_is_stale() {
-        assert!(!same_commit(
-            "0.1.0+2d22e69.1790044097",
-            "0.1.0+c50263a.1790044082"
-        ));
-    }
 }

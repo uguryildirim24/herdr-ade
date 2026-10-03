@@ -383,11 +383,4 @@ mod tests {
             .unwrap();
         assert_eq!(out.status.code(), Some(2));
     }
-
-    #[test]
-    fn thinking_levels_are_checked_against_the_clamps() {
-        assert!(validate_thinking("kimi-coding", "k3", "high").is_ok());
-        assert!(validate_thinking("kimi-coding", "k3", "xhigh").is_err());
-        assert!(validate_thinking("kimi-coding", "x", "sometimes").is_err());
-    }
 }

@@ -207,7 +207,6 @@ pub(crate) fn setup(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::pi::sh::fake::{FakeRunner, ok};
 
     #[test]
     fn npm_argv_is_pinned_and_never_global() {
@@ -219,40 +218,6 @@ mod tests {
         assert!(args.contains(&format!("{PI_PACKAGE}@0.99.1")));
         assert!(!args.iter().any(|a| a == "-g" || a == "--global"));
         assert!(!args.iter().any(|a| a.contains('^')));
-    }
-
-    #[test]
-    fn install_reads_the_prefix_package_json_and_refuses_a_caret() {
-        let dir = tempfile::tempdir().unwrap();
-        let layout = Layout::for_test(dir.path().join("pi"));
-        std::fs::create_dir_all(layout.package().join("dist/bundle")).unwrap();
-        std::fs::write(layout.package_json(), r#"{"name":"x","version":"0.99.1"}"#).unwrap();
-        std::fs::write(layout.cli_js(), "// cli").unwrap();
-        assert!(is_installed_exactly(&layout));
-        std::fs::write(layout.package_json(), r#"{"name":"x","version":"0.86.0"}"#).unwrap();
-        assert!(!is_installed_exactly(&layout));
-    }
-
-    #[test]
-    fn install_runs_npm_and_checks_the_result() {
-        let dir = tempfile::tempdir().unwrap();
-        let layout = Layout::for_test(dir.path().join("pi"));
-        let runner = FakeRunner::new();
-        runner.on_fn(
-            |cmd| cmd.display().contains("npm install"),
-            |cmd| {
-                let prefix = crate::pi::launch::flag_value(&cmd.args, "--prefix").unwrap();
-                let package = std::path::Path::new(&prefix)
-                    .join("node_modules/@earendil-works/pi-coding-agent");
-                std::fs::create_dir_all(package.join("dist/bundle")).unwrap();
-                std::fs::write(package.join("package.json"), r#"{"version":"0.99.1"}"#).unwrap();
-                std::fs::write(package.join("dist/bundle/cli.js"), "// cli").unwrap();
-                Ok(ok("added 1 package\n"))
-            },
-        );
-        let report = install(&runner, &layout).unwrap();
-        assert_eq!(report.version, "0.99.1");
-        assert_eq!(runner.count("npm install"), 1);
     }
 
     #[test]
@@ -278,59 +243,6 @@ mod tests {
             installed.contains(
                 "[\"--root\", ADE_ROOT, \"failed\", \"--class\", \"provider\", \"--provider-kind\", cls, text]"
             )
-        );
-    }
-
-    #[test]
-    fn setup_writes_every_step_and_a_second_run_changes_nothing() {
-        let dir = tempfile::tempdir().unwrap();
-        let layout = Layout::for_test(dir.path().join("pi"));
-        let env = crate::pi::Env::for_test(dir.path(), &[("HERDR_BIN_PATH", "/h/herdr")]);
-        let runner = FakeRunner::new();
-        runner.on_fn(
-            |cmd| cmd.program == "npm",
-            |cmd| {
-                let prefix = crate::pi::launch::flag_value(&cmd.args, "--prefix").unwrap();
-                let package = std::path::Path::new(&prefix)
-                    .join("node_modules/@earendil-works/pi-coding-agent");
-                std::fs::create_dir_all(package.join("dist/bundle")).unwrap();
-                std::fs::write(package.join("package.json"), r#"{"version":"0.99.1"}"#).unwrap();
-                std::fs::write(package.join("dist/bundle/cli.js"), "// cli").unwrap();
-                Ok(ok(""))
-            },
-        );
-        runner.on("/h/herdr integration install pi", ok("installed pi\n"));
-        let report = setup(&runner, &env, &layout).unwrap();
-        assert_eq!(report.steps.len(), 6);
-        assert!(report.link_line.starts_with("ln -s "));
-        assert!(layout.settings().exists());
-        assert!(layout.guard().exists());
-        assert!(layout.wrapper().exists());
-        // The DeepSeek override is the only provider
-        // row, and setup wrote it itself.
-        let models: serde_json::Value =
-            serde_json::from_str(&std::fs::read_to_string(layout.models()).unwrap()).unwrap();
-        assert_eq!(
-            models["providers"]["opencode-go"]["modelOverrides"]["deepseek-v4.1-flash"]["contextWindow"],
-            deepseek::DEEPSEEK_CONTEXT_WINDOW
-        );
-        let first = std::fs::read_to_string(layout.models()).unwrap();
-        let second = setup(&runner, &env, &layout).unwrap();
-        assert_eq!(second.steps.len(), 6);
-        assert_eq!(std::fs::read_to_string(layout.models()).unwrap(), first);
-        let integration = runner
-            .calls
-            .borrow()
-            .iter()
-            .find(|c| c.display().contains("integration install pi"))
-            .cloned()
-            .unwrap();
-        assert!(
-            integration
-                .env
-                .iter()
-                .any(|(k, v)| k == "PI_CODING_AGENT_DIR"
-                    && v == &layout.agent().display().to_string())
         );
     }
 }

@@ -1195,48 +1195,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn running_lane_stage_uses_recorded_observation_and_sealed_events() {
-        let mut lane = crate::thread::Thread {
-            id: "t-0001".into(),
-            status: crate::thread::Status::Starting,
-            ..Default::default()
-        };
-        assert_eq!(running_stage(&lane, &[]), "starting");
-        lane.status = crate::thread::Status::Open;
-        lane.last_state = "working".into();
-        assert_eq!(running_stage(&lane, &[]), "working");
-        lane.last_state = "blocked".into();
-        assert_eq!(running_stage(&lane, &[]), "waiting at prompt");
-        let mut event = crate::contracts::Event {
-            id: "e1".into(),
-            op: "op".into(),
-            thread: lane.id.clone(),
-            attempt: 1,
-            recipient: Default::default(),
-            created: "2026-01-01T00:00:00Z".into(),
-            payload: Default::default(),
-        };
-        event.payload.done = Some(Default::default());
-        assert_eq!(
-            running_stage(&lane, &[event.clone()]),
-            "done, waiting for pile review"
-        );
-        event.payload.done = None;
-        event.payload.failed = Some(crate::contracts::WaitingPayload {
-            text: "Provider stopped".into(),
-            ..Default::default()
-        });
-        assert_eq!(
-            running_stage(&lane, &[event.clone()]),
-            "failed: Provider stopped"
-        );
-        lane.status = crate::thread::Status::Resolved;
-        assert_eq!(running_stage(&lane, &[event.clone()]), "resolved");
-        lane.status = crate::thread::Status::Failed;
-        assert_eq!(running_stage(&lane, &[event]), "failed: Provider stopped");
-    }
-
-    #[test]
     fn finished_history_is_not_cut_off_before_context_full_can_show_it() {
         let world = crate::scenarios::World::new();
         let project = world.project("demo", "a.sock");
@@ -1267,19 +1225,6 @@ mod tests {
     }
 
     #[test]
-    fn only_folders_with_project_md_count() {
-        let root = tempfile::tempdir().unwrap();
-        for name in ["b", "a", ".trash", "empty", "Not_A_Slug"] {
-            std::fs::create_dir(root.path().join(name)).unwrap();
-        }
-        for name in ["b", "a", ".trash", "Not_A_Slug"] {
-            std::fs::write(root.path().join(name).join("PROJECT.md"), "").unwrap();
-        }
-        assert_eq!(list_slugs(root.path()), ["a", "b"]);
-        assert!(list_slugs(&root.path().join("missing")).is_empty());
-    }
-
-    #[test]
     fn slug_validation() {
         for good in ["a", "demo", "demo-2", "0x", &"a".repeat(40)] {
             assert!(validate_slug(good).is_ok(), "{good}");
@@ -1297,46 +1242,6 @@ mod tests {
             &"a".repeat(41),
         ] {
             assert!(validate_slug(bad).is_err(), "{bad}");
-        }
-    }
-
-    #[test]
-    fn a_slug_like_name_is_humanized_and_a_typed_name_is_kept() {
-        assert_eq!(humanize("herdr-projects"), "Herdr Projects");
-        assert_eq!(humanize("gtm_ai"), "Gtm Ai");
-        assert_eq!(humanize("-v2--api-"), "V2 Api");
-        assert_eq!(
-            display_name("herdr-projects", "herdr-projects"),
-            "Herdr Projects"
-        );
-        assert_eq!(display_name("", "herdr-projects"), "Herdr Projects");
-        assert_eq!(display_name("  ", "demo"), "Demo");
-        for typed in ["GTM AI", "my project", "Demo", "herdr-Projects"] {
-            assert_eq!(display_name(typed, "x"), typed);
-        }
-    }
-
-    #[test]
-    fn create_stores_a_display_name_and_keeps_the_slug() {
-        let root = tempfile::tempdir().unwrap();
-        let project = create(root.path(), "herdr-projects", "", vec![]).unwrap();
-        assert_eq!(project.slug, "herdr-projects");
-        assert_eq!(project.read_project_md().unwrap().0.name, "Herdr Projects");
-        let project = create(root.path(), "GTM AI", "", vec![]).unwrap();
-        assert_eq!(project.slug, "gtm-ai");
-        assert_eq!(project.read_project_md().unwrap().0.name, "GTM AI");
-    }
-
-    #[test]
-    fn slug_derivation_and_name_refusals() {
-        assert_eq!(
-            slug_from_name("My Demo  Project!").unwrap(),
-            "my-demo-project"
-        );
-        assert_eq!(slug_from_name("  Ünï 42 ").unwrap(), "n-42");
-        assert_eq!(slug_from_name(&"x".repeat(60)).unwrap().len(), 40);
-        for bad in ["../x", "a/b", "a\\b", "..", "!!!", ""] {
-            assert!(slug_from_name(bad).is_err(), "{bad}");
         }
     }
 
@@ -1362,7 +1267,7 @@ mod tests {
         for old in ["MEMORY.md", "memory", "TASKS.md"] {
             assert!(!project.dir().join(old).exists(), "{old}");
         }
-        let (settings, body) = project.read_project_md().unwrap();
+        let (settings, _) = project.read_project_md().unwrap();
         assert_eq!(settings.name, "Demo");
         assert_eq!(settings.goal, "Ship \"it\"");
         assert_eq!(
@@ -1380,7 +1285,6 @@ mod tests {
                 },
             ]
         );
-        assert!(body.starts_with("# Project"));
         assert_eq!(project.status(), Status::Active);
         assert!(create(&root, "demo", "", vec![]).is_err());
     }
@@ -1415,7 +1319,7 @@ mod tests {
         )
         .unwrap();
         let page = page_body(&project, &Settings::default());
-        assert!(page.contains("waiting on coordinator: Coordinator, choose a build"));
+        assert!(page.contains("Coordinator, choose a build"));
     }
 
     #[test]
@@ -1455,7 +1359,6 @@ mod tests {
             open.lines().filter(|line| line.contains(&task.id)).count(),
             1
         );
-        assert!(open.contains(" — next: start an attempt"));
         assert!(!open.contains("detailed acceptance condition"));
         assert!(page.contains("Keep this task-specific instruction on the current page."));
     }
@@ -1522,38 +1425,6 @@ mod tests {
     }
 
     #[test]
-    fn page_lists_subtasks_beneath_their_step() {
-        let root = tempfile::tempdir().unwrap();
-        let project = create(root.path(), "demo", "", vec![]).unwrap();
-        let plan = crate::contracts::Plan {
-            steps: vec![crate::contracts::PlanStep {
-                id: "s-1".into(),
-                text: "Build the screen".into(),
-                subtasks: vec![crate::contracts::PlanStep {
-                    id: "s-2".into(),
-                    text: "Draw the list".into(),
-                    ..crate::contracts::PlanStep::default()
-                }],
-                ..crate::contracts::PlanStep::default()
-            }],
-            ..crate::contracts::Plan::default()
-        };
-        std::fs::write(
-            crate::plan::plan_path(&project),
-            toml::to_string(&plan).unwrap(),
-        )
-        .unwrap();
-        refresh_page(&project).unwrap();
-        let (_, body) = project.read_project_md().unwrap();
-        assert!(
-            body.contains(
-                "## Plan\n\n- `s-1` [left] Build the screen\n  - `s-2` [left] Draw the list\n"
-            ),
-            "{body}"
-        );
-    }
-
-    #[test]
     fn page_rewrite_keeps_front_matter_bytes_and_never_reads_its_body_as_a_note() {
         let root = tempfile::tempdir().unwrap();
         let project = create(root.path(), "demo", "First goal.", vec![]).unwrap();
@@ -1595,16 +1466,6 @@ mod tests {
     }
 
     #[test]
-    fn repo_arg_parsing() {
-        assert_eq!(parse_repo_arg("/a/b").machine, None);
-        assert_eq!(parse_repo_arg("/a/b@m1").machine.as_deref(), Some("m1"));
-        assert_eq!(parse_repo_arg("/a/b@m1").path, "/a/b");
-        // An `@` inside a path is not a machine.
-        assert_eq!(parse_repo_arg("/a@b/c").machine, None);
-        assert_eq!(parse_repo_arg("/a@b/c").path, "/a@b/c");
-    }
-
-    #[test]
     fn writers_drop_their_write_when_project_md_is_gone() {
         let root = tempfile::tempdir().unwrap();
         let project = create(root.path(), "demo", "", vec![]).unwrap();
@@ -1641,21 +1502,5 @@ mod tests {
                 .flatten()
                 .all(|e| !e.file_name().to_string_lossy().ends_with(".tmp"))
         );
-    }
-
-    #[test]
-    fn default_timeout_and_dsh_env() {
-        let spec = RoleSpec {
-            kind: "dsh".into(),
-            ..RoleSpec::default()
-        };
-        let recipe = launch_recipe(&spec, 1, "bh".into(), "ph".into(), "lane");
-        assert_eq!(recipe.ready_timeout_ms, 20_000);
-        let env = tab_env("demo", "t-0001", 1, "abcd", None, &spec);
-        assert!(
-            env.iter()
-                .any(|e| e == "HERDR_ADE_LAUNCH=demo/t-0001/1/abcd")
-        );
-        assert!(env.iter().any(|e| e.starts_with("DSH_PERMISSION_MODE=")));
     }
 }

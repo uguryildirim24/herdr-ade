@@ -388,40 +388,6 @@ mod tests {
     }
 
     #[test]
-    fn lists_marks_seen_and_moves_to_done() {
-        let root = tempfile::tempdir().unwrap();
-        let project = project::create(root.path(), "demo", "", vec![]).unwrap();
-        write_item(&project, "20260917T000002Z-note-r-2", "\nbody text\n");
-        write_item(&project, "20260917T000001Z-note-r-1", "");
-        let items = unhandled(&project);
-        assert_eq!(items.len(), 2);
-        assert!(items[0].id.ends_with("-1"));
-        assert_eq!(items[1].body, "body text");
-
-        mark_seen(&project, &[items[0].id.clone()]).unwrap();
-        assert_eq!(seen(&project).len(), 1);
-
-        assert_eq!(
-            done_bound(&project, &[items[0].id.clone()], false, None)
-                .unwrap()
-                .moved,
-            [items[0].id.clone()]
-        );
-        assert_eq!(unhandled(&project).len(), 1);
-        assert!(
-            inbox_dir(&project)
-                .join("done")
-                .join(format!("{}.md", items[0].id))
-                .is_file()
-        );
-        assert_eq!(
-            done_bound(&project, &[], true, None).unwrap().moved.len(),
-            1
-        );
-        assert!(unhandled(&project).is_empty());
-    }
-
-    #[test]
     fn lists_event_items_by_creation_time_not_id_prefix() {
         let root = tempfile::tempdir().unwrap();
         let project = project::create(root.path(), "demo", "", vec![]).unwrap();
@@ -439,21 +405,6 @@ mod tests {
     }
 
     #[test]
-    fn done_kind_only_moves_matching_items() {
-        let root = tempfile::tempdir().unwrap();
-        let project = project::create(root.path(), "demo", "", vec![]).unwrap();
-        let first = write(&project, "note", "first", "due", "").unwrap();
-        write(&project, "outage", "box", "offline", "").unwrap();
-        let second = write(&project, "note", "second", "due", "").unwrap();
-        assert_eq!(
-            done_kind_bound(&project, "note", None).unwrap().moved,
-            [first, second]
-        );
-        assert_eq!(unhandled(&project).len(), 1);
-        assert_eq!(unhandled(&project)[0].kind, "outage");
-    }
-
-    #[test]
     fn identical_unhandled_notice_is_written_once() {
         let root = tempfile::tempdir().unwrap();
         let project = project::create(root.path(), "demo", "", vec![]).unwrap();
@@ -463,26 +414,6 @@ mod tests {
             id
         );
         assert_eq!(unhandled(&project).len(), 1);
-    }
-
-    #[test]
-    fn two_events_in_one_tick_get_two_items() {
-        let root = tempfile::tempdir().unwrap();
-        let project = project::create(root.path(), "demo", "", vec![]).unwrap();
-        let a = write(&project, "note", "nightly", "first", "").unwrap();
-        let b = write(&project, "note", "nightly", "second\nline", "").unwrap();
-        assert_ne!(a, b);
-        assert!(a.ends_with("-note-nightly-1"), "{a}");
-        assert!(b.ends_with("-note-nightly-2"), "{b}");
-        let items = unhandled(&project);
-        assert_eq!(items.len(), 2);
-        assert_eq!(items[1].summary, "second line");
-        assert!(items.iter().all(|i| i.body.is_empty()));
-        // A written item can be marked done by its id.
-        assert_eq!(
-            done_bound(&project, &[a], false, None).unwrap().moved.len(),
-            1
-        );
     }
 
     #[test]

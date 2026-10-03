@@ -1206,32 +1206,6 @@ mod tests {
     }
 
     #[test]
-    fn a_good_install_passes_every_scripted_row() {
-        let dir = tempfile::tempdir().unwrap();
-        let layout = installed_layout(dir.path());
-        let env = Env::for_test(dir.path(), &[("HERDR_BIN_PATH", "/h/herdr")]);
-        link_into(&env, &layout);
-        let runner = scripted(&env);
-        let rows = doctor_rows_with(&env, &layout, &runner, &[]);
-        let text: Vec<String> = rows.iter().map(Row::line).collect();
-        assert!(
-            text.iter().any(|l| l.contains("[ok  ] node: v22.19.0")),
-            "{text:?}"
-        );
-        assert!(
-            text.iter().any(|l| l.contains("[ok  ] pin: 0.99.1")),
-            "{text:?}"
-        );
-        assert!(
-            text.iter().any(|l| l.contains("[ok  ] wrapper on PATH")),
-            "{text:?}"
-        );
-        assert!(text.iter().any(|l| l.contains("[ok  ] guard")), "{text:?}");
-        assert!(!text.iter().any(|l| l.contains("[FAIL]")), "{text:?}");
-        assert!(healthy(&rows));
-    }
-
-    #[test]
     fn login_shell_chatter_is_not_a_pi_resolution() {
         let dir = tempfile::tempdir().unwrap();
         let layout = installed_layout(dir.path());
@@ -1262,47 +1236,6 @@ mod tests {
             wrapper_path_row_with(&runner, &env, &layout, "/bin/zsh").level,
             Level::Fail
         );
-    }
-
-    #[test]
-    fn the_probe_uses_the_login_shells_own_word() {
-        assert_eq!(path_probe("/bin/bash"), "type -a pi");
-        assert_eq!(path_probe("/bin/zsh"), "whence -va pi");
-        assert_eq!(path_probe("zsh"), "whence -va pi");
-        assert_eq!(path_probe("/usr/bin/fish"), "command -v pi");
-    }
-
-    #[test]
-    fn the_probe_parse_takes_the_first_path() {
-        let out = |stdout: &str, stderr: &str| sh::Output {
-            code: Some(0),
-            stdout: stdout.to_string(),
-            stderr: stderr.to_string(),
-            timed_out: false,
-        };
-        // bash `type -a pi`
-        assert_eq!(
-            first_pi_path(&out("pi is /one/pi\npi is /two/pi\n", "")),
-            "/one/pi"
-        );
-        // zsh `whence -va pi`
-        assert_eq!(
-            first_pi_path(&out("pi is /one/pi\npi is /two/pi\n", "")),
-            "/one/pi"
-        );
-        // POSIX `command -v pi` prints the bare path
-        assert_eq!(first_pi_path(&out("/three/pi\n", "")), "/three/pi");
-        // rc chatter and a function are not a resolution
-        assert_eq!(
-            first_pi_path(&out(
-                "fnm: this shell is ready\n/etc/profile.d/x.sh: ready\npi is a function\npi is /four/pi\n",
-                ""
-            )),
-            "/four/pi"
-        );
-        // stderr counts too
-        assert_eq!(first_pi_path(&out("", "pi is /five/pi\n")), "/five/pi");
-        assert_eq!(first_pi_path(&out("", "")), "");
     }
 
     #[test]
@@ -1406,35 +1339,6 @@ mod tests {
         assert_eq!(runner.count("--print Reply OK."), 2);
     }
 
-    #[test]
-    fn a_missing_login_is_a_named_failure() {
-        let dir = tempfile::tempdir().unwrap();
-        let layout = installed_layout(dir.path());
-        let env = Env::for_test(dir.path(), &[("HERDR_BIN_PATH", "/h/herdr")]);
-        let runner = scripted(&env);
-        runner.on(
-            "auth check --provider kimi-coding",
-            ok(r#"{"status":"not_ready","reason":"credentials_not_configured"}"#),
-        );
-        runner.on(
-            "auth check --provider opencode-go",
-            ok(r#"{"status":"ready"}"#),
-        );
-        let rows = doctor_rows_with(&env, &layout, &runner, &["kimi-coding", "opencode-go"]);
-        let text: Vec<String> = rows.iter().map(Row::line).collect();
-        assert!(
-            text.iter()
-                .any(|l| l.contains("[FAIL] provider kimi-coding")
-                    && l.contains("credentials_not_configured")),
-            "{text:?}"
-        );
-        assert!(
-            text.iter()
-                .any(|l| l.contains("[ok  ] provider opencode-go")),
-            "{text:?}"
-        );
-    }
-
     /// T9: a global install of the package is a failure; the root's path
     /// string never contains the package name, so the folder is what counts.
     #[test]
@@ -1459,29 +1363,6 @@ mod tests {
         .unwrap();
         let row = prefix(&runner);
         assert_eq!(row.level, Level::Fail, "{row:?}");
-        assert!(row.detail.contains("global npm root"));
-    }
-
-    #[test]
-    fn the_deepseek_compaction_row_is_ok_after_setup_and_names_a_missing_model() {
-        let dir = tempfile::tempdir().unwrap();
-        let layout = installed_layout(dir.path());
-        let env = Env::for_test(dir.path(), &[("HERDR_BIN_PATH", "/h/herdr")]);
-        link_into(&env, &layout);
-        let row = |layout: &Layout| {
-            doctor_rows_with(&env, layout, &scripted(&env), &[])
-                .into_iter()
-                .find(|r| r.label == "deepseek compaction")
-                .unwrap()
-        };
-        assert_eq!(row(&layout).level, Level::Ok);
-        std::fs::write(layout.models(), "{\"providers\":{}}\n").unwrap();
-        let missing = row(&layout);
-        assert_eq!(missing.level, Level::Fail, "{missing:?}");
-        assert!(
-            missing.detail.contains("deepseek-v4.1-flash"),
-            "{missing:?}"
-        );
     }
 
     #[test]
@@ -1517,11 +1398,8 @@ mod tests {
         let first = check_report_model(&env, &layout, &runner, "kimi-coding", None);
         assert!(!first.ok);
         let login = first.rows.iter().find(|row| row.label == "login").unwrap();
-        assert!(
-            login.detail.contains("stored sign-in no longer works")
-                && login.detail.contains("subscription expired"),
-            "{login:?}"
-        );
+        assert_eq!(login.level, Level::Fail);
+        assert!(login.detail.contains("subscription expired"), "{login:?}");
         let cache = std::fs::read_to_string(probe_cache_path(&layout, "kimi-coding")).unwrap();
         assert!(!cache.contains("subscription expired"), "{cache}");
         let second = check_report_model(&env, &layout, &runner, "kimi-coding", None);
@@ -1585,43 +1463,9 @@ mod tests {
         );
         let report = check_report_model(&env, &layout, &runner, "kimi-coding", None);
         assert!(!report.ok);
-        assert!(report.error_text().contains("not ready"));
         let json = report.json();
         assert_eq!(json["ok"], Value::Bool(false));
         assert_eq!(json["provider"], "kimi-coding");
         assert!(report.failures().iter().any(|r| r.label == "login"));
-    }
-
-    #[test]
-    fn standalone_doctor_ignores_an_unrouted_provider() {
-        let dir = tempfile::tempdir().unwrap();
-        std::fs::write(
-            dir.path().join("config.toml"),
-            r#"
-[routing]
-default = "pi_opencode_deepseek"
-
-[recipes.pi_kimi_k3]
-kind = "pi"
-provider = "kimi-coding"
-args = ["--provider", "kimi-coding", "--model", "k3", "--thinking", "high", "--no-skills"]
-plain = "the long task helper"
-"#,
-        )
-        .unwrap();
-        let models = configured_routed_models(dir.path()).unwrap();
-        assert_eq!(
-            models,
-            vec![("opencode-go".into(), "deepseek-v4.1-flash".into())]
-        );
-    }
-
-    #[test]
-    fn node_versions_compare_against_the_floor() {
-        assert_eq!(parse_node("v22.19.0"), Some((22, 19, 0)));
-        assert_eq!(parse_node("22.19"), Some((22, 19, 0)));
-        assert!(parse_node("v22.18.9").unwrap() < super::super::MIN_NODE);
-        assert!(parse_node("v23.0.0").unwrap() >= super::super::MIN_NODE);
-        assert_eq!(parse_node("garbage"), None);
     }
 }

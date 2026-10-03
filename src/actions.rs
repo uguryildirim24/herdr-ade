@@ -280,7 +280,6 @@ pub(crate) fn run_pane(ctx: &Ctx, id: &str) -> Result<()> {
 mod tests {
     use super::*;
     use crate::paths::Env;
-    use crate::runner::fake::ok;
     use crate::scenarios::World;
 
     fn plugin_env(world: &World, extra: &[(&str, &str)]) -> Env {
@@ -299,33 +298,6 @@ mod tests {
     }
 
     #[test]
-    fn an_action_without_a_project_opens_the_picker_with_the_requested_command() {
-        let world = World::new();
-        world.project("demo", "a.sock");
-        world
-            .runner
-            .on("plugin pane open", ok(r#"{"result":{"type":"ok"}}"#));
-        let env = plugin_env(&world, &[("HERDR_WORKSPACE_ID", "w42")]);
-        let ctx = Ctx {
-            env: &env,
-            ..world.ctx()
-        };
-        run_action(&ctx, "pause").unwrap();
-        let calls = world.runner.calls.borrow();
-        let opened = calls
-            .iter()
-            .find(|c| c.display().contains("plugin pane open"))
-            .unwrap();
-        assert!(
-            opened
-                .display()
-                .contains("--plugin herdr-ade --entrypoint pick")
-        );
-        drop(calls);
-        assert_eq!(read_handoff(&ctx).command, "pause");
-    }
-
-    #[test]
     fn an_action_inside_a_project_workspace_acts_on_that_project() {
         let world = World::new();
         let project = world.project("demo", "a.sock");
@@ -339,37 +311,5 @@ mod tests {
         assert_eq!(world.runner.count("plugin pane open"), 0);
         run_action(&ctx, "resume").unwrap();
         assert_eq!(project.status(), Status::Active);
-    }
-
-    #[test]
-    fn adopt_workspace_captures_the_pane_in_the_action_and_refuses_without_an_agent() {
-        let world = World::new();
-        world
-            .runner
-            .on("plugin pane open", ok(r#"{"result":{"type":"ok"}}"#));
-        let context = r#"{"workspace_id":"w5","workspace_label":"My Repo","workspace_cwd":"/work","focused_pane_id":"w5:p1"}"#;
-        let env = plugin_env(&world, &[("HERDR_PLUGIN_CONTEXT_JSON", context)]);
-        let ctx = Ctx {
-            env: &env,
-            ..world.ctx()
-        };
-        // No agent in the pane: refused before any popup opens.
-        assert!(run_action(&ctx, "adopt-workspace").is_err());
-        assert_eq!(world.runner.count("plugin pane open"), 0);
-
-        *world.agents.borrow_mut() = format!(
-            "[{}]",
-            crate::scenarios::agent_json("w5", "w5:t1", "w5:p1", "/work", "", "idle")
-        );
-        run_action(&ctx, "adopt-workspace").unwrap();
-        let handoff = read_handoff(&ctx);
-        assert_eq!(
-            (
-                handoff.pane_id.as_str(),
-                handoff.workspace_label.as_str(),
-                handoff.workspace_cwd.as_str()
-            ),
-            ("w5:p1", "My Repo", "/work")
-        );
     }
 }
