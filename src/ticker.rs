@@ -91,7 +91,17 @@ impl Health {
         log.line(&detail);
         self.failures.push(detail);
         // Publish immediately: a later blocked step must not hide this failure.
-        self.publish(root, log);
+        // Only a completed pass can clear prior failures; ensure and partial
+        // passes have not reobserved the records which produced them.
+        let mut evidence = read_evidence::<Health>(&health_path(root)).unwrap_or_default();
+        evidence.observed = self.observed.clone();
+        evidence.projects = self.projects;
+        for failure in &self.failures {
+            if !evidence.failures.contains(failure) {
+                evidence.failures.push(failure.clone());
+            }
+        }
+        evidence.publish(root, log);
     }
 
     fn publish(&self, root: &Path, log: &Log) {
@@ -339,7 +349,9 @@ fn ensure_free(
         LockState::Held(info) => {
             let (healthy, detail) = progress_health(root, &info);
             if healthy != Some(true) {
-                bail!("ticker ensure: {detail}; keeping the existing lock holder");
+                // Lane starts and retries call ensure too. Report missing
+                // progress without turning a held lock into a work refusal.
+                eprintln!("ticker ensure: {detail}; keeping the existing lock holder");
             }
             return Ok(());
         }
@@ -3752,12 +3764,12 @@ mod tests {
             "{detail}"
         );
         let mut spawned = false;
-        let error = ensure_free(root.path(), false, |_| {
+        ensure_free(root.path(), false, |_| {
             spawned = true;
             Ok(())
         })
-        .unwrap_err();
-        assert!(error.to_string().contains("stalled"));
+        .unwrap();
+        assert!(health_report(root.path()).1.contains("stalled"));
         assert!(!spawned && !stop_path(root.path()).exists());
         progress.sequence += 1;
         progress.step = "pass complete".into();
@@ -5606,7 +5618,11 @@ mod tests {
     fn ensure_leaves_a_running_ticker_alone() {
         let home = tempfile::tempdir().unwrap();
         let root = home.path().join("root");
-        project::create(&root, "demo", "", vec![]).unwrap();
+        let project = project::create(&root, "demo", "", vec![]).unwrap();
+        let lane_path = thread::threads_dir_for_write(&project)
+            .unwrap()
+            .join("t-0001.toml");
+        std::fs::write(&lane_path, "bad = [").unwrap();
         let env = Env::for_test(home.path(), &[]);
         let runner = FakeRunner::new();
         let ctx = Ctx {
@@ -5626,8 +5642,41 @@ mod tests {
             .unwrap();
         file.lock().unwrap();
         file.write_all(br#"{"version":"old","pid":1}"#).unwrap();
-        let error = ensure(&ctx).unwrap_err().to_string();
-        assert!(error.contains("responsiveness unknown"), "{error}");
+        let mut memory = Memory::new(&ctx);
+        assert!(!tick_for_test(&ctx, &mut memory));
+        // An ensure-only discovery cannot clear an unobserved lane failure.
+        let broken = root.join("broken");
+        std::os::unix::fs::symlink("broken", &broken).unwrap();
+        ensure(&ctx).unwrap();
+        let (_, detail) = health_report(&root);
+        assert!(detail.contains("responsiveness unknown"), "{detail}");
+        assert!(
+            detail.contains(&lane_path.display().to_string()),
+            "{detail}"
+        );
+        assert!(
+            detail.contains(&broken.join("PROJECT.md").display().to_string()),
+            "{detail}"
+        );
+        // A partial pass also keeps the prior failure until completion.
+        std::fs::remove_file(&lane_path).unwrap();
+        let log = Log {
+            path: log_path(&root),
+        };
+        assert!(
+            tick_with_steps(&ctx, &log, &mut memory, &mut |step| step != "machine phase").is_none()
+        );
+        assert!(
+            health_report(&root)
+                .1
+                .contains(&lane_path.display().to_string())
+        );
+        assert!(!tick_for_test(&ctx, &mut memory));
+        assert!(
+            !health_report(&root)
+                .1
+                .contains(&lane_path.display().to_string())
+        );
         assert!(!stop_path(&root).exists(), "ensure writes no stop file");
         drop(file);
     }
@@ -5650,12 +5699,12 @@ mod tests {
             .open(lock_path(path))
             .unwrap();
         file.lock().unwrap();
-        let error = ensure_free(path, false, |_| {
+        ensure_free(path, false, |_| {
             starts += 1;
             Ok(())
         })
-        .unwrap_err();
-        assert!(error.to_string().contains("responsiveness unknown"));
+        .unwrap();
+        assert!(health_report(path).1.contains("responsiveness unknown"));
         assert_eq!(starts, 1);
     }
 
