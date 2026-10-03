@@ -1323,6 +1323,44 @@ pub(crate) fn identity_verifies(
         .any(|p| stored.pid == p.pid && stored.argv0 == p.argv0)
 }
 
+pub(crate) fn agent_start_timeout(launch: &crate::contracts::Launch) -> u64 {
+    if launch.ready_timeout_ms == 0 {
+        crate::herdr::AGENT_START_TIMEOUT.as_millis() as u64
+    } else {
+        launch.ready_timeout_ms
+    }
+}
+
+/// A placement owns its ready window, even before `agent start` is submitted.
+/// Historical records without a clock retain their already-started semantics.
+pub(crate) fn in_start_window(thread: &Thread, now: jiff::Timestamp) -> bool {
+    !thread.startup_wait_started.is_empty()
+        && seconds_since(&thread.startup_wait_started, now).max(0) as u64 * 1000
+            < agent_start_timeout(&thread.launch)
+}
+
+pub(crate) fn process_bound_to_pane(thread: &Thread) -> bool {
+    thread.identity.process.is_some()
+        && thread.identity.pane_id == thread.pane_id
+        && thread.identity.tab_id == thread.tab_id
+        && thread.identity.workspace_id == thread.workspace_id
+}
+
+/// Intentional pane closure and pending placement are not process deaths.
+pub(crate) fn can_check_gone(thread: &Thread, now: jiff::Timestamp) -> bool {
+    !thread.parked
+        && !thread.recovery_pending
+        && thread.provider_wait_started.is_empty()
+        && !in_start_window(thread, now)
+}
+
+/// An unregistered process can be checked only after this placement's window,
+/// or when a process was already identified in this exact terminal.
+pub(crate) fn can_check_process_gone(thread: &Thread, now: jiff::Timestamp) -> bool {
+    can_check_gone(thread, now)
+        && (process_bound_to_pane(thread) || !thread.startup_wait_started.is_empty())
+}
+
 pub(crate) fn bind_identity(
     thread: &mut Thread,
     socket: &str,
@@ -1771,6 +1809,18 @@ mod tests {
         bind_identity(&mut t, "/sock", &live, Some(process.clone()));
         assert_eq!(t.identity.socket, "/sock");
         assert_eq!(t.identity.agent_name.as_deref(), Some("hp-demo-t-0001"));
+        assert!(process_bound_to_pane(&t));
+        assert!(can_check_process_gone(&t, now()));
+        for field in ["pane", "tab", "workspace"] {
+            let mut stale = t.clone();
+            match field {
+                "pane" => stale.identity.pane_id = "old-pane".into(),
+                "tab" => stale.identity.tab_id = "old-tab".into(),
+                _ => stale.identity.workspace_id = "old-workspace".into(),
+            }
+            assert!(!process_bound_to_pane(&stale), "{field}");
+            assert!(!can_check_process_gone(&stale, now()), "{field}");
+        }
         let mut adopted = placed_thread(Kind::Adopted);
         bind_identity(&mut adopted, "/sock", &live, None);
         assert!(adopted.identity.agent_name.is_none());

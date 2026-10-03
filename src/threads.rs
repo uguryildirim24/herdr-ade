@@ -1375,7 +1375,7 @@ fn finish_placement(project: &Project, view: &SessionView, id: &str) -> Result<T
         t.brief_submitted = false;
         t.brief_submitted_at.clear();
         t.launch_attempts = 0;
-        t.startup_wait_started.clear();
+        t.startup_wait_started = project::now();
         t.recovery_pending = false;
         t.partial = None;
         t.status = Status::Open;
@@ -3100,6 +3100,8 @@ pub(crate) fn fail_start_checked(
                 || t.pane_id != old.pane_id
                 || t.tab_id != old.tab_id
                 || t.workspace_id != old.workspace_id
+                || t.parked
+                || t.recovery_pending
                 || (class != crate::contracts::FailureClass::ProcessGone
                     && !t.report_hash.is_empty())
         }) {
@@ -7047,6 +7049,7 @@ mod tests {
             assert!(!brief.contains("--report"));
             let check = |lane: &Thread| {
                 assert_eq!(lane.paths, started.paths);
+                assert!(thread::in_start_window(lane, jiff::Timestamp::now()));
                 assert_eq!(
                     thread::artifact(&fx.project, &lane.attachments[name]).unwrap(),
                     bytes
@@ -7103,6 +7106,7 @@ mod tests {
                 crate::testkit::git(checkout, &["commit", "-qm", "lane progress"]);
                 thread::update(&fx.project, &placed.id, |t| {
                     t.status = Status::Failed;
+                    t.startup_wait_started.clear();
                     t.partial = Some("placement".into());
                     t.launch_attempts = thread::MAX_LAUNCH_ATTEMPTS;
                 })
