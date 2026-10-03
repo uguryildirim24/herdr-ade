@@ -3177,6 +3177,19 @@ mod tests {
         for _ in 0..2 {
             check(at("2026-10-03T00:01:00Z"));
         }
+        assert_eq!(
+            thread::load(&project, &lane.id).unwrap().status,
+            thread::Status::Starting
+        );
+        assert_eq!(
+            world.runner.count("pane process-info"),
+            0,
+            "a pre-launch shell is not a dead agent"
+        );
+        thread::update(&project, &lane.id, |t| t.launch_attempts = 1).unwrap();
+        for _ in 0..2 {
+            check(at("2026-10-03T00:01:00Z"));
+        }
         let failed = thread::load(&project, &lane.id).unwrap();
         assert_eq!(failed.status, thread::Status::Failed);
         assert_eq!(

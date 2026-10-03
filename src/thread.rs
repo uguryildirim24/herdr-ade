@@ -45,6 +45,8 @@ pub(crate) enum FollowUpState {
 #[serde(default)]
 pub(crate) struct FollowUp {
     pub(crate) attempt: u32,
+    /// An undelivered instruction carried into a replacement's first prompt.
+    pub(crate) carried_from_attempt: u32,
     pub(crate) text: String,
     pub(crate) state: FollowUpState,
     /// Waiting event visible when this message was accepted, not when it was sent.
@@ -580,10 +582,17 @@ pub(crate) fn update_checked(
         thread.review_reason.clear();
         for follow_up in &mut thread.follow_ups {
             if follow_up.attempt == before.attempt.max(1)
-                && follow_up.state == FollowUpState::Queued
+                && matches!(
+                    follow_up.state,
+                    FollowUpState::Queued | FollowUpState::Uncertain
+                )
             {
-                follow_up.state = FollowUpState::Superseded;
-                follow_up.closed_at = project::now();
+                follow_up.carried_from_attempt = before.attempt.max(1);
+                follow_up.attempt = thread.attempt.max(1);
+                follow_up.state = FollowUpState::Queued;
+                follow_up.delivered_at.clear();
+                follow_up.closed_at.clear();
+                follow_up.after_seal.clear();
             }
         }
     }
@@ -593,10 +602,24 @@ pub(crate) fn update_checked(
         } else {
             FollowUpState::Closed
         };
-        for follow_up in &mut thread.follow_ups {
+        for (index, follow_up) in thread.follow_ups.iter_mut().enumerate() {
             if matches!(
                 follow_up.state,
-                FollowUpState::Queued | FollowUpState::Delivered
+                FollowUpState::Queued | FollowUpState::Uncertain
+            ) {
+                thread.start_notices.push(crate::steps::Notice {
+                    line: format!(
+                        "{} follow-up {} was not delivered: lane resolved ({})",
+                        thread.id,
+                        index + 1,
+                        thread.resolved_reason
+                    ),
+                    submitted: false,
+                });
+            }
+            if matches!(
+                follow_up.state,
+                FollowUpState::Queued | FollowUpState::Uncertain | FollowUpState::Delivered
             ) {
                 follow_up.state = disposition;
                 follow_up.closed_at = project::now();
@@ -660,7 +683,7 @@ pub(crate) fn thread_dir(cwd: &str, slug: &str, id: &str) -> String {
 pub(crate) fn launch_prompt(prefix: &str, slug: &str, t: &Thread) -> String {
     let id = &t.id;
     let role = if t.role.is_empty() { "lane" } else { &t.role };
-    let continuation = if t.last_failure.is_empty() {
+    let mut continuation = if t.last_failure.is_empty() {
         String::new()
     } else {
         format!(
@@ -668,6 +691,23 @@ pub(crate) fn launch_prompt(prefix: &str, slug: &str, t: &Thread) -> String {
             serde_json::to_string(&t.last_failure).unwrap_or_default()
         )
     };
+    let queued: Vec<_> = t
+        .follow_ups
+        .iter()
+        .enumerate()
+        .filter(|(_, f)| {
+            f.attempt == t.attempt.max(1)
+                && f.carried_from_attempt > 0
+                && f.state == FollowUpState::Queued
+        })
+        .map(|(index, f)| format!("Follow-up {}:\n{}", index + 1, f.text))
+        .collect();
+    if !queued.is_empty() {
+        continuation.push_str(&format!(
+            "\n\nRead your frozen brief at {}/brief.md and sealed report at {}. Continue in the same folder; apply these instructions after the brief:\n\n{}",
+            t.thread_dir, t.report_path(), queued.join("\n\n"),
+        ));
+    }
     if t.is_remote() {
         return format!(
             "Run the shell command `{prefix} skill {role}`, then read .herdr-project/{slug}-{id}/brief.md and do what it says. You run on the cloud box named `{}`; finish with `ha done`, never with a parent prompt.{continuation}",
@@ -1364,11 +1404,12 @@ pub(crate) fn can_check_gone(thread: &Thread, now: jiff::Timestamp) -> bool {
         && !in_start_window(thread, now)
 }
 
-/// An unregistered process can be checked only after this placement's window,
-/// or when a process was already identified in this exact terminal.
+/// A shell is not a dead agent before submission. An unregistered launch can
+/// be checked after its ready window; a bound process supplies direct evidence.
 pub(crate) fn can_check_process_gone(thread: &Thread, now: jiff::Timestamp) -> bool {
     can_check_gone(thread, now)
-        && (process_bound_to_pane(thread) || !thread.startup_wait_started.is_empty())
+        && (process_bound_to_pane(thread)
+            || (thread.launch_attempts > 0 && !thread.startup_wait_started.is_empty()))
 }
 
 pub(crate) fn bind_identity(
@@ -1936,8 +1977,10 @@ mod tests {
             });
         })
         .unwrap();
-        let superseded = update(&project, &lane.id, |lane| lane.attempt = 2).unwrap();
-        assert_eq!(superseded.follow_ups[0].state, FollowUpState::Superseded);
+        let carried = update(&project, &lane.id, |lane| lane.attempt = 2).unwrap();
+        assert_eq!(carried.follow_ups[0].state, FollowUpState::Queued);
+        assert_eq!(carried.follow_ups[0].attempt, 2);
+        assert_eq!(carried.follow_ups[0].carried_from_attempt, 1);
 
         let cancelled = update(&project, &lane.id, |lane| {
             lane.follow_ups.push(FollowUp {
@@ -1950,8 +1993,19 @@ mod tests {
             lane.resolved_reason = "cancelled".into();
         })
         .unwrap();
-        assert_eq!(cancelled.follow_ups[0].state, FollowUpState::Superseded);
+        assert_eq!(cancelled.follow_ups[0].state, FollowUpState::Cancelled);
         assert_eq!(cancelled.follow_ups[1].state, FollowUpState::Cancelled);
+        assert_eq!(cancelled.start_notices.len(), 2);
+        assert!(
+            cancelled.start_notices[0]
+                .line
+                .contains("follow-up 1 was not delivered")
+        );
+        assert!(
+            cancelled.start_notices[1]
+                .line
+                .contains("follow-up 2 was not delivered")
+        );
     }
 
     #[test]
