@@ -16,6 +16,67 @@ fn hp(home: &Path, args: &[&str]) -> std::process::Output {
 }
 
 #[test]
+fn ticker_status_reports_the_installed_image_and_actual_lock_holder() {
+    let home = tempfile::tempdir().unwrap();
+    let root = home.path().join("root");
+    std::fs::create_dir(&root).unwrap();
+    let version = String::from_utf8(hp(home.path(), &["--version"]).stdout).unwrap();
+    let build = version.trim().strip_prefix("herdr-ade ").unwrap();
+    let status = || {
+        let out = hp(
+            home.path(),
+            &[
+                "--root",
+                root.to_str().unwrap(),
+                "--json",
+                "ticker",
+                "status",
+            ],
+        );
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let receipt: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+        receipt["data"]["observation"].clone()
+    };
+    assert_eq!(status()["ticker"]["state"], "not_required");
+    let path = root.join(".ticker.lock");
+    let mut holder = std::fs::File::options()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(&path)
+        .unwrap();
+    holder.lock().unwrap();
+    let mut record = |text: &str| {
+        use std::io::{Seek, SeekFrom};
+        holder.set_len(0).unwrap();
+        holder.seek(SeekFrom::Start(0)).unwrap();
+        holder.write_all(text.as_bytes()).unwrap();
+        holder.flush().unwrap();
+    };
+    record(&serde_json::json!({"pid": 4321, "version": build}).to_string());
+    assert_eq!(
+        status(),
+        serde_json::json!({"binary": version.trim(), "ticker": {"state": "running", "pid": 4321, "build": build}})
+    );
+    record(r#"{"pid":4321,"version":"0.1.0+old1234.1"}"#);
+    assert_eq!(status()["ticker"]["state"], "stale");
+    record(&serde_json::json!({"pid": 0, "version": build}).to_string());
+    assert_eq!(status()["ticker"]["state"], "unknown");
+    record("not json");
+    assert_eq!(status()["ticker"]["state"], "unknown");
+    drop(holder);
+    assert_eq!(status()["ticker"]["state"], "not_required");
+    std::fs::create_dir(root.join("demo")).unwrap();
+    std::fs::write(root.join("demo/PROJECT.md"), "").unwrap();
+    assert_eq!(status()["ticker"]["state"], "unknown");
+}
+
+#[test]
 fn internal_install_check_reports_only_counts_and_readability_without_writes() {
     let home = tempfile::tempdir().unwrap();
     let root = home.path().join("root");
