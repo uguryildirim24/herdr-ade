@@ -841,28 +841,21 @@ fn verify_published_sha(
     let url = publish_url_for(ctx, project, lane.machine_route(), &lane.repo)?
         .with_context(|| format!("box_repo_unmapped: {} has no publish URL", lane.repo))?;
     let remote = crate::remote::remote_for_url(ctx.runner, &lane.repo, &url)?;
-    let git = |args: &[&str]| {
-        ctx.runner.run(
-            &crate::runner::Cmd::new("git", Duration::from_secs(60))
-                .args(["-C", lane.repo.as_str()])
-                .args(args.iter().copied()),
-        )
-    };
-    let out = git(&[
+    let git = crate::repo::Git::new(ctx.runner, &lane.repo);
+    git.run(&[
         "fetch",
         "--quiet",
         remote.as_str(),
         &format!("refs/heads/{}", published_ref.unwrap_or(&lane.branch)),
-    ])?;
-    if !out.success() {
-        bail!("published_fetch_failed: {url}: {}", out.error_text());
-    }
+    ])
+    .with_context(|| format!("published_fetch_failed: {url}"))?;
     let matches = if published_ref.is_some() {
-        git(&["rev-parse", "FETCH_HEAD"])?.stdout.trim() == sha
+        git.run(&["rev-parse", "FETCH_HEAD"])? == sha
     } else {
         // Historical seals pointed at a mutable lane branch; their commit
         // may be an ancestor of its current tip.
-        crate::git::is_ancestor(ctx.runner, &lane.repo, sha, "FETCH_HEAD")?
+        git.with_timeout(Duration::from_secs(20))
+            .is_ancestor(sha, "FETCH_HEAD")?
     };
     if !matches {
         bail!("published_sha_missing: {sha} is not reachable on {url}");
@@ -3764,30 +3757,40 @@ pi_bin = "/home/agent/.local/bin/herdr-pi"
             .to_string();
         assert!(error.contains("published_sha_missing"), "{error}");
 
-        let second = crate::runner::fake::FakeRunner::new();
-        second.on(
-            "git -C /repo remote get-url fork",
-            crate::runner::fake::ok("https://github.com/uguryildirim24/herdr-ade.git\n"),
-        );
-        second.on("git -C /repo remote", crate::runner::fake::ok("fork\n"));
-        second.on("git -C /repo fetch", crate::runner::fake::ok(""));
-        second.on(
-            "git -C /repo rev-parse FETCH_HEAD",
+        for output in [
             crate::runner::fake::ok("abc\n"),
-        );
-        let ctx = courier_ctx(root.path(), &env, &second);
-        verify_published_sha(
-            &ctx,
-            &project,
-            &lane,
-            "abc",
-            Some("seals/hp/demo/t-0001/abc"),
-        )
-        .unwrap();
-        assert!(second.calls.borrow().iter().any(|call| {
-            call.args
-                .iter()
-                .any(|arg| arg == "refs/heads/seals/hp/demo/t-0001/abc")
-        }));
+            crate::runner::Output {
+                stdout: "abc\n".into(),
+                ..crate::runner::fake::fail(128, "broken ref")
+            },
+            crate::runner::fake::timeout(),
+        ] {
+            let success = output.success();
+            let second = crate::runner::fake::FakeRunner::new();
+            second.on(
+                "git -C /repo remote get-url fork",
+                crate::runner::fake::ok("https://github.com/uguryildirim24/herdr-ade.git\n"),
+            );
+            second.on("git -C /repo remote", crate::runner::fake::ok("fork\n"));
+            second.on("git -C /repo fetch", crate::runner::fake::ok(""));
+            second.on("git -C /repo rev-parse FETCH_HEAD", output);
+            let ctx = courier_ctx(root.path(), &env, &second);
+            assert_eq!(
+                verify_published_sha(
+                    &ctx,
+                    &project,
+                    &lane,
+                    "abc",
+                    Some("seals/hp/demo/t-0001/abc"),
+                )
+                .is_ok(),
+                success
+            );
+            assert!(second.calls.borrow().iter().any(|call| {
+                call.args
+                    .iter()
+                    .any(|arg| arg == "refs/heads/seals/hp/demo/t-0001/abc")
+            }));
+        }
     }
 }

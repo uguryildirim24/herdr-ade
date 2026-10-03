@@ -114,12 +114,6 @@ impl Output {
         }
     }
 
-    pub(crate) fn merge_tree_conflict(&self) -> bool {
-        !self.timed_out
-            && self.code == Some(1)
-            && (self.stdout.contains("CONFLICT (") || self.stderr.contains("CONFLICT ("))
-    }
-
     /// stderr when it has text, else stdout, trimmed; for error messages.
     pub(crate) fn error_text(&self) -> String {
         if self.timed_out {

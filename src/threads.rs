@@ -99,25 +99,6 @@ fn require_session<'a>(ctx: &'a Ctx, project: &Project) -> Result<SessionView<'a
     })
 }
 
-fn git(runner: &dyn Runner, repo: &str, args: &[&str], timeout: Duration) -> Result<String> {
-    let out = runner.run(
-        &Cmd::new("git", timeout)
-            .args(["-C", repo])
-            .args(args.iter().copied()),
-    )?;
-    if out.timed_out {
-        bail!(
-            "git {}: timed out; repo activity at timeout: {}",
-            args.join(" "),
-            crate::git::repo_activity(repo)
-        );
-    }
-    if !out.success() {
-        bail!("git {}: {}", args.join(" "), out.error_text());
-    }
-    Ok(out.stdout.trim().to_string())
-}
-
 pub fn thread_tokens(thread: &Thread, slug: &str, group: Group) -> Vec<(String, String)> {
     vec![
         ("project".into(), slug.to_string()),
@@ -367,13 +348,10 @@ pub fn start(ctx: &Ctx, slug: &str, args: StartArgs) -> Result<Thread> {
 
     // Keep repository/base and named-file refusals synchronous. No checkout,
     // push, terminal or agent is created in this command.
-    git(
-        ctx.runner,
-        &repo,
-        &["rev-parse", "--show-toplevel"],
-        GIT_TIMEOUT,
-    )
-    .with_context(|| format!("{repo} is not a git repository"))?;
+    crate::repo::Git::new(ctx.runner, &repo)
+        .with_timeout(GIT_TIMEOUT)
+        .run(&["rev-parse", "--show-toplevel"])
+        .with_context(|| format!("{repo} is not a git repository"))?;
     let integration = integration_branch(
         ctx.runner,
         &Thread {
@@ -382,21 +360,21 @@ pub fn start(ctx: &Ctx, slug: &str, args: StartArgs) -> Result<Thread> {
             ..Thread::default()
         },
     )?;
-    let base = crate::git::branch_head(ctx.runner, &repo, &integration)?.ok_or_else(|| {
-        crate::refusal::error(
-            format!("integration_branch_required: `{integration}` is not a local branch"),
-            format!(
-                "ha thread start {slug} --base <existing-branch> --job <job> --task-file <file>"
-            ),
-        )
-    })?;
-    let origin = git(
-        ctx.runner,
-        &repo,
-        &["remote", "get-url", "origin"],
-        GIT_TIMEOUT,
-    )
-    .unwrap_or_default();
+    let base = crate::repo::Git::new(ctx.runner, &repo)
+        .with_timeout(Duration::from_secs(5))
+        .branch_head(&integration)?
+        .ok_or_else(|| {
+            crate::refusal::error(
+                format!("integration_branch_required: `{integration}` is not a local branch"),
+                format!(
+                    "ha thread start {slug} --base <existing-branch> --job <job> --task-file <file>"
+                ),
+            )
+        })?;
+    let origin = crate::repo::Git::new(ctx.runner, &repo)
+        .with_timeout(GIT_TIMEOUT)
+        .run(&["remote", "get-url", "origin"])
+        .unwrap_or_default();
     if !machine.is_empty() {
         let (_, url) = box_repo_candidate(&ctx.config_dir, &machine, Some(&repo), listed)?;
         remote::remote_for_url(ctx.runner, &repo, &url)?;
@@ -1029,12 +1007,9 @@ fn prepare_checkout(ctx: &Ctx, project: &Project, record: &Thread) -> Result<()>
         if Path::new(&path).exists() {
             // A crash may leave an already-created checkout. Verify its git
             // registration and branch; never reset it to the frozen start SHA.
-            let listed = git(
-                ctx.runner,
-                &record.repo,
-                &["worktree", "list", "--porcelain"],
-                GIT_TIMEOUT,
-            )?;
+            let listed = crate::repo::Git::new(ctx.runner, &record.repo)
+                .with_timeout(GIT_TIMEOUT)
+                .run(&["worktree", "list", "--porcelain"])?;
             if !listed.split("\n\n").any(|row| {
                 row.lines().any(|line| line == format!("worktree {path}"))
                     && row
@@ -1045,12 +1020,9 @@ fn prepare_checkout(ctx: &Ctx, project: &Project, record: &Thread) -> Result<()>
             }
         } else {
             ensure_branch(ctx.runner, &record.repo, &record.branch, &record.base)?;
-            git(
-                ctx.runner,
-                &record.repo,
-                &["worktree", "add", &path, &record.branch],
-                GIT_TIMEOUT,
-            )?;
+            crate::repo::Git::new(ctx.runner, &record.repo)
+                .with_timeout(GIT_TIMEOUT)
+                .run(&["worktree", "add", &path, &record.branch])?;
         }
         path
     };
@@ -1224,12 +1196,7 @@ fn integration_branch(runner: &dyn Runner, record: &Thread) -> Result<String> {
     if !record.base.is_empty() {
         return Ok(record.base.clone());
     }
-    git(
-        runner,
-        &record.repo,
-        &["symbolic-ref", "--short", "HEAD"],
-        GIT_TIMEOUT,
-    )
+    crate::repo::Git::new(runner, &record.repo).with_timeout(GIT_TIMEOUT).run(&["symbolic-ref", "--short", "HEAD"])
     .context(
         "integration_branch_required: the repository is on a detached HEAD; pass --base <branch>",
     )
@@ -1238,34 +1205,30 @@ fn integration_branch(runner: &dyn Runner, record: &Thread) -> Result<String> {
 /// Creates the lane branch at `sha`, tolerating a retry that left it at the
 /// same commit. Never moves an existing ref (D9).
 fn ensure_branch(runner: &dyn Runner, repo: &str, branch: &str, sha: &str) -> Result<()> {
-    if let Some(existing) = crate::git::branch_head(runner, repo, branch)? {
+    if let Some(existing) = crate::repo::Git::new(runner, repo)
+        .with_timeout(Duration::from_secs(5))
+        .branch_head(branch)?
+    {
         if existing == sha {
             return Ok(());
         }
         bail!("lane branch {branch} already exists at {existing}, not {sha}");
     }
-    let out =
-        runner.run(&Cmd::new("git", GIT_TIMEOUT).args(["-C", repo, "branch", branch, sha]))?;
-    if !out.success() {
-        bail!("git branch {branch}: {}", out.error_text());
-    }
+    crate::repo::Git::new(runner, repo)
+        .with_timeout(GIT_TIMEOUT)
+        .run(&["branch", branch, sha])?;
     Ok(())
 }
 
 /// Pushes the lane branch by URL, never by remote name and never with force
 /// (SPEC-remote §4.2 step 2).
 fn push_branch(runner: &dyn Runner, repo: &str, url: &str, branch: &str, sha: &str) -> Result<()> {
-    let out = runner.run(&Cmd::new("git", Duration::from_secs(60)).args([
-        "-C",
-        repo,
+    crate::repo::Git::new(runner, repo).run(&[
         "push",
         "--quiet",
         url,
         &format!("{sha}:refs/heads/{branch}"),
-    ]))?;
-    if !out.success() {
-        bail!("push of {branch} to {url}: {}", out.error_text());
-    }
+    ])?;
     Ok(())
 }
 
@@ -1284,26 +1247,20 @@ pub(crate) fn prepare_managed_git_folder(
     let brief_path = folder.join("brief.md");
 
     let head = if folder.join(".git").is_dir() {
-        git(
-            runner,
-            &folder_text,
-            &["for-each-ref", "--format=%(objectname)", "refs/heads/main"],
-            GIT_TIMEOUT,
-        )?
-        .lines()
-        .next()
-        .filter(|head| !head.is_empty())
-        .map(str::to_string)
+        crate::repo::Git::new(runner, &folder)
+            .with_timeout(GIT_TIMEOUT)
+            .run(&["for-each-ref", "--format=%(objectname)", "refs/heads/main"])?
+            .lines()
+            .next()
+            .filter(|head| !head.is_empty())
+            .map(str::to_string)
     } else {
         None
     };
     if let Some(head) = head {
-        let tracked = git(
-            runner,
-            &folder_text,
-            &["ls-tree", "--name-only", "HEAD", "--", "brief.md"],
-            GIT_TIMEOUT,
-        )?;
+        let tracked = crate::repo::Git::new(runner, &folder)
+            .with_timeout(GIT_TIMEOUT)
+            .run(&["ls-tree", "--name-only", "HEAD", "--", "brief.md"])?;
         if tracked != "brief.md" || !brief_path.is_file() {
             bail!(
                 "managed_folder_invalid: {} has a first commit without brief.md",
@@ -1317,37 +1274,25 @@ pub(crate) fn prepare_managed_git_folder(
 
     project::write_atomic(&brief_path, brief.as_bytes())?;
     if !folder.join(".git").is_dir() {
-        git(
-            runner,
-            &folder_text,
-            &["init", "-q", "-b", "main"],
-            GIT_TIMEOUT,
-        )?;
+        crate::repo::Git::new(runner, &folder)
+            .with_timeout(GIT_TIMEOUT)
+            .run(&["init", "-q", "-b", "main"])?;
     }
-    git(
-        runner,
-        &folder_text,
-        &["add", "--", "brief.md"],
-        GIT_TIMEOUT,
-    )?;
-    git(
-        runner,
-        &folder_text,
-        &[
-            "-c",
-            "user.name=herdr-ade",
-            "-c",
-            "user.email=herdr-ade@localhost",
-            "-c",
-            "commit.gpgsign=false",
-            "commit",
-            "-q",
-            "-m",
-            "docs: thread brief",
-        ],
-        GIT_TIMEOUT,
-    )?;
-    let head = git(runner, &folder_text, &["rev-parse", "HEAD"], GIT_TIMEOUT)?;
+    let git = crate::repo::Git::new(runner, &folder).with_timeout(GIT_TIMEOUT);
+    git.run(&["add", "--", "brief.md"])?;
+    git.run(&[
+        "-c",
+        "user.name=herdr-ade",
+        "-c",
+        "user.email=herdr-ade@localhost",
+        "-c",
+        "commit.gpgsign=false",
+        "commit",
+        "-q",
+        "-m",
+        "docs: thread brief",
+    ])?;
+    let head = git.run(&["rev-parse", "HEAD"])?;
     exclude_paths_from_git(runner, &folder_text, &["/report.md", "/library/"])?;
     Ok((folder, thread::sha256_hex(brief.as_bytes()), head))
 }
@@ -1375,12 +1320,10 @@ pub fn exclude_from_git(runner: &dyn Runner, cwd: &str) -> Result<()> {
 }
 
 fn exclude_paths_from_git(runner: &dyn Runner, cwd: &str, patterns: &[&str]) -> Result<()> {
-    let Ok(path) = git(
-        runner,
-        cwd,
-        &["rev-parse", "--git-path", "info/exclude"],
-        GIT_TIMEOUT,
-    ) else {
+    let Ok(path) = crate::repo::Git::new(runner, cwd)
+        .with_timeout(GIT_TIMEOUT)
+        .run(&["rev-parse", "--git-path", "info/exclude"])
+    else {
         return Ok(()); // not inside a git repository
     };
     let path = Path::new(cwd).join(path);
@@ -4298,45 +4241,31 @@ fn repo_link_kept(
                 path.display()
             );
         }
-        if git(
-            ctx.runner,
-            &record.worktree_path,
-            &["ls-files", "-z", "--", &spec],
-            GIT_TIMEOUT,
-        )?
-        .is_empty()
-        {
+        let git =
+            crate::repo::Git::new(ctx.runner, &record.worktree_path).with_timeout(GIT_TIMEOUT);
+        if git.stdout(&["ls-files", "-z", "--", &spec])?.is_empty() {
             bail!(
                 "linked path is an untracked repo file: {}; worktree kept",
                 path.display()
             );
         }
-        if !git(
-            ctx.runner,
-            &record.worktree_path,
-            &[
+        if !git
+            .stdout(&[
                 "status",
                 "--porcelain",
                 "-z",
                 "--untracked-files=all",
                 "--",
                 &spec,
-            ],
-            GIT_TIMEOUT,
-        )?
-        .is_empty()
+            ])?
+            .is_empty()
         {
             bail!(
                 "linked path is an uncommitted repo file: {}; worktree kept",
                 path.display()
             );
         }
-        git(
-            ctx.runner,
-            &record.worktree_path,
-            &["hash-object", "--no-filters", "--", &path.to_string_lossy()],
-            GIT_TIMEOUT,
-        )?
+        git.run(&["hash-object", "--no-filters", "--", &path.to_string_lossy()])?
     };
     // After placement `base` is the frozen start SHA, not a branch name.
     // Honor the configured integration branch even if another is checked out.
@@ -4353,18 +4282,15 @@ fn repo_link_kept(
         &record.repo,
         &format!("refs/heads/{integration}"),
     )?;
-    let blob = git(
-        ctx.runner,
-        &record.repo,
-        &[
+    let blob = crate::repo::Git::new(ctx.runner, &record.repo)
+        .with_timeout(GIT_TIMEOUT)
+        .run(&[
             "ls-tree",
             "--format=%(objecttype) %(objectname)",
             &head,
             "--",
             &spec,
-        ],
-        GIT_TIMEOUT,
-    )?;
+        ])?;
     if blob != format!("blob {hash}") {
         bail!(
             "linked repo file content is not committed on integration branch `{integration}`: {}; worktree kept",
@@ -4670,7 +4596,10 @@ pub(crate) fn finished_worktree_reason_with_merged(
     if merged.is_some_and(|branches| branches.contains(&record.branch)) {
         return Ok(None);
     }
-    let Some(lane_head) = crate::git::branch_head(ctx.runner, &record.repo, &record.branch)? else {
+    let Some(lane_head) = crate::repo::Git::new(ctx.runner, &record.repo)
+        .with_timeout(Duration::from_secs(5))
+        .branch_head(&record.branch)?
+    else {
         return Ok(Some(format!(
             "work_not_done: branch `{}` is missing and no landed review contains the thread",
             record.branch
@@ -4689,9 +4618,14 @@ pub(crate) fn finished_worktree_reason_with_merged(
         )));
     }
     let integration = crate::git::symbolic_head(ctx.runner, &record.repo)?;
-    let integration_head = crate::git::branch_head(ctx.runner, &record.repo, &integration)?
+    let integration_head = crate::repo::Git::new(ctx.runner, &record.repo)
+        .with_timeout(Duration::from_secs(5))
+        .branch_head(&integration)?
         .with_context(|| format!("integration branch `{integration}` is missing"))?;
-    if crate::git::is_ancestor(ctx.runner, &record.repo, &lane_head, &integration_head)? {
+    if crate::repo::Git::new(ctx.runner, &record.repo)
+        .with_timeout(Duration::from_secs(20))
+        .is_ancestor(&lane_head, &integration_head)?
+    {
         Ok(None)
     } else {
         Ok(Some(format!(
@@ -4896,19 +4830,9 @@ fn remove_worktree_force_ignored(ctx: &Ctx, project: &Project, record: &Thread) 
         record.repo.clone()
     };
     if !record.is_remote() {
-        let out = ctx.runner.run(
-            &crate::runner::Cmd::new("git", Duration::from_secs(30)).args([
-                "-C",
-                &repo,
-                "worktree",
-                "remove",
-                "--force",
-                &record.worktree_path,
-            ]),
-        )?;
-        if !out.success() {
-            bail!("{}", out.error_text());
-        }
+        crate::repo::Git::new(ctx.runner, &repo)
+            .with_timeout(Duration::from_secs(30))
+            .run(&["worktree", "remove", "--force", &record.worktree_path])?;
     } else {
         let profile = remote::machine_profile(
             ctx.runner,

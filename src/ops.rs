@@ -258,11 +258,9 @@ pub(crate) fn check_published_ref(
     publish_url: &str,
     sha: &str,
 ) -> Result<()> {
-    let out = runner.run(
-        &Cmd::new("git", std::time::Duration::from_secs(30))
-            .args(["-C", &worktree.to_string_lossy()])
-            .args(["ls-remote", publish_url, &format!("refs/heads/{branch}")]),
-    )?;
+    let out = crate::repo::Git::new(runner, worktree)
+        .with_timeout(std::time::Duration::from_secs(30))
+        .output(&["ls-remote", publish_url, &format!("refs/heads/{branch}")])?;
     if !out.success() {
         return Err(crate::refusal::error(
             format!(
@@ -334,55 +332,32 @@ fn stage_done_inner(
     {
         bail!("report_unstable: report changed after reservation");
     }
-    let status = runner.run(
-        &Cmd::new("git", std::time::Duration::from_secs(20))
-            .args(["status", "--short"])
-            .cwd(worktree),
-    )?;
-    if !status.success() {
-        bail!("git_status_failed: {}", status.error_text());
-    }
-    if !status.stdout.trim().is_empty() {
+    let git =
+        crate::repo::Git::new(runner, worktree).with_timeout(std::time::Duration::from_secs(20));
+    let status = git.stdout(&["status", "--short"])?;
+    if !status.is_empty() {
         return Err(crate::refusal::error(
             "worktree_dirty: ha done requires an empty git status; commit or remove the listed changes first",
             "ha done",
         ));
     }
-    let head = runner.run(
-        &Cmd::new("git", std::time::Duration::from_secs(20))
-            .args(["rev-parse", "HEAD"])
-            .cwd(worktree),
-    )?;
-    if !head.success() {
-        bail!("git_head_failed: {}", head.error_text());
-    }
-    if head.stdout.trim() != sha {
+    let head = git.run(&["rev-parse", "HEAD"])?;
+    if &head != sha {
         return Err(crate::refusal::error(
-            format!(
-                "sha_mismatch: requested {sha}, HEAD is {}",
-                head.stdout.trim()
-            ),
+            format!("sha_mismatch: requested {sha}, HEAD is {}", head),
             "ha done",
         ));
     }
-    let tracked = runner.run(
-        &Cmd::new("git", std::time::Duration::from_secs(20))
-            .args([
-                "ls-tree",
-                "-r",
-                "--name-only",
-                "-z",
-                sha,
-                "--",
-                ".herdr-project/",
-            ])
-            .cwd(worktree),
-    )?;
-    if !tracked.success() {
-        bail!("git_tracked_paths_failed: {}", tracked.error_text());
-    }
+    let tracked = git.stdout(&[
+        "ls-tree",
+        "-r",
+        "--name-only",
+        "-z",
+        sha,
+        "--",
+        ".herdr-project/",
+    ])?;
     let tracked: Vec<_> = tracked
-        .stdout
         .split('\0')
         .filter(|path| !path.is_empty())
         .collect();
@@ -414,7 +389,6 @@ fn stage_done_inner(
     if base.is_empty() {
         bail!("lane base is missing; cannot classify changes");
     }
-    let git = crate::repo::Git::new(runner, worktree);
     validate_scope(&git, base, sha, role, paths)?;
     if let Some(card) = card {
         if card.thread != op.thread || card.attempt != op.attempt || card.recipient != op.recipient
@@ -453,11 +427,9 @@ fn publish_lane_ref(
     publish_url: &str,
     sha: &str,
 ) -> Result<()> {
-    let out = runner.run(
-        &Cmd::new("git", std::time::Duration::from_secs(60))
-            .args(["-C", &worktree.to_string_lossy()])
-            .args(["push", publish_url, &format!("{sha}:refs/heads/{branch}")]),
-    ).map_err(|error| crate::refusal::error(format!(
+    let out = crate::repo::Git::new(runner, worktree)
+        .output(&["push", publish_url, &format!("{sha}:refs/heads/{branch}")])
+        .map_err(|error| crate::refusal::error(format!(
         "lane_publish_failed: {error}; retry `ha done`. If it keeps failing, ask the coordinator to check the remote"
     ), "ha done --report <report-path> --sha <HEAD-sha>"))?;
     if !out.success() {
@@ -922,9 +894,9 @@ mod tests {
         runner
             .on("rev-parse base^{tree}", ok("base-tree\n"))
             .on("rev-parse abc^{tree}", ok("abc-tree\n"))
-            .on("git status --short", ok(""))
-            .on("git rev-parse HEAD", ok("abc\n"))
-            .on("git ls-tree", ok(""));
+            .on("status --short", ok(""))
+            .on("rev-parse HEAD", ok("abc\n"))
+            .on("ls-tree", ok(""));
         let recipient = Recipient {
             pane: "w1:p1".into(),
             coordinator_attempt: 1,
@@ -975,7 +947,7 @@ mod tests {
                 "ls-remote",
                 ok("abc\trefs/heads/seals/hp/demo/t-0088/abc\n"),
             )
-            .on("git -C", ok(""));
+            .on("push", ok(""));
         stage_box_done(&project, &op.op, root.path(), &runner, &card).unwrap();
         let calls = runner.calls.borrow();
         assert_eq!(calls.len(), 7);
@@ -1075,7 +1047,7 @@ mod tests {
     fn rejected_box_push_refuses_with_git_error_and_next_step() {
         let (root, project, runner, recipient) = fixture();
         let op = reserved_box_done(&project, root.path(), &recipient);
-        runner.on("git -C", fail(1, "! [rejected] non-fast-forward"));
+        runner.on("push", fail(1, "! [rejected] non-fast-forward"));
         let error = stage_box_done(
             &project,
             &op.op,
@@ -1539,7 +1511,7 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let project = project::create(root.path(), "demo", "", vec![]).unwrap();
         let runner = FakeRunner::new();
-        runner.on("git status --short", ok(" M src/lib.rs\n"));
+        runner.on("status --short", ok(" M src/lib.rs\n"));
         let recipient = Recipient {
             pane: "w1:p1".into(),
             coordinator_attempt: 1,
@@ -1570,8 +1542,8 @@ mod tests {
         std::fs::write(root2.path().join("report.md"), b"result\n").unwrap();
         let runner2 = FakeRunner::new();
         runner2
-            .on("git status --short", ok(""))
-            .on("git rev-parse HEAD", ok("different\n"));
+            .on("status --short", ok(""))
+            .on("rev-parse HEAD", ok("different\n"));
         let op2 = reserve(
             &project2,
             Reservation {
@@ -1751,15 +1723,15 @@ mod tests {
         std::fs::write(&report, b"first\n").unwrap();
         let changed = report.clone();
         runner.on_fn(
-            |cmd| cmd.display().contains("git status --short"),
+            |cmd| cmd.display().contains("status --short"),
             move |_| {
                 std::fs::write(&changed, b"second\n")?;
                 Ok(ok(""))
             },
         );
         runner
-            .on("git rev-parse HEAD", ok("abc\n"))
-            .on("git ls-tree", ok(""));
+            .on("rev-parse HEAD", ok("abc\n"))
+            .on("ls-tree", ok(""));
         let op = reserve(
             &project,
             Reservation {

@@ -4,7 +4,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 
 use crate::coordinator;
@@ -428,13 +428,10 @@ fn github_name(url: &str) -> Option<String> {
 }
 
 fn checkout_origin(ctx: &Ctx, path: &str) -> Result<String> {
-    let out = ctx.runner.run(
-        &Cmd::new("git", Duration::from_secs(40)).args(["-C", path, "remote", "get-url", "origin"]),
-    )?;
-    if !out.success() {
-        bail!("could not resolve origin: {}", out.error_text());
-    }
-    Ok(out.stdout.trim().to_string())
+    crate::repo::Git::new(ctx.runner, path)
+        .with_timeout(Duration::from_secs(40))
+        .run(&["remote", "get-url", "origin"])
+        .context("could not resolve origin")
 }
 
 fn checkout_github_name(ctx: &Ctx, path: &str) -> Result<String> {
@@ -500,15 +497,10 @@ fn prune_local_worktrees(ctx: &Ctx, repo: &str) -> Result<()> {
     if !Path::new(repo).is_dir() {
         return Ok(());
     }
-    let out = ctx
-        .runner
-        .run(&Cmd::new("git", Duration::from_secs(30)).args(["-C", repo, "worktree", "prune"]))?;
-    if !out.success() {
-        bail!(
-            "could not reconcile worktrees in {repo}: {}",
-            out.error_text()
-        );
-    }
+    crate::repo::Git::new(ctx.runner, repo)
+        .with_timeout(Duration::from_secs(30))
+        .run(&["worktree", "prune"])
+        .with_context(|| format!("could not reconcile worktrees in {repo}"))?;
     println!("reconciled worktrees in kept repo: {repo}");
     Ok(())
 }

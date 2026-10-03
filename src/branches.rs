@@ -7,36 +7,22 @@ use anyhow::{Result, bail};
 
 use crate::paths::Ctx;
 use crate::project::Project;
-use crate::runner::{Cmd, Runner};
+use crate::repo::Git;
+use crate::runner::Runner;
 use crate::thread::{self, Status, Thread};
 
 const TIMEOUT: Duration = Duration::from_secs(40);
 
-fn git(runner: &dyn Runner, repo: &str, args: &[&str]) -> Result<String> {
-    let out = runner.run(
-        &Cmd::new("git", TIMEOUT)
-            .args(["-C", repo])
-            .args(args.iter().copied()),
-    )?;
-    if !out.success() {
-        bail!("git {} in {repo}: {}", args.join(" "), out.error_text());
-    }
-    Ok(out.stdout)
-}
-
 fn refs(runner: &dyn Runner, repo: &str, remote: Option<&str>) -> Result<BTreeMap<String, String>> {
+    let git = Git::new(runner, repo).with_timeout(TIMEOUT);
     let output = if let Some(remote) = remote {
-        git(runner, repo, &["ls-remote", "--heads", remote])?
+        git.run(&["ls-remote", "--heads", remote])?
     } else {
-        git(
-            runner,
-            repo,
-            &[
-                "for-each-ref",
-                "--format=%(objectname) %(refname)",
-                "refs/heads",
-            ],
-        )?
+        git.run(&[
+            "for-each-ref",
+            "--format=%(objectname) %(refname)",
+            "refs/heads",
+        ])?
     };
     Ok(parse_refs(&output))
 }
@@ -59,7 +45,10 @@ fn parse_refs(output: &str) -> BTreeMap<String, String> {
 }
 
 fn checked_out(runner: &dyn Runner, repo: &str) -> Result<BTreeSet<String>> {
-    let output = git(runner, repo, &["worktree", "list", "--porcelain"])?;
+    let output =
+        Git::new(runner, repo)
+            .with_timeout(TIMEOUT)
+            .run(&["worktree", "list", "--porcelain"])?;
     Ok(output
         .lines()
         .filter_map(|line| line.strip_prefix("branch refs/heads/").map(str::to_owned))
@@ -83,19 +72,6 @@ fn harness_ref(name: &str) -> bool {
             .all(|c| c.is_ascii_alphanumeric() || matches!(c, '/' | '-' | '_' | '.'))
 }
 
-// A failed compare-and-delete can mean another cleanup already removed the ref.
-// Interpret its exit only after the postcondition query.
-fn deletion_command(
-    runner: &dyn Runner,
-    repo: &str,
-    args: &[&str],
-) -> Result<crate::runner::Output> {
-    let cmd = Cmd::new("git", TIMEOUT)
-        .args(["-C", repo])
-        .args(args.iter().copied());
-    runner.run(&cmd)
-}
-
 fn delete_local(runner: &dyn Runner, repo: &str, branch: &str, expected: &str) -> Result<()> {
     if checked_out(runner, repo)?.contains(branch) {
         bail!("branch {branch} is still checked out; not removing it");
@@ -103,7 +79,12 @@ fn delete_local(runner: &dyn Runner, repo: &str, branch: &str, expected: &str) -
     let name = format!("refs/heads/{branch}");
     // update-ref compares the old value atomically. Unlike branch -D it cannot
     // lose a check/delete race to another cleanup process.
-    let out = deletion_command(runner, repo, &["update-ref", "-d", &name, expected])?;
+    let out = Git::new(runner, repo).with_timeout(TIMEOUT).output(&[
+        "update-ref",
+        "-d",
+        &name,
+        expected,
+    ])?;
     if out.success() {
         return Ok(());
     }
@@ -144,7 +125,9 @@ fn delete_remote(
     }
     let deletion = format!(":refs/heads/{branch}");
     let lease = format!("--force-with-lease=refs/heads/{branch}:{expected}");
-    let out = deletion_command(runner, repo, &["push", &lease, url, &deletion])?;
+    let out = Git::new(runner, repo)
+        .with_timeout(TIMEOUT)
+        .output(&["push", &lease, url, &deletion])?;
     if out.success() {
         return Ok(());
     }
@@ -243,11 +226,8 @@ pub(crate) fn require_published_tip(
         }
         Ok(tip)
     } else {
-        let checked_out = git(
-            ctx.runner,
-            &record.worktree_path,
-            &["symbolic-ref", "--quiet", "HEAD"],
-        )?;
+        let git = Git::new(ctx.runner, &record.worktree_path).with_timeout(TIMEOUT);
+        let checked_out = git.run(&["symbolic-ref", "--quiet", "HEAD"])?;
         if checked_out.trim() != format!("refs/heads/{}", record.branch) {
             bail!(
                 "{} no longer checks out {}; not removing it",
@@ -255,16 +235,14 @@ pub(crate) fn require_published_tip(
                 record.branch
             );
         }
-        let head = git(ctx.runner, &record.worktree_path, &["rev-parse", "HEAD"])?;
-        let tip = git(
-            ctx.runner,
-            &record.repo,
-            &[
+        let head = git.run(&["rev-parse", "HEAD"])?;
+        let tip = Git::new(ctx.runner, &record.repo)
+            .with_timeout(TIMEOUT)
+            .run(&[
                 "rev-parse",
                 "--verify",
                 &format!("refs/heads/{}", record.branch),
-            ],
-        )?;
+            ])?;
         if head.trim() != tip.trim() {
             bail!(
                 "{} has moved since the branch check; not removing it",
@@ -454,6 +432,7 @@ pub(crate) fn resolved_thread(ctx: &Ctx, project: &Project, record: &Thread) -> 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::runner::Cmd;
     use std::path::Path;
     use std::process::Command;
 
@@ -471,6 +450,16 @@ mod tests {
         );
         String::from_utf8(out.stdout).unwrap().trim().to_string()
     }
+    #[test]
+    fn timed_out_deletion_is_not_success_even_if_a_retry_could_find_absence() {
+        let runner = crate::runner::fake::FakeRunner::new();
+        runner.on("update-ref", crate::runner::fake::timeout());
+        runner.on("worktree list", crate::runner::fake::ok(""));
+        runner.on("for-each-ref", crate::runner::fake::ok(""));
+        assert!(delete_local(&runner, "/repo", "hp/demo/t-1", "abc").is_err());
+        assert_eq!(runner.count("for-each-ref"), 0);
+    }
+
     #[test]
     fn remote_deletion_marker_is_not_a_branch_tip() {
         let refs = parse_refs(
