@@ -308,8 +308,7 @@ impl View {
         lanes.sort_by_key(|row| Group::DISPLAY_ORDER.iter().position(|g| *g == row.group));
         let mut plan = match crate::plan::load(project) {
             Ok(Some(mut plan)) => {
-                crate::plan::project_states_with_evidence(project, &mut plan, &evidence);
-                let holds = crate::plan::failed_check_holds(project, &plan, &evidence);
+                let holds = crate::plan::failed_check_holds(project, &mut plan, &evidence);
                 let mut value = serde_json::to_value(&plan).expect("serializable plan");
                 for step in value["steps"].as_array_mut().into_iter().flatten() {
                     crate::plan::add_hold_json(step, &holds);

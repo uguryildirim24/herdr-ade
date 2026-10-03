@@ -15,6 +15,7 @@ use anyhow::{Context, Result, bail};
 use crate::contracts::{Plan, PlanStep, StepState};
 use crate::paths::Ctx;
 use crate::project::{Project, write_atomic};
+use crate::task::EvidenceSnapshot;
 use crate::thread;
 
 pub(crate) fn plan_path(project: &Project) -> PathBuf {
@@ -27,10 +28,38 @@ fn plan_lock(project: &Project) -> Result<File> {
     crate::project::lock_file(&project.state_dir().join("plan.lock"))
 }
 
+// Binding history and its reason travel in the same atomic write as the card.
+// Old task.plan_step and direct-thread records are never rewritten.
+#[derive(Default, serde::Serialize, serde::Deserialize)]
+struct PlanHistory {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    binding_changes: Vec<BindingChange>,
+}
+
+#[derive(Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub(crate) struct BindingChange {
+    step: String,
+    bindings: Vec<String>,
+    unlink: bool,
+    why: String,
+}
+
 pub(crate) fn load(project: &Project) -> Result<Option<Plan>> {
+    read_plan(project)
+}
+
+pub(crate) fn binding_changes(project: &Project) -> Result<Vec<BindingChange>> {
+    Ok(read_plan::<PlanHistory>(project)?
+        .unwrap_or_default()
+        .binding_changes)
+}
+
+fn read_plan<T: serde::de::DeserializeOwned>(project: &Project) -> Result<Option<T>> {
     let path = plan_path(project);
     match std::fs::read_to_string(&path) {
         Ok(text) => {
+            toml::from_str::<PlanHistory>(&text)
+                .with_context(|| format!("{} has unreadable binding history", path.display()))?;
             Ok(Some(toml::from_str(&text).with_context(|| {
                 format!("{} does not parse", path.display())
             })?))
@@ -42,8 +71,17 @@ pub(crate) fn load(project: &Project) -> Result<Option<Plan>> {
 
 /// A locked write to a temporary file, flushed, atomically renamed and the
 /// parent directory flushed (SPEC-talk §6.5).
+#[cfg(test)]
 fn write(project: &Project, plan: &Plan) -> Result<()> {
-    let text = toml::to_string(plan)?;
+    write_with_history(project, plan, binding_changes(project)?)
+}
+
+fn write_with_history(
+    project: &Project,
+    plan: &Plan,
+    binding_changes: Vec<BindingChange>,
+) -> Result<()> {
+    let text = toml::to_string(plan)? + &toml::to_string(&PlanHistory { binding_changes })?;
     let path = project.record_file("plan.toml");
     write_atomic(&path, text.as_bytes())
 }
@@ -55,13 +93,11 @@ fn step_id_ok(id: &str) -> bool {
 
 fn dedup(values: &[String]) -> Vec<String> {
     let mut seen = BTreeSet::new();
-    let mut out = Vec::new();
-    for value in values {
-        if seen.insert(value.clone()) {
-            out.push(value.clone());
-        }
-    }
-    out
+    values
+        .iter()
+        .filter(|value| seen.insert(*value))
+        .cloned()
+        .collect()
 }
 
 fn check_task_refs(project: &Project, tasks: &[String]) -> Result<()> {
@@ -78,7 +114,7 @@ fn validate(plan: &Plan) -> Result<()> {
         bail!("plan_schema: expected schema 1, got {}", plan.schema);
     }
     let mut ids = BTreeSet::new();
-    for step in &plan.steps {
+    for step in all_steps(plan) {
         if !step_id_ok(&step.id) {
             bail!(
                 "plan_step_id: `{}` is not a step id (expected s-1)",
@@ -92,7 +128,14 @@ fn validate(plan: &Plan) -> Result<()> {
             thread::validate_id(t)?;
         }
     }
-    validate_subtasks(plan, ids)?;
+    for sub in plan.steps.iter().flat_map(|step| &step.subtasks) {
+        if !sub.subtasks.is_empty() {
+            bail!(
+                "plan_step_depth: `{}` is a subtask; a subtask cannot have subtasks",
+                sub.id
+            );
+        }
+    }
     for step in all_steps(plan) {
         for prerequisite in &step.after {
             if !all_steps(plan).any(|s| &s.id == prerequisite) {
@@ -139,38 +182,17 @@ fn reaches(plan: &Plan, from: &str, target: &str, seen: &mut BTreeSet<String>) -
     })
 }
 
-/// Subtasks: step ids unique across both levels, and one level only.
-fn validate_subtasks(plan: &Plan, mut ids: BTreeSet<String>) -> Result<()> {
-    for step in &plan.steps {
-        for sub in &step.subtasks {
-            if !step_id_ok(&sub.id) {
-                bail!("plan_step_id: `{}` is not a step id (expected s-1)", sub.id);
-            }
-            if !ids.insert(sub.id.clone()) {
-                bail!("plan_step_id: duplicate step id `{}`", sub.id);
-            }
-            if !sub.subtasks.is_empty() {
-                bail!(
-                    "plan_step_depth: `{}` is a subtask; a subtask cannot have subtasks",
-                    sub.id
-                );
-            }
-            for t in &sub.threads {
-                thread::validate_id(t)?;
-            }
-        }
-    }
-    Ok(())
-}
-
 /// One revision-guarded, validated, atomic mutation.
 fn with_plan<T>(
     project: &Project,
     expect: impl Into<Option<u64>>,
-    change: impl FnOnce(&mut Plan) -> Result<T>,
+    change: impl FnOnce(&mut Plan, &mut EvidenceSnapshot) -> Result<T>,
 ) -> Result<(Plan, T)> {
     let _lock = plan_lock(project)?;
     let mut plan = load(project)?.unwrap_or_default();
+    let before = plan.clone();
+    let mut evidence = crate::task::EvidenceSnapshot::load(project);
+    let history_before = evidence.binding_changes.clone();
     if expect
         .into()
         .is_some_and(|revision| plan.revision != revision)
@@ -181,22 +203,19 @@ fn with_plan<T>(
             plan.revision
         );
     }
-    let before = plan.clone();
     if plan.schema == 0 {
         plan.schema = 1;
     }
-    let extra = change(&mut plan)?;
+    let extra = change(&mut plan, &mut evidence)?;
     // Every plan mutation also refreshes the persisted projection. In
     // particular, adding or removing a binding must not leave a stale state
     // until a later `plan sync`.
-    project_states(project, &mut plan);
+    evaluate(project, &plan, &evidence).project(&mut plan);
     validate(&plan)?;
-    if plan == before {
-        crate::project::refresh_page(project)?;
-        return Ok((plan, extra));
+    if plan != before || evidence.binding_changes != history_before {
+        plan.revision += 1;
+        write_with_history(project, &plan, evidence.binding_changes)?;
     }
-    plan.revision += 1;
-    write(project, &plan)?;
     crate::project::refresh_page(project)?;
     Ok((plan, extra))
 }
@@ -217,12 +236,11 @@ pub(crate) fn set(
     expect: impl Into<Option<u64>>,
 ) -> Result<Plan> {
     let project = Project::load(&ctx.root, slug)?;
-    let does = does.trim().to_string();
     let goal = project_goal(&project);
-    let (plan, ()) = with_plan(&project, expect, |plan| {
+    let (plan, ()) = with_plan(&project, expect, |plan, _| {
         plan.kind.clear();
         plan.what_you_get.clear();
-        plan.does = does.clone();
+        plan.does = does.trim().into();
         plan.goal = goal.clone();
         Ok(())
     })?;
@@ -238,13 +256,12 @@ pub(crate) fn step_add(
     expect: impl Into<Option<u64>>,
 ) -> Result<Plan> {
     let project = Project::load(&ctx.root, slug)?;
-    let text = text.trim().to_string();
     check_task_refs(&project, &tasks)?;
-    let (plan, ()) = with_plan(&project, expect, |plan| {
+    let (plan, ()) = with_plan(&project, expect, |plan, _| {
         let id = next_id(plan);
         plan.steps.push(PlanStep {
             id,
-            text: text.clone(),
+            text: text.trim().into(),
             state: StepState::Left,
             tasks: dedup(&tasks),
             after: dedup(&after),
@@ -289,9 +306,8 @@ pub(crate) fn subtask_add(
     expect: impl Into<Option<u64>>,
 ) -> Result<(Plan, String)> {
     let project = Project::load(&ctx.root, slug)?;
-    let text = text.trim().to_string();
     check_task_refs(&project, &tasks)?;
-    with_plan(&project, expect, |plan| {
+    with_plan(&project, expect, |plan, _| {
         let Some(at) = plan.steps.iter().position(|s| s.id == under) else {
             if all_steps(plan).any(|s| s.id == under) {
                 return Err(crate::refusal::error(
@@ -309,7 +325,7 @@ pub(crate) fn subtask_add(
         let id = next_id(plan);
         plan.steps[at].subtasks.push(PlanStep {
             id: id.clone(),
-            text: text.clone(),
+            text: text.trim().into(),
             state: StepState::Left,
             tasks: dedup(&tasks),
             after: dedup(&after),
@@ -327,10 +343,9 @@ pub(crate) fn step_edit(
     expect: impl Into<Option<u64>>,
 ) -> Result<Plan> {
     let project = Project::load(&ctx.root, slug)?;
-    let text = text.trim().to_string();
-    let (plan, ()) = with_plan(&project, expect, |plan| {
+    let (plan, ()) = with_plan(&project, expect, |plan, _| {
         let step = find_step(plan, id)?;
-        step.text = text.clone();
+        step.text = text.trim().into();
         Ok(())
     })?;
     Ok(plan)
@@ -352,16 +367,22 @@ pub(crate) fn step_link(
         ));
     }
     check_task_refs(&project, &tasks)?;
-    let (plan, ()) = with_plan(&project, expect, |plan| {
+    let (plan, ()) = with_plan(&project, expect, |plan, evidence| {
+        let changes = &mut evidence.binding_changes;
         let step = find_step(plan, id)?;
-        for task in &tasks {
-            if !step.tasks.contains(task) {
-                step.tasks.push(task.clone());
-            }
+        if tasks.iter().any(|task| is_unlinked(changes, id, task)) {
+            changes.push(BindingChange {
+                step: id.into(),
+                bindings: tasks.clone(),
+                unlink: false,
+                why: String::new(),
+            });
         }
-        for id in &after {
-            if !step.after.contains(id) {
-                step.after.push(id.clone());
+        for (bound, added) in [(&mut step.tasks, tasks), (&mut step.after, after)] {
+            for id in added {
+                if !bound.contains(&id) {
+                    bound.push(id);
+                }
             }
         }
         Ok(())
@@ -385,34 +406,33 @@ pub(crate) fn step_unlink(
             format!("ha plan step unlink {slug} {id} --after <step-id> --reason \"<reason>\""),
         ));
     }
-    let (plan, (removed_tasks, removed_after, changed)) = with_plan(&project, expect, |plan| {
+    let (plan, ()) = with_plan(&project, expect, |plan, evidence| {
         let step = find_step(plan, id)?;
-        let removed_tasks: Vec<_> = step
+        let (bound_tasks, bound_threads) = bindings(step, evidence);
+        let attempts: BTreeSet<_> = evidence
             .tasks
             .iter()
-            .filter(|t| tasks.contains(t))
-            .cloned()
+            .filter(|task| tasks.contains(&task.id))
+            .flat_map(|task| &task.attempts)
             .collect();
-        let removed_after: Vec<_> = step
-            .after
-            .iter()
-            .filter(|a| after.contains(a))
-            .cloned()
+        let removed: Vec<_> = bound_tasks
+            .into_iter()
+            .filter(|id| tasks.contains(id))
+            .chain(bound_threads.into_iter().filter(|id| attempts.contains(id)))
+            .chain(step.after.iter().filter(|id| after.contains(id)).cloned())
             .collect();
         step.tasks.retain(|task| !tasks.contains(task));
         step.after.retain(|edge| !after.contains(edge));
-        let changed = !removed_tasks.is_empty() || !removed_after.is_empty();
-        Ok((removed_tasks, removed_after, changed))
+        if !removed.is_empty() {
+            evidence.binding_changes.push(BindingChange {
+                step: id.into(),
+                bindings: removed,
+                unlink: true,
+                why: why.into(),
+            });
+        }
+        Ok(())
     })?;
-    if changed {
-        crate::launch::dispatch(
-            &project,
-            serde_json::json!({
-                "kind": "plan-unlink", "step": id, "after": removed_after,
-                "tasks": removed_tasks, "why": why, "revision": plan.revision,
-            }),
-        )?;
-    }
     Ok(plan)
 }
 
@@ -423,7 +443,7 @@ pub(crate) fn step_remove(
     expect: impl Into<Option<u64>>,
 ) -> Result<Plan> {
     let project = Project::load(&ctx.root, slug)?;
-    let (plan, ()) = with_plan(&project, expect, |plan| {
+    let (plan, ()) = with_plan(&project, expect, |plan, _| {
         let removed: Vec<_> = plan
             .steps
             .iter()
@@ -470,7 +490,7 @@ pub(crate) fn step_move(
     expect: impl Into<Option<u64>>,
 ) -> Result<Plan> {
     let project = Project::load(&ctx.root, slug)?;
-    let (plan, ()) = with_plan(&project, expect, |plan| {
+    let (plan, ()) = with_plan(&project, expect, |plan, _| {
         let from = plan
             .steps
             .iter()
@@ -523,8 +543,7 @@ pub(crate) struct Show {
     plan: Plan,
     present: bool,
     goal: String,
-    tasks: Vec<crate::task::Task>,
-    holds: BTreeMap<String, FailedCheckHold>,
+    evaluation: Evaluation,
 }
 
 pub(crate) fn show(ctx: &Ctx, slug: &str) -> Result<Show> {
@@ -538,14 +557,13 @@ pub(crate) fn show(ctx: &Ctx, slug: &str) -> Result<Show> {
         ..Plan::default()
     });
     let evidence = crate::task::EvidenceSnapshot::load(&project);
-    project_states_with_evidence(&project, &mut plan, &evidence);
-    let holds = failed_check_holds(&project, &plan, &evidence);
+    let evaluation = evaluate(&project, &plan, &evidence);
+    evaluation.project(&mut plan);
     Ok(Show {
         plan,
         present,
         goal,
-        tasks: crate::task::list_with_errors(&project).0,
-        holds,
+        evaluation,
     })
 }
 
@@ -558,13 +576,13 @@ impl serde::Serialize for Show {
         let mut value = serde_json::to_value(&self.plan).map_err(S::Error::custom)?;
         value["present"] = self.present.into();
         for step in value["steps"].as_array_mut().into_iter().flatten() {
-            add_hold_json(step, &self.holds);
+            add_hold_json(step, &self.evaluation.holds);
             if let Some(subtasks) = step
                 .get_mut("subtasks")
                 .and_then(|value| value.as_array_mut())
             {
                 for sub in subtasks {
-                    add_hold_json(sub, &self.holds);
+                    add_hold_json(sub, &self.evaluation.holds);
                 }
             }
         }
@@ -601,18 +619,10 @@ impl Show {
             std::iter::once(("  ", s)).chain(s.subtasks.iter().map(|sub| ("      ", sub)))
         }) {
             let mut refs = String::new();
-            let linked_tasks: Vec<String> = self
-                .tasks
-                .iter()
-                .filter(|task| {
-                    task.plan_step.as_deref() == Some(step.id.as_str())
-                        || step.tasks.contains(&task.id)
-                })
-                .map(|task| task.id.clone())
-                .collect();
+            let evaluated = &self.evaluation.steps[&step.id];
             for (label, ids) in [
-                ("tasks", &linked_tasks),
-                ("threads", &step.threads),
+                ("tasks", &evaluated.tasks),
+                ("threads", &evaluated.threads),
                 ("after", &step.after),
             ] {
                 if !ids.is_empty() {
@@ -626,7 +636,7 @@ impl Show {
                 step.text,
                 refs
             ));
-            if let Some(hold) = self.holds.get(&step.id) {
+            if let Some(hold) = self.evaluation.holds.get(&step.id) {
                 out.push_str(&format!("{indent}  {}\n", hold.message()));
             }
         }
@@ -645,14 +655,14 @@ pub(crate) fn check_prerequisites(project: &Project, job: &str) -> Result<()> {
     if !all_steps(&plan).any(|step| !step.after.is_empty()) {
         return Ok(());
     }
-    let task = crate::task::load(project, job)?;
-    let (_, errors) = crate::task::list_with_errors(project);
+    crate::task::load(project, job)?;
     let evidence = crate::task::EvidenceSnapshot::load(project);
-    project_states_with_evidence(project, &mut plan, &evidence);
-    let readable = errors.is_empty() && evidence.readable();
-    for dependent in all_steps(&plan).filter(|step| {
-        step.tasks.iter().any(|id| id == job) || task.plan_step.as_deref() == Some(&step.id)
-    }) {
+    let evaluation = evaluate(project, &plan, &evidence);
+    evaluation.project(&mut plan);
+    let readable = evidence.tasks_readable() && evidence.readable();
+    for dependent in
+        all_steps(&plan).filter(|step| evaluation.steps[&step.id].tasks.iter().any(|id| id == job))
+    {
         for id in &dependent.after {
             let prerequisite = all_steps(&plan)
                 .find(|step| &step.id == id)
@@ -665,7 +675,7 @@ pub(crate) fn check_prerequisites(project: &Project, job: &str) -> Result<()> {
                 } else {
                     prerequisite.state
                 };
-                if let Some(check) = failed_check(project, prerequisite, &evidence) {
+                if let Some(check) = evaluation.steps[id].checks.first() {
                     let reason = check.diagnostic.as_deref().unwrap_or("verdict FAIL");
                     bail!(
                         "plan_prerequisite: {job} cannot start; step {} waits for {} (check failed: {} {reason}). Send the work back with ha thread prompt and get a fresh verdict, or change the plan.",
@@ -682,7 +692,7 @@ pub(crate) fn check_prerequisites(project: &Project, job: &str) -> Result<()> {
                     project.slug
                 );
             }
-            require_step_acceptance(project, prerequisite, &evidence)?;
+            require_step_acceptance(project, prerequisite, &evidence, &evaluation)?;
         }
     }
     Ok(())
@@ -694,33 +704,37 @@ pub(crate) fn check_prerequisites(project: &Project, job: &str) -> Result<()> {
 fn require_step_acceptance(
     project: &Project,
     step: &PlanStep,
-    evidence: &crate::task::EvidenceSnapshot,
+    evidence: &EvidenceSnapshot,
+    evaluation: &Evaluation,
 ) -> Result<()> {
-    let (tasks, errors) = crate::task::list_with_errors(project);
-    if !errors.is_empty() {
+    if !evidence.tasks_readable() {
         bail!("plan_prerequisite: acceptance not established: unreadable tasks");
     }
-    let bound: Vec<_> = tasks
+    let evaluated = &evaluation.steps[&step.id];
+    let bound: Vec<_> = evidence
+        .tasks
         .iter()
         .filter(|task| {
             task.dropped.is_empty()
-                && (step.tasks.contains(&task.id)
-                    || task.plan_step.as_deref() == Some(&step.id)
+                && (evaluated.tasks.contains(&task.id)
                     || task
                         .attempts
                         .last()
-                        .is_some_and(|id| step.threads.contains(id)))
+                        .is_some_and(|id| evaluated.threads.contains(id)))
         })
         .collect();
     for task in &bound {
         crate::task::require_accepted(project, task, evidence)
             .map_err(|error| anyhow::anyhow!("plan_prerequisite: step {}: {error}", step.id))?;
     }
-    for id in &step.threads {
+    for id in &evaluated.threads {
         if bound.iter().any(|task| task.attempts.last() == Some(id)) {
             continue;
         }
-        let lane = thread::load(project, id)?;
+        let lane = evidence
+            .lanes
+            .get(id)
+            .context("plan_prerequisite: missing thread")?;
         if lane.merged_sha.is_empty() || !lane.merged_review.is_empty() {
             bail!(
                 "plan_prerequisite: acceptance not established: {id} needs a request-backed task and criterion evidence"
@@ -728,7 +742,7 @@ fn require_step_acceptance(
         }
     }
     for sub in &step.subtasks {
-        require_step_acceptance(project, sub, evidence)?;
+        require_step_acceptance(project, sub, evidence, evaluation)?;
     }
     Ok(())
 }
@@ -766,22 +780,27 @@ pub(crate) enum SyncOutcome {
 /// `ha plan sync`: derive states from the bound work records and write only
 /// on change.
 pub(crate) fn sync(ctx: &Ctx, slug: &str) -> Result<SyncOutcome> {
-    let project = Project::load(&ctx.root, slug)?;
-    let _lock = plan_lock(&project)?;
-    let Some(mut plan) = load(&project)? else {
+    refresh_project(&Project::load(&ctx.root, slug)?)
+}
+
+fn refresh_project(project: &Project) -> Result<SyncOutcome> {
+    let _lock = plan_lock(project)?;
+    let Some(mut plan) = load(project)? else {
+        crate::project::refresh_page(project)?;
         return Ok(SyncOutcome::Missing);
     };
-    let evidence = crate::task::EvidenceSnapshot::load(&project);
-    if !project_states_with_evidence(&project, &mut plan, &evidence) {
-        crate::project::refresh_page(&project)?;
+    let evidence = crate::task::EvidenceSnapshot::load(project);
+    let evaluation = evaluate(project, &plan, &evidence);
+    if !evaluation.project(&mut plan) {
+        crate::project::refresh_page(project)?;
         return Ok(SyncOutcome::Unchanged {
             revision: plan.revision,
-            holds: failed_check_holds(&project, &plan, &evidence),
+            holds: evaluation.holds,
         });
     }
     plan.revision += 1;
-    write(&project, &plan)?;
-    crate::project::refresh_page(&project)?;
+    write_with_history(project, &plan, evidence.binding_changes)?;
+    crate::project::refresh_page(project)?;
     Ok(SyncOutcome::Changed {
         revision: plan.revision,
     })
@@ -791,94 +810,199 @@ pub(crate) fn sync(ctx: &Ctx, slug: &str) -> Result<SyncOutcome> {
 /// work records and writes only on change; a missing card is a no-op. Callers
 /// treat a failure as a separate refresh failure, never a merge failure.
 pub(crate) fn refresh(_ctx: &Ctx, project: &Project) -> Result<bool> {
-    let _lock = plan_lock(project)?;
-    let Some(mut plan) = load(project)? else {
-        crate::project::refresh_page(project)?;
-        return Ok(false);
-    };
-    if !project_states(project, &mut plan) {
-        crate::project::refresh_page(project)?;
-        return Ok(false);
-    }
-    plan.revision += 1;
-    write(project, &plan)?;
-    crate::project::refresh_page(project)?;
-    Ok(true)
+    Ok(matches!(
+        refresh_project(project)?,
+        SyncOutcome::Changed { .. }
+    ))
 }
 
 /// Flips every step's persisted state to the state its bindings derive.
 pub(crate) fn project_states(project: &Project, plan: &mut Plan) -> bool {
-    project_states_with_evidence(project, plan, &crate::task::EvidenceSnapshot::load(project))
+    evaluate(project, plan, &crate::task::EvidenceSnapshot::load(project)).project(plan)
 }
 
-pub(crate) fn project_states_with_evidence(
-    project: &Project,
-    plan: &mut Plan,
-    evidence: &crate::task::EvidenceSnapshot,
-) -> bool {
-    let mut changed = false;
-    // Task enumeration parses every record. Reuse one snapshot across the
-    // whole plan rather than repeating it for every step and subtask.
-    let tasks = crate::task::list_with_errors(project).0;
-    for step in &mut plan.steps {
-        for sub in &mut step.subtasks {
-            let state = derive_state_from_tasks(project, sub, evidence, &tasks);
-            if sub.state != state {
-                sub.state = state;
-                changed = true;
-            }
+#[derive(Default)]
+struct Evaluation {
+    steps: BTreeMap<String, StepEvaluation>,
+    holds: BTreeMap<String, FailedCheckHold>,
+}
+struct StepEvaluation {
+    state: StepState,
+    tasks: Vec<String>,
+    threads: Vec<String>,
+    checks: Vec<HoldingCheck>,
+    terminal: bool,
+}
+impl Evaluation {
+    fn project(&self, plan: &mut Plan) -> bool {
+        let mut changed = false;
+        for step in plan.steps.iter_mut().flat_map(|s| {
+            std::iter::once((&mut s.state, &s.id))
+                .chain(s.subtasks.iter_mut().map(|s| (&mut s.state, &s.id)))
+        }) {
+            let state = self.steps[step.1].state;
+            changed |= *step.0 != state;
+            *step.0 = state;
         }
-        let mut state = derive_state_from_tasks(project, step, evidence, &tasks);
-        if !step.subtasks.is_empty() {
-            state = with_subtasks_from_tasks(step, state, &tasks);
-        }
-        if step.state != state {
-            step.state = state;
-            changed = true;
-        }
+        changed
     }
-    changed
 }
 
-/// A step with subtasks, on top of its own leaf state `own`: done when every
-/// subtask is done and its own linked work (if any) is done too; running when
-/// any subtask or its own work is running or done; else left.
-#[cfg(test)]
-fn with_subtasks(project: &Project, step: &PlanStep, own: StepState) -> StepState {
-    with_subtasks_from_tasks(step, own, &crate::task::list_with_errors(project).0)
+fn is_unlinked(changes: &[BindingChange], step: &str, id: &str) -> bool {
+    changes
+        .iter()
+        .rev()
+        .find(|change| change.step == step && change.bindings.iter().any(|binding| binding == id))
+        .is_some_and(|change| change.unlink)
 }
 
-fn with_subtasks_from_tasks(
+/// Normalize in memory; the original records and reasoned binding history stay.
+fn bindings(step: &PlanStep, evidence: &EvidenceSnapshot) -> (Vec<String>, Vec<String>) {
+    let allowed = |id: &String| !is_unlinked(&evidence.binding_changes, &step.id, id);
+    let mut tasks: BTreeSet<_> = step.tasks.iter().cloned().collect();
+    tasks.extend(
+        evidence
+            .tasks
+            .iter()
+            .filter(|task| task.plan_step.as_deref() == Some(&step.id))
+            .map(|task| task.id.clone()),
+    );
+    tasks.retain(allowed);
+    let threads = step
+        .threads
+        .iter()
+        .filter(|id| allowed(id))
+        .cloned()
+        .collect();
+    (tasks.into_iter().collect(), threads)
+}
+
+/// One bottom-up pass produces states, normalized bindings and failed-check
+/// explanations together. Work completion and critic verdicts are read once.
+fn evaluate(project: &Project, plan: &Plan, evidence: &EvidenceSnapshot) -> Evaluation {
+    let mut work = BTreeMap::new();
+    for lane in evidence.lanes.values() {
+        let check = critic_check(project, lane, evidence).map(|mut check| {
+            check.task_id = evidence
+                .tasks
+                .iter()
+                .find(|task| task.attempts.last() == Some(&lane.id))
+                .map(|task| task.id.clone());
+            check
+        });
+        work.insert(
+            lane.id.clone(),
+            BoundWork {
+                terminal: evidence.lane_done(lane),
+                started: true,
+                check,
+                dropped: false,
+            },
+        );
+    }
+    for task in &evidence.tasks {
+        let view = crate::task::view_with_evidence(project, task.clone(), evidence);
+        let attempt = task.attempts.last().and_then(|id| work.get(id));
+        let check = attempt
+            .and_then(|work| work.check.clone())
+            .map(|mut check| {
+                check.task_id = Some(task.id.clone());
+                check
+            });
+        work.insert(
+            task.id.clone(),
+            BoundWork {
+                terminal: !task.installed.is_empty() || attempt.is_some_and(|work| work.terminal),
+                started: view.state != crate::task::State::Open,
+                check,
+                dropped: !task.dropped.is_empty(),
+            },
+        );
+    }
+    let mut evaluation = Evaluation::default();
+    for step in &plan.steps {
+        evaluate_step(step, evidence, &work, &mut evaluation);
+    }
+    evaluation
+}
+
+#[derive(Default)]
+struct BoundWork {
+    terminal: bool,
+    started: bool,
+    check: Option<HoldingCheck>,
+    dropped: bool,
+}
+
+fn evaluate_step(
     step: &PlanStep,
-    own: StepState,
-    tasks: &[crate::task::Task],
-) -> StepState {
-    let children = step.subtasks.iter().map(|s| s.state);
-    let own_blocks = own != StepState::Done && has_own_work(step, tasks);
-    if !own_blocks && children.clone().all(|s| s == StepState::Done) {
+    evidence: &EvidenceSnapshot,
+    work: &BTreeMap<String, BoundWork>,
+    evaluation: &mut Evaluation,
+) {
+    for sub in &step.subtasks {
+        evaluate_step(sub, evidence, work, evaluation);
+    }
+    let (tasks, threads) = bindings(step, evidence);
+    let missing = BoundWork::default();
+    let own: Vec<_> = tasks
+        .iter()
+        .chain(&threads)
+        .map(|id| work.get(id).unwrap_or(&missing))
+        .filter(|work| !work.dropped)
+        .collect();
+    let own_work = !own.is_empty();
+    let mut terminal = own.iter().all(|work| work.terminal);
+    let mut checks: Vec<_> = own.iter().filter_map(|work| work.check.clone()).collect();
+    let own = if own_work && terminal && checks.is_empty() {
         StepState::Done
-    } else if own != StepState::Left || children.into_iter().any(|s| s != StepState::Left) {
+    } else if own.iter().any(|work| work.started) {
         StepState::Running
     } else {
         StepState::Left
+    };
+    let children: Vec<_> = step
+        .subtasks
+        .iter()
+        .map(|sub| &evaluation.steps[&sub.id])
+        .collect();
+    let state = if children.is_empty() {
+        own
+    } else if (!own_work || own == StepState::Done)
+        && children.iter().all(|sub| sub.state == StepState::Done)
+    {
+        StepState::Done
+    } else if own != StepState::Left || children.iter().any(|sub| sub.state != StepState::Left) {
+        StepState::Running
+    } else {
+        StepState::Left
+    };
+    terminal &= (own_work || !children.is_empty()) && children.iter().all(|sub| sub.terminal);
+    for child in children {
+        checks.extend(child.checks.clone());
     }
-}
-
-/// Whether the step itself carries work the leaf rule counts: a live linked
-/// task or a thread. Its leaf state reads `left` both without work
-/// and with work not yet started.
-fn has_own_work(step: &PlanStep, tasks: &[crate::task::Task]) -> bool {
-    !step.threads.is_empty()
-        // A dropped binding is deliberately excluded, but a missing explicit
-        // binding still blocks a parent from completing through its children.
-        || step.tasks.iter().any(|id| {
-            !tasks.iter().any(|task| task.id == *id && !task.dropped.is_empty())
-        })
-        || tasks.iter().any(|task| {
-            task.dropped.is_empty()
-                && (task.plan_step.as_deref() == Some(step.id.as_str())
-                    || step.tasks.contains(&task.id))
-        })
+    let mut seen = BTreeSet::new();
+    checks.retain(|check| seen.insert((check.lane_id.clone(), check.task_id.clone())));
+    if state == StepState::Running
+        && terminal
+        && !checks.is_empty()
+        && evidence.readable()
+        && evidence.tasks_readable()
+    {
+        evaluation.holds.insert(step.id.clone(), FailedCheckHold {
+            checks: checks.clone(), next: "get a fresh critic verdict (re-check, sealed PASS), or unlink the check task with a reason".into(),
+        });
+    }
+    evaluation.steps.insert(
+        step.id.clone(),
+        StepEvaluation {
+            state,
+            tasks,
+            threads,
+            checks,
+            terminal,
+        },
+    );
 }
 
 /// A display-only explanation: no new persisted state or completion rule.
@@ -922,11 +1046,8 @@ pub(crate) fn add_hold_json(
     holds: &BTreeMap<String, FailedCheckHold>,
 ) {
     if let Some(hold) = value["id"].as_str().and_then(|id| holds.get(id)) {
-        value["failed_check_hold"] = serde_json::json!({
-            "checks": hold.checks,
-            "next": hold.next,
-            "message": hold.message(),
-        });
+        value["failed_check_hold"] = serde_json::to_value(hold).expect("serializable hold");
+        value["failed_check_hold"]["message"] = hold.message().into();
     }
 }
 
@@ -934,79 +1055,18 @@ pub(crate) fn add_hold_json(
 /// terminal evidence as derivation, including missing bindings and children.
 pub(crate) fn failed_check_holds(
     project: &Project,
-    plan: &Plan,
-    evidence: &crate::task::EvidenceSnapshot,
+    plan: &mut Plan,
+    evidence: &EvidenceSnapshot,
 ) -> BTreeMap<String, FailedCheckHold> {
-    let (tasks, errors) = crate::task::list_with_errors(project);
-    if !errors.is_empty() || !evidence.readable() {
-        return BTreeMap::new();
-    }
-    all_steps(plan).filter(|step| step.state == StepState::Running).filter_map(|step| {
-        let checks = terminal_checks(project, step, evidence, &tasks)?;
-        if checks.is_empty() {
-            return None;
-        }
-        let next = "get a fresh critic verdict (re-check, sealed PASS), or unlink the check task with a reason".into();
-        Some((step.id.clone(), FailedCheckHold { checks, next }))
-    }).collect()
-}
-
-fn terminal_checks(
-    project: &Project,
-    step: &PlanStep,
-    evidence: &crate::task::EvidenceSnapshot,
-    tasks: &[crate::task::Task],
-) -> Option<Vec<HoldingCheck>> {
-    if step
-        .tasks
-        .iter()
-        .any(|id| !tasks.iter().any(|task| &task.id == id))
-    {
-        return None;
-    }
-    if !has_own_work(step, tasks) && step.subtasks.is_empty() {
-        return None;
-    }
-    let mut checks = Vec::new();
-    for task in tasks.iter().filter(|task| {
-        task.dropped.is_empty()
-            && (step.tasks.contains(&task.id) || task.plan_step.as_deref() == Some(&step.id))
-    }) {
-        let view = crate::task::view_with_evidence(project, task.clone(), evidence);
-        if !view.terminal_with_evidence(project, evidence) {
-            return None;
-        }
-        if let Some(check) = task_failed_check(project, task, evidence) {
-            checks.push(check);
-        }
-    }
-    for id in &step.threads {
-        let lane = thread::load(project, id).ok()?;
-        if !crate::review::lane_done(project, &lane, evidence.events()) {
-            return None;
-        }
-        if let Some(mut check) = critic_check(project, &lane, evidence)
-            && !checks.iter().any(|check| &check.lane_id == id)
-        {
-            check.task_id = tasks
-                .iter()
-                .find(|task| task.attempts.last() == Some(id))
-                .map(|task| task.id.clone());
-            checks.push(check);
-        }
-    }
-    for sub in &step.subtasks {
-        checks.extend(terminal_checks(project, sub, evidence, tasks)?);
-    }
-    let mut seen = BTreeSet::new();
-    checks.retain(|check| seen.insert((check.lane_id.clone(), check.task_id.clone())));
-    Some(checks)
+    let evaluation = evaluate(project, plan, evidence);
+    evaluation.project(plan);
+    evaluation.holds
 }
 
 fn critic_check(
     project: &Project,
     lane: &thread::Thread,
-    evidence: &crate::task::EvidenceSnapshot,
+    evidence: &EvidenceSnapshot,
 ) -> Option<HoldingCheck> {
     if lane.role != "critic" {
         return None;
@@ -1029,120 +1089,6 @@ fn critic_check(
         task_id: None,
         diagnostic,
     })
-}
-
-fn task_failed_check(
-    project: &Project,
-    task: &crate::task::Task,
-    evidence: &crate::task::EvidenceSnapshot,
-) -> Option<HoldingCheck> {
-    let id = task.attempts.last()?;
-    let lane = thread::load(project, id).ok()?;
-    let mut check = critic_check(project, &lane, evidence)?;
-    check.task_id = Some(task.id.clone());
-    Some(check)
-}
-
-fn failed_check(
-    project: &Project,
-    step: &PlanStep,
-    evidence: &crate::task::EvidenceSnapshot,
-) -> Option<HoldingCheck> {
-    let tasks = crate::task::list_with_errors(project).0;
-    for task in tasks.iter().filter(|task| {
-        task.dropped.is_empty()
-            && (step.tasks.contains(&task.id) || task.plan_step.as_deref() == Some(&step.id))
-    }) {
-        if let Some(id) = task_failed_check(project, task, evidence) {
-            return Some(id);
-        }
-    }
-    for id in &step.threads {
-        let Ok(lane) = thread::load(project, id) else {
-            continue;
-        };
-        if let Some(check) = critic_check(project, &lane, evidence) {
-            return Some(check);
-        }
-    }
-    for sub in &step.subtasks {
-        if let Some(id) = failed_check(project, sub, evidence) {
-            return Some(id);
-        }
-    }
-    None
-}
-
-/// Derive each state in the fixed order (SPEC-talk §6.5): `done` when at least
-/// one binding exists and every binding is positively satisfied, else
-/// `running` when any required work has started or partially landed, else
-/// `left`.
-#[cfg(test)]
-fn derive_state(
-    project: &Project,
-    step: &PlanStep,
-    evidence: &crate::task::EvidenceSnapshot,
-) -> StepState {
-    derive_state_from_tasks(
-        project,
-        step,
-        evidence,
-        &crate::task::list_with_errors(project).0,
-    )
-}
-
-fn derive_state_from_tasks(
-    project: &Project,
-    step: &PlanStep,
-    evidence: &crate::task::EvidenceSnapshot,
-    tasks: &[crate::task::Task],
-) -> StepState {
-    let linked_tasks: Vec<_> = tasks
-        .iter()
-        .filter(|task| {
-            task.plan_step.as_deref() == Some(step.id.as_str()) || step.tasks.contains(&task.id)
-        })
-        .cloned()
-        .map(|task| crate::task::view_with_evidence(project, task, evidence))
-        .filter(|view| view.record.dropped.is_empty())
-        .collect();
-    if linked_tasks.is_empty() && step.threads.is_empty() {
-        return StepState::Left;
-    }
-    // Explicit dropped tasks exist but are excluded from the live bindings.
-    // Only a genuinely missing or unreadable explicit task blocks completion.
-    let mut all_satisfied = step
-        .tasks
-        .iter()
-        .all(|id| tasks.iter().any(|task| task.id == *id));
-    let mut any_started = false;
-    for view in linked_tasks {
-        if !view.terminal_with_evidence(project, evidence)
-            || task_failed_check(project, &view.record, evidence).is_some()
-        {
-            all_satisfied = false;
-        }
-        if view.state != crate::task::State::Open {
-            any_started = true;
-        }
-    }
-    for id in &step.threads {
-        match thread::load(project, id) {
-            Ok(lane) => {
-                any_started = true;
-                all_satisfied &= crate::review::lane_done(project, &lane, evidence.events())
-                    && critic_check(project, &lane, evidence).is_none();
-            }
-            Err(_) => all_satisfied = false,
-        }
-    }
-    if all_satisfied {
-        StepState::Done
-    } else if any_started {
-        StepState::Running
-    } else {
-        StepState::Left
-    }
 }
 
 #[cfg(test)]
@@ -1221,7 +1167,7 @@ mod tests {
     }
 
     fn link_historical_threads(fx: &Fx, threads: Vec<String>, expect: u64) -> Plan {
-        with_plan(&fx.project, expect, |plan| {
+        with_plan(&fx.project, expect, |plan, _| {
             find_step(plan, "s-1")?.threads = threads;
             Ok(())
         })
@@ -1274,67 +1220,96 @@ mod tests {
         }
         // Explicit installed evidence needs neither a lane nor a seal.
         tasks[0].installed.push(crate::task::Evidence {
-            at: project_goal(&fx.project), command: "historical install".into(),
-            acceptance: vec![], machine: None, build: None,
+            at: project_goal(&fx.project),
+            command: "historical install".into(),
+            acceptance: vec![],
+            machine: None,
+            build: None,
         });
         tasks[1] = tasks[0].clone();
         tasks[1].id = "job-0002".into();
         tasks[1].plan_step = Some("s-2".into());
         tasks[2].dropped.push(crate::task::DropEvidence {
-            at: "2026-09-22T00:00:00Z".into(), reason: "not required".into(),
+            at: "2026-09-22T00:00:00Z".into(),
+            reason: "not required".into(),
         });
         let historical = fx.thread("historical merged");
-        thread::update(&fx.project, &historical, |t| t.merged_sha = "old-sha".into()).unwrap();
+        thread::update(&fx.project, &historical, |t| {
+            t.merged_sha = "old-sha".into()
+        })
+        .unwrap();
         let no_change = fx.thread("no change");
         let seal = fx.seal_done(&no_change, 1, 1, "old-sha", "research");
         thread::update(&fx.project, &no_change, |t| {
-            t.changes_seal = seal.clone(); t.has_changes = Some(false);
-        }).unwrap();
+            t.changes_seal = seal.clone();
+            t.has_changes = Some(false);
+        })
+        .unwrap();
         tasks[3].attempts = vec![no_change];
         let critic = fx.thread("failed critic");
         thread::update(&fx.project, &critic, |t| {
-            t.role = "critic".into(); t.merged_sha = "old-sha".into();
-        }).unwrap();
+            t.role = "critic".into();
+            t.merged_sha = "old-sha".into();
+        })
+        .unwrap();
         fx.seal_done(&critic, 1, 1, "old-sha", "+++\nverdict = \"FAIL\"\n+++\n");
         tasks[4].attempts = vec![critic.clone()];
         let awaiting_install = fx.thread("historical awaiting install");
         thread::update(&fx.project, &awaiting_install, |t| {
-            t.merged_sha = "old-sha".into(); t.historical_install_required = true;
-        }).unwrap();
+            t.merged_sha = "old-sha".into();
+            t.historical_install_required = true;
+        })
+        .unwrap();
         tasks[5].attempts = vec![awaiting_install];
         for task in tasks {
-            std::fs::write(fx.project.state_dir().join("tasks").join(format!("{}.toml", task.id)), toml::to_string(&task).unwrap()).unwrap();
+            std::fs::write(
+                fx.project
+                    .state_dir()
+                    .join("tasks")
+                    .join(format!("{}.toml", task.id)),
+                toml::to_string(&task).unwrap(),
+            )
+            .unwrap();
         }
         let step = |n: u32, tasks: &[&str], threads: Vec<String>| PlanStep {
-            id: format!("s-{n}"), tasks: tasks.iter().map(|id| (*id).into()).collect(),
-            threads, ..PlanStep::default()
+            id: format!("s-{n}"),
+            tasks: tasks.iter().map(|id| (*id).into()).collect(),
+            threads,
+            ..PlanStep::default()
         };
-        let mut plan = Plan { schema: 1, steps: vec![
-            step(1, &["job-0001"], vec![]),
-            step(2, &[], vec![]),
-            step(3, &[], vec![historical]),
-            step(4, &["job-0003"], vec![]),
-            step(5, &["job-0004"], vec![]),
-            step(6, &["job-0005"], vec![]),
-            step(7, &["job-9999"], vec![]),
-            step(8, &["job-0001", "job-0003"], vec![]),
-            step(9, &["job-0006"], vec![]),
-            step(10, &["job-0007"], vec![]),
-            step(11, &[], vec!["t-9999".into()]),
-            step(12, &[], vec![]),
-            step(14, &["job-9999"], vec![]),
-            step(16, &[], vec![critic]),
-        ], ..Plan::default() };
+        let mut plan = Plan {
+            schema: 1,
+            steps: vec![
+                step(1, &["job-0001"], vec![]),
+                step(2, &[], vec![]),
+                step(3, &[], vec![historical]),
+                step(4, &["job-0003"], vec![]),
+                step(5, &["job-0004"], vec![]),
+                step(6, &["job-0005"], vec![]),
+                step(7, &["job-9999"], vec![]),
+                step(8, &["job-0001", "job-0003"], vec![]),
+                step(9, &["job-0006"], vec![]),
+                step(10, &["job-0007"], vec![]),
+                step(11, &[], vec!["t-9999".into()]),
+                step(12, &[], vec![]),
+                step(14, &["job-9999"], vec![]),
+                step(16, &[], vec![critic]),
+            ],
+            ..Plan::default()
+        };
         plan.steps[11].subtasks = vec![step(13, &["job-0001"], vec![])];
         plan.steps[12].subtasks = vec![step(15, &["job-0001"], vec![])];
         write(&fx.project, &plan).unwrap();
         let mut loaded = load(&fx.project).unwrap().unwrap();
         project_states(&fx.project, &mut loaded);
         use StepState::{Done, Left, Running};
-        assert_eq!(all_steps(&loaded).map(|s| s.state).collect::<Vec<_>>(), vec![
-            Done, Done, Done, Left, Done, Running, Left, Done, Running, Left,
-            Left, Done, Done, Running, Done, Running,
-        ]);
+        assert_eq!(
+            all_steps(&loaded).map(|s| s.state).collect::<Vec<_>>(),
+            vec![
+                Done, Done, Done, Left, Done, Running, Left, Done, Running, Left, Left, Done, Done,
+                Running, Done, Running,
+            ]
+        );
         assert_eq!(all_steps(&loaded).filter(|s| s.state == Done).count(), 8);
     }
 
@@ -1345,7 +1320,7 @@ mod tests {
         let (lane, _) = fx.lane(1);
         add(&fx, "Compare red.md and blue.md", 0);
         let old = link_historical_threads(&fx, vec![lane], 1);
-        let old = with_plan(&fx.project, old.revision, |plan| {
+        let old = with_plan(&fx.project, old.revision, |plan, _| {
             plan.kind = "unlisted historical kind".into();
             plan.what_you_get = "Compare files (Rolf, 2026-09-25).".into();
             Ok(())
@@ -1396,7 +1371,32 @@ mod tests {
     #[test]
     fn a_step_with_subtasks_is_done_when_every_subtask_is_done() {
         let fx = fixture();
-        let evidence = crate::task::EvidenceSnapshot::load(&fx.project);
+        for id in ["job-0001", "job-0002", "job-0003"] {
+            write_task(&fx, id);
+        }
+        let lane = fx.thread("working");
+        crate::task::link_attempt(&fx.project, "job-0002", &lane).unwrap();
+        let mut installed = crate::task::load(&fx.project, "job-0001").unwrap();
+        installed.installed.push(crate::task::Evidence {
+            at: "old".into(),
+            command: "installed".into(),
+            acceptance: vec![],
+            machine: None,
+            build: None,
+        });
+        std::fs::write(
+            fx.project.state_dir().join("tasks/job-0001.toml"),
+            toml::to_string(&installed).unwrap(),
+        )
+        .unwrap();
+        let project = |parent: PlanStep| {
+            let mut plan = Plan {
+                steps: vec![parent],
+                ..Plan::default()
+            };
+            project_states(&fx.project, &mut plan);
+            plan.steps.remove(0).state
+        };
         let step = |states: &[StepState]| PlanStep {
             id: "s-1".into(),
             subtasks: states
@@ -1404,7 +1404,14 @@ mod tests {
                 .enumerate()
                 .map(|(n, state)| PlanStep {
                     id: format!("s-{}", n + 2),
-                    state: *state,
+                    tasks: vec![
+                        match state {
+                            StepState::Done => "job-0001",
+                            StepState::Running => "job-0002",
+                            StepState::Left => "job-0003",
+                        }
+                        .into(),
+                    ],
                     ..PlanStep::default()
                 })
                 .collect(),
@@ -1417,26 +1424,20 @@ mod tests {
             (&[Running, Left], Running),
             (&[Left, Left], Left),
         ] {
-            let parent = step(states);
-            let own = derive_state(&fx.project, &parent, &evidence);
-            assert_eq!(with_subtasks(&fx.project, &parent, own), want, "{states:?}");
+            assert_eq!(project(step(states)), want, "{states:?}");
         }
         // Work linked to the step itself also counts: an open task keeps it
         // from being done, and nothing started keeps it left.
-        write_task(&fx, "job-0001");
         let mut parent = step(&[Done, Done]);
-        parent.tasks = vec!["job-0001".into()];
-        let own = derive_state(&fx.project, &parent, &evidence);
-        assert_eq!(own, Left);
-        assert_eq!(with_subtasks(&fx.project, &parent, own), Running);
+        parent.tasks = vec!["job-0003".into()];
+        assert_eq!(project(parent.clone()), Running);
         // A missing explicit task is still required work, even if the
         // children are done. A stale card must not open a dependent step.
         parent.tasks = vec!["job-9999".into()];
-        assert_eq!(derive_state(&fx.project, &parent, &evidence), Left);
-        assert_eq!(with_subtasks(&fx.project, &parent, Left), Running);
+        assert_eq!(project(parent), Running);
         let mut parent = step(&[Left]);
-        parent.tasks = vec!["job-0001".into()];
-        assert_eq!(with_subtasks(&fx.project, &parent, own), Left);
+        parent.tasks = vec!["job-0003".into()];
+        assert_eq!(project(parent), Left);
     }
 
     #[test]
@@ -1711,7 +1712,7 @@ mod tests {
     }
 
     #[test]
-    fn unlink_journals_only_changes_with_reason_and_revision() {
+    fn unlink_atomically_keeps_only_changes_with_reason_and_revision() {
         let fx = fixture();
         let ctx = fx.world.ctx();
         write_task(&fx, "job-0001");
@@ -1725,11 +1726,8 @@ mod tests {
             None,
         )
         .unwrap();
-        let journal = fx.project.state_dir().join("dispatch.jsonl");
-        let before = std::fs::read_to_string(&journal)
-            .unwrap_or_default()
-            .lines()
-            .count();
+        // An unavailable old journal cannot separate the reason from the unlink.
+        std::fs::create_dir(fx.project.state_dir().join("dispatch.jsonl")).unwrap();
         let plan = step_unlink(
             &ctx,
             "demo",
@@ -1740,20 +1738,13 @@ mod tests {
             None,
         )
         .unwrap();
-        let records: Vec<serde_json::Value> = std::fs::read_to_string(&journal)
-            .unwrap()
-            .lines()
-            .skip(before)
-            .map(|line| serde_json::from_str(line).unwrap())
-            .collect();
-        assert_eq!(records.len(), 1);
-        let row = &records[0];
-        assert_eq!(row["kind"], "plan-unlink");
-        assert_eq!(row["step"], "s-2");
-        assert_eq!(row["after"], serde_json::json!(["s-1"]));
-        assert_eq!(row["tasks"], serde_json::json!(["job-0001"]));
-        assert_eq!(row["why"], "Rolf released the hold");
-        assert_eq!(row["revision"], plan.revision);
+        let rows = binding_changes(&fx.project).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].step, "s-2");
+        assert_eq!(rows[0].bindings, vec!["job-0001", "s-1"]);
+        assert_eq!(rows[0].why, "Rolf released the hold");
+        assert_eq!(load(&fx.project).unwrap().unwrap().revision, plan.revision);
+        let before = std::fs::read(plan_path(&fx.project)).unwrap();
         step_unlink(
             &ctx,
             "demo",
@@ -1764,9 +1755,137 @@ mod tests {
             None,
         )
         .unwrap();
+        assert_eq!(std::fs::read(plan_path(&fx.project)).unwrap(), before);
+        // A later writer must not silently discard unreadable reason history.
+        let corrupt = String::from_utf8(before)
+            .unwrap()
+            .replace("why =", "lost_why =");
+        std::fs::write(plan_path(&fx.project), &corrupt).unwrap();
+        assert!(step_edit(&ctx, "demo", "s-2", "changed", None).is_err());
         assert_eq!(
-            std::fs::read_to_string(&journal).unwrap().lines().count(),
-            before + 1
+            std::fs::read_to_string(plan_path(&fx.project)).unwrap(),
+            corrupt
+        );
+    }
+
+    #[test]
+    fn unlink_covers_historical_tasks_and_direct_attempts_without_rewriting_history() {
+        for shape in ["explicit", "historical", "direct", "union"] {
+            let fx = fixture();
+            let ctx = fx.world.ctx();
+            write_task(&fx, "job-0001");
+            let lane = fx.thread("failed check");
+            thread::update(&fx.project, &lane, |t| {
+                t.role = "critic".into();
+                t.merged_sha = "old".into();
+            })
+            .unwrap();
+            fx.seal_done(&lane, 1, 1, "old", "+++\nverdict = \"FAIL\"\n+++\n");
+            crate::task::link_attempt(&fx.project, "job-0001", &lane).unwrap();
+            let mut task = crate::task::load(&fx.project, "job-0001").unwrap();
+            if shape == "historical" || shape == "union" {
+                task.plan_step = Some("s-1".into());
+            }
+            let task_path = fx.project.state_dir().join("tasks/job-0001.toml");
+            std::fs::write(&task_path, toml::to_string(&task).unwrap()).unwrap();
+            step_add(
+                &ctx,
+                "demo",
+                "Check",
+                if shape == "explicit" || shape == "union" {
+                    vec![task.id.clone()]
+                } else {
+                    vec![]
+                },
+                vec![],
+                None,
+            )
+            .unwrap();
+            if shape == "direct" || shape == "union" {
+                with_plan(&fx.project, None, |plan, _| {
+                    plan.steps[0].threads = vec![lane.clone()];
+                    Ok(())
+                })
+                .unwrap();
+            }
+            let original = std::fs::read(&task_path).unwrap();
+            assert_eq!(
+                show(&ctx, "demo").unwrap().plan.steps[0].state,
+                StepState::Running
+            );
+            let frozen = show(&ctx, "demo").unwrap();
+            step_unlink(
+                &ctx,
+                "demo",
+                "s-1",
+                vec![task.id.clone()],
+                vec![],
+                "Rolf changed the required work",
+                None,
+            )
+            .unwrap();
+            let shown = show(&ctx, "demo").unwrap();
+            assert_eq!(shown.plan.steps[0].state, StepState::Left, "{shape}");
+            assert!(shown.evaluation.holds.is_empty());
+            assert_eq!(std::fs::read(&task_path).unwrap(), original);
+            assert_eq!(
+                binding_changes(&fx.project).unwrap()[0].why,
+                "Rolf changed the required work"
+            );
+            assert_eq!(frozen.plan.steps[0].state, StepState::Running);
+            step_link(&ctx, "demo", "s-1", vec![task.id.clone()], vec![], None).unwrap();
+            assert_eq!(
+                show(&ctx, "demo").unwrap().plan.steps[0].state,
+                StepState::Running
+            );
+            let before = std::fs::read(plan_path(&fx.project)).unwrap();
+            step_link(&ctx, "demo", "s-1", vec![task.id.clone()], vec![], None).unwrap();
+            assert_eq!(std::fs::read(plan_path(&fx.project)).unwrap(), before);
+        }
+    }
+
+    #[test]
+    fn concurrent_attempt_links_have_one_task_winner() {
+        let fx = fixture();
+        for id in ["job-0001", "job-0002"] {
+            write_task(&fx, id);
+        }
+        let lane = fx.thread("one attempt");
+        let barrier = std::sync::Barrier::new(2);
+        let results = std::thread::scope(|scope| {
+            let handles: Vec<_> = ["job-0001", "job-0002"]
+                .into_iter()
+                .map(|id| {
+                    let project = &fx.project;
+                    let lane = &lane;
+                    let barrier = &barrier;
+                    scope.spawn(move || {
+                        barrier.wait();
+                        crate::task::link_attempt(project, id, lane)
+                    })
+                })
+                .collect();
+            handles
+                .into_iter()
+                .map(|handle| handle.join().unwrap())
+                .collect::<Vec<_>>()
+        });
+        assert_eq!(results.iter().filter(|result| result.is_ok()).count(), 1);
+        assert!(
+            results
+                .iter()
+                .find_map(|result| result.as_ref().err())
+                .unwrap()
+                .to_string()
+                .contains("already belongs")
+        );
+        assert_eq!(
+            crate::task::list_with_errors(&fx.project)
+                .0
+                .iter()
+                .filter(|task| task.attempts.contains(&lane))
+                .count(),
+            1
         );
     }
 
@@ -1850,7 +1969,7 @@ mod tests {
         add(&fx, "Land the lane", 1);
         subtask_add(&ctx, "demo", "s-1", "The lane's part", vec![], vec![], 2).unwrap();
         subtask_add(&ctx, "demo", "s-1", "The rest", vec![], vec![], 3).unwrap();
-        let plan = with_plan(&fx.project, 4, |plan| {
+        let plan = with_plan(&fx.project, 4, |plan, _| {
             find_step(plan, "s-2")?.threads = vec![lane.clone()];
             Ok(())
         })

@@ -547,12 +547,15 @@ pub(crate) fn sealed<'a>(
     Some(event)
 }
 pub(crate) fn lane_review(project: &Project, lane: &Thread) -> Result<Option<Review>> {
-    Ok(list(project)?.into_iter().rev().find(|r| {
+    Ok(lane_review_from(&list(project)?, lane).cloned())
+}
+pub(crate) fn lane_review_from<'a>(reviews: &'a [Review], lane: &Thread) -> Option<&'a Review> {
+    reviews.iter().rev().find(|r| {
         r.fast_forward
             && r.members.iter().any(|m| {
                 m.thread == lane.id && m.attempt == lane.attempt.max(1) && !excluded(r, &m.thread)
             })
-    }))
+    })
 }
 fn excluded(review: &Review, lane: &str) -> bool {
     review
@@ -560,12 +563,12 @@ fn excluded(review: &Review, lane: &str) -> bool {
         .as_ref()
         .is_some_and(|v| v.without.contains_key(lane))
 }
-pub(crate) fn lane_done(
-    project: &Project,
+pub(crate) fn lane_done_from(
     lane: &Thread,
     events: &[crate::contracts::Event],
+    review: Option<&Review>,
 ) -> bool {
-    if let Ok(Some(review)) = lane_review(project, lane) {
+    if let Some(review) = review {
         return !review.install_required || review.install;
     }
     if !lane.merged_sha.is_empty() && lane.merged_review.is_empty() {
