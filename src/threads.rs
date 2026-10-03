@@ -7032,6 +7032,21 @@ mod tests {
             let (fx, _) = box_fixture();
             write_config(&fx, &lane_config());
             stub_box(&fx);
+            crate::prompt::record_test_request(
+                &fx.project,
+                "q-facts",
+                "Keep global facts retrievable.",
+            )
+            .unwrap();
+            let fact = crate::note::add(
+                &fx.project,
+                crate::note::Kind::Memory,
+                "Settled global history, not this lane's task.",
+                "q-facts",
+                None,
+                vec![],
+            )
+            .unwrap();
             let name = "named ' input.bin";
             let source = fx.world.home.path().join(name);
             let bytes = b"\0\xffnamed bytes\n";
@@ -7060,6 +7075,29 @@ mod tests {
             assert!(brief.contains("# Writable paths\n\n- `src/**`\n- `progress.txt`"));
             assert!(brief.contains("run `ha done`."));
             assert!(!brief.contains("--report"));
+            assert!(!brief.contains(&fact.text));
+            let pointer = brief
+                .lines()
+                .find(|line| line.starts_with("- Unscoped facts"))
+                .unwrap()
+                .split('`')
+                .nth(1)
+                .unwrap()
+                .to_string();
+            let frozen_facts = if remote {
+                let filename = Path::new(&pointer).file_name().unwrap().to_str().unwrap();
+                thread::artifact(&fx.project, &started.attachments[filename]).unwrap()
+            } else {
+                std::fs::read(&pointer).unwrap()
+            };
+            assert!(String::from_utf8_lossy(&frozen_facts).contains(&fact.text));
+            crate::note::retire(
+                &fx.project,
+                &fact.id,
+                "q-facts",
+                "History no longer current.",
+            )
+            .unwrap();
             let check = |lane: &Thread| {
                 assert_eq!(lane.paths, started.paths);
                 assert!(thread::in_start_window(lane, jiff::Timestamp::now()));
@@ -7087,8 +7125,15 @@ mod tests {
                                 .unwrap()
                                 .contains(&format!("{}/attachments/", lane.thread_dir))
                     }));
+                    let encoded: String = frozen_facts.iter().map(|b| format!("{b:02x}")).collect();
+                    assert!(fx.world.runner.calls.borrow().iter().any(|call| {
+                        call.program == "ssh"
+                            && call.stdin.as_deref() == Some(&encoded)
+                            && call.args.last().unwrap().contains(&pointer)
+                    }));
                 } else {
                     assert_eq!(std::fs::read(&path).unwrap(), bytes);
+                    assert_eq!(std::fs::read(&pointer).unwrap(), frozen_facts);
                 }
             };
             let placed = place_started(&fx.world.ctx(), &fx.project, &started);
