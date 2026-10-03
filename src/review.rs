@@ -172,7 +172,7 @@ pub(crate) fn save(project: &Project, record: &Review) -> Result<()> {
         &path(project, &record.id),
         toml::to_string(record)?.as_bytes(),
     )?;
-    std::fs::File::open(dir(project))?.sync_all()?;
+    // write_atomic synced reviews/; keep this sync for its creation in .state/.
     std::fs::File::open(project.state_dir())?.sync_all()?;
     Ok(())
 }
