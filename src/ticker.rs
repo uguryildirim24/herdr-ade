@@ -213,8 +213,11 @@ pub(crate) fn start(ctx: &Ctx) -> Result<()> {
     // The installer owns replacement while holding its lock. Never compete
     // with it, or claim a running loop when its old holder has already left.
     if install_in_progress(ctx) {
-        if lock_state(&ctx.root) == LockState::Free {
-            bail!("ticker start deferred: installation in progress and no ticker is running");
+        if !matches!(lock_state(&ctx.root), LockState::Held(info) if info.pid != 0 && !info.version.is_empty())
+        {
+            bail!(
+                "ticker start deferred: installation in progress and no running ticker is confirmed"
+            );
         }
         return Ok(());
     }
@@ -5453,6 +5456,21 @@ mod tests {
         );
         ensure(&ctx).unwrap();
         assert!(!lock_path(&root).exists());
+        let holder = File::options()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(lock_path(&root))
+            .unwrap();
+        holder.lock().unwrap();
+        assert!(
+            start(&ctx)
+                .unwrap_err()
+                .to_string()
+                .contains("no running ticker is confirmed")
+        );
+        assert!(!stop_path(&root).exists());
     }
 
     #[test]
@@ -6871,7 +6889,7 @@ mod tests {
         runner.on("pane list", ok(&with_cwd(PANE, &f)));
         runner.on(
             "pane process-info",
-            ok(r#"{"result":{"process_info":{"foreground_processes":[]}}}"#),
+            ok(r#"{"result":{"process_info":{"pane_id":"w1:p1","foreground_processes":[]}}}"#),
         );
         runner.on("agent start", ok(r#"{"result":{"agent":{"pane_id":"w1:p1","tab_id":"w1:t1","workspace_id":"w1","cwd":"/repo"}}}"#));
         let ctx = Ctx {

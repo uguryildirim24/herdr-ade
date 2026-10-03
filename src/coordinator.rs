@@ -255,6 +255,9 @@ pub(crate) fn recover(
             Ok(info) => info,
             Err(_) => return Ok(()),
         };
+        if info.pane_id != record.pane_id {
+            return Ok(());
+        }
         if info.foreground_processes.iter().any(|p| {
             p.name == record.launch.kind
                 || p.argv0
@@ -266,7 +269,7 @@ pub(crate) fn recover(
             }
             return Ok(());
         }
-        if state.restarted {
+        if state.restarted || !info.agent_gone(&record.pane_id) {
             return Ok(());
         }
         // Process inspection also resolves a previous uncertain start: the
@@ -745,7 +748,8 @@ pub(crate) fn open(ctx: &Ctx, slug: &str, options: &OpenOptions) -> Result<()> {
 
     match start_coordinator(&herdr, &name, &record.pane_id, &launch) {
         Ok(agent) => {
-            if let Err(error) = deliver_or_defer(&project, &herdr, &record, &agent, &prompt, false) {
+            if let Err(error) = deliver_or_defer(&project, &herdr, &record, &agent, &prompt, false)
+            {
                 println!("the priming prompt is pending ({error})");
             }
         }
@@ -1626,9 +1630,17 @@ mod tests {
                 .unwrap();
             let before = project.coordinator().unwrap();
             let runner = FakeRunner::new();
-            runner.on(
-                "pane process-info",
-                ok(r#"{"result":{"process_info":{"foreground_processes":[]}}}"#),
+            let observations = std::cell::Cell::new(0);
+            runner.on_fn(
+                |cmd| cmd.display().contains("pane process-info"),
+                move |_| {
+                    observations.set(observations.get() + 1);
+                    Ok(ok(match observations.get() {
+                        2 => r#"{"result":{"process_info":{"pane_id":"w1:p1","foreground_processes":[{"pid":42,"name":"node"}]}}}"#,
+                        3 => r#"{"result":{"process_info":{"pane_id":"w9:p9","foreground_processes":[]}}}"#,
+                        _ => r#"{"result":{"process_info":{"pane_id":"w1:p1","foreground_processes":[]}}}"#,
+                    }))
+                },
             );
             let attempts = std::cell::Cell::new(0);
             runner.on_fn(
@@ -1646,6 +1658,14 @@ mod tests {
             recover(&project, &herdr, &before, None, true).unwrap();
             assert_eq!(project.coordinator().unwrap(), before);
             assert!(!recovery(&project, &before).restarted);
+            // A lost reply followed by an unknown process or a mismatched pane
+            // is not proof that the first start failed. Do not submit again.
+            for _ in 0..2 {
+                recover(&project, &herdr, &before, None, true).unwrap();
+                assert_eq!(project.coordinator().unwrap(), before);
+                assert!(!recovery(&project, &before).restarted);
+                assert_eq!(runner.count("agent start"), 1);
+            }
             recover(&project, &herdr, &before, None, true).unwrap();
             let accepted = project.coordinator().unwrap();
             assert_eq!(accepted.generation, before.generation + 1);
@@ -1690,7 +1710,7 @@ mod tests {
                     .unwrap();
             }
             let runner = FakeRunner::new();
-            runner.on("pane process-info", ok(r#"{"result":{"process_info":{"foreground_processes":[{"pid":42,"name":"claude"}]}}}"#));
+            runner.on("pane process-info", ok(r#"{"result":{"process_info":{"pane_id":"w1:p1","foreground_processes":[{"pid":42,"name":"claude"}]}}}"#));
             let herdr = Herdr::new("herdr", &before.socket, &runner);
             recover(
                 &project,

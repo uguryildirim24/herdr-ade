@@ -174,7 +174,7 @@ Each launch record and dispatch journal row says `pin`, `default`, `explicit` or
 
 ## Inbox notifications
 
-The ticker shows one Herdr notification for each set of new inbox items. The coordinator reads those items in its next context; the ticker never types an inbox or next-step prompt into its pane. If the coordinator pane is missing but its session responds, the ticker attempts to relaunch it with its saved recipe at most once per hour.
+The ticker shows one Herdr notification for each set of new inbox items. The coordinator reads those items in its next context; the ticker never types an inbox prompt into its pane. A confirmed shell in the existing bound pane permits one accepted automatic restart with the saved recipe. Failed starts remain retryable after another process check; unknown processes and missing panes do not authorize a restart. A missing pane produces a notice to run `open`. Explicit prompt refusals remain retryable; ambiguous delivery waits for resolution instead of blindly repeating the prompt.
 
 ## Brief delivery
 
