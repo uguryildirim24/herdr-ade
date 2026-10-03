@@ -120,22 +120,28 @@ pub(crate) fn is_task_notification_prompt(text: &str) -> bool {
     found && rest.is_empty()
 }
 
-/// True only when the complete prompt is Claude Code's cross-session wrapper.
-/// Native words before or after the wrapper remain Rolf's request.
+/// True only for complete cross-session wrappers, possibly paste-wrapped.
+/// Native words before, after, or between wrappers remain Rolf's request.
 pub(crate) fn is_cross_session_prompt(text: &str) -> bool {
-    let text = text.trim();
-    let Some(after_name) = text.strip_prefix(CROSS_SESSION_OPEN) else {
-        return false;
-    };
-    if !after_name.starts_with('>')
-        && !after_name.starts_with(|character: char| character.is_whitespace())
-    {
-        return false;
+    let text = marker_text(text);
+    let mut rest = text.trim();
+    let mut found = false;
+    while let Some(after_name) = rest.strip_prefix(CROSS_SESSION_OPEN) {
+        if !after_name.starts_with('>')
+            && !after_name.starts_with(|character: char| character.is_whitespace())
+        {
+            return false;
+        }
+        let Some((_, body)) = after_name.split_once('>') else {
+            return false;
+        };
+        let Some((_, after_close)) = body.split_once(CROSS_SESSION_CLOSE) else {
+            return false;
+        };
+        found = true;
+        rest = after_close.trim_start();
     }
-    let Some((_, body)) = after_name.split_once('>') else {
-        return false;
-    };
-    body.strip_suffix(CROSS_SESSION_CLOSE).is_some()
+    found && rest.is_empty()
 }
 
 /// True only when the complete prompt is one or more of Claude Code's idle

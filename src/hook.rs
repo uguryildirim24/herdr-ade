@@ -467,7 +467,7 @@ mod tests {
     }
 
     #[test]
-    fn scheduled_prompts_record_no_request_and_reowe_no_goal_check() {
+    fn scheduled_and_cross_session_prompts_record_no_request_and_reowe_no_goal_check() {
         let fx = crate::testkit::fixture();
         let project = &fx.project;
         crate::steps::goal_check::reconcile(project, None, 10).unwrap();
@@ -487,6 +487,9 @@ mod tests {
             serde_json::json!({"prompt_source":"scheduled", "prompt":"Check in"}),
             serde_json::json!({"prompt":"This is a scheduled trigger, not Rolf.\nCheck in"}),
             serde_json::json!({"prompt":"Overnight self check-in (adeherdr coordinator, scheduled by itself).\nThis is a scheduled trigger, not Rolf.\nCheck in"}),
+            serde_json::json!({"prompt":"<cross-session-message from=\"another-claude-session\">I finished the task.</cross-session-message>"}),
+            serde_json::json!({"prompt":"<pasted_content id=\"1\"><cross-session-message from=\"another-claude-session\">I finished the task.</cross-session-message></pasted_content id=\"1\">"}),
+            serde_json::json!({"prompt":"<cross-session-message from=\"a\">First</cross-session-message>\n<cross-session-message from=\"b\">Second</cross-session-message>"}),
         ] {
             assert!(
                 handle_prompt_input(project, "w1:p1", &input)
@@ -501,6 +504,9 @@ mod tests {
             "Build the dashboard",
             "Please recognize the phrase This is a scheduled trigger, not Rolf. but keep my words.",
             "The cron says:\nThis is a scheduled trigger, not Rolf.\nFix its intake.",
+            "Please fix <cross-session-message from=\"a\">the quoted wrapper</cross-session-message>",
+            "<cross-session-message from=\"a\">First</cross-session-message>\nRolf's own words\n<cross-session-message from=\"b\">Second</cross-session-message>",
+            "<cross-session-message-copy from=\"a\">Not a wrapper</cross-session-message>",
         ] {
             let request = handle_prompt_input(
                 project,

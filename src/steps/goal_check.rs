@@ -13,7 +13,8 @@ use crate::{
 #[serde(default)]
 pub(crate) struct Check {
     pub(crate) generation: u64,
-    source: String,
+    exhausted: Option<bool>,
+    wait_answers: Option<Vec<String>>,
     results: String,
     request: String,
     effects: Vec<String>,
@@ -66,7 +67,6 @@ fn lock(project: &Project) -> Result<std::fs::File> {
 }
 
 struct Snapshot {
-    source: String,
     results: String,
     request: String,
     effects: Vec<String>,
@@ -146,19 +146,8 @@ fn snapshot(project: &Project) -> Result<Snapshot> {
         .chain(review_keys.iter().map(|id| (*id).clone()))
         .collect();
     let request = crate::prompt::latest_request_id(project);
-    let source = format!(
-        "{:x}",
-        Sha256::digest(serde_json::to_vec(&(
-            plan,
-            &tasks,
-            result_keys,
-            review_keys,
-            &request
-        ))?)
-    );
     let evidence = crate::task::EvidenceSnapshot::load(project);
     Ok(Snapshot {
-        source,
         results,
         request,
         effects,
@@ -171,8 +160,35 @@ fn snapshot(project: &Project) -> Result<Snapshot> {
     })
 }
 
+/// Observe answers to the sealed lane waits covered by recorded dispositions.
+/// Starting/linking work and editing its records are not outside evidence.
+fn wait_answers(project: &Project, check: &Check) -> Vec<String> {
+    if check.waits.is_empty() {
+        return Vec::new();
+    }
+    let (tasks, _) = crate::task::list_with_errors(project);
+    let events = crate::events::list(project);
+    let mut answers: Vec<_> = crate::thread::list(project)
+        .into_iter()
+        .filter(|lane| {
+            check.waits.iter().any(|(wait, _)| {
+                matches!(wait, Disposition::Wait { tasks: ids, .. } if ids.is_empty() || tasks.iter().any(|task| ids.contains(&task.id) && task.attempts.contains(&lane.id)))
+            })
+        })
+        .filter_map(|lane| {
+            crate::events::latest_event(&events, &lane.id, lane.attempt.max(1))
+                .filter(|event| {
+                    event.payload.waiting.is_some() && lane.answered_waiting_event == event.id
+                })
+                .map(|event| event.id.clone())
+        })
+        .collect();
+    answers.sort();
+    answers
+}
+
 /// Reconcile even while lanes/review run: independent work must not be hidden.
-/// A new request, plan/result change, or exhausted checklist owes judgment.
+/// Only outside evidence or newly exhausted work owes another judgment.
 pub(crate) fn reconcile(project: &Project, agent: Option<&Agent>, now: u64) -> Result<()> {
     // Serialize evidence reads with dispositions too: an older snapshot must
     // not overwrite a command that completed while reconciliation waited.
@@ -180,9 +196,17 @@ pub(crate) fn reconcile(project: &Project, agent: Option<&Agent>, now: u64) -> R
     let snapshot = snapshot(project)?;
     let mut check = load(project);
     let before = check.clone();
+    let answers = wait_answers(project, &check);
+    let fresh_evidence = check.results != snapshot.results
+        || check.request != snapshot.request
+        || (check.exhausted == Some(false) && snapshot.exhausted)
+        || check
+            .wait_answers
+            .as_ref()
+            .is_some_and(|old| answers.iter().any(|answer| !old.contains(answer)));
     if check.generation > 0
         && check.disposition.is_none()
-        && check.results == snapshot.results
+        && !fresh_evidence
         && let Some(action) = snapshot.actions.iter().find(|a| !check.actions.contains(a))
     {
         let task = action.split(':').next().unwrap().to_string();
@@ -194,27 +218,17 @@ pub(crate) fn reconcile(project: &Project, agent: Option<&Agent>, now: u64) -> R
             record.title,
             record.acceptance.join("; ")
         );
-        check.source = snapshot.source.clone();
-        check.actions = snapshot.actions.clone();
     }
-    let changed = check.source != snapshot.source;
-    let fresh_evidence = check.results != snapshot.results || check.request != snapshot.request;
-    // While judgment is owed, plan wording or bookkeeping cannot buy an
-    // endless supply of identical wakes. Coalesce it without resetting the
-    // bounded diagnosis count. Only new result/request evidence does that.
-    if check.generation > 0 && check.disposition.is_none() && changed && !fresh_evidence {
-        check.source = snapshot.source.clone();
-        check.actions = snapshot.actions.clone();
-    }
-    if (check.generation == 0 && (snapshot.exhausted || snapshot.unfinished))
-        || (changed && (fresh_evidence || check.disposition.is_some()))
-    {
+    // Remember bookkeeping without owing a wake or resetting bounded diagnosis.
+    // Optional baselines let historical records load without a spurious check.
+    check.exhausted = Some(snapshot.exhausted);
+    check.wait_answers = Some(answers);
+    check.actions = snapshot.actions;
+    if (check.generation == 0 && (snapshot.exhausted || snapshot.unfinished)) || fresh_evidence {
         check.generation += 1;
-        check.source = snapshot.source;
         check.results = snapshot.results;
         check.request = snapshot.request;
         check.effects = snapshot.effects;
-        check.actions = snapshot.actions;
         if let Some(previous) = check.disposition.take() {
             check.last = Some((previous, std::mem::take(&mut check.evidence)));
         }
@@ -375,7 +389,7 @@ pub(crate) fn record(project: &Project, disposition: Disposition, evidence: &str
         }
         Disposition::NeedsRolf => bail!("goal_check: escalation is automatic"),
     }
-    check.source = snapshot.source;
+    check.exhausted = Some(snapshot.exhausted);
     check.results = snapshot.results;
     check.request = snapshot.request;
     check.effects = snapshot.effects;
@@ -394,6 +408,7 @@ pub(crate) fn record(project: &Project, disposition: Disposition, evidence: &str
         Disposition::Closed { .. } => check.waits.clear(),
         _ => {}
     }
+    check.wait_answers = Some(wait_answers(project, &check));
     check.disposition = Some(disposition);
     check.evidence = evidence.trim().into();
     save(project, &check)
@@ -417,7 +432,7 @@ pub(crate) fn status(project: &Project) -> Option<String> {
         Some(Disposition::NeedsRolf) => check.evidence.clone(),
         Some(Disposition::Action { task }) => format!("Goal check action {task}: {}", check.evidence),
         Some(Disposition::Closed { outcome, .. }) => format!("Goal check closed: {outcome}; {}", check.evidence),
-        Some(Disposition::Wait { .. }) => "Goal check waiting; next check on request/result/plan change.".into(),
+        Some(Disposition::Wait { .. }) => "Goal check waiting; next check on outside evidence, exhaustion, or wait answer.".into(),
     };
     for (wait, evidence) in &check.waits {
         if let Disposition::Wait {

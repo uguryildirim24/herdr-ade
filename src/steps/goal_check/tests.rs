@@ -87,8 +87,17 @@ fn exhausted_unproved_plan_owes_once_and_justified_work_consumes_without_count_c
     .unwrap();
     reconcile(&f.project, None, 30).unwrap();
     assert!(
-        matches!(load(&f.project).disposition, Some(Disposition::Action { task }) if task == "job-0001")
+        notice(&f.project).is_some(),
+        "the new request still owes judgment"
     );
+    record(
+        &f.project,
+        Disposition::Action {
+            task: "job-0001".into(),
+        },
+        "The request-backed action covers the gap",
+    )
+    .unwrap();
     assert!(notice(&f.project).is_none());
     let plan = crate::plan::load(&f.project).unwrap().unwrap();
     // Plan mutations refresh actual evidence, but goal checks do not touch the counts.
@@ -110,6 +119,175 @@ fn exhausted_unproved_plan_owes_once_and_justified_work_consumes_without_count_c
             .filter(|s| s.state == StepState::Done)
             .count()
     );
+}
+
+#[test]
+fn recorded_action_follow_through_owes_nothing_then_seal_owes_once() {
+    let f = fixture();
+    task(&f, "job-0001", vec![]);
+    let ctx = f.world.ctx();
+    crate::plan::step_add(
+        &ctx,
+        "demo",
+        "Next action",
+        vec!["job-0001".into()],
+        vec![],
+        None,
+    )
+    .unwrap();
+    reconcile(&f.project, None, 10).unwrap();
+    record(
+        &f.project,
+        Disposition::Action {
+            task: "job-0001".into(),
+        },
+        "Close the outcome gap",
+    )
+    .unwrap();
+    let generation = load(&f.project).generation;
+    let assert_consumed = || {
+        reconcile(&f.project, Some(&idle()), 20).unwrap();
+        assert_eq!(load(&f.project).generation, generation);
+        assert!(
+            matches!(load(&f.project).disposition, Some(Disposition::Action { task }) if task == "job-0001")
+        );
+        assert!(notice(&f.project).is_none());
+    };
+    crate::plan::set(&ctx, "demo", "A usable result", None).unwrap();
+    assert_consumed();
+    let plan = crate::plan::step_add(&ctx, "demo", "Follow through", vec![], vec![], None).unwrap();
+    let step = &plan.steps.last().unwrap().id;
+    assert_consumed();
+    crate::plan::step_link(&ctx, "demo", step, vec!["job-0001".into()], vec![], None).unwrap();
+    assert_consumed();
+    crate::plan::step_unlink(
+        &ctx,
+        "demo",
+        step,
+        vec!["job-0001".into()],
+        vec![],
+        "Already linked above",
+        None,
+    )
+    .unwrap();
+    assert_consumed();
+    crate::plan::step_edit(&ctx, "demo", step, "Follow through, clarified", None).unwrap();
+    assert_consumed();
+    crate::plan::step_move(&ctx, "demo", step, "s-1", None).unwrap();
+    assert_consumed();
+    *f.world.panes.borrow_mut() = format!("[{}]", f.world.coordinator_pane(&f.project));
+    let lane = crate::threads::start(
+        &ctx,
+        "demo",
+        crate::threads::StartArgs {
+            title: "Next action started".into(),
+            repo: None,
+            machine: Some("local".into()),
+            base: None,
+            task: "Close the outcome gap".into(),
+            attach: vec![],
+            paths: vec![],
+            workflow: None,
+            recipe: None,
+            task_id: "job-0001".into(),
+            review_id: String::new(),
+        },
+    )
+    .unwrap();
+    assert_eq!(lane.status, crate::thread::Status::Starting);
+    let lane = lane.id;
+    assert!(
+        crate::task::load(&f.project, "job-0001")
+            .unwrap()
+            .attempts
+            .contains(&lane)
+    );
+    assert_consumed();
+    crate::thread::update(&f.project, &lane, |t| {
+        t.status = crate::thread::Status::Open
+    })
+    .unwrap();
+    assert_consumed();
+    crate::note::add(
+        &f.project,
+        crate::note::Kind::Memory,
+        "The next action covers the gap",
+        "q-1",
+        None,
+        vec!["job-0001".into()],
+    )
+    .unwrap();
+    assert_consumed();
+    let event = f.seal_done(&lane, 1, 1, "", "New outcome evidence");
+    reconcile(&f.project, None, 30).unwrap();
+    let owed = load(&f.project);
+    assert_eq!(owed.generation, generation + 1);
+    assert!(owed.effects.contains(&event));
+    assert!(notice(&f.project).is_some());
+    for _ in 0..3 {
+        reconcile(&f.project, None, 40).unwrap();
+        assert_eq!(load(&f.project), owed);
+    }
+}
+
+#[test]
+fn later_exhaustion_owes_once_but_already_exhausted_wait_does_not() {
+    let f = fixture();
+    crate::plan::step_add(&f.world.ctx(), "demo", "Unfinished", vec![], vec![], None).unwrap();
+    crate::prompt::record_test_request(&f.project, "q-1", "Deliver a usable result").unwrap();
+    reconcile(&f.project, None, 10).unwrap();
+    let wait = Disposition::Wait {
+        tasks: vec![],
+        party: "result".into(),
+        condition: "finished checklist".into(),
+    };
+    record(&f.project, wait.clone(), "Work remains").unwrap();
+    let generation = load(&f.project).generation;
+    done_plan(&f);
+    reconcile(&f.project, None, 20).unwrap();
+    assert_eq!(load(&f.project).generation, generation + 1);
+    assert!(notice(&f.project).is_some());
+    record(&f.project, wait, "Exhaustion is not acceptance").unwrap();
+    let consumed = load(&f.project);
+    for _ in 0..3 {
+        reconcile(&f.project, None, 30).unwrap();
+        assert_eq!(load(&f.project), consumed);
+        assert!(notice(&f.project).is_none());
+    }
+}
+
+#[test]
+fn recorded_lane_wait_answer_owes_once_without_a_new_seal_or_request() {
+    let f = fixture();
+    let lane = f.thread("Await evidence");
+    task(&f, "job-0001", vec![lane.clone()]);
+    let event = f.seal_waiting(&lane, 1, 1, "Need upstream data");
+    reconcile(&f.project, None, 10).unwrap();
+    record(
+        &f.project,
+        Disposition::Wait {
+            tasks: vec!["job-0001".into()],
+            party: "upstream".into(),
+            condition: "data delivered to lane".into(),
+        },
+        "No data yet",
+    )
+    .unwrap();
+    let before = load(&f.project);
+    crate::thread::update(&f.project, &lane, |t| {
+        t.answered_waiting_event = event.clone()
+    })
+    .unwrap();
+    reconcile(&f.project, None, 20).unwrap();
+    let owed = load(&f.project);
+    assert_eq!(owed.generation, before.generation + 1);
+    assert_eq!(owed.results, before.results);
+    assert_eq!(owed.request, before.request);
+    assert!(notice(&f.project).is_some());
+    for _ in 0..3 {
+        reconcile(&f.project, None, 30).unwrap();
+        assert_eq!(load(&f.project), owed);
+    }
 }
 
 #[test]
@@ -147,10 +325,19 @@ fn absent_plan_articulates_then_links_request_backed_work() {
     )
     .unwrap();
     reconcile(&f.project, None, 30).unwrap();
-    assert!(matches!(
-        load(&f.project).disposition,
-        Some(Disposition::Action { .. })
-    ));
+    assert!(
+        notice(&f.project).is_some(),
+        "the new request still owes judgment"
+    );
+    record(
+        &f.project,
+        Disposition::Action {
+            task: "job-0001".into(),
+        },
+        "Challenge the assumption before building",
+    )
+    .unwrap();
+    assert!(notice(&f.project).is_none());
 }
 
 #[test]
@@ -374,9 +561,15 @@ fn scoped_wait_survives_independent_work_and_replacement_then_answer_rechecks_on
     .unwrap();
     reconcile(&f.project, Some(&idle()), 20).unwrap();
     assert!(notice(&f.project).is_none());
+    let generation = load(&f.project).generation;
     let c = f.thread("Independent C");
     task(&f, "job-0002", vec![c]);
     reconcile(&f.project, Some(&idle()), 30).unwrap();
+    assert_eq!(load(&f.project).generation, generation);
+    assert!(
+        notice(&f.project).is_none(),
+        "independent starts are follow-through"
+    );
     record(
         &f.project,
         Disposition::Action {
@@ -496,5 +689,28 @@ fn historical_ticker_and_plan_load_without_changing_completion() {
     assert_eq!(
         load(&f.project),
         project::read_json::<Check>(&path(&f.project)).unwrap()
+    );
+    record(
+        &f.project,
+        Disposition::Wait {
+            tasks: vec![],
+            party: "result".into(),
+            condition: "new evidence".into(),
+        },
+        "Already judged",
+    )
+    .unwrap();
+    let mut historical = serde_json::to_value(load(&f.project)).unwrap();
+    historical.as_object_mut().unwrap().remove("exhausted");
+    historical.as_object_mut().unwrap().remove("wait_answers");
+    historical["source"] = serde_json::json!("old whole-plan fingerprint");
+    project::write_json(&path(&f.project), &historical).unwrap();
+    let generation = load(&f.project).generation;
+    reconcile(&f.project, None, 20).unwrap();
+    assert_eq!(load(&f.project).generation, generation);
+    assert!(notice(&f.project).is_none());
+    assert_eq!(
+        before,
+        std::fs::read(crate::plan::plan_path(&f.project)).unwrap()
     );
 }
