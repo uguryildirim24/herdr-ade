@@ -912,7 +912,8 @@ fn evaluate(project: &Project, plan: &Plan, evidence: &EvidenceSnapshot) -> Eval
         work.insert(
             task.id.clone(),
             BoundWork {
-                terminal: !task.installed.is_empty() || attempt.is_some_and(|work| work.terminal),
+                terminal: view.state == crate::task::State::Installed
+                    || attempt.is_some_and(|work| work.terminal),
                 started: view.state != crate::task::State::Open,
                 check,
                 dropped: !task.dropped.is_empty(),
@@ -1311,6 +1312,56 @@ mod tests {
             ]
         );
         assert_eq!(all_steps(&loaded).filter(|s| s.state == Done).count(), 8);
+    }
+
+    #[test]
+    fn installed_lane_evidence_keeps_task_done_without_a_retained_review() {
+        let fx = fixture();
+        let ctx = fx.world.ctx();
+        for id in ["job-0001", "job-0002"] {
+            write_task(&fx, id);
+        }
+        let lane = fx.thread("installed work");
+        thread::update(&fx.project, &lane, |t| {
+            t.merged_sha = "old-sha".into();
+            t.installed_sha = "old-sha".into();
+            t.merged_review = "review-1".into();
+        })
+        .unwrap();
+        crate::task::link_attempt(&fx.project, "job-0001", &lane).unwrap();
+        let task = crate::task::load(&fx.project, "job-0001").unwrap();
+        let evidence = EvidenceSnapshot::load(&fx.project);
+        let view = crate::task::view_with_evidence(&fx.project, task.clone(), &evidence);
+        assert_eq!(view.state, crate::task::State::Installed);
+        assert!(view.terminal_with_evidence(&fx.project, &evidence));
+        assert!(crate::task::require_accepted(&fx.project, &task, &evidence).is_err());
+        step_add(&ctx, "demo", "Installed task", vec![task.id], vec![], None).unwrap();
+        step_add(&ctx, "demo", "Direct thread", vec![], vec![], None).unwrap();
+        with_plan(&fx.project, None, |plan, _| {
+            plan.steps[1].threads = vec![lane];
+            Ok(())
+        })
+        .unwrap();
+        let shown = show(&ctx, "demo").unwrap();
+        // Historical task installation is terminal; a direct lane still needs
+        // its review. Neither completion shape invents criterion acceptance.
+        assert_eq!(shown.plan.steps[0].state, StepState::Done);
+        assert_eq!(shown.plan.steps[1].state, StepState::Running);
+        step_add(
+            &ctx,
+            "demo",
+            "Dependent work",
+            vec!["job-0002".into()],
+            vec!["s-1".into()],
+            None,
+        )
+        .unwrap();
+        assert!(
+            check_prerequisites(&fx.project, "job-0002")
+                .unwrap_err()
+                .to_string()
+                .contains("acceptance not established")
+        );
     }
 
     #[test]
