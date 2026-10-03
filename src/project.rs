@@ -824,6 +824,47 @@ pub(crate) fn parse_repo_arg(arg: &str) -> Repo {
     }
 }
 
+/// Register the checked-out integration branch and an unambiguous push target.
+/// Multiple remotes require an explicit choice; never infer one at review time.
+pub(crate) fn register_repo(repo: &mut Repo, runner: &dyn crate::runner::Runner) -> Option<String> {
+    if repo.machine.is_some() {
+        return None; // This path belongs to another machine, not this filesystem.
+    }
+    let git = crate::repo::Git::new(runner, &repo.path);
+    if repo.branch.is_none() {
+        repo.branch = git
+            .run(&["symbolic-ref", "--quiet", "--short", "HEAD"])
+            .ok()
+            .filter(|branch| !branch.is_empty());
+    }
+    if repo
+        .push_remote
+        .as_deref()
+        .is_some_and(|s| !s.trim().is_empty())
+        || repo
+            .publish_url
+            .as_deref()
+            .is_some_and(|s| !s.trim().is_empty())
+    {
+        return None;
+    }
+    let remotes = git.run(&["remote"]).ok()?;
+    let remotes: Vec<_> = remotes.lines().filter(|s| !s.is_empty()).collect();
+    match remotes.as_slice() {
+        [remote] => {
+            repo.push_remote = Some((*remote).into());
+            None
+        }
+        [] => None,
+        _ => Some(format!(
+            "repo {} has several remotes ({}); choose one and add push_remote = {:?} to its [[repos]] row in PROJECT.md",
+            repo.path,
+            remotes.join(", "),
+            remotes[0]
+        )),
+    }
+}
+
 pub(crate) fn markdown_item(id: &str, provenance: &str, text: &str) -> String {
     let text = text.trim().replace('\n', "\n  ");
     format!("- `{id}` ({provenance}): {text}\n")
@@ -894,6 +935,7 @@ pub(crate) fn create(root: &Path, name: &str, goal: &str, repos: Vec<Repo>) -> R
     if dir.exists() {
         bail!("`{slug}` already exists in {}", root.display());
     }
+    let mut guidance = Vec::new();
     let repos = repos
         .into_iter()
         .map(|repo| match repo.machine {
@@ -904,7 +946,11 @@ pub(crate) fn create(root: &Path, name: &str, goal: &str, repos: Vec<Repo>) -> R
                     .or_else(|_| std::path::absolute(&repo.path))
                     .map(|p| p.to_string_lossy().into_owned())
                     .unwrap_or_else(|_| repo.path.clone());
-                Repo { path, ..repo }
+                let mut repo = Repo { path, ..repo };
+                if let Some(note) = register_repo(&mut repo, &crate::runner::RealRunner) {
+                    guidance.push(note);
+                }
+                repo
             }
         })
         .collect();
@@ -931,6 +977,9 @@ pub(crate) fn create(root: &Path, name: &str, goal: &str, repos: Vec<Repo>) -> R
         format!("+++\n# Repository gates: {{ command = \"...\", paths = [\"src/**\"] }}. Omit paths to always run.\n# Paths are repository-relative: * and ? match within a segment; ** is a whole directory segment.\n{front}+++\n\nSettings are hand-edited here. The generated current page is [.state/page.md](.state/page.md).\n").as_bytes(),
     )?;
     refresh_page(&project)?;
+    for note in guidance {
+        println!("{note}");
+    }
     Ok(project)
 }
 
@@ -980,6 +1029,52 @@ mod tests {
         let page = std::fs::read_to_string(project.state_dir().join("page.md")).unwrap();
         assert!(!page.contains("job-0000"));
         assert!(!project.read_project_md().unwrap().1.contains("job-0000"));
+    }
+
+    #[test]
+    fn creation_registers_single_remote_and_branch_but_multiple_remotes_need_a_choice() {
+        let root = tempfile::tempdir().unwrap();
+        let repo = root.path().join("code");
+        std::fs::create_dir(&repo).unwrap();
+        crate::testkit::git(&repo, &["init", "-b", "main"]);
+        crate::testkit::git(
+            &repo,
+            &["remote", "add", "upstream", "https://example.test/code.git"],
+        );
+        let project = create(
+            root.path(),
+            "single",
+            "",
+            vec![parse_repo_arg(repo.to_str().unwrap())],
+        )
+        .unwrap();
+        let row = project.read_project_md().unwrap().0.repos.remove(0);
+        assert_eq!(row.push_remote.as_deref(), Some("upstream"));
+        assert_eq!(row.branch.as_deref(), Some("main"));
+
+        crate::testkit::git(
+            &repo,
+            &["remote", "add", "fork", "https://example.test/fork.git"],
+        );
+        let project = create(
+            root.path(),
+            "multiple",
+            "",
+            vec![parse_repo_arg(repo.to_str().unwrap())],
+        )
+        .unwrap();
+        let mut row = project.read_project_md().unwrap().0.repos.remove(0);
+        assert!(row.push_remote.is_none());
+        assert_eq!(row.branch.as_deref(), Some("main"));
+        let guidance = register_repo(&mut row, &crate::runner::RealRunner).unwrap();
+        assert!(guidance.contains("fork, upstream"));
+        assert!(guidance.contains("choose one and add push_remote = \"fork\""));
+        row.publish_url = Some("https://example.test/chosen.git".into());
+        assert!(register_repo(&mut row, &crate::runner::RealRunner).is_none());
+        assert!(
+            row.push_remote.is_none(),
+            "explicit publication target is preserved"
+        );
     }
 
     #[test]

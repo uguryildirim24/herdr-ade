@@ -1542,10 +1542,64 @@ pub struct RetryOutcome {
     pub attempt: u32,
     pub pane_id: String,
     pub recipe: String,
+    pub machine: String,
+    pub state: RetryState,
     /// The pane was still showing the old startup block when the ready
     /// window had expired. Keep this visible on the recovery result.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub screen: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum RetryState {
+    Queued,
+    Starting,
+    Delivered,
+}
+
+impl RetryOutcome {
+    fn from_thread(record: Thread, screen: Option<String>) -> Self {
+        let state = if record.recovery_pending {
+            RetryState::Queued
+        } else if record.brief_submitted {
+            RetryState::Delivered
+        } else {
+            RetryState::Starting
+        };
+        Self {
+            thread: record.id,
+            attempt: record.attempt,
+            pane_id: if state == RetryState::Queued {
+                String::new()
+            } else {
+                record.pane_id
+            },
+            recipe: record.launch.recipe_id,
+            machine: if record.machine.is_empty() {
+                "local".into()
+            } else {
+                record.machine
+            },
+            state,
+            screen,
+        }
+    }
+
+    pub fn message(&self) -> String {
+        let placement = match self.state {
+            RetryState::Queued => format!(
+                "queued for placement on {}; its brief is delivered when the agent is ready",
+                self.machine
+            ),
+            RetryState::Starting => format!(
+                "in pane {}; startup is pending; its brief is delivered when the agent is ready",
+                self.pane_id
+            ),
+            RetryState::Delivered => format!("in pane {}; its brief was delivered", self.pane_id),
+        };
+        format!("{} attempt {} is {placement}", self.thread, self.attempt)
+    }
 }
 
 /// Start the same task as a new bounded recovery attempt. Unlike the removed
@@ -1597,13 +1651,7 @@ fn retry_inner(
     if record.recovery_pending {
         ticker::ensure(ctx)?;
         let placed = thread::load(&project, id)?;
-        return Ok(RetryOutcome {
-            thread: placed.id,
-            attempt: placed.attempt,
-            pane_id: placed.pane_id,
-            recipe: placed.launch.recipe_id,
-            screen: None,
-        });
+        return Ok(RetryOutcome::from_thread(placed, None));
     }
     if record.kind == Kind::Adopted {
         return Err(crate::refusal::error(
@@ -1627,16 +1675,8 @@ fn retry_inner(
         }
         // A correction to sealed work keeps the same branch and attempt.
         // Routing recovery is only for a failed start or failed work.
-        let outcome = prompt(ctx, slug, id, reason)?;
-        return Ok(RetryOutcome {
-            thread: id.into(),
-            attempt: match outcome {
-                PromptOutcome::Queued { attempt } | PromptOutcome::Sent { attempt, .. } => attempt,
-            },
-            pane_id: thread::load(&project, id)?.pane_id,
-            recipe: record.launch.recipe_id,
-            screen: None,
-        });
+        prompt(ctx, slug, id, reason)?;
+        return Ok(RetryOutcome::from_thread(thread::load(&project, id)?, None));
     }
     let reason = reason.trim();
     if reason.is_empty() {
@@ -1712,7 +1752,6 @@ fn retry_inner(
     } else {
         None
     };
-    let selected_recipe = launch.recipe_id.clone();
     thread::update_checked(&project, id, |t| {
         if t.attempt != record.attempt || t.pane_id != record.pane_id {
             bail!("retry_stale: thread changed while its replacement was prepared");
@@ -1752,13 +1791,7 @@ fn retry_inner(
 
     ticker::ensure(ctx)?;
     let placed = thread::load(&project, id)?;
-    Ok(RetryOutcome {
-        thread: placed.id,
-        attempt: placed.attempt,
-        pane_id: placed.pane_id,
-        recipe: selected_recipe,
-        screen,
-    })
+    Ok(RetryOutcome::from_thread(placed, screen))
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -6462,7 +6495,8 @@ mod tests {
         .unwrap();
         let retried = retry_during_advance(&ctx, "demo", &lane.id, "Repair the conflict").unwrap();
         assert_eq!(retried.attempt, 1);
-        assert_eq!(retried.pane_id, "w2:p1");
+        assert_eq!(retried.state, RetryState::Queued);
+        assert!(retried.pane_id.is_empty());
         assert!(thread::load(&project, &lane.id).unwrap().recovery_pending);
         assert_eq!(
             thread::load(&project, &lane.id).unwrap().worktree_path,
@@ -7376,7 +7410,19 @@ mod tests {
             t.failure_class = crate::contracts::FailureClass::ProcessGone;
         })
         .unwrap();
-        retry(&fx.world.ctx(), "demo", &started.id, "process disappeared").unwrap();
+        let result = retry(&fx.world.ctx(), "demo", &started.id, "process disappeared").unwrap();
+        assert_eq!(result.state, RetryState::Queued);
+        assert!(
+            result.pane_id.is_empty(),
+            "never expose the old attempt's pane"
+        );
+        assert!(
+            result
+                .message()
+                .contains("queued for placement on buildbox")
+        );
+        assert!(!result.message().contains("was delivered"));
+        assert!(!result.message().contains(&started.pane_id));
         let placed = thread::load(&fx.project, &started.id).unwrap();
         assert_eq!(placed.machine, "buildbox");
 

@@ -1680,19 +1680,12 @@ fn dispatch_with_start(
                 if let Some(note) = &note {
                     crate::output::insert("note", note.clone());
                 }
-                let launch = if current.prompt_pending {
-                    "startup is still pending; the ticker resumes it"
-                } else {
-                    "its brief was delivered"
-                };
                 crate::output::success(
                     Some("retried"),
                     &result,
                     &format!(
-                        "{} attempt {} is in pane {}; {launch}{}\n{}",
-                        result.thread,
-                        result.attempt,
-                        result.pane_id,
+                        "{}{}\n{}",
+                        result.message(),
                         result
                             .screen
                             .as_ref()

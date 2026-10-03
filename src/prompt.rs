@@ -194,6 +194,7 @@ pub(crate) fn is_historical_system_prompt(text: &str) -> bool {
         || is_idle_notice_prompt(text)
         || is_ticker_prompt(text)
         || is_parent_status_line(text)
+        || is_scheduled_prompt(text)
     {
         return true;
     }
@@ -208,6 +209,16 @@ pub(crate) fn is_historical_system_prompt(text: &str) -> bool {
         || (text.starts_with("You are the coordinator of the herdr project `")
             && text.contains(" skill coordinator`")
             && text.contains(" context "))
+}
+
+/// A reserved marker at the start identifies a scheduled prompt, not a human
+/// message quoting it. Also recognize the existing coordinator cron envelope.
+fn is_scheduled_prompt(text: &str) -> bool {
+    const MARKER: &str = "This is a scheduled trigger, not Rolf.";
+    let text = text.trim();
+    text.lines().next() == Some(MARKER)
+        || (text.starts_with("Overnight self check-in (")
+            && text.lines().any(|line| line.trim() == MARKER))
 }
 
 /// Returns only Rolf's words from a recorded request. Before prompt markers
