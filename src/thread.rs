@@ -1165,43 +1165,26 @@ pub(crate) fn seconds_since(timestamp: &str, now: jiff::Timestamp) -> i64 {
 /// The group of a thread. First matching row wins. One function, so the CLI
 /// and the ticker always agree.
 pub(crate) fn recorded_group(thread: &Thread, now: jiff::Timestamp) -> Group {
-    match thread.status {
-        Status::Resolved => Group::Resolved,
-        Status::Failed => Group::WaitingOnYou,
-        Status::Starting
-            if !thread.startup_wait_started.is_empty()
-                || !thread.provider_wait_started.is_empty() =>
-        {
-            Group::Working
-        }
-        Status::Starting
-            if !thread.recovery_pending
-                && seconds_since(&thread.created, now) >= STARTING_TIMEOUT_SECS =>
-        {
-            Group::WaitingOnYou
-        }
-        Status::Starting => Group::Working,
-        Status::Open if thread.parked => Group::Parked,
-        Status::Open if thread.connection_waiting => Group::WaitingOnYou,
-        Status::Open if !thread.startup_wait_started.is_empty() => Group::Working,
-        Status::Open if thread.is_remote() && thread.last_state.is_empty() => Group::Unknown,
-        Status::Open => Group::from_token(&thread.last_group).unwrap_or(if thread.prompt_pending {
-            Group::Working
-        } else {
-            Group::Idle
-        }),
-    }
+    project_group(thread, None, now)
 }
 
 pub(crate) fn group(thread: &Thread, live: &Live, now: jiff::Timestamp) -> Group {
-    let state = live.agent_state.as_deref();
-    let has_report = !thread.report_hash.is_empty();
+    project_group(thread, Some(live), now)
+}
+
+fn project_group(thread: &Thread, live: Option<&Live>, now: jiff::Timestamp) -> Group {
     // 1
     if thread.status == Status::Resolved {
         return Group::Resolved;
     }
+    if thread.status == Status::Failed {
+        return Group::WaitingOnYou;
+    }
     if thread.parked {
         return Group::Parked;
+    }
+    if thread.recovery_pending {
+        return Group::Working;
     }
     if thread.connection_waiting {
         return Group::WaitingOnYou;
@@ -1223,6 +1206,19 @@ pub(crate) fn group(thread: &Thread, live: &Live, now: jiff::Timestamp) -> Group
     if !thread.startup_wait_started.is_empty() {
         return Group::Working;
     }
+    let Some(live) = live else {
+        return if thread.is_remote() && thread.last_state.is_empty() {
+            Group::Unknown
+        } else {
+            Group::from_token(&thread.last_group).unwrap_or(if thread.prompt_pending {
+                Group::Working
+            } else {
+                Group::Idle
+            })
+        };
+    };
+    let state = live.agent_state.as_deref();
+    let has_report = !thread.report_hash.is_empty();
     // 3
     let stuck_launch = thread.prompt_pending
         && state.is_some_and(|s| !ready_state(s))
