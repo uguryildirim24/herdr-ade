@@ -1884,6 +1884,7 @@ mod tests {
         crate::events::seal_create_if_absent(
             &project,
             &Event {
+                usage: None,
                 id: "done-1".into(),
                 op: "done-1".into(),
                 thread: sealed.id.clone(),

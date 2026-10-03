@@ -1303,6 +1303,7 @@ mod tests {
         crate::events::seal_create_if_absent(
             &project,
             &crate::contracts::Event {
+                usage: None,
                 id: "wait-1".into(),
                 op: "wait-1".into(),
                 thread: lane.id.clone(),
@@ -1396,6 +1397,7 @@ mod tests {
             let event = crate::contracts::Event {
                 id: format!("{}-1-1", thread.id),
                 op: format!("{}-1-1", thread.id),
+                usage: None,
                 thread: thread.id,
                 attempt: 1,
                 recipient: crate::contracts::Recipient::default(),

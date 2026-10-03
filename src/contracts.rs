@@ -337,6 +337,8 @@ pub(crate) struct Event {
     pub(crate) recipient: Recipient,
     pub(crate) created: String,
     pub(crate) payload: EventPayload,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) usage: Option<crate::usage::Usage>,
 }
 
 /// Delivery journal states appended to `deliveries/<event id>.jsonl`

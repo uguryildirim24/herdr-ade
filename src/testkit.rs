@@ -166,6 +166,7 @@ impl Fx {
                 pane: "w1:p1".into(),
                 coordinator_attempt: 0,
             },
+            usage: None,
             created: format!("2026-09-18T10:{:02}:{:02}Z", attempt, n),
             payload,
         };

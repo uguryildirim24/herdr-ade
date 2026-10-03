@@ -533,6 +533,7 @@ mod tests {
                 coordinator_attempt: 2,
             },
             created: project::now(),
+            usage: None,
             payload: crate::contracts::EventPayload {
                 done: None,
                 waiting: Some(crate::contracts::WaitingPayload {

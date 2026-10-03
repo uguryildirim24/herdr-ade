@@ -517,6 +517,7 @@ fn advance_staged(
 pub(crate) fn seal(
     project: &Project,
     id: &str,
+    usage: Option<crate::usage::Usage>,
     validate: impl FnOnce(&Op) -> Result<()>,
 ) -> Result<Event> {
     let _lock = project.lock()?;
@@ -528,7 +529,13 @@ pub(crate) fn seal(
         bail!("op_state_changed: {id} is not staged at revision 2");
     }
     validate(&op)?;
-    let event = event_from_op(&op)?;
+    let mut event = event_from_op(&op)?;
+    // X2b repairs the marker with the first sealer's usage, not a later sample.
+    event.usage = if events::event_path(project, &op.event)?.exists() {
+        events::load(project, &op.event)?.usage
+    } else {
+        usage
+    };
     events::seal_create_if_absent(project, &event)?;
     // The receipt records the bytes this sealer hashed (D5); the courier
     // carries it to the Mac event records.
@@ -597,6 +604,7 @@ fn event_from_op(op: &Op) -> Result<Event> {
         recipient: op.recipient.clone(),
         created: op.created.clone(),
         payload,
+        usage: None,
     })
 }
 
@@ -726,7 +734,7 @@ pub(crate) fn validate_binding(project: &Project, op: &Op, on_box: bool) -> Resu
 
 fn recover_staged(project: &Project, op: &Op, on_box: bool) -> Result<()> {
     let mut invalid = false;
-    let result = seal(project, &op.op, |candidate| {
+    let result = seal(project, &op.op, None, |candidate| {
         let result = validate_binding(project, candidate, on_box);
         invalid = result.is_err();
         result.map(|_| ())
@@ -949,7 +957,16 @@ mod tests {
             staged.published_ref.as_deref(),
             Some("seals/hp/demo/t-0088/abc")
         );
-        let event = seal(&project, &op.op, |_| Ok(())).unwrap();
+        let usage = crate::usage::Usage {
+            input: 1,
+            total: 1,
+            ..Default::default()
+        };
+        let event = seal(&project, &op.op, Some(usage.clone()), |_| Ok(())).unwrap();
+        assert_eq!(
+            events::load(&project, &event.id).unwrap().usage,
+            Some(usage)
+        );
         assert_eq!(
             event.payload.done.unwrap().published_ref,
             staged.published_ref
@@ -1069,7 +1086,7 @@ mod tests {
         )
         .unwrap();
         stage_done(project, &op.op, worktree, runner).unwrap();
-        seal(project, &op.op, |_| Ok(())).unwrap()
+        seal(project, &op.op, None, |_| Ok(())).unwrap()
     }
 
     #[test]
@@ -1106,7 +1123,7 @@ mod tests {
         let second = reserve();
         assert_ne!(first.op, second.op);
         stage_done(&project, &second.op, root.path(), &runner).unwrap();
-        seal(&project, &second.op, |_| Ok(())).unwrap();
+        seal(&project, &second.op, None, |_| Ok(())).unwrap();
     }
 
     #[test]
@@ -1216,7 +1233,7 @@ mod tests {
                 rebind();
             }
             assert!(
-                seal(&project, &op.op, |candidate| validate_binding(
+                seal(&project, &op.op, None, |candidate| validate_binding(
                     &project, candidate, on_box
                 )
                 .map(|_| ()))
@@ -1273,7 +1290,7 @@ mod tests {
         )
         .unwrap();
         stage_done(&project, &op.op, root.path(), &runner).unwrap();
-        let event = seal(&project, &op.op, |_| Ok(())).unwrap();
+        let event = seal(&project, &op.op, None, |_| Ok(())).unwrap();
         assert_eq!(event.id, op.op);
         assert_eq!(load(&project, &op.op).unwrap().revision, 3);
     }
@@ -1358,37 +1375,63 @@ mod tests {
         )
         .unwrap();
         let staged = stage_waiting(&project, &op.op).unwrap();
-        let event = event_from_op(&staged).unwrap();
+        let mut event = event_from_op(&staged).unwrap();
+        event.usage = Some(crate::usage::Usage {
+            input: 7,
+            total: 7,
+            ..Default::default()
+        });
         events::seal_create_if_absent(&project, &event).unwrap();
         assert_eq!(load(&project, &op.op).unwrap().state, OpState::Staged);
-        seal(&project, &op.op, |_| Ok(())).unwrap();
+        let repaired = seal(&project, &op.op, None, |_| Ok(())).unwrap();
+        assert_eq!(repaired.usage, event.usage);
         assert_eq!(load(&project, &op.op).unwrap().state, OpState::Sealed);
     }
 
     #[test]
-    fn waiting_text_needs_no_clean_tree_or_sha() {
-        let (_root, project, _runner, recipient) = fixture();
-        let op = reserve(
-            &project,
-            Reservation {
-                thread: "t-0001",
-                pane: "w1:p2",
-                attempt: 1,
-                kind: OpKind::Waiting,
-                recipient,
-                requested: Requested::Waiting {
-                    text: "blocked".into(),
-                    class: crate::contracts::FailureClass::Unknown,
-                    provider_kind: None,
+    fn waiting_and_failed_seal_usage_without_a_clean_tree_or_sha() {
+        for kind in [OpKind::Waiting, OpKind::Failed] {
+            let (_root, project, _runner, recipient) = fixture();
+            let op = reserve(
+                &project,
+                Reservation {
+                    thread: "t-0001",
+                    pane: "w1:p2",
+                    attempt: 1,
+                    kind,
+                    recipient,
+                    requested: if kind == OpKind::Waiting {
+                        Requested::Waiting {
+                            text: "blocked".into(),
+                            class: crate::contracts::FailureClass::Unknown,
+                            provider_kind: None,
+                        }
+                    } else {
+                        Requested::Failed {
+                            failure: "failed work".into(),
+                            class: crate::contracts::FailureClass::WorkFailed,
+                            provider_kind: None,
+                        }
+                    },
+                    helper_pid: 1,
                 },
-                helper_pid: 1,
-            },
-        )
-        .unwrap();
-        assert_eq!(
-            stage_waiting(&project, &op.op).unwrap().state,
-            OpState::Staged
-        );
+            )
+            .unwrap();
+            assert_eq!(
+                stage_waiting(&project, &op.op).unwrap().state,
+                OpState::Staged
+            );
+            let usage = crate::usage::Usage {
+                input: 3,
+                total: 3,
+                ..Default::default()
+            };
+            let event = seal(&project, &op.op, Some(usage.clone()), |_| Ok(())).unwrap();
+            assert_eq!(
+                events::load(&project, &event.id).unwrap().usage,
+                Some(usage)
+            );
+        }
     }
 
     #[test]
@@ -1584,7 +1627,7 @@ mod tests {
         )
         .unwrap();
         stage_done(&project, &clean_op.op, &repo, &RealRunner).unwrap();
-        seal(&project, &clean_op.op, |_| Ok(())).unwrap();
+        seal(&project, &clean_op.op, None, |_| Ok(())).unwrap();
         assert_eq!(load(&project, &clean_op.op).unwrap().state, OpState::Sealed);
     }
 
@@ -1659,8 +1702,8 @@ mod tests {
         let b_project = project.clone();
         let a_id = op.op.clone();
         let b_id = op.op.clone();
-        let a = std::thread::spawn(move || seal(&a_project, &a_id, |_| Ok(())).unwrap());
-        let b = std::thread::spawn(move || seal(&b_project, &b_id, |_| Ok(())).unwrap());
+        let a = std::thread::spawn(move || seal(&a_project, &a_id, None, |_| Ok(())).unwrap());
+        let b = std::thread::spawn(move || seal(&b_project, &b_id, None, |_| Ok(())).unwrap());
         assert_eq!(a.join().unwrap(), b.join().unwrap());
         assert_eq!(events::list(&project).len(), 1);
     }

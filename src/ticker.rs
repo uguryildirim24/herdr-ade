@@ -3797,6 +3797,7 @@ mod tests {
             thread: lane.id.clone(),
             attempt: 1,
             created: project::now(),
+            usage: None,
             recipient: Recipient {
                 pane: "w1:p1".into(),
                 coordinator_attempt: 1,
@@ -5623,6 +5624,7 @@ mod tests {
         );
         let event = crate::contracts::Event {
             id: format!("{}-1-1", lane.id),
+            usage: None,
             op: "done".into(),
             thread: lane.id.clone(),
             attempt: 1,
@@ -5743,6 +5745,7 @@ mod tests {
                         coordinator_attempt: 1,
                     },
                     created: project::now(),
+                    usage: None,
                     payload: if number % 2 == 0 {
                         EventPayload {
                             done: Some(DonePayload::default()),
@@ -6143,6 +6146,7 @@ mod tests {
             use crate::contracts::{Event, EventPayload, Recipient, WaitingPayload};
             let event = Event {
                 id: format!("{}-1-{sequence}", lane.id),
+                usage: None,
                 op: format!("test-{sequence}"),
                 thread: lane.id.clone(),
                 attempt: 1,

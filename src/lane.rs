@@ -87,16 +87,23 @@ pub(crate) fn done(ctx: &Ctx, report: &str, sha: &str) -> Result<()> {
     } else {
         ops::stage_done(&binding.project, &op.op, Path::new(git_folder), ctx.runner)?;
     }
-    let event = ops::seal(&binding.project, &op.op, |candidate| {
-        validate_current(&binding, candidate.attempt, candidate)
-    })?;
+    let event = ops::seal(
+        &binding.project,
+        &op.op,
+        crate::usage::collect(ctx, &binding.thread),
+        |candidate| validate_current(&binding, candidate.attempt, candidate),
+    )?;
     let _ = crate::project::refresh_page(&binding.project);
     if binding.card.is_none() {
         steps::deliver_event(ctx, &binding.project, &event)?;
         ticker::start(ctx)?;
     }
     crate::output::insert("event", event.id.clone());
-    println!("sealed {}", event.id);
+    println!(
+        "sealed {} · {}",
+        event.id,
+        crate::usage::summary(event.usage.as_ref())
+    );
     Ok(())
 }
 
@@ -171,9 +178,12 @@ fn seal_message(
         },
     )?;
     ops::stage_waiting(&binding.project, &op.op)?;
-    let event = ops::seal(&binding.project, &op.op, |candidate| {
-        validate_current(&binding, candidate.attempt, candidate)
-    })?;
+    let event = ops::seal(
+        &binding.project,
+        &op.op,
+        crate::usage::collect(ctx, &binding.thread),
+        |candidate| validate_current(&binding, candidate.attempt, candidate),
+    )?;
     let _ = crate::project::refresh_page(&binding.project);
     if binding.card.is_none() {
         // Failure is consumed by the next ticker pass, never synchronously:
@@ -188,7 +198,11 @@ fn seal_message(
     if let Some(kind) = provider_kind {
         crate::output::insert("provider_kind", serde_json::json!(kind));
     }
-    println!("sealed {}", event.id);
+    println!(
+        "sealed {} · {}",
+        event.id,
+        crate::usage::summary(event.usage.as_ref())
+    );
     Ok(())
 }
 

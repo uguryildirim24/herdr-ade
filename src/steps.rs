@@ -1849,6 +1849,7 @@ mod tests {
         let event = crate::contracts::Event {
             id: format!("{id}-1-1"),
             op: format!("{id}-1-1"),
+            usage: None,
             thread: id.into(),
             attempt: 1,
             recipient: crate::contracts::Recipient {
@@ -3274,6 +3275,7 @@ mod tests {
         let event = crate::contracts::Event {
             id: id.into(),
             op: id.into(),
+            usage: None,
             thread: "t-0001".into(),
             attempt: 1,
             recipient: crate::contracts::Recipient {

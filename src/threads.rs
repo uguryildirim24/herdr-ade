@@ -2737,6 +2737,7 @@ pub fn attest(ctx: &Ctx, slug: &str, id: &str, reason: &str) -> Result<AttestOut
     let event = crate::contracts::Event {
         id: event_id.clone(),
         op: event_id.clone(),
+        usage: None,
         thread: id.to_string(),
         attempt,
         recipient: crate::contracts::Recipient {
@@ -4637,6 +4638,7 @@ fn preserve_report_links(ctx: &Ctx, project: &Project, record: &Thread) -> Resul
     let text = String::from_utf8(bytes)?;
     let destinations = report_destinations(&text);
     let mut replacements = Vec::new();
+    let mut library_replacements = Vec::new();
     let mut files = std::collections::BTreeMap::new();
     let mut total = 0_u64;
     let mut missing = Vec::new();
@@ -4644,8 +4646,23 @@ fn preserve_report_links(ctx: &Ctx, project: &Project, record: &Thread) -> Resul
         let relative = match linked_relative_path(project, record, &dest)? {
             Some(ReportLink::Thread(relative)) => relative,
             Some(ReportLink::Repo { relative, source }) => {
-                // Git keeps this content on integration; leave the link as written.
+                // Git keeps this content on integration; the library copy is
+                // outside the worktree, so point it at the kept repository.
                 repo_link_kept(ctx, project, record, &relative, &source)?;
+                let path = Path::new(&record.repo).join(&relative);
+                let encoded: String = path
+                    .to_string_lossy()
+                    .bytes()
+                    .map(|byte| {
+                        if byte.is_ascii_alphanumeric() || b"/-_.~".contains(&byte) {
+                            (byte as char).to_string()
+                        } else {
+                            format!("%{byte:02X}")
+                        }
+                    })
+                    .collect();
+                let suffix = &dest[dest.split(['#', '?']).next().unwrap_or(&dest).len()..];
+                library_replacements.push((range, format!("{encoded}{suffix}")));
                 continue;
             }
             None => continue,
@@ -4688,6 +4705,10 @@ fn preserve_report_links(ctx: &Ctx, project: &Project, record: &Thread) -> Resul
             }
         }
         let suffix = &dest[dest.split(['#', '?']).next().unwrap_or(&dest).len()..];
+        library_replacements.push((
+            range.clone(),
+            format!("../../.state/artifacts/{hash}{suffix}"),
+        ));
         replacements.push((range, format!("{hash}{suffix}")));
     }
     thread::update(project, &record.id, |t| {
@@ -4697,19 +4718,30 @@ fn preserve_report_links(ctx: &Ctx, project: &Project, record: &Thread) -> Resul
         thread::store_artifact(project, &bytes)
             .with_context(|| format!("could not preserve {}", relative.display()))?;
     }
-    if replacements.is_empty() {
-        return Ok(());
+    let mut library_report = text.clone();
+    for (range, dest) in library_replacements.into_iter().rev() {
+        library_report.replace_range(range, &dest);
     }
-    let mut rewritten = text;
-    for (range, dest) in replacements.into_iter().rev() {
-        rewritten.replace_range(range, &dest);
+    if !replacements.is_empty() {
+        let mut rewritten = text;
+        for (range, dest) in replacements.into_iter().rev() {
+            rewritten.replace_range(range, &dest);
+        }
+        let hash = thread::store_artifact(project, rewritten.as_bytes())?;
+        thread::update(project, &record.id, |t| {
+            t.final_report_hash = hash.clone();
+            t.final_report_seal = sealed.clone();
+        })?;
     }
-    let hash = thread::store_artifact(project, rewritten.as_bytes())?;
-    thread::update(project, &record.id, |t| {
-        t.final_report_hash = hash.clone();
-        t.final_report_seal = sealed.clone();
-    })?;
-    Ok(())
+    let _lock = project.lock()?;
+    let library = project.dir().join("library");
+    let target = library.join(&record.id);
+    for dir in [&library, &target] {
+        if !dir.is_dir() {
+            std::fs::create_dir(dir)?;
+        }
+    }
+    project::write_atomic(&target.join("report.md"), library_report.as_bytes())
 }
 
 /// A box lane's report arrives as the courier's imported artifact
@@ -5541,6 +5573,20 @@ fn placement_summary(record: &Thread) -> String {
     format!("runs_on = {machine:?}\nplacement = {reason:?}\n")
 }
 
+fn report_summary(project: &Project, record: &Thread) -> Result<String> {
+    let events = crate::events::for_thread(project, &record.id);
+    let latest = crate::events::latest_event(&events, &record.id, record.attempt.max(1));
+    let report = crate::events::latest_done_event(&events, &record.id, record.attempt.max(1))
+        .and_then(|event| event.payload.done.as_ref())
+        .map(|done| std::path::absolute(crate::events::artifact_path(project, &done.artifact)))
+        .transpose()?;
+    Ok(format!(
+        "report: {} · {}",
+        report.map_or_else(|| "no report yet".into(), |path| path.display().to_string()),
+        crate::usage::summary(latest.and_then(|event| event.usage.as_ref()))
+    ))
+}
+
 pub fn print_show(ctx: &Ctx, slug: &str, id: &str) -> Result<()> {
     let project = Project::load(&ctx.root, slug)?;
     let record = thread::load(&project, id)?;
@@ -5548,6 +5594,7 @@ pub fn print_show(ctx: &Ctx, slug: &str, id: &str) -> Result<()> {
         .into_iter()
         .find(|row| row.thread.id == id)
         .context("thread disappeared while reading its live state")?;
+    println!("{}", report_summary(&project, &record)?);
     println!("group = {:?}", row.group.label());
     println!("live = {:?}", row.note);
     print!("{}", placement_summary(&record));
@@ -5572,19 +5619,6 @@ pub fn print_show(ctx: &Ctx, slug: &str, id: &str) -> Result<()> {
             "attested = {:?}",
             format!("{}: {}", attestation.coordinator, attestation.reason)
         );
-    }
-    if let Some(report) = thread::sealed_report_path(&project, &record) {
-        println!("# final report: {}", report.display());
-    } else if let Some(report) = thread::final_report_path(&project, &record) {
-        println!("# historical report (not completion): {}", report.display());
-    } else {
-        let draft = Path::new(&record.thread_dir).join("report.md");
-        if std::fs::symlink_metadata(&draft).is_ok_and(|metadata| metadata.is_file()) {
-            println!(
-                "# unsealed report draft (not completion): {}",
-                draft.display()
-            );
-        }
     }
     Ok(())
 }
@@ -5625,6 +5659,7 @@ mod tests {
             &crate::contracts::Event {
                 id: format!("{}-1-done", lane.id),
                 op: format!("{}-1-done", lane.id),
+                usage: None,
                 thread: lane.id.clone(),
                 attempt: 1,
                 created: project::now(),
@@ -5747,6 +5782,21 @@ mod tests {
                 std::fs::read_to_string(thread::final_report_path(&fx.project, &saved).unwrap())
                     .unwrap(),
                 report
+            );
+            let library_report = std::fs::read_to_string(
+                fx.project
+                    .dir()
+                    .join("library")
+                    .join(&lane.id)
+                    .join("report.md"),
+            )
+            .unwrap();
+            assert_eq!(
+                library_report,
+                format!(
+                    "[Figure]({}/figures/3d/gaba-dose/curves.svg#plot)\n",
+                    fx.repo.display()
+                )
             );
             let figure_hash = thread::sha256_hex(b"<svg/>\n");
             assert!(!crate::events::artifact_path(&fx.project, &figure_hash).exists());
@@ -5920,11 +5970,91 @@ mod tests {
                     bytes
                 );
             }
+            let library = project.dir().join("library").join(&lane.id);
+            let library_report = std::fs::read_to_string(library.join("report.md")).unwrap();
+            assert_eq!(
+                library_report,
+                format!("Screenshots: [library](../../.state/artifacts/{index_hash}#shots)\n")
+            );
+            assert_eq!(
+                std::fs::read_to_string(library.join("../../.state/artifacts").join(&index_hash))
+                    .unwrap(),
+                index
+            );
             assert!(rewritten.contains("#shots"));
             if remote {
                 assert_eq!(world.runner.count("manifest.append"), 2);
             }
         }
+    }
+
+    #[test]
+    fn sealed_report_without_links_is_in_library_and_show_names_the_done_path() {
+        for remote in [false, true] {
+            let world = crate::scenarios::World::new();
+            let project = world.project("demo", "a.sock");
+            let lane = world.thread(&project, world.home.path(), |t| {
+                if remote {
+                    t.machine = "buildbox".into();
+                }
+            });
+            assert_eq!(
+                report_summary(&project, &lane).unwrap(),
+                "report: no report yet · usage unknown"
+            );
+            seal_linked_report(&project, &lane, "A finished report.\n");
+            preserve_report_links(&world.ctx(), &project, &lane).unwrap();
+            assert_eq!(
+                std::fs::read_to_string(
+                    project
+                        .dir()
+                        .join("library")
+                        .join(&lane.id)
+                        .join("report.md")
+                )
+                .unwrap(),
+                "A finished report.\n"
+            );
+            let event = crate::events::for_thread(&project, &lane.id).pop().unwrap();
+            let path = std::path::absolute(crate::events::artifact_path(
+                &project,
+                &event.payload.done.as_ref().unwrap().artifact,
+            ))
+            .unwrap();
+            assert!(
+                crate::events::typed_line(&project, &event)
+                    .unwrap()
+                    .contains(&path.display().to_string())
+            );
+            assert_eq!(
+                report_summary(&project, &lane).unwrap(),
+                format!("report: {} · usage unknown", path.display())
+            );
+        }
+    }
+
+    #[test]
+    fn show_prints_the_latest_seals_usage_next_to_its_report() {
+        let world = crate::scenarios::World::new();
+        let project = world.project("demo", "a.sock");
+        let lane = world.thread(&project, world.home.path(), |_| {});
+        seal_linked_report(&project, &lane, "Report.\n");
+        let mut event = crate::events::for_thread(&project, &lane.id).pop().unwrap();
+        event.id = format!("{}-1-new", lane.id);
+        event.op = event.id.clone();
+        event.created = "2099-01-01T00:00:00Z".into();
+        event.usage = Some(crate::usage::Usage {
+            input: 200000,
+            cache_read: 4900000,
+            total: 5100000,
+            ..Default::default()
+        });
+        crate::events::seal_create_if_absent(&project, &event).unwrap();
+        assert!(
+            report_summary(&project, &lane)
+                .unwrap()
+                .ends_with(" · 5.1M tokens (4.9M cached)")
+        );
     }
 
     #[test]
@@ -6106,6 +6236,7 @@ mod tests {
                 attempt,
                 recipient: Recipient::default(),
                 created: created.into(),
+                usage: None,
                 payload: EventPayload {
                     done: Some(DonePayload {
                         artifact: artifact.clone(),
@@ -6216,6 +6347,7 @@ mod tests {
         let event = crate::contracts::Event {
             id: format!("{}-1-1", completed.id),
             op: format!("{}-1-1", completed.id),
+            usage: None,
             thread: completed.id.clone(),
             attempt: 1,
             recipient: crate::contracts::Recipient::default(),
@@ -6460,6 +6592,7 @@ mod tests {
         crate::events::seal_create_if_absent(
             &project,
             &crate::contracts::Event {
+                usage: None,
                 id: "waiting-2".into(),
                 op: "waiting-2".into(),
                 thread: lane.id.clone(),

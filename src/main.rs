@@ -74,6 +74,7 @@ mod testkit;
 mod thread;
 mod threads;
 mod ticker;
+mod usage;
 mod worktrees;
 
 /// Crate version plus a build identifier (short git hash and build time), so a
