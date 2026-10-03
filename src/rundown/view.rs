@@ -1,10 +1,8 @@
-//! The Rundown tab's picture: the plan card turned into a calm, plain to-do
-//! list. Pure: JSON in, styled lines out, so the look is tested without a
-//! terminal.
+//! The Rundown tab's picture: the plan card turned into a calm to-do list.
+//! Pure: JSON in, styled lines out, so the look is tested without a terminal.
 //!
-//! Only the plan card feeds it (`ha --json plan show`). Prefer plain words,
-//! but never hide work: a technical-only row keeps its text without ids, or
-//! gets a neutral numbered label.
+//! Only the plan card feeds it (`ha --json plan show`). Step labels are shown
+//! as written, cut only to fit the width.
 
 use serde_json::Value;
 
@@ -25,30 +23,17 @@ pub(crate) struct Step {
 }
 
 impl Step {
-    fn from_plan(step: &Value, number: &mut usize) -> Step {
-        *number += 1;
-        let original = step["text"].as_str().unwrap_or_default();
-        let mut text = plain(original).trim_end_matches('.').to_string();
-        if text.is_empty() {
-            text = original
-                .split_whitespace()
-                .filter(|word| !id_word(word))
-                .collect::<Vec<_>>()
-                .join(" ");
-        }
-        if text.is_empty() {
-            text = format!("step {number}");
-        }
+    fn from_plan(step: &Value) -> Step {
         Step {
             mark: match step["state"].as_str().unwrap_or_default() {
                 "done" => Mark::Done,
                 "running" => Mark::Now,
                 _ => Mark::Later,
             },
-            text,
+            text: step["text"].as_str().unwrap_or_default().to_string(),
             subtasks: list(&step["subtasks"])
                 .iter()
-                .map(|sub| Step::from_plan(sub, number))
+                .map(Step::from_plan)
                 .map(|sub| Step {
                     subtasks: Vec::new(),
                     ..sub
@@ -87,16 +72,12 @@ impl Card {
                 .to_string();
             for line in [sentence, clause] {
                 let line = line.trim().trim_end_matches(['.', ',']).trim().to_string();
-                if !line.is_empty() && !technical(&line) && !about.contains(&line) {
+                if !line.is_empty() && !about.contains(&line) {
                     about.push(line);
                 }
             }
         }
-        let mut number = 0;
-        let steps = list(&plan["steps"])
-            .iter()
-            .map(|step| Step::from_plan(step, &mut number))
-            .collect();
+        let steps = list(&plan["steps"]).iter().map(Step::from_plan).collect();
         Card {
             title: title.trim().to_string(),
             about,
@@ -133,91 +114,6 @@ fn has_date(text: &str) -> bool {
             _ => b.is_ascii_digit(),
         })
     })
-}
-
-/// True when a word reads like a path, a file, an id, a hash or code.
-fn technical_word(word: &str) -> bool {
-    let word = word.trim_matches(|c: char| ",.;:!?()[]\"'".contains(c));
-    if word.is_empty() {
-        return false;
-    }
-    if word.contains(['/', '\\', '`', '_', '<', '>', '{', '}', '='])
-        || word.contains("::")
-        || word.starts_with("--")
-    {
-        return true;
-    }
-    const FILES: &[&str] = &[
-        ".md", ".rs", ".toml", ".json", ".jsonl", ".py", ".ts", ".js", ".sh", ".yaml", ".yml",
-        ".txt", ".lock", ".html",
-    ];
-    let lower = word.to_ascii_lowercase();
-    if FILES
-        .iter()
-        .any(|ext| lower.ends_with(ext) && lower.len() > ext.len())
-    {
-        return true;
-    }
-    id_word(word)
-}
-
-/// Record ids and hashes are removed even from a technical-only fallback.
-fn id_word(word: &str) -> bool {
-    let lower = word
-        .trim_matches(|c: char| ",.;:!?()[]\"'`".contains(c))
-        .to_ascii_lowercase();
-    // Record ids: s-15, t-0508, job-0098, r198, w1:p2.
-    if let Some((head, tail)) = lower.split_once('-')
-        && (1..=4).contains(&head.len())
-        && head.chars().all(|c| c.is_ascii_lowercase())
-        && !tail.is_empty()
-        && tail.chars().all(|c| c.is_ascii_digit())
-    {
-        return true;
-    }
-    if lower.len() >= 3
-        && lower.starts_with(['r', 'w'])
-        && lower[1..].chars().all(|c| c.is_ascii_digit())
-    {
-        return true;
-    }
-    if let Some((workspace, pane)) = lower.split_once(":p")
-        && workspace.starts_with('w')
-        && workspace.len() > 1
-        && workspace[1..].chars().all(|c| c.is_ascii_digit())
-        && !pane.is_empty()
-        && pane.chars().all(|c| c.is_ascii_digit())
-    {
-        return true;
-    }
-    // Commit hashes: seven or more hex characters mixing digits and letters.
-    lower.len() >= 7
-        && lower.chars().all(|c| c.is_ascii_hexdigit())
-        && lower.chars().any(|c| c.is_ascii_digit())
-        && lower.chars().any(|c| c.is_ascii_alphabetic())
-}
-
-fn technical(text: &str) -> bool {
-    text.split_whitespace().any(technical_word)
-}
-
-/// The sentence without its technical words.
-fn plain(text: &str) -> String {
-    let text = without_attribution(text);
-    if !technical(&text) {
-        return text;
-    }
-    let words: Vec<_> = text.split_whitespace().collect();
-    words.iter().enumerate()
-        .filter(|(i, word)| {
-            !technical_word(word)
-                // Remove a preposition with its stripped object, not a dangling "in".
-                && !(matches!(word.to_ascii_lowercase().as_str(), "in" | "on" | "at" | "from" | "to" | "under")
-                    && words.get(i + 1).is_some_and(|next| technical_word(next)))
-        })
-        .map(|(_, word)| *word)
-        .collect::<Vec<_>>()
-        .join(" ")
 }
 
 // ------------------------------------------------------------- drawing
@@ -544,13 +440,16 @@ mod tests {
     }
 
     #[test]
-    fn path_only_steps_and_subtasks_survive_with_plan_counts() {
-        // The plan-show result, including text that the plain-words filter empties.
-        let plan = json!({"steps": [
+    fn literal_steps_and_subtasks_keep_plan_counts() {
+        let plan = json!({"goal": "Compare red.md and blue.md", "steps": [
             {"id": "s-1", "state": "done", "text": "src/rundown/view.rs"},
             {"id": "s-2", "state": "left", "text": "t-0508", "subtasks": [
                 {"id": "s-3", "state": "left", "text": "notes.md"},
                 {"id": "s-4", "state": "left", "text": "job-0001"},
+                {"id": "s-5", "state": "running", "text": "Compare red.md and blue.md"},
+                {"id": "s-6", "state": "done", "text": "Fix src/pi/doctor.rs."},
+                {"id": "s-7", "state": "left", "text": "Cut unused parts (Rolf, 2026-09-25)."},
+                {"id": "s-8", "state": "left", "text": ""},
             ]},
         ]});
         let card = Card::from_plan("Demo", &plan);
@@ -561,19 +460,28 @@ mod tests {
             steps.iter().filter(|s| s["state"] == "done").count()
         );
         assert_eq!(card.steps[0].text, "src/rundown/view.rs");
-        assert_eq!(card.steps[1].text, "step 2");
-        assert_eq!(card.steps[1].subtasks.len(), 2);
-        assert_eq!(card.steps[1].subtasks[0].text, "notes.md");
-        assert_eq!(card.steps[1].subtasks[1].text, "step 4");
+        assert_eq!(card.steps[1].text, "t-0508");
+        let subtasks = steps[1]["subtasks"].as_array().unwrap();
+        assert_eq!(card.steps[1].subtasks.len(), subtasks.len());
+        for (sub, stored) in card.steps[1].subtasks.iter().zip(subtasks) {
+            assert_eq!(sub.text, stored["text"].as_str().unwrap());
+        }
+        assert_eq!(card.about, ["Compare red.md and blue.md"]);
         let text = screen(&card, 80);
         for row in [
             "src/rundown/view.rs",
-            "step 2",
+            "t-0508",
             "notes.md",
-            "step 4",
+            "job-0001",
+            "Compare red.md and blue.md",
+            "Fix src/pi/doctor.rs.",
+            "Cut unused parts (Rolf, 2026-09-25).",
             "1 of 2",
         ] {
             assert!(text.contains(row), "{row}: {text}");
         }
+        let narrow = screen(&card, 40);
+        assert!(narrow.contains(&cut("Compare red.md and blue.md", 20)));
+        assert!(narrow.contains("1 of 2"));
     }
 }
