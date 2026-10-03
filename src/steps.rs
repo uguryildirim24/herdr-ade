@@ -1514,15 +1514,6 @@ pub(crate) fn remote_attention(
             ctx.runner,
         )
         .on_machine(lane.machine_route());
-        if agents
-            .iter()
-            .any(|agent| thread::agent_matches(lane, agent) && agent.parent().is_some())
-            && panes.iter().any(|pane| thread::pane_matches(lane, pane))
-            && let Err(error) = remote.pane_clear_tokens(&lane.pane_id, &["parent"])
-        {
-            errors.push(error.into());
-            continue;
-        }
         // A missing agent alone is unknown; sealed attempts need no replacement.
         if current.parked || crate::threads::attempt_sealed(project, &current) {
             state.blocked.remove(&lane.id);
@@ -2134,6 +2125,55 @@ mod tests {
         }
         assert_eq!(gone, 0);
         println!("synthetic sealed park: GONE 1 -> {gone}");
+    }
+
+    #[test]
+    fn live_box_observation_keeps_the_parent_link() {
+        let (world, project) = delivery_world();
+        let lane = world.thread(&project, world.home.path(), |t| {
+            t.machine_id = "box".into();
+            t.machine = "box".into();
+            t.launch_attempts = 1;
+        });
+        let parent = project.coordinator().unwrap().pane_id;
+        let agent = Agent {
+            pane_id: lane.pane_id.clone(),
+            tab_id: lane.tab_id.clone(),
+            workspace_id: lane.workspace_id.clone(),
+            cwd: lane.cwd.clone(),
+            name: lane.agent_name.clone(),
+            agent: lane.agent.clone(),
+            agent_status: "working".into(),
+            tokens: [("parent".into(), parent.clone())].into(),
+            ..Agent::default()
+        };
+        let pane = serde_json::from_str(&crate::scenarios::pane_json(
+            &lane.workspace_id,
+            &lane.tab_id,
+            &lane.pane_id,
+            &lane.cwd,
+        ))
+        .unwrap();
+        assert!(thread::agent_matches(&lane, &agent));
+        assert!(thread::pane_matches(&lane, &pane));
+        assert_eq!(agent.parent(), Some(parent.as_str()));
+        for _ in 0..3 {
+            let errors = remote_attention(
+                &world.ctx(),
+                &project,
+                RemoteView {
+                    machine_id: "box",
+                    threads: std::slice::from_ref(&lane),
+                    agents: std::slice::from_ref(&agent),
+                    panes: std::slice::from_ref(&pane),
+                    boot_id: "boot-1",
+                    now: at("2026-09-19T00:00:00Z"),
+                },
+            );
+            assert!(errors.is_empty(), "{errors:?}");
+        }
+        assert_eq!(world.runner.count("--clear-token parent"), 0);
+        assert!(typed_lines(&world).is_empty());
     }
 
     #[test]
