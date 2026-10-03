@@ -4,116 +4,74 @@
 //! Only the plan card feeds it (`ha --json plan show`). Step labels are shown
 //! as written, cut only to fit the width.
 
+use serde::Deserialize;
 use serde_json::Value;
 
 /// Where a step stands, in the tab's own words.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 pub(crate) enum Mark {
+    #[serde(rename = "done")]
     Done,
+    #[serde(rename = "running")]
     Now,
+    #[serde(rename = "left")]
     Later,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 pub(crate) struct Step {
+    #[serde(rename = "state")]
     pub(crate) mark: Mark,
     pub(crate) text: String,
     /// One level only: a subtask's own list is always empty.
+    #[serde(default)]
     pub(crate) subtasks: Vec<Step>,
 }
 
-impl Step {
-    fn from_plan(step: &Value) -> Step {
-        Step {
-            mark: match step["state"].as_str().unwrap_or_default() {
-                "done" => Mark::Done,
-                "running" => Mark::Now,
-                _ => Mark::Later,
-            },
-            text: step["text"].as_str().unwrap_or_default().to_string(),
-            subtasks: list(&step["subtasks"])
-                .iter()
-                .map(Step::from_plan)
-                .map(|sub| Step {
-                    subtasks: Vec::new(),
-                    ..sub
-                })
-                .collect(),
-        }
-    }
-}
-
-fn list(value: &Value) -> &[Value] {
-    value.as_array().map(Vec::as_slice).unwrap_or_default()
+#[derive(Deserialize)]
+struct PlanView {
+    #[serde(rename = "schema")]
+    _schema: u32,
+    #[serde(rename = "revision")]
+    _revision: u64,
+    #[serde(default)]
+    goal: String,
+    #[serde(default)]
+    does: String,
+    #[serde(default)]
+    what_you_get: String,
+    steps: Vec<Step>,
 }
 
 /// One project's rundown.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Card {
     pub(crate) title: String,
-    /// Ways to say what the project is, best first. The tab shows the first
-    /// that fits beside the name on one line, or none.
-    pub(crate) about: Vec<String>,
+    /// Authored outcome, cut only to fit the panel.
+    pub(crate) about: String,
     pub(crate) steps: Vec<Step>,
 }
 
 impl Card {
     /// Builds the card from `ha --json plan show` output: the whole reply or
     /// just its `data.result`.
-    pub(crate) fn from_plan(title: &str, reply: &Value) -> Card {
-        let plan = reply.pointer("/data/result").unwrap_or(reply);
-        let text = |key: &str| without_attribution(plan[key].as_str().unwrap_or_default());
-        let mut about: Vec<String> = Vec::new();
-        for sentence in [text("goal"), text("does")] {
-            let clause = sentence
-                .split([':', ';', '—'])
-                .next()
-                .unwrap_or_default()
-                .to_string();
-            for line in [sentence, clause] {
-                let line = line.trim().trim_end_matches(['.', ',']).trim().to_string();
-                if !line.is_empty() && !about.contains(&line) {
-                    about.push(line);
-                }
-            }
-        }
-        let steps = list(&plan["steps"]).iter().map(Step::from_plan).collect();
-        Card {
+    pub(crate) fn from_plan(title: &str, reply: &Value) -> serde_json::Result<Card> {
+        let plan: PlanView =
+            serde_json::from_value(reply.pointer("/data/result").unwrap_or(reply).clone())?;
+        let about = [plan.does, plan.goal, plan.what_you_get]
+            .into_iter()
+            .find(|text| !text.is_empty())
+            .unwrap_or_default();
+        Ok(Card {
             title: title.trim().to_string(),
             about,
-            steps,
-        }
+            steps: plan.steps,
+        })
     }
 
     fn count(&self, mark: Mark) -> usize {
         self.steps.iter().filter(|s| s.mark == mark).count()
     }
-}
-
-/// Drops a trailing "(Rolf, 2026-09-25)" style attribution: who said it and
-/// when is record keeping, not what the project is.
-fn without_attribution(text: &str) -> String {
-    let trimmed = text.trim_end();
-    let (body, stop) = match trimmed.strip_suffix('.') {
-        Some(body) => (body.trim_end(), "."),
-        None => (trimmed, ""),
-    };
-    if let Some(inner) = body.strip_suffix(')')
-        && let Some(open) = inner.rfind('(')
-        && has_date(&inner[open + 1..])
-    {
-        return format!("{}{stop}", inner[..open].trim_end());
-    }
-    text.trim().to_string()
-}
-
-fn has_date(text: &str) -> bool {
-    text.as_bytes().windows(10).any(|w| {
-        w.iter().enumerate().all(|(i, b)| match i {
-            4 | 7 => *b == b'-',
-            _ => b.is_ascii_digit(),
-        })
-    })
 }
 
 // ------------------------------------------------------------- drawing
@@ -190,14 +148,7 @@ pub(crate) fn render(card: &Card, width: usize, height: usize, note: &str) -> Ve
     } else {
         &card.title
     };
-    let about = match card.about.iter().find(|a| len(a) <= inner) {
-        Some(about) => about.clone(),
-        None => card
-            .about
-            .first()
-            .map(|a| cut(a, inner))
-            .unwrap_or_default(),
-    };
+    let about = cut(&card.about, inner);
     let mut header = vec![String::new(), shine(&cut(title, inner))];
     if !about.is_empty() {
         header.push(format!("{}{about}", QUIET.fg()));
@@ -440,8 +391,36 @@ mod tests {
     }
 
     #[test]
+    fn outcomes_are_literal_and_unknown_replies_are_errors() {
+        let outcome =
+            "Compare red.md and blue.md: report differences; retain names (Rolf, 2026-09-25).";
+        let plan = json!({"schema": 1, "revision": 4, "kind": "screen",
+            "what_you_get": "A screen you open.", "goal": "A shorter goal",
+            "does": outcome, "steps": []});
+        let reply = json!({"data": {"result": plan}});
+        let card = Card::from_plan("Demo", &reply).unwrap();
+        assert_eq!(card.about, outcome);
+        assert!(screen(&card, 40).contains(&cut(outcome, 28)));
+        for reply in [
+            json!({}),
+            json!({"data": {}}),
+            json!({"steps": []}),
+            json!({"schema": 1, "revision": 4, "steps": [{}]}),
+            json!({"schema": 1, "revision": 4, "steps": "wrong"}),
+        ] {
+            assert!(Card::from_plan("Demo", &reply).is_err(), "{reply}");
+        }
+        let old = json!({"schema": 1, "revision": 3, "kind": "screen",
+            "what_you_get": "A screen you open.", "steps": []});
+        assert_eq!(
+            Card::from_plan("Demo", &old).unwrap().about,
+            "A screen you open."
+        );
+    }
+
+    #[test]
     fn literal_steps_and_subtasks_keep_plan_counts() {
-        let plan = json!({"goal": "Compare red.md and blue.md", "steps": [
+        let plan = json!({"schema": 1, "revision": 3, "goal": "Compare red.md and blue.md", "steps": [
             {"id": "s-1", "state": "done", "text": "src/rundown/view.rs"},
             {"id": "s-2", "state": "left", "text": "t-0508", "subtasks": [
                 {"id": "s-3", "state": "left", "text": "notes.md"},
@@ -452,7 +431,7 @@ mod tests {
                 {"id": "s-8", "state": "left", "text": ""},
             ]},
         ]});
-        let card = Card::from_plan("Demo", &plan);
+        let card = Card::from_plan("Demo", &plan).unwrap();
         let steps = plan["steps"].as_array().unwrap();
         assert_eq!(card.steps.len(), steps.len());
         assert_eq!(
@@ -466,7 +445,7 @@ mod tests {
         for (sub, stored) in card.steps[1].subtasks.iter().zip(subtasks) {
             assert_eq!(sub.text, stored["text"].as_str().unwrap());
         }
-        assert_eq!(card.about, ["Compare red.md and blue.md"]);
+        assert_eq!(card.about, "Compare red.md and blue.md");
         let text = screen(&card, 80);
         for row in [
             "src/rundown/view.rs",

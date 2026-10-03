@@ -690,9 +690,6 @@ pub(crate) fn views_with_evidence(
     )
 }
 
-pub(crate) fn render_list(project: &Project, view: &View) -> String {
-    render(project, view)
-}
 pub(crate) fn render(_project: &Project, view: &View) -> String {
     let task = &view.record;
     let mut text = format!(

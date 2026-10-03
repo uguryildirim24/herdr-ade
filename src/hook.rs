@@ -83,14 +83,10 @@ pub(crate) fn install(ctx: &Ctx, project: &Project, kind: &str, pane: &str) -> R
         quote(pane)
     );
     let _lock = project.lock()?;
-    if shape == ConfigShape::Pi {
-        // The global extension resolves coordinator-hook.json from ADE state.
-        // Never write commands into the checkout. Existing extension-command
-        // files are ignored, even if malformed; leave them harmless on disk.
-        remove_old_pi_hooks(project, &adapter)?;
-    } else {
+    // Pi's global extension reads the binding from ADE state, not checkout hooks.
+    if shape != ConfigShape::Pi {
         let mut value = read_json_object(&path)?;
-        remove_entries(&mut value, shape, &adapter);
+        remove_entries(&mut value, &adapter);
         install_entry(&mut value, shape, &adapter, &command)?;
         write_json_atomic(&path, &value)?;
     }
@@ -150,34 +146,14 @@ pub(crate) fn remove(ctx: &Ctx, project: &Project) -> Result<()> {
                 if path.exists() {
                     std::fs::remove_file(&path)?;
                 }
-                remove_old_pi_hooks(project, &adapter)?;
             } else if path.exists() {
                 let mut value = read_json_object(&path)?;
-                remove_entries(&mut value, shape, &adapter);
+                remove_entries(&mut value, &adapter);
                 write_json_atomic(&path, &value)?;
             }
         }
     }
     let _ = std::fs::remove_file(binding_path(project));
-    Ok(())
-}
-
-fn remove_old_pi_hooks(project: &Project, adapter: &crate::adapters::Adapter) -> Result<()> {
-    let old = project.dir().join(".pi/hooks.json");
-    if old.exists() {
-        let mut value = read_json_object(&old)?;
-        remove_entries(&mut value, ConfigShape::ClaudeLike, adapter);
-        if value["hooks"].as_object().is_some_and(|hooks| {
-            value.as_object().is_some_and(|root| root.len() == 1)
-                && hooks
-                    .values()
-                    .all(|entries| entries.as_array().is_some_and(Vec::is_empty))
-        }) {
-            std::fs::remove_file(old)?;
-        } else {
-            write_json_atomic(&old, &value)?;
-        }
-    }
     Ok(())
 }
 
@@ -191,10 +167,6 @@ pub(crate) fn captures(project: &Project, pane: &str) -> Result<bool> {
         return Ok(false);
     }
     Ok(true)
-}
-
-fn event_phase<'a>(adapter: &'a crate::adapters::Adapter, event: &str) -> Option<&'a str> {
-    (event == adapter.hook.prompt_event).then_some("prompt")
 }
 
 fn owned_hook(value: &serde_json::Value) -> bool {
@@ -224,70 +196,28 @@ fn install_entry(
         .or_insert_with(|| serde_json::json!({}))
         .as_object_mut()
         .context("hook_config_invalid: `hooks` is not an object")?;
-    match shape {
-        ConfigShape::ClaudeLike => {
-            for event in adapter
-                .hook
-                .events
-                .iter()
-                .filter(|event| *event == &adapter.hook.prompt_event)
-            {
-                let entries = hooks
-                    .entry(event.clone())
-                    .or_insert_with(|| serde_json::json!([]))
-                    .as_array_mut()
-                    .with_context(|| {
-                        format!("hook_config_invalid: `hooks.{event}` is not an array")
-                    })?;
-                entries.retain(|entry| !owned_hook(entry));
-                let command = match event_phase(adapter, event) {
-                    Some(phase) => format!("{command} --phase {phase}"),
-                    None => command.to_string(),
-                };
-                entries.push(serde_json::json!({
-                    "matcher": "",
-                    "hooks": [{ "type": "command", "command": command }]
-                }));
-            }
-        }
-        ConfigShape::Cursor => {
-            for event in adapter
-                .hook
-                .events
-                .iter()
-                .filter(|event| *event == &adapter.hook.prompt_event)
-            {
-                let phase = if event == &adapter.hook.prompt_event {
-                    "prompt"
-                } else if event == "stop" {
-                    "stop"
-                } else {
-                    "observe"
-                };
-                let entries = hooks
-                    .entry(event)
-                    .or_insert_with(|| serde_json::json!([]))
-                    .as_array_mut()
-                    .with_context(|| {
-                        format!("hook_config_invalid: `hooks.{event}` is not an array")
-                    })?;
-                entries.retain(|entry| !owned_hook(entry));
-                entries.push(serde_json::json!({
-                    "command": format!("{command} --phase {phase}"),
-                    "loop_limit": 3
-                }));
-            }
-        }
+    let event = &adapter.hook.prompt_event;
+    let entries = hooks
+        .entry(event)
+        .or_insert_with(|| serde_json::json!([]))
+        .as_array_mut()
+        .with_context(|| format!("hook_config_invalid: `hooks.{event}` is not an array"))?;
+    let command = format!("{command} --phase prompt");
+    entries.push(match shape {
+        ConfigShape::ClaudeLike => serde_json::json!({
+            "matcher": "",
+            "hooks": [{ "type": "command", "command": command }]
+        }),
+        ConfigShape::Cursor => serde_json::json!({
+            "command": command,
+            "loop_limit": 3
+        }),
         ConfigShape::Pi => bail!("pi hooks use the ADE state binding"),
-    }
+    });
     Ok(())
 }
 
-fn remove_entries(
-    value: &mut serde_json::Value,
-    _shape: ConfigShape,
-    adapter: &crate::adapters::Adapter,
-) {
+fn remove_entries(value: &mut serde_json::Value, adapter: &crate::adapters::Adapter) {
     for name in &adapter.hook.events {
         if let Some(entries) = value
             .get_mut("hooks")
@@ -301,19 +231,13 @@ fn remove_entries(
 
 fn verify_owned_entry(path: &Path, pane: &str, adapter: &crate::adapters::Adapter) -> Result<()> {
     let value = read_json_object(path)?;
-    let names = std::slice::from_ref(&adapter.hook.prompt_event);
-    let found: usize = names
-        .iter()
-        .map(|event| {
-            value["hooks"][event]
-                .as_array()
-                .into_iter()
-                .flatten()
-                .filter(|entry| owned_hook(entry))
-                .count()
-        })
-        .sum();
-    if found != names.len() || !value.to_string().contains(pane) {
+    let found = value["hooks"][&adapter.hook.prompt_event]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|entry| owned_hook(entry))
+        .count();
+    if found != 1 || !value.to_string().contains(pane) {
         bail!("hook_install_failed: owned prompt entry did not verify");
     }
     Ok(())
@@ -396,16 +320,14 @@ fn handle_prompt(project: &Project, pane: &str, text: &str) -> Result<Option<Str
     {
         return Ok(None);
     }
-    match crate::prompt::take_pending_prompt(project, pane, text) {
-        Some(crate::prompt::PendingPrompt::Automated) => Ok(None),
-        None => {
-            let text = crate::prompt::take_automated_parts(project, pane, text);
-            let Some(text) = crate::prompt::human_request_text(&text) else {
-                return Ok(None);
-            };
-            Ok(Some(crate::prompt::record_pane_request(project, &text)?))
-        }
+    if crate::prompt::take_pending_prompt(project, pane, text) {
+        return Ok(None);
     }
+    let text = crate::prompt::take_automated_parts(project, pane, text);
+    let Some(text) = crate::prompt::human_request_text(&text) else {
+        return Ok(None);
+    };
+    Ok(Some(crate::prompt::record_pane_request(project, &text)?))
 }
 
 fn read_json_object(path: &Path) -> Result<serde_json::Value> {
@@ -642,7 +564,8 @@ at = "2026-09-18T00:02:00Z"
         std::fs::create_dir_all(old.parent().unwrap()).unwrap();
         std::fs::write(&old, r#"{"hooks":{"Stop":[{"hooks":[{"command":"ha plain hook --kind pi"}]}],"UserPromptSubmit":[{"hooks":[{"command":"ha plain hook --kind pi --phase prompt"}]}]}}"#).unwrap();
         install(&ctx, &project, "pi", "w1:p1").unwrap();
-        assert!(!old.exists(), "pi never reads hooks.json");
+        assert!(old.exists(), "pi never reads or scrubs hooks.json");
+        std::fs::write(&old, "not json").unwrap();
         let path = project.dir().join(".pi/herdr-ade-hooks.json");
         assert!(!path.exists(), "no pi commands are written to the checkout");
         let binding = read_binding(&project).unwrap().unwrap();
@@ -667,6 +590,7 @@ at = "2026-09-18T00:02:00Z"
         assert!(scope_binding(&project, "pi", "w1:p1", "pi-session", "prompt").unwrap());
         remove(&ctx, &project).unwrap();
         assert!(!path.exists());
+        assert_eq!(std::fs::read_to_string(&old).unwrap(), "not json");
         assert!(!captures(&project, "w1:p1").unwrap());
     }
 

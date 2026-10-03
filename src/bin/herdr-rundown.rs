@@ -94,7 +94,7 @@ impl Source {
             bail!("plan show exited with {}", out.status);
         }
         let reply: serde_json::Value = serde_json::from_slice(&out.stdout)?;
-        Ok(view::Card::from_plan(title, &reply))
+        Ok(view::Card::from_plan(title, &reply)?)
     }
 }
 

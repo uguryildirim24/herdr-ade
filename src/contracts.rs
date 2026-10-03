@@ -378,23 +378,6 @@ pub(crate) struct Ask {
 
 // --------------------------------------------------------------- plan card
 
-/// The seven end-result kinds and their fixed display sentence
-/// (SPEC-talk §2.7, §6.5). The coordinator picks one; the file stores it.
-pub(crate) const PLAN_KINDS: &[(&str, &str)] = &[
-    ("screen", "A screen you open."),
-    ("command", "A command you run."),
-    ("background", "A program that runs underneath."),
-    ("document", "A document."),
-    ("picture", "A picture."),
-    ("number", "A number."),
-    ("finding", "A finding."),
-];
-
-/// The fixed sentence for a stored kind, or `None` for an unknown one.
-pub(crate) fn plan_kind_sentence(kind: &str) -> Option<&'static str> {
-    PLAN_KINDS.iter().find(|(k, _)| *k == kind).map(|(_, v)| *v)
-}
-
 /// `state` on one plan step (SPEC-talk §6.5). It is a persisted projection of
 /// the bound work, never a coordinator-supplied status.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
@@ -446,7 +429,10 @@ pub(crate) struct Plan {
     pub(crate) revision: u64,
     pub(crate) next_step: u64,
     pub(crate) goal: String,
+    /// Historical outcome fields; new outcomes are authored in `does`.
+    #[serde(skip_serializing_if = "String::is_empty")]
     pub(crate) kind: String,
+    #[serde(skip_serializing_if = "String::is_empty")]
     pub(crate) what_you_get: String,
     pub(crate) does: String,
     pub(crate) steps: Vec<PlanStep>,
