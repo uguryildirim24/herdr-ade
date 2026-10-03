@@ -815,11 +815,7 @@ fn old_no_change_seal_finishes_without_merge_even_when_resolved() {
     let record = thread::load(&fx.project, &id).unwrap();
     assert_eq!(record.has_changes, Some(false));
     assert!(record.merged_sha.is_empty());
-    assert!(crate::review::lane_done(
-        &fx.project,
-        &record,
-        &crate::events::list(&fx.project)
-    ));
+    assert!(crate::task::EvidenceSnapshot::load(&fx.project).lane_done(&record));
     assert_eq!(
         crate::task::view(&fx.project, task).state,
         crate::task::State::Finished
@@ -2707,7 +2703,10 @@ fn historical_merged_acceptance_does_not_require_a_retained_done_seal() {
         lane.merged_review = "review-1".into()
     })
     .unwrap();
-    assert!(crate::task::require_accepted(&fx.project, &task, &snapshot).is_err());
+    // A read keeps its original lane/review evidence; the next read sees the change.
+    crate::task::require_accepted(&fx.project, &task, &snapshot).unwrap();
+    let fresh = crate::task::EvidenceSnapshot::load(&fx.project);
+    assert!(crate::task::require_accepted(&fx.project, &task, &fresh).is_err());
 }
 
 #[test]

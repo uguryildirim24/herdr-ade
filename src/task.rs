@@ -8,7 +8,7 @@
 #[path = "task/incident_tests.rs"]
 mod incident_tests;
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 
 use anyhow::{Context, Result, bail};
@@ -160,17 +160,17 @@ pub(crate) struct View {
 impl View {
     pub(crate) fn terminal_with_evidence(
         &self,
-        project: &Project,
+        _project: &Project,
         evidence: &EvidenceSnapshot,
     ) -> bool {
-        if !self.record.dropped.is_empty() || self.state == State::Installed {
-            return true;
-        }
-        self.record
-            .attempts
-            .last()
-            .and_then(|id| crate::thread::load(project, id).ok())
-            .is_some_and(|lane| crate::review::lane_done(project, &lane, &evidence.events))
+        !self.record.dropped.is_empty()
+            || self.state == State::Installed
+            || self
+                .record
+                .attempts
+                .last()
+                .and_then(|id| evidence.lanes.get(id))
+                .is_some_and(|lane| evidence.lane_done(lane))
     }
 }
 
@@ -528,21 +528,20 @@ pub(crate) fn withdraw_acceptance(
 pub(crate) fn link_attempt(project: &Project, id: &str, thread: &str) -> Result<Task> {
     crate::thread::load(project, thread)
         .with_context(|| format!("task_attempt: no thread `{thread}`"))?;
-    for other in list_with_errors(project).0 {
-        if other.id != id && other.attempts.iter().any(|attempt| attempt == thread) {
-            return Err(crate::refusal::error(
-                format!("task_attempt: `{thread}` already belongs to `{}`", other.id),
-                "ha task show <project> <job> (use the task already linked to this thread)",
-            ));
+    update(project, id, |task| {
+        for other in list_with_errors(project).0 {
+            if other.id != id && other.attempts.iter().any(|attempt| attempt == thread) {
+                return Err(crate::refusal::error(
+                    format!("task_attempt: `{thread}` already belongs to `{}`", other.id),
+                    "ha task show <project> <job> (use the task already linked to this thread)",
+                ));
+            }
         }
-    }
-    let task = update(project, id, |task| {
         if !task.attempts.iter().any(|attempt| attempt == thread) {
             task.attempts.push(thread.to_string());
         }
         Ok(())
-    })?;
-    Ok(task)
+    })
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -915,9 +914,9 @@ fn repair_views(project: &Project, task: &Task, snapshot: &EvidenceSnapshot) -> 
                 }
             }
             for id in &task.attempts {
-                if let Ok(lane) = crate::thread::load(project, id) {
+                if let Some(lane) = snapshot.lanes.get(id) {
                     cost_events.extend(snapshot.events.iter().filter(|event| event.thread == *id));
-                    match crate::review::lane_review(project, &lane) {
+                    match snapshot.lane_review(lane) {
                         Ok(Some(review)) => timeline.push(format!(
                             "review {}: merged; install {}",
                             review.id,
@@ -1038,12 +1037,48 @@ pub(crate) fn repair_summary(repair: &RepairView) -> String {
 pub(crate) struct EvidenceSnapshot {
     events: Vec<crate::contracts::Event>,
     readable: bool,
+    pub(crate) tasks: Vec<Task>,
+    task_errors: Vec<anyhow::Error>,
+    pub(crate) lanes: BTreeMap<String, crate::thread::Thread>,
+    reviews: Result<Vec<crate::review::Review>>,
+    pub(crate) binding_changes: Vec<crate::plan::BindingChange>,
 }
 
 impl EvidenceSnapshot {
     pub(crate) fn load(project: &Project) -> Self {
         let (events, readable) = crate::events::list_checked(project);
-        Self { events, readable }
+        let binding_changes = crate::plan::binding_changes(project);
+        let readable = readable && binding_changes.is_ok();
+        let (tasks, errors) = list_with_errors(project);
+        Self {
+            events,
+            readable,
+            tasks,
+            task_errors: errors,
+            lanes: crate::thread::snapshot(project)
+                .iter()
+                .cloned()
+                .map(|lane| (lane.id.clone(), lane))
+                .collect(),
+            reviews: crate::review::list(project),
+            binding_changes: binding_changes.unwrap_or_default(),
+        }
+    }
+
+    pub(crate) fn tasks_readable(&self) -> bool {
+        self.task_errors.is_empty()
+    }
+
+    fn lane_review(&self, lane: &crate::thread::Thread) -> Result<Option<&crate::review::Review>> {
+        let rows = self
+            .reviews
+            .as_deref()
+            .map_err(|e| anyhow::anyhow!("{e:#}"))?;
+        Ok(crate::review::lane_review_from(rows, lane))
+    }
+
+    pub(crate) fn lane_done(&self, lane: &crate::thread::Thread) -> bool {
+        crate::review::lane_done_from(lane, &self.events, self.lane_review(lane).ok().flatten())
     }
 
     pub(crate) fn events(&self) -> &[crate::contracts::Event] {
@@ -1073,71 +1108,59 @@ pub(crate) fn view_with_evidence(
         provider_kind: None,
         repairs,
     };
-    if !view.record.dropped.is_empty() {
-        view.state = State::Dropped;
-        view.next = "none".into();
-        return view;
-    }
-    if !view.record.installed.is_empty() {
-        view.state = State::Installed;
+    if !view.record.dropped.is_empty() || !view.record.installed.is_empty() {
+        view.state = if view.record.dropped.is_empty() {
+            State::Installed
+        } else {
+            State::Dropped
+        };
         view.next = "none".into();
         return view;
     }
     let Some(id) = view.record.attempts.last() else {
         return view;
     };
-    let lane = match crate::thread::load(project, id) {
-        Ok(lane) => lane,
-        Err(_) => {
-            view.next = "repair the missing attempt record".into();
-            return view;
-        }
+    let Some(lane) = evidence.lanes.get(id) else {
+        view.next = "repair the missing attempt record".into();
+        return view;
     };
     if !evidence.readable {
         view.next = "repair the unreadable event evidence".into();
         return view;
     }
-    match crate::review::lane_review(project, &lane) {
-        Ok(Some(review)) => {
-            view.state = if review.install_required && review.install {
-                State::Installed
-            } else {
-                State::Merged
-            };
-            view.next = if review.install_required && !review.install {
-                "finish the pile installation".into()
-            } else {
-                "none".into()
-            };
-            return view;
-        }
+    let review = match evidence.lane_review(lane) {
+        Ok(review) => review,
         Err(_) => {
             view.next = "repair the unreadable review record".into();
             return view;
         }
-        Ok(None) => {}
-    }
-    if !lane.merged_sha.is_empty() {
-        view.state = if !lane.installed_sha.is_empty() {
+    };
+    if review.is_some() || !lane.merged_sha.is_empty() {
+        let required = review.map_or(lane.historical_install_required, |r| r.install_required);
+        let installed = match review {
+            Some(r) => r.install_required && r.install,
+            None => !lane.installed_sha.is_empty(),
+        };
+        view.state = if installed {
             State::Installed
         } else {
             State::Merged
         };
-        view.next = if lane.historical_install_required && lane.installed_sha.is_empty() {
+        view.next = if required && !installed {
             "finish the pile installation".into()
         } else {
             "none".into()
         };
         return view;
     }
-    if let Some(seal) = crate::review::sealed(&evidence.events, &lane) {
+    if let Some(seal) = crate::review::sealed(&evidence.events, lane) {
         view.state = State::Finished;
-        view.next = if crate::review::lane_done(project, &lane, &evidence.events) {
+        view.next = if evidence.lane_done(lane) {
             "none".into()
         } else {
             "review the repository pile".into()
         };
-        if crate::review::changes(&lane, seal) == Some(false)
+        if crate::review::changes(lane, seal) == Some(false)
             && require_accepted(project, &view.record, evidence).is_err()
         {
             view.next =
@@ -1166,7 +1189,7 @@ pub(crate) fn view_with_evidence(
     }
     if lane.status == crate::thread::Status::Failed {
         view.failure_class = Some(lane.failure_class);
-        view.provider_kind = lane.provider_failure_kind;
+        view.provider_kind = lane.provider_failure_kind.clone();
         view.next = "retry or cancel the current attempt".into();
     }
     if lane.status == crate::thread::Status::Resolved {
@@ -1238,14 +1261,17 @@ pub(crate) fn require_accepted(
         .attempts
         .last()
         .context("acceptance not established: no attempt")?;
-    let lane = crate::thread::load(project, id)?;
+    let lane = snapshot
+        .lanes
+        .get(id)
+        .context("acceptance not established: missing attempt")?;
     // Named historical consumer: pre-pile merged/installed records retain
     // their accepted delivery semantics, even without a retained done seal.
     // No-change equality is not that fact.
     if !lane.merged_sha.is_empty() && lane.merged_review.is_empty() {
         return Ok(());
     }
-    let event = crate::review::sealed(snapshot.events(), &lane)
+    let event = crate::review::sealed(snapshot.events(), lane)
         .context("acceptance not established: no current seal")?;
     let done = event.payload.done.as_ref().expect("done seal");
     crate::thread::artifact(project, &done.artifact)
@@ -1262,11 +1288,16 @@ pub(crate) fn require_accepted(
     }
     // A landed pile's independent reviewer judges the member, not the member's
     // own report. Read that exact sealed verdict, never today's draft.
-    if let Some(review) = crate::review::lane_review(project, &lane)? {
-        let seal = crate::events::load(project, &review.verdict_event)?;
+    if let Some(review) = snapshot.lane_review(lane)? {
+        let seal = snapshot
+            .events()
+            .iter()
+            .find(|event| event.id == review.verdict_event)
+            .context("acceptance not established: reviewer seal missing")?;
         let judged = seal
             .payload
             .done
+            .as_ref()
             .context("acceptance not established: reviewer seal missing")?;
         let text = String::from_utf8(crate::thread::artifact(project, &judged.artifact)?)?;
         let criteria = report_criteria(&text)?;
@@ -1276,11 +1307,12 @@ pub(crate) fn require_accepted(
     }
     // Reuse an existing critic when one was requested. No compulsory second
     // judge, and a critic's PASS without criterion evidence is not enough.
-    for critic in crate::thread::list(project)
-        .into_iter()
+    for critic in snapshot
+        .lanes
+        .values()
         .filter(|critic| critic.role == "critic" && critic.id != lane.id)
     {
-        let Some(seal) = crate::review::sealed(snapshot.events(), &critic) else {
+        let Some(seal) = crate::review::sealed(snapshot.events(), critic) else {
             continue;
         };
         let judged = seal.payload.done.as_ref().expect("critic done");
@@ -1401,13 +1433,18 @@ pub(crate) fn views_with_evidence(
     project: &Project,
     evidence: &EvidenceSnapshot,
 ) -> (Vec<View>, Vec<anyhow::Error>) {
-    let (tasks, errors) = list_with_errors(project);
     (
-        tasks
-            .into_iter()
+        evidence
+            .tasks
+            .iter()
+            .cloned()
             .map(|task| view_with_evidence(project, task, evidence))
             .collect(),
-        errors,
+        evidence
+            .task_errors
+            .iter()
+            .map(|error| anyhow::anyhow!("{error:#}"))
+            .collect(),
     )
 }
 
