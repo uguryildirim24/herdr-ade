@@ -755,7 +755,7 @@ pub(crate) fn resolve_request(project: &Project, basis: &str) -> Result<Resolved
     })
 }
 
-/// Latest human request identity, used to re-arm an idle plan nudge.
+/// Latest human request identity, used to reassess an outcome or explicit wait.
 pub(crate) fn latest_request_id(project: &Project) -> String {
     recent_requests(project, 1)
         .pop()

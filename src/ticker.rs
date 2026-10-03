@@ -3224,165 +3224,25 @@ fn clean_managed_project_tabs(
         .collect()
 }
 
-/// Nudges only a bound, live, idle coordinator. The state tracks changes
-/// even if a lane starts and finishes between two ticker passes.
-fn plan_nudge(
-    project: &Project,
-    herdr: &Herdr<'_>,
-    agents: &[Agent],
-    state: &mut steps::State,
-) -> Result<()> {
-    let lanes = thread::list(project);
-    let mut lane_ids: Vec<_> = lanes
-        .iter()
-        .filter(|lane| lane.role != "reviewer")
-        .map(|lane| lane.id.clone())
-        .collect();
-    lane_ids.sort();
-    let request = crate::prompt::latest_request_id(project);
-    let plan = crate::plan::load(project)?;
-    let revision = plan.as_ref().map_or(0, |p| p.revision);
-    if state.plan_revision != revision
-        || state.plan_lane_ids != lane_ids
-        || state.plan_request != request
-    {
-        state.plan_nudged = false;
-    }
-    state.plan_revision = revision;
-    state.plan_lane_ids = lane_ids;
-    state.plan_request = request;
-
-    if lanes.iter().any(|lane| {
-        lane.role != "reviewer"
-            && matches!(lane.status, thread::Status::Starting | thread::Status::Open)
-    }) {
-        state.plan_nudged = false;
-        return Ok(());
-    }
-    if state.plan_nudged {
-        return Ok(());
-    }
-    if crate::review::list(project)?
-        .iter()
-        .any(|review| !review.phase.closed())
-    {
-        return Ok(());
-    }
-    let Some(coordinator) = project.coordinator() else {
+/// Reconcile the outcome obligation independently of transport and running work.
+fn goal_check_nudge(project: &Project, herdr: &Herdr<'_>, agents: &[Agent]) -> Result<()> {
+    let coordinator = project.coordinator();
+    let agent = coordinator
+        .as_ref()
+        .and_then(|c| agents.iter().find(|a| coordinator::agent_matches(c, a)));
+    steps::goal_check::reconcile(project, agent, jiff::Timestamp::now().as_second() as u64)?;
+    let Some(coordinator) = coordinator else {
         return Ok(());
     };
     if !coordinator.closed_by_rolf_at.is_empty()
         || coordinator.prime_pending
         || coordinator::paused_by_provider(project, &coordinator)
+        || !agent.is_some_and(Agent::ready)
     {
         return Ok(());
     }
-    if !agents.iter().any(|agent| {
-        coordinator::agent_matches(&coordinator, agent) && agent.agent_status == "idle"
-    }) {
-        return Ok(());
-    }
-    let Some(ref plan) = plan else {
-        return Ok(());
-    };
-    // Transitions refresh the persisted plan. Re-deriving every step just to
-    // decide whether to nudge rereads all task/review evidence each pass.
-    let left: Vec<_> = plan
-        .steps
-        .iter()
-        .filter(|step| step.state != crate::contracts::StepState::Done)
-        .collect();
-    if left.is_empty() {
-        return Ok(());
-    }
-    let next = left
-        .iter()
-        .filter(|step| step.state == crate::contracts::StepState::Left)
-        .find(|step| {
-            // Use the same evidence gate as `thread start` for bound tasks.
-            let gate = step
-                .tasks
-                .iter()
-                .try_for_each(|job| crate::plan::check_prerequisites(project, job));
-            if gate.is_err() {
-                return false;
-            }
-            let waiting: Vec<_> = step
-                .after
-                .iter()
-                .filter(|id| {
-                    crate::plan::all_steps(plan)
-                        .find(|candidate| &candidate.id == *id)
-                        .is_none_or(|candidate| {
-                            candidate.state != crate::contracts::StepState::Done
-                        })
-                })
-                .collect();
-            if !waiting.is_empty() {
-                return false;
-            }
-            true
-        });
-    let holds = crate::plan::failed_check_holds(
-        project,
-        plan,
-        &crate::task::EvidenceSnapshot::load(project),
-    );
-    let held = left
-        .iter()
-        .filter_map(|step| {
-            holds
-                .get(&step.id)
-                .map(|hold| format!("{}: {}", step.id, hold.message()))
-        })
-        .collect::<Vec<_>>();
-    let held_count = held.len();
-    let work_left = if held_count == 0 {
-        format!("{} steps are left", left.len())
-    } else {
-        format!(
-            "{} steps have unfinished work; {} held by failed checks",
-            left.len() - held_count,
-            held_count
-        )
-    };
-    let mut line = if let Some(next) = next {
-        format!(
-            "{} Nothing is running and {}. Next: {} {}. Start work that can proceed without Rolf's reply. If you are waiting for his reply in chat, keep waiting.",
-            steps::TICKER_PROMPT_PREFIX,
-            work_left,
-            next.id,
-            next.text
-        )
-    } else {
-        let waiting = left
-            .iter()
-            .filter(|step| !holds.contains_key(&step.id))
-            .map(|step| {
-                if step.state == crate::contracts::StepState::Running {
-                    format!("{} is still running", step.id)
-                } else {
-                    format!("{} waits for {}", step.id, step.after.join(", "))
-                }
-            })
-            .collect::<Vec<_>>()
-            .join("; ");
-        format!(
-            "{} Nothing is running and {}. {}",
-            steps::TICKER_PROMPT_PREFIX,
-            work_left,
-            if waiting.is_empty() {
-                waiting
-            } else {
-                format!("{waiting}.")
-            }
-        )
-    };
-    if !held.is_empty() {
-        line.push_str(&format!(" {}.", held.join("; ")));
-    }
-    if steps::deliver_coordinator_prompt(project, herdr, &coordinator.pane_id, &line)? {
-        state.plan_nudged = true;
+    if let Some((token, line)) = steps::goal_check::notice(project) {
+        steps::deliver_goal_check(project, herdr, &coordinator.pane_id, &token, &line)?;
     }
     Ok(())
 }
@@ -3530,8 +3390,8 @@ fn tick_slow_with_steps(
             .map(|e| e.context("ops")),
     );
     errors.extend(crate::threads::park_completed(ctx, project).err());
-    stop_after_state!("plan nudge");
-    errors.extend(plan_nudge(project, &herdr, &seen.agents, &mut state).err());
+    stop_after_state!("goal check");
+    errors.extend(goal_check_nudge(project, &herdr, &seen.agents).err());
     inbox::prune_done(project, steps::DONE_RETENTION_DAYS);
     if state != before {
         errors.extend(steps::save_state(project, &state).err());
@@ -6279,10 +6139,8 @@ mod tests {
             &f.project.coordinator().unwrap().socket,
             runner,
         );
-        let mut state = steps::load_state(&f.project);
-        plan_nudge(&f.project, &herdr, agents, &mut state).unwrap();
+        goal_check_nudge(&f.project, &herdr, agents).unwrap();
         steps::flush_notices_for_test(&f.project, &herdr);
-        steps::save_state(&f.project, &state).unwrap();
     }
 
     fn nudge_setup() -> (Fixture, FakeRunner, Agent) {
@@ -6305,7 +6163,7 @@ mod tests {
     }
 
     #[test]
-    fn plan_nudge_skips_review_running_done_unbound_and_busy() {
+    fn goal_check_allows_independent_work_during_review_but_not_closed_unbound_or_busy() {
         let (f, runner, mut agent) = nudge_setup();
         let ctx = Ctx {
             env: &f.env,
@@ -6314,8 +6172,6 @@ mod tests {
             runner: &runner,
             detached_ticker: false,
         };
-        // A plan with no unfinished steps cannot prompt.
-        nudge_pass(&f, &runner, std::slice::from_ref(&agent));
         crate::plan::step_add(&ctx, "demo", "Outcome", vec![], vec![], None).unwrap();
         agent.agent_status = "busy".into();
         nudge_pass(&f, &runner, std::slice::from_ref(&agent));
@@ -6330,7 +6186,7 @@ mod tests {
             t.status = thread::Status::Resolved
         })
         .unwrap();
-        assert_eq!(runner.count("agent prompt"), 0);
+        assert_eq!(runner.count("agent prompt"), 1);
         let review = crate::review::Review {
             id: "review-1".into(),
             repo: String::new(),
@@ -6370,7 +6226,7 @@ mod tests {
         )
         .unwrap();
         nudge_pass(&f, &runner, std::slice::from_ref(&agent));
-        assert_eq!(runner.count("agent prompt"), 0);
+        assert_eq!(runner.count("agent prompt"), 2);
         std::fs::remove_file(crate::review::path(&f.project, "review-1")).unwrap();
         // An unbound project does not start a coordinator or get a prompt.
         let unbound = project::create(&f.root, "unbound", "", vec![]).unwrap();
@@ -6380,14 +6236,77 @@ mod tests {
             &f.project.coordinator().unwrap().socket,
             &runner,
         );
-        let mut state = steps::State::default();
-        plan_nudge(&unbound, &herdr, &[agent.clone()], &mut state).unwrap();
+        goal_check_nudge(&unbound, &herdr, &[agent.clone()]).unwrap();
         f.project
             .update_coordinator(|c| c.closed_by_rolf_at = project::now())
             .unwrap();
         nudge_pass(&f, &runner, &[agent]);
-        assert_eq!(runner.count("agent prompt"), 0);
+        assert_eq!(runner.count("agent prompt"), 2);
         assert_eq!(runner.count("agent start"), 0);
+    }
+
+    #[test]
+    fn goal_check_outbox_preserves_drafts_deduplicates_restarts_and_drops_consumed_wakes() {
+        let (f, _, agent) = nudge_setup();
+        let runner = FakeRunner::new();
+        runner.on("agent list", ok(&with_cwd(AGENT_READY, &f)));
+        runner.on("agent prompt", ok(r#"{"result":{}}"#));
+        let screen = std::rc::Rc::new(std::cell::RefCell::new(
+            "❯ Rolf's unfinished draft\n".to_string(),
+        ));
+        let visible = screen.clone();
+        runner.on_fn(
+            |cmd| cmd.display().contains("pane read"),
+            move |_| Ok(ok(&visible.borrow())),
+        );
+        nudge_pass(&f, &runner, std::slice::from_ref(&agent));
+        assert_eq!(runner.count("agent prompt"), 0);
+        assert!(steps::goal_check::load(&f.project).disposition.is_none());
+        *screen.borrow_mut() = "❯ \n".into();
+        nudge_pass(&f, &runner, std::slice::from_ref(&agent));
+        for _ in 0..4 {
+            nudge_pass(&f, &runner, std::slice::from_ref(&agent));
+        }
+        assert_eq!(runner.count("agent prompt"), 1);
+        assert!(
+            steps::goal_check::load(&f.project).disposition.is_none(),
+            "submission is not progress"
+        );
+        crate::prompt::record_test_request(&f.project, "q-new", "Reconsider the outcome").unwrap();
+        let c = f.project.coordinator().unwrap();
+        let herdr = Herdr::new(f.env.herdr_bin(), &c.socket, &runner);
+        goal_check_nudge(&f.project, &herdr, std::slice::from_ref(&agent)).unwrap();
+        f.project
+            .update_coordinator(|c| c.closed_by_rolf_at = project::now())
+            .unwrap();
+        steps::flush_notices_for_test(&f.project, &herdr);
+        assert_eq!(
+            runner.count("agent prompt"),
+            1,
+            "never wake a deliberately closed coordinator"
+        );
+        f.project
+            .update_coordinator(|c| c.closed_by_rolf_at.clear())
+            .unwrap();
+        steps::goal_check::record(
+            &f.project,
+            steps::goal_check::Disposition::Wait {
+                tasks: vec![],
+                party: "Rolf".into(),
+                condition: "reply to the consequential choice".into(),
+            },
+            "The choice blocks authorized work",
+        )
+        .unwrap();
+        steps::flush_notices_for_test(&f.project, &herdr);
+        assert_eq!(
+            runner.count("agent prompt"),
+            1,
+            "consumed checks do not leak through the batch"
+        );
+        let batch: serde_json::Value =
+            project::read_json(&f.project.state_dir().join("notice-batch.json")).unwrap();
+        assert_eq!(batch["goals"], serde_json::json!([]));
     }
 
     #[test]

@@ -304,6 +304,12 @@ enum HarnessCommand {
 
 #[derive(Subcommand)]
 enum PlanCommand {
+    /// Record the outcome check's next action, acceptance evidence or explicit wait
+    Check {
+        slug: String,
+        #[command(subcommand)]
+        command: GoalCheckCommand,
+    },
     /// Print the plan card; a missing card prints revision zero
     Show {
         /// Project slug
@@ -332,6 +338,30 @@ enum PlanCommand {
         /// Project slug
         #[arg(value_name = "PROJECT")]
         slug: String,
+    },
+}
+
+#[derive(Subcommand)]
+enum GoalCheckCommand {
+    Action {
+        task: String,
+        #[arg(long)]
+        evidence: String,
+    },
+    Close {
+        #[arg(long = "task", required = true)]
+        tasks: Vec<String>,
+        #[arg(long)]
+        evidence: String,
+    },
+    Wait {
+        party: String,
+        #[arg(long)]
+        condition: String,
+        #[arg(long = "task")]
+        tasks: Vec<String>,
+        #[arg(long)]
+        evidence: String,
     },
 }
 
@@ -431,6 +461,40 @@ fn run_project_commands(ctx: &Ctx, command: Command) -> Result<()> {
     use crate::plan;
     match command {
         Command::Plan { command } => match command {
+            PlanCommand::Check { slug, command } => {
+                use crate::steps::goal_check::{self, Disposition};
+                let project = Project::load(&ctx.root, &slug)?;
+                goal_check::reconcile(&project, None, jiff::Timestamp::now().as_second() as u64)?;
+                let (disposition, evidence) = match command {
+                    GoalCheckCommand::Action { task, evidence } => {
+                        (Disposition::Action { task }, evidence)
+                    }
+                    GoalCheckCommand::Close { tasks, evidence } => {
+                        let outcome = plan::load(&project)?.map_or(String::new(), |p| p.does);
+                        (Disposition::Closed { tasks, outcome }, evidence)
+                    }
+                    GoalCheckCommand::Wait {
+                        party,
+                        condition,
+                        tasks,
+                        evidence,
+                    } => (
+                        Disposition::Wait {
+                            tasks,
+                            party,
+                            condition,
+                        },
+                        evidence,
+                    ),
+                };
+                goal_check::record(&project, disposition, &evidence)?;
+                crate::output::insert(
+                    "goal_check",
+                    serde_json::to_value(goal_check::load(&project))?,
+                );
+                println!("goal check disposition recorded");
+                Ok(())
+            }
             PlanCommand::Show { slug } => {
                 crate::review::classify_old_seals(ctx, &Project::load(&ctx.root, &slug)?, true)?;
                 let text = plan::show(ctx, &slug, false)?;
