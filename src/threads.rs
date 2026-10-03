@@ -2150,6 +2150,16 @@ pub(crate) fn record_follow_up_delivery(
             .follow_ups
             .get_mut(index)
             .context("queued follow-up disappeared during delivery")?;
+        // A successful old submission can arrive after recovery carried its
+        // uncertain instruction. Settle that receipt only before resubmission.
+        if saved.carried_from_attempt == follow_up.attempt
+            && saved.state == FollowUpState::Queued
+            && saved.text == follow_up.text
+        {
+            saved.attempt = follow_up.attempt;
+            saved.carried_from_attempt = 0;
+            saved.state = FollowUpState::Uncertain;
+        }
         if saved.attempt != follow_up.attempt
             || saved.text != follow_up.text
             || saved.state != FollowUpState::Uncertain
@@ -3307,6 +3317,105 @@ pub(crate) fn parkable(project: &Project, record: &Thread) -> bool {
     })
 }
 
+/// Pi reports a session file on the machine that owns the lane. Never ask pi
+/// to resume an absent file (or an old opaque id); that can exit before ready.
+fn parked_session_available(ctx: &Ctx, record: &Thread) -> Result<bool> {
+    let Some(session) = record
+        .identity
+        .agent_session
+        .as_deref()
+        .filter(|s| !s.is_empty())
+    else {
+        return Ok(false);
+    };
+    if crate::adapters::resume_args(&record.launch, Some(session)).is_none() {
+        return Ok(false);
+    }
+    if record.launch.kind != "pi" {
+        return Ok(true);
+    }
+    // Herdr's pi identity is an absolute path. Historical ids have no proven
+    // file on this machine, so restart with the preserved brief and correction.
+    if !Path::new(session).is_absolute() {
+        return Ok(false);
+    }
+    if !record.is_remote() {
+        return Ok(Path::new(session).is_file());
+    }
+    let profile = remote::machine_profile(
+        ctx.runner,
+        &ctx.env.herdr_bin(),
+        &ctx.config_dir,
+        record.machine_route(),
+    )?;
+    let out = remote::ssh(
+        ctx.runner,
+        &profile.target,
+        &format!(
+            "if test -f {}; then printf 'present'; else printf 'missing'; fi",
+            remote::quote(session)
+        ),
+        None,
+        Duration::from_secs(20),
+    )?;
+    if !out.success() {
+        bail!(
+            "resume_session_check: {}: {}",
+            record.machine,
+            out.error_text()
+        );
+    }
+    match out.stdout.trim() {
+        "present" => Ok(true),
+        "missing" => Ok(false),
+        other => bail!(
+            "resume_session_check: {}: unexpected reply {other:?}",
+            record.machine
+        ),
+    }
+}
+
+fn reopening_prompt(record: &Thread, text: &str) -> String {
+    format!(
+        "Read your frozen brief at {}/brief.md and sealed report at {}. Continue in the same folder.\n\n{}",
+        record.thread_dir,
+        record.report_path(),
+        text
+    )
+}
+
+/// Recheck at submission too: placement may have waited since the reopen.
+/// Connection/observation errors leave the same queued attempt untouched.
+pub(crate) fn resume_launch_record(
+    ctx: &Ctx,
+    project: &Project,
+    record: &Thread,
+) -> Result<Thread> {
+    if record.bootstrap != "resuming"
+        || record.launch.kind != "pi"
+        || parked_session_available(ctx, record)?
+    {
+        return Ok(record.clone());
+    }
+    thread::update(project, &record.id, |current| {
+        if current.attempt != record.attempt
+            || current.pane_id != record.pane_id
+            || current.launch_attempts > 0
+            || current.bootstrap != "resuming"
+        {
+            return;
+        }
+        current.bootstrap.clear();
+        for follow_up in &mut current.follow_ups {
+            if follow_up.attempt == current.attempt.max(1)
+                && follow_up.state == FollowUpState::Queued
+            {
+                follow_up.text = reopening_prompt(record, &follow_up.text);
+            }
+        }
+    })
+}
+
 /// Bring a completed lane back without provisioning its branch or replacing
 /// its frozen task. The old agent session id is kept across the pane close.
 fn reopen_parked(
@@ -3318,9 +3427,7 @@ fn reopen_parked(
 ) -> Result<()> {
     require_session(ctx, project)?;
     ticker::ensure(ctx)?;
-    let resuming =
-        crate::adapters::resume_args(&record.launch, record.identity.agent_session.as_deref())
-            .is_some();
+    let resuming = parked_session_available(ctx, record)?;
     thread::update_checked(project, &record.id, |t| {
         if !t.parked || t.attempt != record.attempt {
             bail!("reopen_stale: completion changed during reopen");
@@ -3330,6 +3437,7 @@ fn reopen_parked(
         t.recovery_pending = true;
         t.launch_attempts = 0;
         t.startup_wait_started.clear();
+        t.identity.process = None;
         t.brief_submitted = false;
         t.brief_submitted_at.clear();
         t.partial = Some("placement".into());
@@ -3344,12 +3452,14 @@ fn reopen_parked(
         };
         t.follow_ups.push(FollowUp {
             attempt: t.attempt.max(1),
-            text: if resuming { text.to_string() } else {
-                format!("Read your frozen brief at {}/brief.md and sealed report at {}. Continue in the same folder.\n\n{}",
-                    record.thread_dir, record.report_path(), text)
+            text: if resuming {
+                text.to_string()
+            } else {
+                reopening_prompt(record, text)
             },
             state: FollowUpState::Queued,
-            waiting_event: latest_waiting_event_id(events, &record.id, record.attempt.max(1)).unwrap_or_default(),
+            waiting_event: latest_waiting_event_id(events, &record.id, record.attempt.max(1))
+                .unwrap_or_default(),
             queued_at: project::now(),
             ..FollowUp::default()
         });
@@ -6401,6 +6511,8 @@ mod tests {
         let project = world.project("demo", "a.sock");
         let folder = world.home.path().join("lane");
         std::fs::create_dir_all(&folder).unwrap();
+        let session = folder.join("session-42.jsonl");
+        std::fs::write(&session, b"saved pi session").unwrap();
         let lane = world.thread(&project, &folder, |t| {
             t.attempt = 1;
             t.parked = true;
@@ -6411,7 +6523,7 @@ mod tests {
             t.launch.recipe_id = "test_pi".into();
             t.launch.brief_hash = "brief".into();
             t.agent = "pi".into();
-            t.identity.agent_session = Some("session-42".into());
+            t.identity.agent_session = Some(session.to_string_lossy().into_owned());
         });
         thread::update(&project, &lane.id, |t| t.bootstrap = "acknowledged".into()).unwrap();
         *world.panes.borrow_mut() = format!("[{}]", world.coordinator_pane(&project));
@@ -6454,7 +6566,7 @@ mod tests {
         assert_eq!(world.runner.count("agent start"), 0);
         assert_eq!(
             reopened.identity.agent_session.as_deref(),
-            Some("session-42")
+            Some(session.to_str().unwrap())
         );
         assert_eq!(reopened.follow_ups.len(), 1);
         assert_eq!(reopened.follow_ups[0].text, "Fix the rejection");
@@ -6482,7 +6594,7 @@ mod tests {
         assert!(world.runner.calls.borrow().iter().any(|c| {
             let text = c.display();
             text.contains("agent start")
-                && text.contains("--session session-42")
+                && text.contains(&format!("--session {}", session.display()))
                 && text.contains("--parent w1:p9")
         }));
         // Round retry uses the same reopen path instead of spending a new attempt.

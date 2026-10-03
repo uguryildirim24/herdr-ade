@@ -195,7 +195,7 @@ pub(crate) struct Agent {
 
 #[derive(Debug, Clone, Deserialize, PartialEq, Default)]
 pub(crate) struct AgentSession {
-    #[serde(default)]
+    #[serde(default, alias = "value")]
     pub(crate) id: String,
 }
 

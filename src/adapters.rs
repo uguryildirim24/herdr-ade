@@ -246,8 +246,9 @@ pub(crate) fn resume_args(
         "codex" => "resume",
         _ => return None,
     };
+    let session = session.filter(|s| !s.trim().is_empty())?;
     let mut args = launch.args.clone();
-    args.extend([flag.to_string(), session?.to_string()]);
+    args.extend([flag.to_string(), session.to_string()]);
     Some(args)
 }
 

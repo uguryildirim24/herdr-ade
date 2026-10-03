@@ -1802,6 +1802,44 @@ fn resume_session(
     }
 }
 
+/// The first prompt carries queued corrections too. Confirm them only with
+/// activity/receipt evidence, never merely because a PTY paste was staged.
+fn acknowledge_first_prompt(project: &Project, submitted: &thread::Thread) -> Result<()> {
+    let after_seal = crate::events::latest_done_event(
+        &crate::events::for_thread(project, &submitted.id),
+        &submitted.id,
+        submitted.attempt.max(1),
+    )
+    .map(|event| event.id.clone())
+    .unwrap_or_default();
+    thread::update(project, &submitted.id, |record| {
+        if record.attempt != submitted.attempt || record.pane_id != submitted.pane_id {
+            return;
+        }
+        record.prompt_pending = false;
+        record.error.clear();
+        for follow_up in &mut record.follow_ups {
+            if follow_up.attempt == record.attempt.max(1)
+                && follow_up.carried_from_attempt > 0
+                && follow_up.state == thread::FollowUpState::Uncertain
+                && follow_up.queued_at <= record.brief_submitted_at
+            {
+                follow_up.state = thread::FollowUpState::Delivered;
+                follow_up.delivered_at = project::now();
+                follow_up.after_seal = after_seal.clone();
+                record.connection_waiting = false;
+                record.connection_resumes.clear();
+                record.failure_class = crate::contracts::FailureClass::Unknown;
+                record.provider_failure_kind = None;
+                if !follow_up.waiting_event.is_empty() {
+                    record.answered_waiting_event = follow_up.waiting_event.clone();
+                }
+            }
+        }
+    })?;
+    Ok(())
+}
+
 fn thread_pass(
     input: &LaunchPass<'_>,
     prefix: &str,
@@ -1862,6 +1900,7 @@ fn thread_pass(
                         current.last_group = "working".into();
                     }
                 })?;
+                acknowledge_first_prompt(project, t)?;
                 continue;
             }
             let records = thread::list_live(project);
@@ -2133,14 +2172,7 @@ fn thread_pass(
                     if current.bootstrap == "acknowledged"
                         || matches!(state.as_str(), "working" | "blocked")
                     {
-                        thread::update(project, &t.id, |record| {
-                            if record.attempt == current.attempt
-                                && record.pane_id == current.pane_id
-                            {
-                                record.prompt_pending = false;
-                                record.error.clear();
-                            }
-                        })?;
+                        acknowledge_first_prompt(project, &current)?;
                     } else if current.brief_submitted_at.is_empty() {
                         // Historical staged submissions have no timestamp. Give
                         // them a full observation window after installation.
@@ -2153,7 +2185,7 @@ fn thread_pass(
                             >= brief_delivery_timeout(&current.launch)
                     {
                         let screen = threads::startup_screen(herdr, &t.pane_id);
-                        let detail = format!(
+                        let mut detail = format!(
                             "brief_delivery_failed: no activity or bootstrap receipt since {}; last submission: {}; screen: {screen}. Check the pane, then thread retry --reason",
                             current.brief_submitted_at,
                             if current.error.is_empty() {
@@ -2162,6 +2194,26 @@ fn thread_pass(
                                 &current.error
                             },
                         );
+                        let undelivered: Vec<_> = current
+                            .follow_ups
+                            .iter()
+                            .enumerate()
+                            .filter(|(_, f)| {
+                                f.attempt == current.attempt.max(1)
+                                    && matches!(
+                                        f.state,
+                                        thread::FollowUpState::Queued
+                                            | thread::FollowUpState::Uncertain
+                                    )
+                            })
+                            .map(|(index, _)| format!("follow-up {}", index + 1))
+                            .collect();
+                        if !undelivered.is_empty() {
+                            detail.push_str(&format!(
+                                "; delivery not established for {}",
+                                undelivered.join(", ")
+                            ));
+                        }
                         let mut failed = false;
                         thread::update(project, &t.id, |record| {
                             if record.attempt == current.attempt
@@ -2187,26 +2239,29 @@ fn thread_pass(
                 } else {
                     // Staging is not proof of delivery. Persist its deadline
                     // before calling herdr, including interruption before send.
+                    let prompt = thread::launch_prompt(prefix, slug, &current);
                     thread::update(project, &t.id, |record| {
                         record.brief_submitted = true;
                         record.brief_submitted_at = project::now();
+                        for follow_up in &mut record.follow_ups {
+                            if follow_up.attempt == current.attempt.max(1)
+                                && follow_up.carried_from_attempt > 0
+                                && follow_up.state == thread::FollowUpState::Queued
+                                && current.follow_ups.contains(follow_up)
+                            {
+                                follow_up.state = thread::FollowUpState::Uncertain;
+                            }
+                        }
                     })?;
                     match herdr.agent_prompt_wait_started(
                         &t.pane_id,
-                        &thread::launch_prompt(prefix, slug, &current),
+                        &prompt,
                         thread::agent_start_timeout(&current.launch)
                             .min(crate::herdr::AGENT_START_TIMEOUT.as_millis() as u64),
                     ) {
                         Ok(()) => {
                             delivered = true;
-                            thread::update_checked(project, &t.id, |record| {
-                                if record.attempt == current.attempt
-                                    && record.pane_id == current.pane_id
-                                {
-                                    record.prompt_pending = false;
-                                }
-                                Ok(())
-                            })?;
+                            acknowledge_first_prompt(project, &current)?;
                         }
                         Err(error) if crate::threads::prompt_refused_before_submission(&error) => {
                             // Nothing was typed; registration can disappear between
@@ -2217,6 +2272,14 @@ fn thread_pass(
                                 {
                                     record.brief_submitted = false;
                                     record.brief_submitted_at.clear();
+                                    for follow_up in &mut record.follow_ups {
+                                        if follow_up.attempt == current.attempt.max(1)
+                                            && follow_up.carried_from_attempt > 0
+                                            && follow_up.state == thread::FollowUpState::Uncertain
+                                        {
+                                            follow_up.state = thread::FollowUpState::Queued;
+                                        }
+                                    }
                                 }
                             })?;
                         }
@@ -2864,6 +2927,13 @@ fn launch_pass(
             }
             continue;
         }
+        let launch_record = match threads::resume_launch_record(pass.ctx, pass.project, t) {
+            Ok(record) => record,
+            Err(error) => {
+                errors.push(error.context(format!("{}: resume session", t.id)));
+                continue;
+            }
+        };
         // The CLI and the ticker can race on the same newly placed pane.
         // Claim the launch under the record lock before issuing `agent start`.
         let mut claimed = false;
@@ -2881,14 +2951,14 @@ fn launch_pass(
                 current.error.clear();
             }
             current.trust_answered = false;
-            if current.startup_wait_started.is_empty() {
-                current.startup_wait_started = project::now();
-            }
+            // Placement can wait on the courier or readiness. The agent gets
+            // its full ready window only when its launch is submitted.
+            current.startup_wait_started = project::now();
             claimed = true;
             Ok(())
         }) {
             Ok(_) if claimed => {
-                pending.push(t);
+                pending.push(launch_record);
                 if one_at_a_time {
                     *may_start = false;
                     break;
@@ -5613,6 +5683,16 @@ mod tests {
         })
         .unwrap();
         check();
+        assert_eq!(
+            thread::load(&project, &lane.id).unwrap().status,
+            thread::Status::Open
+        );
+        assert_eq!(
+            world.runner.count("tab close") + world.runner.count("workspace close"),
+            0
+        );
+        thread::update(&project, &lane.id, |t| t.launch_attempts = 1).unwrap();
+        check();
         let failed = thread::load(&project, &lane.id).unwrap();
         assert_eq!(failed.status, thread::Status::Failed);
         assert_eq!(
@@ -7199,31 +7279,82 @@ mod tests {
 
     #[test]
     fn parked_local_pi_reopens_with_brief_then_ordered_follow_ups() {
-        parked_pi_reopens_with_brief_then_ordered_follow_ups(false, false, false);
+        parked_pi_reopens_with_brief_then_ordered_follow_ups(false, false, false, None);
     }
 
     #[test]
     fn parked_box_pi_reopens_with_brief_then_ordered_follow_ups() {
-        parked_pi_reopens_with_brief_then_ordered_follow_ups(true, false, false);
+        parked_pi_reopens_with_brief_then_ordered_follow_ups(true, false, false, None);
     }
 
     #[test]
     fn resumed_local_and_box_pi_deliver_the_reopening_follow_up_and_record_later_delivery() {
         for (remote, late) in [(false, false), (true, false), (false, true)] {
-            parked_pi_reopens_with_brief_then_ordered_follow_ups(remote, true, late);
+            parked_pi_reopens_with_brief_then_ordered_follow_ups(remote, true, late, None);
+        }
+        for remote in [false, true] {
+            parked_pi_reopens_with_brief_then_ordered_follow_ups(
+                remote,
+                true,
+                false,
+                Some("delayed"),
+            );
+        }
+    }
+
+    #[test]
+    fn parked_pi_missing_session_restarts_locally_and_on_box() {
+        for remote in [false, true] {
+            for timing in ["missing", "disappeared"] {
+                parked_pi_reopens_with_brief_then_ordered_follow_ups(
+                    remote,
+                    timing == "disappeared",
+                    false,
+                    Some(timing),
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn parked_pi_follow_up_survives_gone_and_manual_retry_in_first_prompt() {
+        for (remote, recovery) in [
+            (true, "gone"),
+            (true, "uncertain"),
+            (true, "gone-timeout"),
+            (true, "manual"),
+            (false, "manual"),
+        ] {
+            parked_pi_reopens_with_brief_then_ordered_follow_ups(
+                remote,
+                true,
+                false,
+                Some(recovery),
+            );
         }
     }
 
     fn parked_pi_reopens_with_brief_then_ordered_follow_ups(
         remote: bool,
-        resuming: bool,
+        mut resuming: bool,
         late: bool,
+        recovery: Option<&'static str>,
     ) {
         use crate::scenarios::World;
         let world = World::new();
         let project = world.project("demo", "a.sock");
         let folder = world.home.path().join("lane");
         std::fs::create_dir_all(&folder).unwrap();
+        let session = folder.join("saved-session.jsonl");
+        // A Mac-side file must not authorize a resume on a box that lacks it.
+        if remote || recovery != Some("missing") {
+            std::fs::write(
+                &session,
+                b"{\"type\":\"session\",\"id\":\"saved-session\"}\n",
+            )
+            .unwrap();
+        }
+        let session_present = std::rc::Rc::new(std::cell::Cell::new(recovery != Some("missing")));
         if remote {
             let config = world.home.path().join("cfg/config.toml");
             let existing = std::fs::read_to_string(&config).unwrap();
@@ -7236,9 +7367,17 @@ mod tests {
             )
             .unwrap();
             world.runner.on("machine list --json", ok("[]"));
-            world
-                .runner
-                .on_fn(|cmd| cmd.program == "ssh", |_| Ok(ok("")));
+            let present = session_present.clone();
+            world.runner.on_fn(
+                |cmd| cmd.program == "ssh",
+                move |cmd| {
+                    Ok(ok(if cmd.display().contains("if test -f") {
+                        if !present.get() { "missing" } else { "present" }
+                    } else {
+                        ""
+                    }))
+                },
+            );
         }
         let brief_hash = thread::store_artifact(&project, b"frozen brief").unwrap();
         let lane = world.thread(&project, &folder, |t| {
@@ -7247,6 +7386,7 @@ mod tests {
             t.prompt_pending = false;
             t.bootstrap = "acknowledged".into();
             t.launch.kind = "pi".into();
+            t.launch.recipe_id = "pi_codex_astra_high".into();
             t.launch.brief_hash = brief_hash.clone();
             t.identity.workspace_id = t.workspace_id.clone();
             t.identity.tab_id = t.tab_id.clone();
@@ -7256,14 +7396,41 @@ mod tests {
                 argv0: "pi".into(),
             });
             t.agent = "pi".into();
-            if resuming {
-                t.identity.agent_session = Some("saved-session".into());
+            if resuming || recovery == Some("missing") {
+                let reported: Agent = serde_json::from_value(serde_json::json!({
+                    "pane_id": t.pane_id, "tab_id": t.tab_id, "workspace_id": t.workspace_id,
+                    "agent_session": {"agent":"pi", "kind":"path", "value":session, "source":"herdr:pi"}
+                })).unwrap();
+                t.identity.agent_session = Some(reported.agent_session.unwrap().id);
             }
             if remote {
                 t.machine = "buildbox".into();
                 t.machine_id = "buildbox".into();
             }
         });
+        std::fs::write(thread::task_path(&project, &lane.id), "frozen brief").unwrap();
+        let seal = format!("{}-{}-1", lane.id, lane.attempt);
+        crate::events::seal_create_if_absent(
+            &project,
+            &crate::contracts::Event {
+                id: seal.clone(),
+                op: seal,
+                thread: lane.id.clone(),
+                attempt: lane.attempt,
+                recipient: Default::default(),
+                created: project::now(),
+                usage: None,
+                payload: crate::contracts::EventPayload {
+                    done: Some(crate::contracts::DonePayload {
+                        report_path: lane.report_path(),
+                        artifact: thread::store_artifact(&project, b"sealed report").unwrap(),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                },
+            },
+        )
+        .unwrap();
         *world.panes.borrow_mut() = format!("[{}]", world.coordinator_pane(&project));
         world
             .runner
@@ -7312,7 +7479,7 @@ mod tests {
         world.runner.on("pane parent", ok(r#"{"result":{}}"#));
         world.runner.on(
             "pane process-info",
-            ok(r#"{"result":{"process_info":{"foreground_processes":[]}}}"#),
+            ok(r#"{"result":{"process_info":{"pane_id":"w1:p2","foreground_processes":[{"pid":99,"name":"bash"}]}}}"#),
         );
         let delivery_project = project.clone();
         let delivery_id = lane.id.clone();
@@ -7324,6 +7491,10 @@ mod tests {
                 // consumed its first instruction. Require the activity gate.
                 assert!(cmd.args.iter().any(|arg| arg == "--wait"));
                 let saved = thread::load(&delivery_project, &delivery_id).unwrap();
+                if recovery == Some("gone-timeout") && cmd.display().contains("skill lane") {
+                    assert!(saved.follow_ups.iter().all(|f| f.state == thread::FollowUpState::Uncertain));
+                    return Ok(fail(1, r#"{"error":{"code":"timeout","message":"activity unknown"}}"#));
+                }
                 if !cmd.display().contains("skill lane") {
                     let pending = saved
                         .follow_ups
@@ -7384,9 +7555,19 @@ mod tests {
             );
         }
         threads::place_recovery(&ctx, &project, &reopened).unwrap();
-        let reopened =
-            thread::update(&project, &lane.id, |t| t.error = "provider ready".into()).unwrap();
+        let mut reopened = thread::update(&project, &lane.id, |t| {
+            t.error = "provider ready".into();
+            if recovery == Some("delayed") {
+                t.startup_wait_started =
+                    (jiff::Timestamp::now() - jiff::SignedDuration::from_secs(600)).to_string();
+            }
+        })
+        .unwrap();
         assert!(!reopened.startup_wait_started.is_empty());
+        assert!(
+            reopened.identity.process.is_none(),
+            "the parked process cannot prove death in a new pane"
+        );
         if remote {
             for _ in 0..2 {
                 assert!(
@@ -7418,31 +7599,133 @@ mod tests {
                     .all(|n| !n.line.contains("GONE"))
             );
         }
+        let retried = matches!(
+            recovery,
+            Some("gone" | "uncertain" | "gone-timeout" | "manual")
+        );
+        if retried {
+            // The first reopen really loses its pane before submission. This
+            // is an external death, not the missing-session fallback above.
+            if recovery != Some("manual") {
+                if recovery == Some("uncertain") {
+                    reopened = thread::update(&project, &lane.id, |t| {
+                        t.follow_ups[0].state = thread::FollowUpState::Uncertain
+                    })
+                    .unwrap();
+                }
+                for _ in 0..2 {
+                    assert!(
+                        steps::remote_attention(
+                            &ctx,
+                            &project,
+                            steps::RemoteView {
+                                machine_id: reopened.machine_route(),
+                                threads: std::slice::from_ref(&reopened),
+                                agents: &[],
+                                panes: &[],
+                                boot_id: "boot-1",
+                                now: jiff::Timestamp::now() + jiff::SignedDuration::from_secs(600),
+                            }
+                        )
+                        .is_empty()
+                    );
+                }
+                assert!(
+                    thread::load(&project, &lane.id)
+                        .unwrap()
+                        .start_notices
+                        .iter()
+                        .any(|n| n.line.contains("GONE"))
+                );
+            } else {
+                thread::update(&project, &lane.id, |t| {
+                    t.status = thread::Status::Failed;
+                    t.startup_wait_started.clear();
+                })
+                .unwrap();
+                threads::retry(&ctx, "demo", &lane.id, "replace the lost reopen").unwrap();
+            }
+            let pending = thread::load(&project, &lane.id).unwrap();
+            assert_eq!(pending.attempt, lane.attempt + 1);
+            assert!(
+                pending
+                    .follow_ups
+                    .iter()
+                    .all(|f| f.state == thread::FollowUpState::Queued
+                        && f.attempt == pending.attempt
+                        && f.carried_from_attempt == lane.attempt)
+            );
+            threads::place_recovery(&ctx, &project, &pending).unwrap();
+            reopened =
+                thread::update(&project, &lane.id, |t| t.error = "provider ready".into()).unwrap();
+            resuming = false;
+        }
+        if recovery == Some("disappeared") {
+            session_present.set(false);
+            if !remote {
+                std::fs::remove_file(&session).unwrap();
+            }
+            resuming = false;
+        }
         let herdr = Herdr::new("herdr", "", &world.runner).on_machine(reopened.machine_route());
         let mut errors = Vec::new();
-        launch_pass(
-            &LaunchPass {
-                ctx: &ctx,
-                project: &project,
-                herdr: &herdr,
-                threads: std::slice::from_ref(&reopened),
-                agents: &[],
-                panes: std::slice::from_ref(&pane),
-            },
-            &mut true,
-            true,
-            &mut errors,
-        );
+        let input = LaunchPass {
+            ctx: &ctx,
+            project: &project,
+            herdr: &herdr,
+            threads: std::slice::from_ref(&reopened),
+            agents: &[],
+            panes: std::slice::from_ref(&pane),
+        };
+        if remote {
+            remote_pass(
+                &input,
+                reopened.machine_route(),
+                &steps::CourierOutcome {
+                    machine_id: reopened.machine_route().into(),
+                    boot_id: "boot-1".into(),
+                    agents: Some(vec![]),
+                    panes: Some(vec![pane.clone()]),
+                    progress: Default::default(),
+                },
+                &mut true,
+                &mut errors,
+            )
+            .unwrap();
+        } else {
+            errors.extend(thread_pass(&input, "ha", None, false, None).unwrap().error);
+            launch_pass(&input, &mut true, true, &mut errors);
+        }
         assert!(errors.is_empty(), "{errors:?}");
-        assert_eq!(reopened.attempt, lane.attempt);
+        let submitted = thread::load(&project, &lane.id).unwrap();
+        assert!(
+            thread::in_start_window(&submitted, jiff::Timestamp::now()),
+            "submission, not the old placement, starts the ready window"
+        );
+        assert_eq!(reopened.attempt, lane.attempt + u32::from(retried));
         assert_eq!(reopened.worktree_path, lane.worktree_path);
-        assert_eq!(world.runner.count("agent start"), 1);
+        let calls = world.runner.calls.borrow();
+        let launch = calls
+            .iter()
+            .find(|c| c.display().contains("agent start") && !c.display().contains("--help"))
+            .unwrap();
+        let resume_flag = launch.args.iter().position(|arg| arg == "--session");
+        assert_eq!(resume_flag.is_some(), resuming);
+        if let Some(index) = resume_flag {
+            assert_eq!(launch.args[index + 1], session.to_string_lossy());
+            assert!(launch.args[..index].iter().any(|arg| arg == "--"));
+        }
+        drop(calls);
+        assert_eq!(
+            world.runner.count("agent start") - world.runner.count("agent start --help"),
+            1
+        );
         assert_eq!(world.runner.count("agent prompt"), 0);
         if remote {
             let calls = world.runner.calls.borrow();
             let card_call = calls
                 .iter()
-                .find(|call| {
+                .rfind(|call| {
                     call.program == "ssh"
                         && call
                             .stdin
@@ -7453,7 +7736,7 @@ mod tests {
             let card: crate::contracts::LaneCard =
                 toml::from_str(card_call.stdin.as_ref().unwrap()).unwrap();
             assert_eq!(card.pane_id, reopened.pane_id);
-            assert_eq!(card.attempt, 2);
+            assert_eq!(card.attempt, reopened.attempt);
             assert_eq!(card.brief_hash, brief_hash);
         }
         let herdr = Herdr::new("herdr", "", &world.runner).on_machine(reopened.machine_route());
@@ -7475,6 +7758,47 @@ mod tests {
             .unwrap();
             pass.error
         };
+        if retried {
+            assert!(run_pass().is_none());
+            if recovery == Some("gone-timeout") {
+                let staged = thread::load(&project, &lane.id).unwrap();
+                assert!(
+                    staged
+                        .follow_ups
+                        .iter()
+                        .all(|f| f.state == thread::FollowUpState::Uncertain
+                            && f.delivered_at.is_empty())
+                );
+                assert!(run_pass().is_none());
+                assert_eq!(
+                    world.runner.count("agent prompt"),
+                    1,
+                    "ambiguous initial prompt is not replayed"
+                );
+                thread::update(&project, &lane.id, |t| t.bootstrap = "acknowledged".into())
+                    .unwrap();
+                assert!(run_pass().is_none());
+            }
+            let saved = thread::load(&project, &lane.id).unwrap();
+            assert!(
+                saved
+                    .follow_ups
+                    .iter()
+                    .all(|f| f.state == thread::FollowUpState::Delivered
+                        && !f.delivered_at.is_empty())
+            );
+            let calls = world.runner.calls.borrow();
+            let prompt = calls
+                .iter()
+                .find(|c| c.display().contains("agent prompt"))
+                .unwrap()
+                .display();
+            assert!(prompt.contains("first correction"), "{prompt}");
+            assert!(prompt.contains("second correction"), "{prompt}");
+            assert!(prompt.contains("sealed report"), "{prompt}");
+            assert_eq!(world.runner.count("agent prompt"), 1);
+            return;
+        }
         if late {
             startup_failure(
                 &LaunchPass {
@@ -7548,6 +7872,37 @@ mod tests {
                 .iter()
                 .all(|f| f.state == thread::FollowUpState::Delivered && !f.delivered_at.is_empty())
         );
+        assert_eq!(saved.attempt, lane.attempt);
+        assert_eq!(
+            saved.launch.same_recipe_retries,
+            lane.launch.same_recipe_retries
+        );
+        assert!(saved.start_notices.iter().all(|n| !n.line.contains("GONE")));
+        if remote {
+            assert!(
+                steps::remote_attention(
+                    &ctx,
+                    &project,
+                    steps::RemoteView {
+                        machine_id: saved.machine_route(),
+                        threads: std::slice::from_ref(&saved),
+                        agents: std::slice::from_ref(&agent),
+                        panes: std::slice::from_ref(&pane),
+                        boot_id: "boot-1",
+                        now: jiff::Timestamp::now() + jiff::SignedDuration::from_secs(600),
+                    }
+                )
+                .is_empty()
+            );
+            let observed = thread::load(&project, &lane.id).unwrap();
+            assert_eq!(observed.attempt, lane.attempt);
+            assert!(
+                observed
+                    .start_notices
+                    .iter()
+                    .all(|n| !n.line.contains("GONE"))
+            );
+        }
         // A later message takes the immediate CLI path on this same reopened
         // pane. It must use the same durable delivery lifecycle as the queue.
         *world.agents.borrow_mut() = format!(
