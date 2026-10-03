@@ -741,6 +741,24 @@ impl<'a> Herdr<'a> {
         }
         self.call(&args, CALL_TIMEOUT).map(|_| ())
     }
+
+    /// Adopt / reconcile the sidebar parent token without a TTL.
+    pub(crate) fn pane_set_parent(&self, pane: &str, parent: &str) -> Result<(), HerdrError> {
+        let token = format!("parent={parent}");
+        self.call(
+            &[
+                "pane",
+                "report-metadata",
+                pane,
+                "--source",
+                SOURCE,
+                "--token",
+                &token,
+            ],
+            CALL_TIMEOUT,
+        )
+        .map(|_| ())
+    }
 }
 
 /// True when `herdr agent start --help` names `--parent` (the r2 fork).

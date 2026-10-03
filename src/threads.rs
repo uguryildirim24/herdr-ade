@@ -137,6 +137,19 @@ pub fn report_thread_tokens(herdr: &Herdr, thread: &Thread, slug: &str, group: G
     );
 }
 
+/// Local lanes name their coordinator pane; box lanes use herdr's existing
+/// machine-qualified parent form so they nest under the Mac coordinator.
+pub fn parent_token(record: &Thread, coordinator_pane: &str) -> String {
+    if record.is_remote() {
+        format!(
+            "{}:{coordinator_pane}",
+            crate::contracts::MACHINE_LOCAL_LABEL
+        )
+    } else {
+        coordinator_pane.to_string()
+    }
+}
+
 fn clear_thread_tokens(herdr: &Herdr, thread: &Thread) {
     if !thread.pane_id.is_empty() {
         let _ = herdr
@@ -1039,14 +1052,14 @@ fn place_box_worktree(
         .tab_rename(&created.tab_id, &format!("{} starting…", record.id))
         .map_err(|e| anyhow::anyhow!("{e}"))?;
 
-    // ADE owns attention notices on both machines. Clear historical links
-    // before starting; fork notices would bypass the shared outbox.
-    if project.coordinator().is_some() {
+    // The box lane nests from placement onward. Its agent start does not
+    // pass --parent; the pane carries the machine-qualified token instead.
+    if let Some(coord) = project.coordinator() {
         herdr
-            .pane_clear_tokens(&created.pane_id, &["parent"])
+            .pane_set_parent(&created.pane_id, &parent_token(record, &coord.pane_id))
             .map_err(|error| {
                 anyhow::anyhow!(
-                    "could not clear box pane {} push link: {error}",
+                    "could not link box pane {} to its coordinator: {error}",
                     created.pane_id
                 )
             })?;
@@ -1938,7 +1951,8 @@ pub fn rebind(ctx: &Ctx, slug: &str, id: &str, pane_id: &str) -> Result<RebindOu
         thread::bind_identity(t, &socket, agent, process.clone());
         Ok(())
     })?;
-    herdr.pane_clear_tokens(pane_id, &["parent"])?;
+    let coordinator_pane = project.coordinator().map(|c| c.pane_id).unwrap_or_default();
+    herdr.pane_set_parent(pane_id, &parent_token(&rebound, &coordinator_pane))?;
     report_thread_tokens(&herdr, &rebound, slug, Group::Working);
     Ok(RebindOutcome {
         thread: id.to_string(),
@@ -3477,7 +3491,7 @@ fn reopen_parked(
     // than silently starting from an empty conversation.
     let result = (|| -> Result<()> {
         if let Some(machine) = &machine {
-            herdr.pane_clear_tokens(&placed.pane_id, &["parent"])?;
+            herdr.pane_set_parent(&placed.pane_id, &parent_token(record, &coordinator.pane_id))?;
             // The box's `ha done` authenticates the pane against its lane
             // card. Rebind that card before starting a resumed agent.
             let profile = remote::machine_profile(
@@ -3532,7 +3546,11 @@ fn reopen_parked(
             pane: &placed.pane_id,
             agent_args: &args,
             launch_bin: None,
-            parent: None,
+            parent: if record.is_remote() {
+                None
+            } else {
+                Some(&coordinator.pane_id)
+            },
             ready_timeout_ms: record.launch.ready_timeout_ms,
         })?;
         let process = herdr
@@ -5258,8 +5276,8 @@ fn removal_in_use_gate(
     Ok(())
 }
 
-/// Remove historical push links from verified box lanes after a rebind.
-pub(crate) fn clear_push_links(ctx: &Ctx, project: &Project) -> Result<()> {
+/// Reparent verified live box lanes when the coordinator binding changes.
+pub(crate) fn relink_binding(ctx: &Ctx, project: &Project, pane: &str) -> Result<()> {
     let view = require_session(ctx, project)?;
     let mut observed = std::collections::BTreeMap::new();
     for lane in thread::list_live(project) {
@@ -5294,8 +5312,9 @@ pub(crate) fn clear_push_links(ctx: &Ctx, project: &Project) -> Result<()> {
         if !thread::identity_verifies(&lane, agent, &live) {
             continue;
         }
-        if agent.parent().is_some() {
-            herdr.pane_clear_tokens(&lane.pane_id, &["parent"])?;
+        let parent = parent_token(&lane, pane);
+        if agent.parent() != Some(parent.as_str()) {
+            herdr.pane_set_parent(&lane.pane_id, &parent)?;
         }
     }
     Ok(())
@@ -5303,9 +5322,9 @@ pub(crate) fn clear_push_links(ctx: &Ctx, project: &Project) -> Result<()> {
 
 /// Lineage repair (SPEC-ADE D3); lineage is local.
 pub fn tick(project: &Project, herdr: &Herdr, agents: &[Agent]) -> Result<()> {
-    if project.coordinator().is_none() {
+    let Some(coordinator) = project.coordinator() else {
         return Ok(());
-    }
+    };
     for record in thread::list_live(project) {
         if record.is_remote() || record.status == Status::Resolved {
             continue;
@@ -5328,8 +5347,8 @@ pub fn tick(project: &Project, herdr: &Herdr, agents: &[Agent]) -> Result<()> {
         if mismatch {
             continue;
         }
-        if agent.parent().is_some() {
-            herdr.pane_clear_tokens(&record.pane_id, &["parent"])?;
+        if agent.parent() != Some(coordinator.pane_id.as_str()) {
+            herdr.pane_set_parent(&record.pane_id, &coordinator.pane_id)?;
         }
     }
     Ok(())
@@ -6038,7 +6057,7 @@ mod tests {
     }
 
     #[test]
-    fn rebind_clears_push_links_on_both_machines() {
+    fn rebind_sets_current_coordinator_parent_on_both_machines() {
         for machine in ["", "buildbox"] {
             let world = crate::scenarios::World::new();
             let project = world.project("demo", "a.sock");
@@ -6050,15 +6069,58 @@ mod tests {
             .unwrap();
             *world.agents.borrow_mut() = r#"[{"pane_id":"w1:p2","tab_id":"w1:t2","workspace_id":"w1","cwd":"/work/lane","agent":"pi","agent_status":"working"}]"#.into();
 
+            project
+                .update_coordinator(|c| c.pane_id = "w1:p9".into())
+                .unwrap();
             rebind(&world.ctx(), "demo", &lane.id, "w1:p2").unwrap();
 
-            let expected = "parent";
+            let expected = if machine.is_empty() {
+                "parent=w1:p9"
+            } else {
+                "parent=Local:w1:p9"
+            };
             assert!(world.runner.calls.borrow().iter().any(|cmd| {
                 cmd.display().contains("pane report-metadata w1:p2")
-                    && cmd.display().contains("--clear-token")
+                    && cmd.display().contains("--token")
                     && cmd.args.iter().any(|arg| arg == expected)
                     && (machine.is_empty() || cmd.display().contains("--machine buildbox"))
             }));
+        }
+    }
+
+    #[test]
+    fn replacement_binding_reparents_only_verified_box_lanes() {
+        use crate::runner::fake::ok;
+        use crate::scenarios::{World, agent_json, pane_json};
+
+        for pid in [42, 99] {
+            let world = World::new();
+            let project = world.project("demo", "a.sock");
+            let lane = world.thread(&project, Path::new("/box/lane"), |t| {
+                t.machine = "buildbox".into();
+                t.identity.process = Some(crate::contracts::ProcessIdentity {
+                    pid,
+                    argv0: "claude".into(),
+                });
+            });
+            *world.agents.borrow_mut() = format!(
+                "[{}]",
+                agent_json("w2", "w2:t1", "w2:p1", &lane.cwd, &lane.agent_name, "idle")
+            );
+            *world.panes.borrow_mut() =
+                format!("[{}]", pane_json("w2", "w2:t1", "w2:p1", &lane.cwd));
+            world.runner.on(
+                "pane process-info",
+                ok(r#"{"result":{"process_info":{"foreground_processes":[{"pid":42,"name":"claude","argv0":"claude"}]}}}"#),
+            );
+            project
+                .update_coordinator(|c| c.pane_id = "w1:p9".into())
+                .unwrap();
+            relink_binding(&world.ctx(), &project, "w1:p9").unwrap();
+            assert_eq!(
+                world.runner.count("--machine buildbox pane report-metadata w2:p1 --source herdr-ade --token parent=Local:w1:p9"),
+                usize::from(pid == 42),
+            );
         }
     }
 
@@ -6541,6 +6603,9 @@ mod tests {
             "pane process-info",
             ok(r#"{"result":{"process_info":{"foreground_processes":[]}}}"#),
         );
+        project
+            .update_coordinator(|c| c.pane_id = "w1:p9".into())
+            .unwrap();
         let ctx = world.ctx();
         let outcome = prompt(&ctx, "demo", &lane.id, "Fix the rejection").unwrap();
         assert!(
@@ -6568,7 +6633,9 @@ mod tests {
         assert_eq!(reopened.attempt, 1);
         assert!(world.runner.calls.borrow().iter().any(|c| {
             let text = c.display();
-            text.contains("agent start") && text.contains("--session session-42")
+            text.contains("agent start")
+                && text.contains("--session session-42")
+                && text.contains("--parent w1:p9")
         }));
         // Round retry uses the same reopen path instead of spending a new attempt.
         thread::update(&project, &lane.id, |t| {
@@ -6926,7 +6993,7 @@ mod tests {
             .find(|c| c.display().contains("agent start") && !c.display().contains("--help"))
             .map(|c| c.display())
             .expect("agent start");
-        assert!(!launch.contains("--parent"), "{launch}");
+        assert!(launch.contains("--parent w1:p1"), "{launch}");
         drop(calls);
 
         // The ready lane is primed once with its role skill and frozen
@@ -7448,6 +7515,14 @@ mod tests {
         .unwrap();
         assert_eq!(second.workspace_id, started.workspace_id);
         let calls = fx.world.runner.calls.borrow();
+        for lane in [&started, &second] {
+            assert!(calls.iter().any(|call| {
+                call.display().contains(&format!(
+                    "--machine buildbox-id pane report-metadata {} --source herdr-ade --token parent=Local:w1:p1",
+                    lane.pane_id
+                ))
+            }));
+        }
         assert_eq!(
             calls
                 .iter()
@@ -7474,6 +7549,53 @@ mod tests {
             1,
             "only the later lane adds a tab to the shared workspace"
         );
+    }
+
+    #[test]
+    fn reopened_box_lane_sets_current_machine_qualified_parent() {
+        use crate::runner::fake::ok;
+        let (fx, _) = box_fixture();
+        write_config(&fx, &lane_config());
+        stub_box(&fx);
+        let started = start(
+            &fx.world.ctx(),
+            "demo",
+            start_args(Some(fx.repo.to_string_lossy().into_owned()), None),
+        )
+        .unwrap();
+        let parked = thread::update(&fx.project, &started.id, |t| {
+            t.parked = true;
+            t.identity.agent_session = Some("session-42".into());
+        })
+        .unwrap();
+        fx.project
+            .update_coordinator(|c| c.pane_id = "w1:p9".into())
+            .unwrap();
+        fx.world.runner.on(
+            "agent start",
+            ok(r#"{"result":{"agent":{"workspace_id":"w1","tab_id":"w1:t3","pane_id":"w1:p3","agent_status":"idle"}}}"#),
+        );
+        reopen_parked(
+            &fx.world.ctx(),
+            &fx.project,
+            &parked,
+            "Fix the rejection",
+            &[],
+        )
+        .unwrap();
+        assert!(fx.world.runner.calls.borrow().iter().any(|call| {
+            call.display().contains("--machine buildbox-id pane report-metadata w1:p3 --source herdr-ade --token parent=Local:w1:p9")
+        }));
+        let calls = fx.world.runner.calls.borrow();
+        let launch = calls
+            .iter()
+            .find(|call| {
+                call.display().contains("agent start") && !call.display().contains("--help")
+            })
+            .unwrap()
+            .display();
+        assert!(launch.contains("--resume session-42"), "{launch}");
+        assert!(!launch.contains("--parent"), "{launch}");
     }
 
     #[test]

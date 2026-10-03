@@ -210,7 +210,7 @@ pub(crate) fn adopt(
     // Keep the record in Starting while this command owns first delivery, so
     // the ticker cannot race it and send the brief twice. Passive adopt
     // (SPEC-ADE D7) sends nothing.
-    herdr.pane_clear_tokens(pane, &["parent"])?;
+    herdr.pane_set_parent(pane, &record.pane_id)?;
     let pending = !passive;
     let adopted = thread::update(&project, &id, |t| {
         t.status = if passive {
@@ -582,7 +582,7 @@ mod tests {
     }
 
     #[test]
-    fn passive_adopt_sends_no_prompt_and_clears_push_link() {
+    fn passive_adopt_sends_no_prompt_and_sets_parent() {
         let (world, _, _) = world_with_agent("idle", "pro");
         let t = adopt(
             &world.ctx(),
@@ -602,8 +602,8 @@ mod tests {
         assert_eq!(world.runner.count("agent prompt"), 0);
         let calls = world.runner.calls.borrow();
         let parent = calls.iter().any(|c| {
-            c.display().contains("report-metadata") && c.display().contains("--clear-token parent")
+            c.display().contains("report-metadata") && c.display().contains("--token parent=w1:p1")
         });
-        assert!(parent, "expected parent link removal");
+        assert!(parent, "expected coordinator parent token");
     }
 }
