@@ -6,136 +6,44 @@
 //! one ticker interval. `npm root -g` runs inside `$SHELL -lic` like every
 //! other login-shell probe.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
-use serde::Deserialize;
 use serde_json::Value;
 
-use super::{Env, Layout, PI_VERSION, folder, install, launch, provider, sh};
+use super::{Env, Layout, PI_VERSION, folder, install, launch, provider};
+use crate::runner as sh;
 
 // A healthy Mac Codex print-mode probe has exceeded 10s; leave room for
 // normal provider latency without treating a real refusal as ready.
 const LIVE_PROBE_TIMEOUT: Duration = Duration::from_secs(30);
 pub(crate) const READINESS_CACHE_TTL: Duration = Duration::from_secs(15);
 
-#[derive(Debug, Deserialize)]
-#[serde(default)]
-struct ConfigRecipe {
-    kind: String,
-    provider: String,
-    args: Vec<String>,
-    env: Vec<String>,
-    enabled: bool,
-}
-
-impl Default for ConfigRecipe {
-    fn default() -> Self {
-        Self {
-            kind: String::new(),
-            provider: String::new(),
-            args: Vec::new(),
-            env: Vec::new(),
-            enabled: true,
-        }
-    }
-}
-
-#[derive(Debug, Default, Deserialize)]
-#[serde(default)]
-struct ConfigRouting {
-    default: String,
-    pins: BTreeMap<String, String>,
-    rules: Vec<ConfigRule>,
-}
-
-#[derive(Debug, Default, Deserialize)]
-#[serde(default)]
-struct ConfigRule {
-    recipe: String,
-}
-
-#[derive(Debug, Default, Deserialize)]
-#[serde(default)]
-struct ConfigDoctorAdapter {
-    readiness: String,
-}
-
-#[derive(Debug, Default, Deserialize)]
-#[serde(default)]
-struct ConfigAdapter {
-    doctor: ConfigDoctorAdapter,
-}
-
-#[derive(Debug, Default, Deserialize)]
-#[serde(default)]
-struct RecipeConfig {
-    recipes: BTreeMap<String, ConfigRecipe>,
-    routing: ConfigRouting,
-    adapters: BTreeMap<String, ConfigAdapter>,
-}
-
-fn recipe_config(config_dir: &Path) -> Result<RecipeConfig> {
-    let defaults: RecipeConfig = toml::from_str(include_str!("../../assets/default-recipes.toml"))
-        .context("shipped recipe declarations do not parse")?;
-    let document = crate::config::Document::read(config_dir)?;
-    let configured: RecipeConfig = document.decode()?;
-    let mut recipes = defaults.recipes;
-    recipes.extend(configured.recipes);
-    Ok(RecipeConfig {
-        recipes,
-        routing: configured.routing,
-        adapters: configured.adapters,
-    })
-}
-
-fn validate_config_recipe(id: &str, recipe: &ConfigRecipe) -> Result<String> {
-    launch::validate_recipe(id, &recipe.provider, &recipe.args, &recipe.env)
-}
-
-fn uses_pi(config: &RecipeConfig, recipe: &ConfigRecipe) -> bool {
-    config
+fn pi_model(
+    config: &crate::launch::LaunchConfig,
+    id: &str,
+    recipe: &crate::contracts::Recipe,
+) -> Result<Option<String>> {
+    let adapter = config
         .adapters
         .get(&recipe.kind)
-        .map(|adapter| adapter.doctor.readiness.as_str())
-        .unwrap_or(if recipe.kind == "pi" { "pi" } else { "command" })
-        == "pi"
-}
-
-fn routed_ids(routing: &ConfigRouting) -> BTreeSet<&str> {
-    let mut ids = BTreeSet::new();
-    ids.insert(routing.default.as_str());
-    ids.extend(routing.pins.values().map(String::as_str));
-    for rule in &routing.rules {
-        ids.insert(rule.recipe.as_str());
+        .with_context(|| format!("adapter_unknown: recipe `{id}` uses `{}`", recipe.kind))?;
+    if adapter.doctor.readiness != "pi" {
+        return Ok(None);
     }
-    ids
+    crate::adapters::validate_recipe(adapter, id, recipe)?;
+    Ok(launch::flag_value(&recipe.args, "--model"))
 }
 
 /// Provider/model pairs used by enabled routes in the canonical recipe file.
 pub(crate) fn configured_routed_models(config_dir: &Path) -> Result<Vec<(String, String)>> {
-    let config = recipe_config(config_dir)?;
-    if config.routing.default.trim().is_empty() {
-        anyhow::bail!(
-            "routing_default_missing: add [routing] with default = \"<recipe>\" to config.toml"
-        );
-    }
-    let routed = routed_ids(&config.routing);
-    for id in &routed {
-        let recipe = config
-            .recipes
-            .get(*id)
-            .with_context(|| format!("routing_recipe_unknown: {id}"))?;
-        if !recipe.enabled {
-            anyhow::bail!("routing_recipe_disabled: {id}");
-        }
-    }
+    let config = crate::launch::parse_launch_config(config_dir)?;
     let mut models = BTreeSet::new();
-    for (id, recipe) in &config.recipes {
-        if routed.contains(id.as_str()) && recipe.enabled && uses_pi(&config, recipe) {
-            let model = validate_config_recipe(id, recipe)?;
+    for id in config.routing.recipe_ids() {
+        let recipe = &config.recipes[id];
+        if let Some(model) = pi_model(&config, id, recipe)? {
             models.insert((recipe.provider.clone(), model));
         }
     }
@@ -143,14 +51,13 @@ pub(crate) fn configured_routed_models(config_dir: &Path) -> Result<Vec<(String,
 }
 
 pub(crate) fn configured_deepseek_models(config_dir: &Path) -> Result<Vec<String>> {
-    let config = recipe_config(config_dir)?;
+    let config = crate::launch::recipe_catalog(config_dir)?;
     let mut models = BTreeSet::new();
     for (id, recipe) in &config.recipes {
-        if !uses_pi(&config, recipe) {
-            continue;
-        }
-        let model = validate_config_recipe(id, recipe)?;
-        if recipe.provider == provider::PROVIDER_ID && model.starts_with("deepseek") {
+        if let Some(model) = pi_model(&config, id, recipe)?
+            && recipe.provider == provider::PROVIDER_ID
+            && model.starts_with("deepseek")
+        {
             models.insert(model);
         }
     }
@@ -292,9 +199,11 @@ pub(crate) fn doctor_rows_with(
 
     // pi version: the wrapper and the prefix pin must agree, exactly.
     let wrapper_version = if layout.wrapper().is_file() {
-        match runner
-            .run(&sh::Cmd::new(layout.wrapper().display().to_string(), sh::SHORT).arg("--version"))
-        {
+        match runner.run(
+            &sh::Cmd::new(layout.wrapper().display().to_string(), sh::SHORT)
+                .arg("--version")
+                .own_group(),
+        ) {
             Ok(output) if output.success() => Some(sh::first_line(&output)),
             Ok(output) => {
                 rows.push(Row::fail(
@@ -477,6 +386,7 @@ pub(crate) fn doctor_rows_with(
     // the herdr state hook: the running herdr must call it current.
     let herdr_status = runner.run(
         &sh::Cmd::new(env.herdr_bin(), sh::SHORT)
+            .own_group()
             .args(["integration", "status"])
             .env("PI_CODING_AGENT_DIR", layout.agent().display().to_string()),
     );
@@ -696,6 +606,7 @@ pub(crate) fn check_report_model(
 
     match runner.run(
         &sh::Cmd::new(env.herdr_bin(), sh::SHORT)
+            .own_group()
             .args(["integration", "status"])
             .env("PI_CODING_AGENT_DIR", layout.agent().display().to_string()),
     ) {
@@ -827,6 +738,7 @@ fn auth_check_uncached(
     let output = runner
         .run(
             &sh::Cmd::new(layout.wrapper().display().to_string(), sh::SHORT)
+                .own_group()
                 .args(["auth", "check", "--provider", provider, "--json"])
                 .env("PI_CODING_AGENT_DIR", layout.agent().display().to_string()),
         )
@@ -881,6 +793,7 @@ fn auth_check_uncached(
     let live = runner
         .run(
             &sh::Cmd::new(layout.wrapper().display().to_string(), LIVE_PROBE_TIMEOUT)
+                .own_group()
                 .args([
                     "--provider",
                     provider,
@@ -1055,7 +968,11 @@ fn wrapper_path_row_with(runner: &dyn sh::Runner, env: &Env, layout: &Layout, sh
     // `whence` is zsh and `type -a` is bash, so the machine's own login shell
     // picks its own word; anything else gets POSIX `command -v`.
     let script = path_probe(shell);
-    let output = match runner.run(&sh::Cmd::new(shell, sh::SHORT).args(["-lic", script])) {
+    let output = match runner.run(
+        &sh::Cmd::new(shell, sh::SHORT)
+            .args(["-lic", script])
+            .own_group(),
+    ) {
         Ok(output) => output,
         Err(error) => return Row::fail("wrapper on PATH", format!("{error:#}")),
     };
@@ -1155,7 +1072,54 @@ fn canonical_or_self(path: &Path) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::pi::sh::fake::{FakeRunner, fail, ok};
+    use crate::runner::fake::{FakeRunner, fail, ok};
+
+    #[test]
+    fn pi_inventory_uses_the_canonical_catalog_and_route_validation() {
+        let dir = tempfile::tempdir().unwrap();
+        // Setup can write compaction overrides before routing is configured.
+        assert!(!configured_deepseek_models(dir.path()).unwrap().is_empty());
+        let path = dir.path().join("config.toml");
+        let config = r#"
+[routing]
+default = "pi_opencode_deepseek"
+[routing.pins]
+"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" = "pi_codex_sol_high"
+[[routing.rules]]
+workflow = "reviewer"
+recipe = "pi_opencode_muse"
+[recipes.pi_opencode_deepseek]
+kind = "pi"
+provider = "opencode-go"
+args = ["--provider=opencode-go", "--model=deepseek-custom", "--thinking=low", "--no-skills"]
+"#;
+        std::fs::write(&path, config).unwrap();
+        let catalog = crate::launch::parse_launch_config(dir.path()).unwrap();
+        let models = configured_routed_models(dir.path()).unwrap();
+        assert_eq!(models.len(), 3);
+        for id in catalog.routing.recipe_ids() {
+            let recipe = &catalog.recipes[id];
+            let model =
+                launch::validate_recipe(id, &recipe.provider, &recipe.args, &recipe.env).unwrap();
+            assert!(models.contains(&(recipe.provider.clone(), model)));
+        }
+        assert_eq!(
+            configured_deepseek_models(dir.path()).unwrap(),
+            ["deepseek-custom"]
+        );
+        // The former shadow schema accepted invalid rules and recipe fields.
+        for invalid in [
+            config.replace("workflow = \"reviewer\"\n", ""),
+            config.replace("kind = \"pi\"", "kind = \"pi\"\nextra = true"),
+            config.replace(
+                "provider = \"opencode-go\"",
+                "provider = \"opencode-go\"\ncapabilities = [\"undeclared\"]",
+            ),
+        ] {
+            std::fs::write(&path, invalid).unwrap();
+            assert!(configured_routed_models(dir.path()).is_err());
+        }
+    }
 
     fn scripted(env: &Env) -> FakeRunner {
         let link = env.home.join(".local/bin/pi");
@@ -1368,6 +1332,13 @@ mod tests {
         assert!(auth_check_model(&runner, &layout, "opencode-go", Some("second")).is_ok());
         assert_eq!(runner.count("auth check --provider opencode-go"), 2);
         assert_eq!(runner.count("--print Reply OK."), 2);
+        let calls = runner.calls.borrow();
+        assert!(calls.iter().all(|cmd| cmd.own_group));
+        assert!(calls.iter().all(|cmd| cmd.env
+            == [(
+                "PI_CODING_AGENT_DIR".into(),
+                layout.agent().display().to_string()
+            )]));
     }
 
     /// T9: a global install of the package is a failure; the root's path

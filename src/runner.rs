@@ -366,6 +366,34 @@ fn kill(child: &mut std::process::Child, own_group: bool) {
     let _ = child.kill();
 }
 
+/// Default deadline for short login-shell and provider checks.
+pub(crate) const SHORT: Duration = Duration::from_secs(10);
+/// npm installation can take a while.
+pub(crate) const SETUP: Duration = Duration::from_secs(600);
+
+/// The machine's interactive login shell (zsh is absent on the box).
+pub(crate) fn shell() -> String {
+    std::env::var("SHELL")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| "zsh".into())
+}
+
+/// Probe through the login shell; the deadline includes its descendants.
+pub(crate) fn login_shell(runner: &dyn Runner, script: &str) -> Result<Output> {
+    runner.run(&Cmd::new(shell(), SHORT).args(["-lic", script]).own_group())
+}
+
+pub(crate) fn first_line(output: &Output) -> String {
+    let text = if output.stdout.trim().is_empty() {
+        &output.stderr
+    } else {
+        &output.stdout
+    };
+    text.lines().next().unwrap_or("").trim().to_string()
+}
+
 #[cfg(test)]
 pub(crate) mod fake {
     use super::*;
@@ -513,6 +541,15 @@ mod tests {
         assert!(!out.success());
         assert!(start.elapsed() < Duration::from_secs(5));
         assert!(out.stdout.len() > 65_536);
+    }
+
+    #[test]
+    fn missing_stdin_is_closed() {
+        let out = RealRunner
+            .run(&Cmd::new("cat", Duration::from_secs(5)))
+            .unwrap();
+        assert_eq!(out.code, Some(0));
+        assert_eq!(out.stdout, "");
     }
 
     #[test]
