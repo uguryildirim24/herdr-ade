@@ -596,6 +596,21 @@ impl View {
             )
         }));
         sections.push(Section::new("Open tasks", task_rows));
+        // Keep recurrence visible even when the ordinary delivery task is done.
+        let repairs: Vec<_> = tasks
+            .iter()
+            .flat_map(|task| {
+                task.repairs.iter().map(|repair| {
+                    entry(
+                        format!("{}:{}", task.record.id, repair.cause),
+                        crate::task::repair_summary(repair),
+                    )
+                })
+            })
+            .collect();
+        if !repairs.is_empty() {
+            sections.push(Section::new("Repair outcomes", repairs));
+        }
         let mut notes = crate::note::active_rows(project);
         crate::note::sort_newest_first(&mut notes);
         for (kind, name) in [

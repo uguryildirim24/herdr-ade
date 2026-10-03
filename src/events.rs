@@ -612,6 +612,43 @@ pub(crate) fn for_unresolved_threads(project: &Project) -> Vec<Event> {
         .unwrap_or_else(|| select(&list(project)))
 }
 
+/// Incident input only: both failed seals and dependency waits are evidence,
+/// but neither is a diagnosis. A caller must explicitly confirm a common cause.
+pub(crate) fn incident_text(event: &Event) -> Option<&str> {
+    match (
+        &event.payload.failed,
+        &event.payload.waiting,
+        &event.payload.done,
+    ) {
+        (Some(failed), None, None) => Some(&failed.text),
+        (None, Some(waiting), None) => Some(&waiting.text),
+        _ => None,
+    }
+}
+
+/// Read the existing recovery journal, not a second incident writer. Missing
+/// or corrupt input is surfaced in the local projection, never in delivery.
+pub(crate) fn recovery_facts(project: &Project, event: &str) -> Vec<String> {
+    let path = project.state_dir().join("dispatch.jsonl");
+    let (rows, error) = project::read_jsonl::<serde_json::Value>(&path)
+        .unwrap_or_else(|error| (vec![], Some(error.to_string().into_bytes())));
+    let mut facts: Vec<_> = rows
+        .into_iter()
+        .filter(|row| row["event"].as_str() == Some(event))
+        .map(|row| {
+            format!(
+                "{}: {}",
+                row["kind"].as_str().unwrap_or("unknown"),
+                row["error"].as_str().unwrap_or("details unknown")
+            )
+        })
+        .collect();
+    if error.is_some() {
+        facts.push("recovery journal evidence unknown".into());
+    }
+    facts
+}
+
 /// Appends a fact once. Re-running acknowledgement or handling is idempotent;
 /// `submitted` may still be duplicated when the transport succeeded before a
 /// crash, which is the intentional X4 at-least-once boundary.

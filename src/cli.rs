@@ -698,6 +698,8 @@ enum InboxCommand {
 
 #[derive(Subcommand)]
 enum TaskCommand {
+    /// Link confirmed incidents and measured outcomes to an ordinary repair task
+    Repair(crate::task::RepairArgs),
     /// Add a task tied to Rolf's request and exact acceptance conditions
     Add {
         #[arg(value_name = "PROJECT")]
@@ -1424,6 +1426,17 @@ fn dispatch_with_start(
             }
         },
         Command::Task { command } => match command {
+            TaskCommand::Repair(args) => {
+                let project = Project::load(&ctx.root, &args.slug)?;
+                let task = crate::task::record_repair(&project, &args.id, args.command)?;
+                let view = crate::task::view(&project, task);
+                crate::output::success(
+                    Some("recorded"),
+                    &serde_json::json!({"task": view}),
+                    &crate::task::render(&project, &view),
+                    "",
+                )
+            }
             TaskCommand::Add {
                 slug,
                 title,
