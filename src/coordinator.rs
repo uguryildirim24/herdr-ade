@@ -31,6 +31,10 @@ struct Recovery {
     retried: bool,
     refused: bool,
     unavailable: bool,
+    /// Written before transport. An interrupted/ambiguous call remains an
+    /// intent, not an accepted retry. Prompt rejection clears it; a start
+    /// always rechecks the bound process before trying again.
+    intent: String,
 }
 
 fn recovery_path(project: &Project) -> std::path::PathBuf {
@@ -38,7 +42,17 @@ fn recovery_path(project: &Project) -> std::path::PathBuf {
 }
 
 fn recovery(project: &Project, record: &Coordinator) -> Recovery {
-    let saved = project::read_json::<Recovery>(&recovery_path(project)).unwrap_or_default();
+    let mut saved = project::read_json::<Recovery>(&recovery_path(project)).unwrap_or_default();
+    // Complete a restart receipt interrupted after the incarnation was advanced.
+    if saved.pane == record.pane_id
+        && saved.intent == "start"
+        && saved.restarted
+        && record.launch_attempts > 1
+        && saved.generation + 1 == record.generation
+    {
+        saved.generation = record.generation;
+        saved.intent.clear();
+    }
     if saved.pane == record.pane_id && saved.generation == record.generation {
         saved
     } else {
@@ -113,10 +127,19 @@ pub(crate) fn recover(
     agent: Option<&Agent>,
     pane_alive: bool,
 ) -> Result<()> {
-    if !record.closed_by_rolf_at.is_empty() || record.pane_id.is_empty() {
+    let _binding = project.coordinator_lock()?;
+    if !current_binding(project, record)
+        || !record.closed_by_rolf_at.is_empty()
+        || record.pane_id.is_empty()
+    {
         return Ok(());
     }
+    let current = project.coordinator().expect("binding checked under lock");
+    let record = &current;
     let mut state = recovery(project, record);
+    if state.intent == "start" && (state.restarted || agent.is_some()) {
+        return accept_restart(project, record, &mut state);
+    }
     if !pane_alive {
         if agent.is_some() {
             return Ok(());
@@ -150,6 +173,7 @@ pub(crate) fn recover(
                 state.fingerprint.clear();
                 state.retried = false;
                 state.refused = false;
+                state.intent.clear();
                 save_recovery(project, &state)?;
             }
             return Ok(());
@@ -194,12 +218,36 @@ pub(crate) fn recover(
         if !crate::prompt::coordinator_prompt_clear(project, herdr, &record.pane_id)? {
             return Ok(());
         }
-        // Persist before sending: a ticker restart must not duplicate a prompt.
-        state.retried = true;
-        state.retry_at = jiff::Timestamp::now().as_second() + 60;
-        save_recovery(project, &state)?;
+        if !state.intent.is_empty() {
+            // Without a transport receipt or a completed turn, resending could
+            // duplicate an accepted prompt. Keep the retry unspent and visible,
+            // including an interruption before the original call returned.
+            report_uncertain_prompt(project)?;
+            bail!(
+                "coordinator recovery prompt delivery is uncertain for {}",
+                project.slug
+            );
+        }
         crate::prompt::mark_automated_prompt(project, &record.pane_id, RESUME)?;
-        herdr.agent_prompt(&record.pane_id, RESUME)?;
+        state.intent = "prompt".into();
+        save_recovery(project, &state)?;
+        match herdr.agent_prompt(&record.pane_id, RESUME) {
+            Ok(()) => {
+                state.intent.clear();
+                state.retried = true;
+                state.retry_at = jiff::Timestamp::now().as_second() + 60;
+                save_recovery(project, &state)?;
+            }
+            Err(error) => {
+                if crate::threads::prompt_refused_before_submission(&error) {
+                    state.intent.clear();
+                    save_recovery(project, &state)?;
+                } else {
+                    report_uncertain_prompt(project)?;
+                }
+                return Err(error.into());
+            }
+        }
     } else if !record.last_agent_seen_at.is_empty() && !record.prime_pending {
         // A missing agent list entry alone can be a server handoff. Confirm the
         // bound pane has no foreground agent process before a bounded restart.
@@ -212,23 +260,21 @@ pub(crate) fn recover(
                 || p.argv0
                     .as_deref()
                     .is_some_and(|s| s.ends_with(&record.launch.kind))
-        }) || state.restarted
-        {
+        }) {
+            if state.intent == "start" {
+                accept_restart(project, record, &mut state)?;
+            }
             return Ok(());
         }
-        state.restarted = true;
-        state.generation += 1;
+        if state.restarted {
+            return Ok(());
+        }
+        // Process inspection also resolves a previous uncertain start: the
+        // exact bound pane is still at a shell, so starting is safe to retry.
+        state.intent = "start".into();
         save_recovery(project, &state)?;
-        project.update_coordinator(|c| {
-            c.generation += 1;
-            c.prime_pending = true;
-            c.prime_sent = false;
-            c.bootstrap.clear();
-            c.last_agent_seen_at.clear();
-            c.launch_attempts += 1;
-        })?;
         let spec = &record.launch;
-        if let Err(error) = herdr.agent_start_opts(&crate::herdr::AgentStart {
+        match herdr.agent_start_opts(&crate::herdr::AgentStart {
             name: &record.agent_name,
             kind: &spec.kind,
             pane: &record.pane_id,
@@ -237,20 +283,72 @@ pub(crate) fn recover(
             parent: None,
             ready_timeout_ms: spec.ready_timeout_ms,
         }) {
-            inbox::write(
-                project,
-                "coordinator-unavailable",
-                &project.slug,
-                &format!(
-                    "coordinator_unavailable: {} restart in its bound pane was not confirmed ({error}); check the pane or run ha open {} to resume.",
-                    project.slug, project.slug
-                ),
-                "",
-            )?;
+            Ok(_) => accept_restart(project, record, &mut state)?,
+            Err(error) => {
+                // Even a readiness refusal can follow spawning the process.
+                // Keep the intent until the next bound-process inspection.
+                inbox::write(
+                    project,
+                    "coordinator-unavailable",
+                    &project.slug,
+                    &format!(
+                        "coordinator_unavailable: {} restart in its bound pane was not confirmed ({error}); recovery will recheck the bound process before retrying.",
+                        project.slug
+                    ),
+                    "",
+                )?;
+            }
         }
         // The normal priming path sends exactly one context line when ready.
     }
     Ok(())
+}
+
+fn report_uncertain_prompt(project: &Project) -> Result<()> {
+    // Inbox writes deduplicate this unresolved notice across polls.
+    inbox::write(
+        project,
+        "coordinator-unavailable",
+        &project.slug,
+        &format!(
+            "Coordinator {} recovery prompt delivery is uncertain; its retry is unspent. Check the bound pane before resending.",
+            project.slug
+        ),
+        "",
+    )?;
+    Ok(())
+}
+
+/// Called with the lifecycle lock held; stale ticker snapshots do not own a
+/// replacement binding, even if a server reused its pane ids.
+fn current_binding(project: &Project, record: &Coordinator) -> bool {
+    project.coordinator().is_some_and(|current| {
+        current.generation == record.generation
+            && current.socket == record.socket
+            && current.workspace_id == record.workspace_id
+            && current.tab_id == record.tab_id
+            && current.pane_id == record.pane_id
+            && current.cwd == record.cwd
+            && current.closed_by_rolf_at == record.closed_by_rolf_at
+    })
+}
+
+fn accept_restart(project: &Project, record: &Coordinator, state: &mut Recovery) -> Result<()> {
+    // Durable acceptance precedes the incarnation change. Either side of an
+    // interrupted record write can finish this transition without another start.
+    state.restarted = true;
+    save_recovery(project, state)?;
+    project.update_coordinator(|c| {
+        c.generation = record.generation + 1;
+        c.prime_pending = true;
+        c.prime_sent = false;
+        c.bootstrap.clear();
+        c.last_agent_seen_at.clear();
+        c.launch_attempts += 1;
+    })?;
+    state.generation += 1;
+    state.intent.clear();
+    save_recovery(project, state)
 }
 
 /// The digest is a work queue, not an archive.
@@ -380,6 +478,7 @@ pub(crate) struct OpenOptions {
 
 pub(crate) fn open(ctx: &Ctx, slug: &str, options: &OpenOptions) -> Result<()> {
     let project = Project::load(&ctx.root, slug)?;
+    let binding = project.coordinator_lock()?;
     if project.status() == Status::Archived {
         bail!("`{slug}` is archived; run `unarchive {slug}` first");
     }
@@ -399,6 +498,7 @@ pub(crate) fn open(ctx: &Ctx, slug: &str, options: &OpenOptions) -> Result<()> {
 
     // A project belongs to the session it was opened in.
     let mut previous = project.coordinator();
+    let generation = previous.as_ref().map_or(0, |r| r.generation);
     let mut rebound_launch = None;
     if let Some(record) = &previous
         && !record.socket.is_empty()
@@ -456,9 +556,12 @@ pub(crate) fn open(ctx: &Ctx, slug: &str, options: &OpenOptions) -> Result<()> {
         let _ = herdr.agent_focus(&record.pane_id);
         report_tokens(&herdr, slug, &record.pane_id);
         crate::rundown::ensure_tab(&herdr, &record.workspace_id, &ctx.root, slug, &label)?;
-        if options.reprime {
-            deliver_or_defer(&project, &herdr, &agent, &prompt)?;
+        if options.reprime
+            && let Err(error) = deliver_or_defer(&project, &herdr, record, &agent, &prompt, true)
+        {
+            println!("the priming prompt is pending ({error})");
         }
+        drop(binding);
         ticker::start(ctx)?;
         crate::output::insert("workspace_id", record.workspace_id.clone());
         crate::output::insert("pane_id", record.pane_id.clone());
@@ -589,7 +692,6 @@ pub(crate) fn open(ctx: &Ctx, slug: &str, options: &OpenOptions) -> Result<()> {
     // Ids are recorded before the agent is started, so a command killed midway
     // still leaves a record the ticker and a later `open` can act on.
     let name = agent_name(slug);
-    let generation = previous.as_ref().map_or(0, |r| r.generation);
     let record = project.update_coordinator(|c| {
         *c = Coordinator {
             socket: socket.clone(),
@@ -642,7 +744,11 @@ pub(crate) fn open(ctx: &Ctx, slug: &str, options: &OpenOptions) -> Result<()> {
     crate::hook::install(ctx, &project, &launch.kind, &record.pane_id)?;
 
     match start_coordinator(&herdr, &name, &record.pane_id, &launch) {
-        Ok(agent) => deliver_or_defer(&project, &herdr, &agent, &prompt)?,
+        Ok(agent) => {
+            if let Err(error) = deliver_or_defer(&project, &herdr, &record, &agent, &prompt, false) {
+                println!("the priming prompt is pending ({error})");
+            }
+        }
         Err(error) if error.code == "command_failed" => return Err(error.into()),
         Err(error) => println!(
             "the coordinator agent is not ready yet ({error}). If it shows a dialog, answer it in pane {}; the ticker sends the priming prompt once it is ready.",
@@ -651,6 +757,7 @@ pub(crate) fn open(ctx: &Ctx, slug: &str, options: &OpenOptions) -> Result<()> {
     }
     report_tokens(&herdr, slug, &record.pane_id);
     crate::rundown::ensure_tab(&herdr, &record.workspace_id, &ctx.root, slug, &label)?;
+    drop(binding);
     ticker::start(ctx)?;
     crate::output::insert("workspace_id", record.workspace_id.clone());
     crate::output::insert("pane_id", record.pane_id.clone());
@@ -724,39 +831,39 @@ fn sync_label(herdr: &Herdr, workspace_id: &str, label: &str) {
 
 /// Sends the priming prompt now when the agent is ready for one; otherwise
 /// leaves `prime_pending` set so the ticker delivers it. One delivery path.
-fn deliver_or_defer(project: &Project, herdr: &Herdr, agent: &Agent, prompt: &str) -> Result<()> {
-    let sent = agent.ready() && {
-        let _writer = crate::prompt::writer_lock(project)?;
-        if !crate::prompt::coordinator_prompt_clear(project, herdr, &agent.pane_id)? {
-            return project
-                .update_coordinator(|c| {
-                    c.prime_pending = true;
-                    c.prime_sent = false;
-                })
-                .map(|_| ());
-        }
-        crate::prompt::mark_automated_prompt(project, &agent.pane_id, prompt)?;
-        match herdr.agent_prompt(&agent.pane_id, prompt) {
-            Ok(()) => true,
-            Err(error) => {
-                println!("the priming prompt was not accepted ({error})");
-                false
-            }
-        }
-    };
-    // Transport is not the bootstrap receipt: `prime_pending` clears only when
-    // the matching `ha context` call records `bootstrap = acknowledged`.
-    project.update_coordinator(|c| {
-        c.prime_pending = true;
-        c.prime_sent = sent;
-    })?;
-    if sent {
-        println!("priming prompt sent");
-    } else {
-        println!(
-            "priming prompt pending; the ticker sends it when the agent is ready for a prompt"
-        );
+/// Caller holds the coordinator lifecycle lock. Check both incarnation and
+/// priming receipt again after acquiring the shared prompt writer lock.
+pub(crate) fn deliver_or_defer(
+    project: &Project,
+    herdr: &Herdr,
+    record: &Coordinator,
+    agent: &Agent,
+    prompt: &str,
+    reprime: bool,
+) -> Result<()> {
+    let _writer = crate::prompt::writer_lock(project)?;
+    if !current_binding(project, record) || !agent_on_pane(record, agent) {
+        return Ok(());
     }
+    let current = project.coordinator().expect("binding checked under lock");
+    if !reprime && (!current.prime_pending || current.prime_sent) {
+        return Ok(());
+    }
+    if reprime {
+        project.update_coordinator(|c| {
+            c.prime_pending = true;
+            c.prime_sent = false;
+        })?;
+    }
+    if !agent.ready() || !crate::prompt::coordinator_prompt_clear(project, herdr, &record.pane_id)?
+    {
+        return Ok(());
+    }
+    crate::prompt::mark_automated_prompt(project, &record.pane_id, prompt)?;
+    herdr.agent_prompt(&record.pane_id, prompt)?;
+    // Transport is not the bootstrap receipt: only the matching context call
+    // clears prime_pending. Keep the writer lock through this transport receipt.
+    project.update_coordinator(|c| c.prime_sent = true)?;
     Ok(())
 }
 
@@ -1148,13 +1255,20 @@ pub(crate) fn repo_snapshot(runner: &dyn crate::runner::Runner, path: &str) -> S
 /// Retires the coordinator binding and removes only this plugin's hook entry.
 pub(crate) fn close(ctx: &Ctx, slug: &str) -> Result<()> {
     let project = Project::load(&ctx.root, slug)?;
+    let _binding = project.coordinator_lock()?;
     crate::hook::remove(ctx, &project)?;
-    project.update_coordinator(|record| *record = Coordinator::default())?;
+    project.update_coordinator(|record| {
+        *record = Coordinator {
+            generation: record.generation,
+            ..Coordinator::default()
+        };
+    })?;
     println!("closed coordinator binding for `{slug}`");
     Ok(())
 }
 
 fn acknowledge_bootstrap(project: &Project) -> Result<()> {
+    let _binding = project.coordinator_lock()?;
     let Some(record) = project.coordinator() else {
         return Ok(());
     };
@@ -1312,7 +1426,7 @@ mod tests {
 
     #[test]
     fn provider_retry_is_durable_and_repeat_refuses() {
-        use crate::runner::fake::{FakeRunner, ok};
+        use crate::runner::fake::{FakeRunner, fail, ok};
         let world = crate::scenarios::World::new();
         let project = world.project("demo", "a.sock");
         project
@@ -1328,20 +1442,39 @@ mod tests {
             "pane read",
             ok("API Error: 500 Internal Server Error\n❯ \n"),
         );
-        runner.on("agent prompt", ok(r#"{"result":{}}"#));
+        let attempts = std::cell::Cell::new(0);
+        runner.on_fn(
+            |cmd| cmd.display().contains("agent prompt"),
+            move |_| {
+                attempts.set(attempts.get() + 1);
+                Ok(if attempts.get() == 1 {
+                    fail(
+                        1,
+                        r#"{"error":{"code":"agent_blocked","message":"not accepted"}}"#,
+                    )
+                } else {
+                    ok(r#"{"result":{}}"#)
+                })
+            },
+        );
         let herdr = Herdr::new("herdr", &record.socket, &runner);
         recover(&project, &herdr, &record, Some(&agent), true).unwrap();
         assert_eq!(runner.count("agent prompt"), 0);
         let mut saved = recovery(&project, &record);
         saved.retry_at = 0;
         save_recovery(&project, &saved).unwrap();
+        assert!(recover(&project, &herdr, &record, Some(&agent), true).is_err());
+        let rejected = recovery(&project, &record);
+        assert!(!rejected.retried && rejected.intent.is_empty());
+        // Rejection is immediately retryable; only acceptance spends the retry.
         recover(&project, &herdr, &record, Some(&agent), true).unwrap();
         let mut saved = recovery(&project, &record);
         saved.retry_at = 0;
         save_recovery(&project, &saved).unwrap();
         recover(&project, &herdr, &record, Some(&agent), true).unwrap();
-        assert_eq!(runner.count("agent prompt"), 1);
+        assert_eq!(runner.count("agent prompt"), 2);
         assert!(recovery(&project, &record).refused);
+        assert!(recovery(&project, &record).retried);
         assert_eq!(
             inbox::unhandled(&project)
                 .iter()
@@ -1349,6 +1482,311 @@ mod tests {
                 .count(),
             1
         );
+    }
+
+    #[test]
+    fn concurrent_opens_create_one_current_binding() {
+        use crate::runner::fake::{FakeRunner, ok};
+        use std::sync::{
+            Arc, Barrier,
+            atomic::{AtomicBool, AtomicUsize, Ordering},
+        };
+
+        let world = crate::scenarios::World::new();
+        let project = project::create(&world.root, "demo", "", vec![]).unwrap();
+        let socket = world.home.path().join("a.sock");
+        std::fs::write(&socket, b"").unwrap();
+        let cwd = project.canonical_dir().to_string_lossy().into_owned();
+        let agent = serde_json::json!({
+            "pane_id": "w1:p1", "tab_id": "w1:t1", "workspace_id": "w1",
+            "cwd": cwd, "name": agent_name("demo"), "agent_status": "idle"
+        });
+        let start = Arc::new(Barrier::new(3));
+        let created = Arc::new(AtomicUsize::new(0));
+        let running = Arc::new(AtomicBool::new(false));
+        std::thread::scope(|scope| {
+            let mut handles = Vec::new();
+            for _ in 0..2 {
+                let (root, config_dir, env, socket, agent) = (
+                    world.root.clone(),
+                    world.home.path().join("cfg"),
+                    world.env.clone(),
+                    socket.clone(),
+                    agent.clone(),
+                );
+                let (start, created, running) = (start.clone(), created.clone(), running.clone());
+                handles.push(scope.spawn(move || {
+                    let runner = FakeRunner::new();
+                    runner.on("agent start --help", ok("[possible values: pi, claude, cursor, agy]"));
+                    let live = running.clone();
+                    let listed = agent.clone();
+                    runner.on_fn(|cmd| cmd.display().contains("agent list"), move |_| {
+                        Ok(ok(&serde_json::json!({"result": {"agents": if live.load(Ordering::SeqCst) { vec![listed.clone()] } else { vec![] }}}).to_string()))
+                    });
+                    runner.on("pane list", ok(r#"{"result":{"panes":[]}}"#));
+                    runner.on_fn(|cmd| cmd.display().contains("workspace create"), move |_| {
+                        created.fetch_add(1, Ordering::SeqCst);
+                        // Keep the first creation in flight while the other open
+                        // competes for the lifecycle lock, not a stale snapshot.
+                        std::thread::sleep(Duration::from_millis(50));
+                        Ok(ok(r#"{"result":{"root_pane":{"workspace_id":"w1","tab_id":"w1:t1","pane_id":"w1:p1"}}}"#))
+                    });
+                    runner.on_fn(|cmd| cmd.display().contains("agent start"), move |_| {
+                        running.store(true, Ordering::SeqCst);
+                        Ok(ok(&serde_json::json!({"result": {"agent": agent}}).to_string()))
+                    });
+                    for command in ["tab rename", "agent focus", "report-metadata"] {
+                        runner.on(command, ok(r#"{"result":{}}"#));
+                    }
+                    runner.on("agent prompt", ok(r#"{"result":{}}"#));
+                    runner.on("tab list", ok(r#"{"result":{"tabs":[]}}"#));
+                    runner.on("plugin pane open", ok(r#"{"result":{"plugin_pane":{"pane":{"tab_id":"w1:t2"}}}}"#));
+                    let ctx = Ctx { env: &env, root, config_dir, runner: &runner, detached_ticker: false };
+                    start.wait();
+                    open(&ctx, "demo", &OpenOptions {
+                        session: SessionFlags { session: None, socket: Some(socket) },
+                        reprime: false, rebind: false, recipe: None, recipe_basis: None,
+                    }).unwrap();
+                    runner.count("agent prompt")
+                }));
+            }
+            start.wait();
+            assert_eq!(
+                handles
+                    .into_iter()
+                    .map(|h| h.join().unwrap())
+                    .sum::<usize>(),
+                1
+            );
+        });
+        assert_eq!(created.load(Ordering::SeqCst), 1);
+        let binding = project.coordinator().unwrap();
+        assert_eq!(binding.pane_id, "w1:p1");
+        assert_eq!(binding.generation, 1);
+        assert!(binding.prime_pending && binding.prime_sent);
+        let mut interrupted = recovery(&project, &binding);
+        interrupted.intent = "start".into();
+        interrupted.restarted = true;
+        save_recovery(&project, &interrupted).unwrap();
+        close(&world.ctx(), "demo").unwrap();
+        let closed = project.coordinator().unwrap();
+        assert!(closed.pane_id.is_empty());
+        assert_eq!(closed.generation, binding.generation);
+        // Reused ids after close or rebind must still be a new incarnation.
+        world.runner.on("workspace create", ok(r#"{"result":{"root_pane":{"workspace_id":"w1","tab_id":"w1:t1","pane_id":"w1:p1"}}}"#));
+        world.runner.on(
+            "agent start hp-demo-coordinator",
+            crate::runner::fake::timeout(),
+        );
+        world.runner.on("tab rename", ok(r#"{"result":{}}"#));
+        world.runner.on("tab list", ok(r#"{"result":{"tabs":[]}}"#));
+        world.runner.on(
+            "plugin pane open",
+            ok(r#"{"result":{"plugin_pane":{"pane":{"tab_id":"w1:t2"}}}}"#),
+        );
+        let mut options = OpenOptions {
+            session: SessionFlags {
+                session: None,
+                socket: Some(socket.clone()),
+            },
+            reprime: false,
+            rebind: false,
+            recipe: None,
+            recipe_basis: None,
+        };
+        open(&world.ctx(), "demo", &options).unwrap();
+        let reopened = project.coordinator().unwrap();
+        assert_eq!(reopened.generation, 2);
+        assert!(!recovery(&project, &reopened).restarted);
+        std::fs::remove_file(socket).unwrap();
+        options.session.socket = Some(world.home.path().join("b.sock"));
+        options.rebind = true;
+        open(&world.ctx(), "demo", &options).unwrap();
+        assert_eq!(project.coordinator().unwrap().generation, 3);
+    }
+
+    #[test]
+    fn restart_failure_keeps_retry_and_incarnation_until_acceptance() {
+        use crate::runner::fake::{FakeRunner, fail, ok, timeout};
+        for rejected in [
+            fail(
+                1,
+                r#"{"error":{"code":"agent_blocked","message":"not started"}}"#,
+            ),
+            timeout(),
+        ] {
+            let world = crate::scenarios::World::new();
+            let project = world.project("demo", "a.sock");
+            project
+                .update_coordinator(|c| {
+                    c.launch.kind = "claude".into();
+                    c.last_agent_seen_at = project::now();
+                    c.launch_attempts = 1;
+                })
+                .unwrap();
+            let before = project.coordinator().unwrap();
+            let runner = FakeRunner::new();
+            runner.on(
+                "pane process-info",
+                ok(r#"{"result":{"process_info":{"foreground_processes":[]}}}"#),
+            );
+            let attempts = std::cell::Cell::new(0);
+            runner.on_fn(
+                |cmd| cmd.display().contains("agent start"),
+                move |_| {
+                    attempts.set(attempts.get() + 1);
+                    Ok(if attempts.get() == 1 {
+                        rejected.clone()
+                    } else {
+                        ok(r#"{"result":{"agent":{"pane_id":"w1:p1","tab_id":"w1:t1","workspace_id":"w1"}}}"#)
+                    })
+                },
+            );
+            let herdr = Herdr::new("herdr", &before.socket, &runner);
+            recover(&project, &herdr, &before, None, true).unwrap();
+            assert_eq!(project.coordinator().unwrap(), before);
+            assert!(!recovery(&project, &before).restarted);
+            recover(&project, &herdr, &before, None, true).unwrap();
+            let accepted = project.coordinator().unwrap();
+            assert_eq!(accepted.generation, before.generation + 1);
+            assert_eq!(accepted.launch_attempts, 2);
+            assert!(accepted.prime_pending);
+            assert!(recovery(&project, &accepted).restarted);
+            recover(&project, &herdr, &accepted, None, true).unwrap();
+            // An old poll is no longer authorized to mutate this incarnation.
+            recover(&project, &herdr, &before, None, true).unwrap();
+            assert_eq!(runner.count("agent start"), 2);
+        }
+    }
+
+    #[test]
+    fn interrupted_restart_receipts_complete_without_another_start() {
+        use crate::runner::fake::{FakeRunner, ok};
+        // Lost transport reply, interrupted acceptance write, interrupted
+        // incarnation write: each resolves the same accepted restart once.
+        for checkpoint in 0..3 {
+            let world = crate::scenarios::World::new();
+            let project = world.project("demo", "a.sock");
+            project
+                .update_coordinator(|c| {
+                    c.launch.kind = "claude".into();
+                    c.last_agent_seen_at = project::now();
+                    c.launch_attempts = 1;
+                })
+                .unwrap();
+            let before = project.coordinator().unwrap();
+            let mut saved = recovery(&project, &before);
+            saved.intent = "start".into();
+            saved.restarted = checkpoint > 0;
+            save_recovery(&project, &saved).unwrap();
+            if checkpoint == 2 {
+                project
+                    .update_coordinator(|c| {
+                        c.generation += 1;
+                        c.launch_attempts += 1;
+                        c.prime_pending = true;
+                        c.last_agent_seen_at.clear();
+                    })
+                    .unwrap();
+            }
+            let runner = FakeRunner::new();
+            runner.on("pane process-info", ok(r#"{"result":{"process_info":{"foreground_processes":[{"pid":42,"name":"claude"}]}}}"#));
+            let herdr = Herdr::new("herdr", &before.socket, &runner);
+            recover(
+                &project,
+                &herdr,
+                &project.coordinator().unwrap(),
+                None,
+                true,
+            )
+            .unwrap();
+            let accepted = project.coordinator().unwrap();
+            assert_eq!(accepted.generation, before.generation + 1);
+            assert_eq!(accepted.launch_attempts, 2);
+            let saved = recovery(&project, &accepted);
+            assert!(saved.restarted && saved.intent.is_empty());
+            recover(&project, &herdr, &accepted, None, true).unwrap();
+            assert_eq!(runner.count("agent start"), 0);
+        }
+    }
+
+    #[test]
+    fn uncertain_prompt_is_unspent_without_duplicate_delivery() {
+        use crate::runner::fake::{FakeRunner, ok, timeout};
+        let world = crate::scenarios::World::new();
+        let project = world.project("demo", "a.sock");
+        project
+            .update_coordinator(|c| c.launch.kind = "claude".into())
+            .unwrap();
+        let record = project.coordinator().unwrap();
+        let agent = Agent {
+            agent_status: "idle".into(),
+            ..Agent::default()
+        };
+        let runner = FakeRunner::new();
+        runner.on("pane read", ok("API Error: 500\n❯ \n"));
+        runner.on("agent prompt", timeout());
+        let herdr = Herdr::new("herdr", &record.socket, &runner);
+        // Historical recovery records have no intent field.
+        project::write_json(
+            &recovery_path(&project),
+            &serde_json::json!({
+                "pane": record.pane_id, "generation": record.generation,
+                "restarted": false, "fingerprint": "", "retry_at": 0,
+                "retried": false, "refused": false, "unavailable": false
+            }),
+        )
+        .unwrap();
+        assert!(recovery(&project, &record).intent.is_empty());
+        recover(&project, &herdr, &record, Some(&agent), true).unwrap();
+        let mut saved = recovery(&project, &record);
+        saved.retry_at = 0;
+        save_recovery(&project, &saved).unwrap();
+        assert!(recover(&project, &herdr, &record, Some(&agent), true).is_err());
+        assert!(recover(&project, &herdr, &record, Some(&agent), true).is_err());
+        assert_eq!(runner.count("agent prompt"), 1);
+        let saved = recovery(&project, &record);
+        assert!(!saved.retried && saved.intent == "prompt");
+        assert_eq!(
+            inbox::unhandled(&project)
+                .iter()
+                .filter(|i| i.summary.contains("delivery is uncertain"))
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn priming_rechecks_receipt_and_incarnation() {
+        use crate::runner::fake::FakeRunner;
+        let world = crate::scenarios::World::new();
+        let project = world.project("demo", "a.sock");
+        project
+            .update_coordinator(|c| c.prime_pending = true)
+            .unwrap();
+        let record = project.coordinator().unwrap();
+        let agent = Agent {
+            pane_id: record.pane_id.clone(),
+            tab_id: record.tab_id.clone(),
+            workspace_id: record.workspace_id.clone(),
+            cwd: record.cwd.clone(),
+            agent_status: "idle".into(),
+            ..Agent::default()
+        };
+        let runner = FakeRunner::new();
+        let herdr = Herdr::new("herdr", &record.socket, &runner);
+        let _binding = project.coordinator_lock().unwrap();
+        project.update_coordinator(|c| c.prime_sent = true).unwrap();
+        deliver_or_defer(&project, &herdr, &record, &agent, "prime", false).unwrap();
+        project
+            .update_coordinator(|c| {
+                c.generation += 1;
+                c.prime_sent = false;
+            })
+            .unwrap();
+        deliver_or_defer(&project, &herdr, &record, &agent, "prime", false).unwrap();
+        assert_eq!(runner.count("agent prompt"), 0);
+        assert!(!project.coordinator().unwrap().prime_sent);
     }
 
     #[test]

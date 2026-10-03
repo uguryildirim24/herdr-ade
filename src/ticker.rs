@@ -2634,6 +2634,7 @@ pub(crate) fn socket_inode(path: &std::path::Path) -> u64 {
 /// Returns `Ok(None)` when the project's session cannot be reached: then no
 /// state is read, so nothing is ever reported as gone.
 fn tick_cheap(ctx: &Ctx, project: &Project, refresh_tokens: bool) -> Result<Option<Seen>> {
+    let binding = project.coordinator_lock()?;
     let Some(record) = project.coordinator() else {
         return Ok(None);
     };
@@ -2698,21 +2699,23 @@ fn tick_cheap(ctx: &Ctx, project: &Project, refresh_tokens: bool) -> Result<Opti
             } else {
                 coordinator::priming_prompt(&prefix, slug)
             };
-            let _writer = crate::prompt::writer_lock(project)?;
-            if crate::prompt::coordinator_prompt_clear(project, &herdr, &record.pane_id)? {
-                crate::prompt::mark_automated_prompt(project, &record.pane_id, &prompt)?;
-                match herdr.agent_prompt(&record.pane_id, &prompt) {
-                    Ok(()) => {
-                        project.update_coordinator(|c| c.prime_sent = true)?;
-                    }
-                    Err(error) => first_error = Some(anyhow::anyhow!("priming prompt: {error}")),
-                }
+            if let Err(error) =
+                coordinator::deliver_or_defer(project, &herdr, &record, agent, &prompt, false)
+            {
+                first_error = Some(error.context("priming prompt"));
             }
         }
         if refresh_tokens {
             coordinator::report_tokens(&herdr, slug, &record.pane_id);
         }
     }
+
+    let pane_alive = panes.iter().any(|p| coordinator::pane_matches(&record, p));
+    let inode = socket_inode(Path::new(&record.socket));
+    if pane_alive && inode != 0 && record.server_socket_inode != inode {
+        project.update_coordinator(|c| c.server_socket_inode = inode)?;
+    }
+    drop(binding);
 
     if let Err(error) = crate::threads::retry_pending_cleanup(ctx, project) {
         eprintln!("note: pending cleanup will retry: {error:#}");
@@ -2743,11 +2746,6 @@ fn tick_cheap(ctx: &Ctx, project: &Project, refresh_tokens: bool) -> Result<Opti
     }
     // The ops pass (A2) and the reviews pass (A3) run in the slow pass,
     // outside the project lock (SPEC-ADE item 57).
-    let pane_alive = panes.iter().any(|p| coordinator::pane_matches(&record, p));
-    let inode = socket_inode(Path::new(&record.socket));
-    if pane_alive && inode != 0 && record.server_socket_inode != inode {
-        project.update_coordinator(|c| c.server_socket_inode = inode)?;
-    }
     // A reused pane id after a server restart is not the original process.
     let bound_pane =
         pane_alive && (record.server_socket_inode == 0 || record.server_socket_inode == inode);
