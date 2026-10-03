@@ -958,10 +958,6 @@ fn build_plan(ctx: &Ctx, project: &Project, github: bool) -> Result<DeleteIntent
         }
     }
     for repo in &owned {
-        // Never remove the record (and its completion journal) before the last step.
-        if Path::new(&project.dir()).starts_with(&repo.path) {
-            bail!("repo overlaps project record: {}", repo.path);
-        }
         add_trash(
             ctx,
             &mut steps,
@@ -1031,14 +1027,18 @@ fn build_plan(ctx: &Ctx, project: &Project, github: bool) -> Result<DeleteIntent
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
         Err(e) => return Err(e.into()),
     }
+    let record = std::fs::canonicalize(project.dir())?;
+    let journal = std::fs::canonicalize(ctx.root.join(".deletions"))?;
     for step in &steps {
         if let DeleteStep::Trash { path, machine, .. } = step
             && machine.is_empty()
         {
-            if project.dir().starts_with(path) {
+            // Identity pins the inode; containment must resolve aliases too.
+            let target = std::fs::canonicalize(path).unwrap_or_else(|_| PathBuf::from(path));
+            if record.starts_with(&target) {
                 bail!("planned target would remove the project record before completion: {path}");
             }
-            if deletion_path(&ctx.root, &project.slug).starts_with(path) {
+            if journal.starts_with(&target) {
                 bail!("planned target would remove the deletion journal: {path}");
             }
         }
@@ -1963,6 +1963,9 @@ mod tests {
         assert_eq!(trash_calls(&world), 0);
         assert_eq!(project.status(), Status::Archived);
         assert!(persisted(&world, "demo").completed.contains("0"));
+        // A start that passed its initial active check before deletion must
+        // recheck after acquiring the allocation lock, even after a failed effect.
+        assert!(thread::allocate(&project, |_| {}).is_err());
         assert!(
             set_status(&world.ctx(), "demo", Status::Active)
                 .unwrap_err()
@@ -2500,6 +2503,17 @@ mod tests {
                 .to_string()
                 .contains("remove the deletion journal")
         );
+        assert_eq!(trash_calls(&world), 0);
+        assert_eq!(world.runner.count("workspace close"), 0);
+    }
+
+    #[test]
+    fn noncanonical_parent_target_cannot_remove_record_or_journal() {
+        let world = World::new();
+        let project = world.project("demo", "a.sock");
+        world.add_repo(&project, world.root.join("demo/..").to_str().unwrap());
+        mock_trash(&world);
+        assert!(delete(&world.ctx(), "demo", false, true).is_err());
         assert_eq!(trash_calls(&world), 0);
         assert_eq!(world.runner.count("workspace close"), 0);
     }

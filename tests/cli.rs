@@ -74,6 +74,16 @@ fn ticker_status_reports_the_installed_image_and_actual_lock_holder() {
     std::fs::create_dir(root.join("demo")).unwrap();
     std::fs::write(root.join("demo/PROJECT.md"), "").unwrap();
     assert_eq!(status()["ticker"]["state"], "unknown");
+    std::fs::remove_file(root.join("demo/PROJECT.md")).unwrap();
+    std::fs::create_dir(root.join("demo/PROJECT.md")).unwrap();
+    let unknown = status();
+    assert_eq!(unknown["ticker"]["state"], "unknown");
+    assert!(
+        unknown["ticker"]["reason"]
+            .as_str()
+            .unwrap()
+            .contains("not a project file")
+    );
 }
 
 #[test]

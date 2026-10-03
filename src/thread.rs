@@ -634,6 +634,13 @@ pub(crate) fn update_checked(
 /// Allocates the next id under the project lock and writes the first record.
 pub(crate) fn allocate(project: &Project, fill: impl FnOnce(&mut Thread)) -> Result<Thread> {
     let _lock = project.lock()?;
+    let status = project.status();
+    if status != crate::project::Status::Active {
+        bail!(
+            "`{}` is {status}; new work is refused until it is active again",
+            project.slug
+        );
+    }
     let next = list(project)
         .iter()
         .filter_map(|t| t.id.strip_prefix("t-")?.parse::<u32>().ok())

@@ -3657,7 +3657,7 @@ fn report_destinations(report: &str) -> Vec<(std::ops::Range<usize>, String)> {
             .unwrap()
             .0;
         found.push((
-            markdown_destination_range(report, def.span.start + label_end + 2, &def.dest),
+            markdown_destination_range(report, def.span.start, def.span.start + label_end + 2),
             def.dest.to_string(),
         ));
     }
@@ -3692,7 +3692,7 @@ fn report_destinations(report: &str) -> Vec<(std::ops::Range<usize>, String)> {
                 // code in labels cannot be mistaken for the destination.
                 let start = child_end + report[child_end..span.end].find("](").unwrap() + 2;
                 found.push((
-                    markdown_destination_range(report, start, &dest),
+                    markdown_destination_range(report, span.start, start),
                     dest.to_string(),
                 ));
             }
@@ -3722,18 +3722,23 @@ fn report_destinations(report: &str) -> Vec<(std::ops::Range<usize>, String)> {
 /// delimiters intact. Recognition, code exclusion and decoding belong to Parser.
 fn markdown_destination_range(
     report: &str,
+    source_start: usize,
     mut start: usize,
-    dest: &pulldown_cmark::CowStr<'_>,
 ) -> std::ops::Range<usize> {
-    // Unescaped destinations borrow the exact input token, including in lists
-    // and blockquotes whose continuation prefixes are absent from the URL.
-    if let pulldown_cmark::CowStr::Borrowed(raw) = dest {
-        let offset = raw.as_ptr() as usize - report.as_ptr() as usize;
-        return offset..offset + raw.len();
-    }
     let bytes = report.as_bytes();
+    // Skip parser-validated blockquote prefixes on continuation lines.
+    let line_start = report[..source_start].rfind('\n').map_or(0, |i| i + 1);
+    let quotes = report[line_start..source_start].matches('>').count();
     while bytes.get(start).is_some_and(u8::is_ascii_whitespace) {
         start += 1;
+        if bytes[start - 1] == b'\n' {
+            for _ in 0..quotes {
+                while matches!(bytes.get(start), Some(b' ' | b'\t')) {
+                    start += 1;
+                }
+                start += usize::from(bytes.get(start) == Some(&b'>'));
+            }
+        }
     }
     let angle = bytes.get(start) == Some(&b'<');
     start += usize::from(angle);
@@ -5765,8 +5770,7 @@ mod tests {
             for (name, bytes) in contents {
                 std::fs::write(root.join(name), bytes).unwrap();
             }
-            let report =
-                "Screenshots: [library](<library/#shots> \"title\") `![literal](missing.png)`\n";
+            let report = "Screenshots: [library](<library/#shots> \"title\") `![literal](missing.png)`\n\n> [refs]:\n> library/&#35;shots \"reference title\"\n>\n> [refs]\n";
             std::fs::write(root.join("report.md"), report).unwrap();
             seal_linked_report(&project, &lane, report);
             world
@@ -5807,7 +5811,7 @@ mod tests {
             assert_eq!(
                 library_report,
                 format!(
-                    "Screenshots: [library](<../../.state/artifacts/{index_hash}#shots> \"title\") `![literal](missing.png)`\n"
+                    "Screenshots: [library](<../../.state/artifacts/{index_hash}#shots> \"title\") `![literal](missing.png)`\n\n> [refs]:\n> ../../.state/artifacts/{index_hash}#shots \"reference title\"\n>\n> [refs]\n"
                 )
             );
             assert_eq!(
@@ -5817,7 +5821,7 @@ mod tests {
             );
             assert!(rewritten.contains("#shots"));
             if remote {
-                assert_eq!(world.runner.count("manifest.append"), 2);
+                assert_eq!(world.runner.count("manifest.append"), 4);
             }
         }
     }
@@ -6142,6 +6146,35 @@ mod tests {
                 "<img\r\n SRC=KEPT href=\"KEPT\">",
             ),
             ("> [x]:\n> a.png\n\n> [x]\n", "> [x]:\n> KEPT\n\n> [x]\n"),
+            (
+                "[]() ![x]() [x](<> \"title\")",
+                "[](KEPT) ![x](KEPT) [x](<KEPT> \"title\")",
+            ),
+            (
+                "> [r]:\n> a&amp;b.png\n\n> [r]\n",
+                "> [r]:\n> KEPT\n\n> [r]\n",
+            ),
+            (
+                "> > [r]:\n> > a&amp;b.png\n\n> > [r]\n",
+                "> > [r]:\n> > KEPT\n\n> > [r]\n",
+            ),
+            (
+                "- > [r]:\n  > a\\(b\\).png\n\n  > [r]\n",
+                "- > [r]:\n  > KEPT\n\n  > [r]\n",
+            ),
+            ("> [x](\n> a&amp;b.png)", "> [x](\n> KEPT)"),
+            (
+                "> <img\r\n> src='a&amp;b.png'>\r\n",
+                "> <img\r\n> src='KEPT'>\r\n",
+            ),
+            (
+                "[outer ![inner][r]](out.png)\n\n[r]: in.png\n",
+                "[outer ![inner][r]](KEPT)\n\n[r]: KEPT\n",
+            ),
+            (
+                "<script>\n<img src='hidden.png'>\n</script>\n<img src='real.png'>",
+                "<script>\n<img src='hidden.png'>\n</script>\n<img src='KEPT'>",
+            ),
         ] {
             let mut rewritten = report.to_string();
             for (range, dest) in report_destinations(report).into_iter().rev() {

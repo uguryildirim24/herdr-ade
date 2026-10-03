@@ -5125,7 +5125,6 @@ mod tests {
         use crate::contracts::{DonePayload, Event, EventPayload, Recipient};
         let world = crate::scenarios::World::new();
         let project = world.project("demo", "a.sock");
-        project.set_status(Status::Paused).unwrap();
         let lane = thread::allocate(&project, |t| {
             t.status = thread::Status::Open;
             t.machine = "box".into();
@@ -5135,6 +5134,7 @@ mod tests {
             t.workspace_id = "w2".into();
         })
         .unwrap();
+        project.set_status(Status::Paused).unwrap();
         let report = b"finished on the box\n";
         let artifact = thread::sha256_hex(report);
         let event = Event {

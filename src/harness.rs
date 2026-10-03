@@ -257,12 +257,24 @@ pub(crate) fn observation(root: &Path) -> Observation {
                 reason: "ticker lock has no complete build record".into(),
             },
         },
-        crate::ticker::LockState::Free if crate::project::list_slugs(root).is_empty() => {
-            TickerProof::NotRequired
+        crate::ticker::LockState::Free => {
+            let (projects, errors) = crate::project::list_slugs_with_errors(root);
+            if !errors.is_empty() {
+                TickerProof::Unknown {
+                    reason: errors
+                        .iter()
+                        .map(|error| format!("{error:#}"))
+                        .collect::<Vec<_>>()
+                        .join("; "),
+                }
+            } else if projects.is_empty() {
+                TickerProof::NotRequired
+            } else {
+                TickerProof::Unknown {
+                    reason: "ticker lock is free".into(),
+                }
+            }
         }
-        crate::ticker::LockState::Free => TickerProof::Unknown {
-            reason: "ticker lock is free".into(),
-        },
         crate::ticker::LockState::Unknown(reason) => TickerProof::Unknown { reason },
     };
     Observation {
