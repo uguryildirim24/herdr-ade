@@ -416,8 +416,11 @@ impl Project {
             root: root.to_path_buf(),
             slug: slug.to_string(),
         };
-        if !project.project_md().is_file() {
-            bail!("no project `{slug}` in {}", root.display());
+        let path = project.project_md();
+        let metadata = std::fs::metadata(&path)
+            .with_context(|| format!("could not load project {}", path.display()))?;
+        if !metadata.is_file() {
+            bail!("{} is not a project file", path.display());
         }
         Ok(project)
     }
@@ -699,17 +702,70 @@ impl LaunchEnv {
 /// Slugs of the projects in `root`: folders that contain `PROJECT.md`. Entries
 /// whose names start with a dot are ignored. A missing root has no projects.
 pub(crate) fn list_slugs(root: &Path) -> Vec<String> {
-    let Ok(entries) = std::fs::read_dir(root) else {
-        return Vec::new();
+    list_slugs_with_errors(root).0
+}
+
+/// Partial discovery retains failures alongside healthy projects. NotFound is
+/// normal on first setup or when an authorized delete removes a record.
+pub(crate) fn list_slugs_with_errors(root: &Path) -> (Vec<String>, Vec<anyhow::Error>) {
+    let entries = match std::fs::read_dir(root) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return (Vec::new(), Vec::new());
+        }
+        Err(error) => {
+            return (
+                Vec::new(),
+                vec![
+                    anyhow::Error::new(error)
+                        .context(format!("could not discover projects in {}", root.display())),
+                ],
+            );
+        }
     };
-    let mut slugs: Vec<String> = entries
-        .flatten()
-        .filter_map(|entry| entry.file_name().into_string().ok())
-        .filter(|name| !name.starts_with('.') && validate_slug(name).is_ok())
-        .filter(|name| root.join(name).join("PROJECT.md").is_file())
-        .collect();
+    let mut slugs = Vec::new();
+    let mut errors = Vec::new();
+    for entry in entries {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(error) => {
+                errors.push(
+                    anyhow::Error::new(error)
+                        .context(format!("could not read directory {}", root.display())),
+                );
+                continue;
+            }
+        };
+        let Ok(name) = entry.file_name().into_string() else {
+            continue;
+        };
+        if name.starts_with('.') || validate_slug(&name).is_err() {
+            continue;
+        }
+        // Non-directory files at the root are not projects.
+        match entry.file_type() {
+            Ok(kind) if !kind.is_dir() && !kind.is_symlink() => continue,
+            Err(error) => {
+                errors.push(
+                    anyhow::Error::new(error)
+                        .context(format!("could not inspect {}", entry.path().display())),
+                );
+                continue;
+            }
+            _ => {}
+        }
+        let path = entry.path().join("PROJECT.md");
+        match std::fs::metadata(&path) {
+            Ok(metadata) if metadata.is_file() => slugs.push(name),
+            Ok(_) => errors.push(anyhow::anyhow!("{} is not a project file", path.display())),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => errors.push(
+                anyhow::Error::new(error).context(format!("could not inspect {}", path.display())),
+            ),
+        }
+    }
     slugs.sort();
-    slugs
+    (slugs, errors)
 }
 
 /// `PATH[@MACHINE]` as given to `new --repo`.

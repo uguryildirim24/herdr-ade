@@ -1020,9 +1020,25 @@ fn report_with_checks(
         ),
     }
 
-    if root.is_dir() {
-        let count = project::list_slugs(root).len();
-        check(&mut out, Some(true), "root", format!("{count} project(s)"));
+    let (slugs, discovery_errors) = project::list_slugs_with_errors(root);
+    if !discovery_errors.is_empty() {
+        check(
+            &mut out,
+            Some(false),
+            "root",
+            discovery_errors
+                .iter()
+                .map(|error| format!("{error:#}"))
+                .collect::<Vec<_>>()
+                .join("; "),
+        );
+    } else if root.is_dir() {
+        check(
+            &mut out,
+            Some(true),
+            "root",
+            format!("{} project(s)", slugs.len()),
+        );
     } else {
         check(
             &mut out,
@@ -1032,13 +1048,15 @@ fn report_with_checks(
         );
     }
 
-    match crate::ticker::lock_state(root) {
-        crate::ticker::LockState::Free => check(&mut out, None, "ticker", "not running".into()),
-        crate::ticker::LockState::Held(info) => {
-            let (status, detail) = ticker_folder_check(&info);
-            check(&mut out, status, "ticker", detail);
+    let (mut status, mut detail) = crate::ticker::health_report(root);
+    if let crate::ticker::LockState::Held(info) = crate::ticker::lock_state(root) {
+        let (folder_ok, folder_detail) = ticker_folder_check(&info);
+        if folder_ok == Some(false) {
+            status = Some(false);
         }
+        detail.push_str(&format!("; {folder_detail}"));
     }
+    check(&mut out, status, "ticker", detail);
 
     if cfg!(target_os = "macos") {
         let supervisor_loaded = crate::harness::ticker_supervisor_loaded();

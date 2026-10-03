@@ -64,6 +64,118 @@ struct Progress {
     started: String,
     sequence: u64,
     step: String,
+    #[serde(default)]
+    updated: String,
+}
+
+#[derive(Default, Serialize, Deserialize)]
+struct Health {
+    observed: String,
+    projects: usize,
+    failures: Vec<String>,
+}
+
+thread_local! {
+    // Validation keeps only stamps, not a second copy of lane history. Failed
+    // snapshots are retried, including repairs which do not change the directory.
+    static OBSERVATION_RECORDS: std::cell::RefCell<crate::record_cache::Records<()>> =
+        std::cell::RefCell::new(crate::record_cache::Records::default());
+}
+
+fn health_path(root: &Path) -> PathBuf {
+    root.join(".ticker.health")
+}
+
+impl Health {
+    fn failure(&mut self, root: &Path, log: &Log, detail: String) {
+        log.line(&detail);
+        self.failures.push(detail);
+        // Publish immediately: a later blocked step must not hide this failure.
+        self.publish(root, log);
+    }
+
+    fn publish(&self, root: &Path, log: &Log) {
+        if let Err(error) = project::write_json(&health_path(root), self) {
+            log.line(&format!("could not publish root health: {error:#}"));
+        }
+    }
+}
+
+fn read_evidence<T: serde::de::DeserializeOwned>(path: &Path) -> Result<T> {
+    let text = std::fs::read_to_string(path)
+        .with_context(|| format!("could not read {}", path.display()))?;
+    serde_json::from_str(&text).with_context(|| format!("{} does not parse", path.display()))
+}
+
+/// A held lock is process ownership, not proof of progress. Old progress
+/// records still load, but without a timestamp their responsiveness is unknown.
+fn progress_health(root: &Path, info: &Info) -> (Option<bool>, String) {
+    let progress = match read_evidence::<Progress>(&progress_path(root)) {
+        Ok(progress) if progress.pid == info.pid && progress.started == info.started => progress,
+        Ok(_) => {
+            return (
+                None,
+                "responsiveness unknown: progress belongs to another run".into(),
+            );
+        }
+        Err(error) => return (None, format!("responsiveness unknown: {error:#}")),
+    };
+    let detail = format!("sequence {}, step {}", progress.sequence, progress.step);
+    let Ok(updated) = progress.updated.parse::<jiff::Timestamp>() else {
+        return (
+            None,
+            format!("responsiveness unknown: {detail}; no progress timestamp"),
+        );
+    };
+    let age = jiff::Timestamp::now()
+        .as_second()
+        .saturating_sub(updated.as_second());
+    if age > INSTALL_REPLACE_WAIT.as_secs() as i64 {
+        (
+            Some(false),
+            format!("stalled: {detail}; no progress for {age}s; lock still held"),
+        )
+    } else if age < 0 {
+        (
+            None,
+            format!("responsiveness unknown: {detail}; progress timestamp is in the future"),
+        )
+    } else {
+        (
+            Some(true),
+            format!("recent progress: {detail}; observed {age}s ago"),
+        )
+    }
+}
+
+pub(crate) fn health_report(root: &Path) -> (Option<bool>, String) {
+    let (mut healthy, mut detail) = match lock_state(root) {
+        LockState::Free => (None, "not running (lock released)".into()),
+        LockState::Unknown(error) => (Some(false), format!("ownership unknown: {error}")),
+        LockState::Held(info) => progress_health(root, &info),
+    };
+    match read_evidence::<Health>(&health_path(root)) {
+        Ok(health) => {
+            detail.push_str(&format!(
+                "; last observation {}: {} project(s)",
+                health.observed, health.projects
+            ));
+            if !health.failures.is_empty() {
+                healthy = Some(false);
+                detail.push_str(&format!(
+                    "; missing observations: {}",
+                    health.failures.join("; ")
+                ));
+            }
+        }
+        Err(error) => {
+            if healthy == Some(true) {
+                healthy = None;
+            }
+            detail.push_str(&format!("; observations unknown: {error:#}"));
+        }
+    }
+    (healthy, detail)
 }
 
 fn current_progress(root: &Path, info: &Info) -> Option<Progress> {
@@ -125,16 +237,23 @@ pub(crate) struct Info {
 pub(crate) enum LockState {
     Free,
     Held(Info),
+    Unknown(String),
 }
 
 /// Probes the lock without keeping it. The file is never created here.
 pub(crate) fn lock_state(root: &Path) -> LockState {
-    let Ok(mut file) = File::options().read(true).write(true).open(lock_path(root)) else {
-        return LockState::Free;
+    let path = lock_path(root);
+    let mut file = match File::options().read(true).write(true).open(&path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return LockState::Free,
+        Err(error) => return LockState::Unknown(format!("{}: {error}", path.display())),
     };
     match file.try_lock() {
         Ok(()) => LockState::Free,
-        Err(_) => {
+        Err(std::fs::TryLockError::Error(error)) => {
+            LockState::Unknown(format!("{}: {error}", path.display()))
+        }
+        Err(std::fs::TryLockError::WouldBlock) => {
             let mut text = String::new();
             let _ = file.read_to_string(&mut text);
             LockState::Held(serde_json::from_str(&text).unwrap_or_default())
@@ -164,6 +283,7 @@ fn decide_start(lock: &LockState, my_version: &str) -> StartAction {
             StartAction::Nothing
         }
         LockState::Held(_) => StartAction::StopThenSpawn,
+        LockState::Unknown(_) => StartAction::Nothing,
     }
 }
 
@@ -174,14 +294,39 @@ fn decide_start(lock: &LockState, my_version: &str) -> StartAction {
 /// start` and installation replace a stale-version ticker when it can stop.
 pub(crate) fn ensure(ctx: &Ctx) -> Result<()> {
     let root = &ctx.root;
-    if !ctx.detached_ticker || project::list_slugs(root).is_empty() || install_in_progress(ctx) {
+    if !ctx.detached_ticker || install_in_progress(ctx) {
+        return Ok(());
+    }
+    let (slugs, errors) = project::list_slugs_with_errors(root);
+    if !errors.is_empty() {
+        let log = Log {
+            path: log_path(root),
+        };
+        let mut health = Health {
+            observed: project::now(),
+            projects: slugs.len(),
+            ..Health::default()
+        };
+        for error in errors {
+            health.failure(root, &log, format!("{error:#}"));
+        }
+        // Do not turn failed discovery into an empty-root success. Even with
+        // no readable projects, start the normal loop so it can retry.
+    } else if slugs.is_empty() && lock_state(root) == LockState::Free {
         return Ok(());
     }
     ensure_free(
         root,
         std::env::var_os("HERDR_ADE_TICKER_SUPERVISOR").is_some(),
         spawn,
-    )
+    )?;
+    let (healthy, detail) = health_report(root);
+    if healthy == Some(false) {
+        // Degraded discovery must stay visible without blocking healthy
+        // projects' commands or declaring the process dead.
+        eprintln!("ticker health: {detail}");
+    }
+    Ok(())
 }
 
 fn ensure_free(
@@ -189,7 +334,18 @@ fn ensure_free(
     supervised: bool,
     spawn_ticker: impl FnOnce(&Path) -> Result<()>,
 ) -> Result<()> {
-    if lock_state(root) == LockState::Free {
+    match lock_state(root) {
+        LockState::Unknown(error) => bail!("ticker ownership unknown: {error}"),
+        LockState::Held(info) => {
+            let (healthy, detail) = progress_health(root, &info);
+            if healthy != Some(true) {
+                bail!("ticker ensure: {detail}; keeping the existing lock holder");
+            }
+            return Ok(());
+        }
+        LockState::Free => {}
+    }
+    {
         // Only the launchd interval records an unattended outage. The lock,
         // not the interval or this snapshot, still decides who runs the loop.
         if supervised {
@@ -244,6 +400,7 @@ fn start_for_install_with_wait(ctx: &Ctx, wait: Duration) -> Result<()> {
                 .map(|progress| progress.step)
                 .unwrap_or_else(|| "unknown (ticker has no progress record)".into()),
             LockState::Free => "unknown (lock released)".into(),
+            LockState::Unknown(error) => error,
         };
         bail!(
             "ticker replacement timed out: stalled after {} seconds without progress in step {step}; stop request remains active; lock state: {:?}",
@@ -278,6 +435,9 @@ fn start_inner_with_wait(ctx: &Ctx, wait: Duration, install: bool) -> Result<boo
         }
         std::thread::sleep(Duration::from_millis(25));
         state = lock_state(root);
+    }
+    if let LockState::Unknown(error) = &state {
+        bail!("ticker ownership unknown: {error}");
     }
     match decide_start(&state, crate::VERSION) {
         StartAction::Nothing => {
@@ -459,6 +619,7 @@ fn request_stop_with_progress_on(
                 }
             }
             LockState::Held(_) => {}
+            LockState::Unknown(error) => bail!("ticker ownership unknown: {error}"),
         }
         if now() >= deadline {
             break;
@@ -480,10 +641,11 @@ pub(crate) fn stop(root: &Path) -> Result<()> {
 }
 
 pub(crate) fn status(root: &Path) -> Result<()> {
+    let (_, detail) = health_report(root);
+    println!("ticker: {detail}");
     match lock_state(root) {
-        LockState::Free => println!("ticker: not running (root {})", root.display()),
+        LockState::Free | LockState::Unknown(_) => {}
         LockState::Held(info) => {
-            println!("ticker: running");
             println!("  version: {}", info.version);
             println!("  pid:     {}", info.pid);
             println!("  root:    {}", info.root);
@@ -622,13 +784,22 @@ pub(crate) fn run(ctx: &Ctx) -> Result<()> {
             info.started
         );
         log.line(&notice);
-        for slug in project::list_slugs(root) {
-            if let Ok(project) = Project::load(root, &slug)
+        let (slugs, errors) = project::list_slugs_with_errors(root);
+        let mut health = Health {
+            observed: project::now(),
+            projects: slugs.len(),
+            ..Health::default()
+        };
+        for error in errors {
+            health.failure(root, &log, format!("{error:#}"));
+        }
+        for slug in slugs {
+            if let Some(project) = load_for_tick(root, &slug, &mut health, &log)
                 && project.status() == Status::Active
                 && let Err(error) =
                     inbox::write(&project, "ticker-unavailable", "ticker", &notice, "")
             {
-                log.line(&format!("{slug}: recovery notice: {error:#}"));
+                health.failure(root, &log, format!("{slug}: recovery notice: {error:#}"));
             }
         }
     }
@@ -640,6 +811,7 @@ pub(crate) fn run(ctx: &Ctx) -> Result<()> {
     let mut step = |name: &str| {
         progress.sequence += 1;
         progress.step = name.to_string();
+        progress.updated = jiff::Timestamp::now().to_string();
         if let Err(error) = project::write_json(&progress_path(root), &progress) {
             log.line(&format!("could not publish ticker progress: {error:#}"));
         }
@@ -691,10 +863,21 @@ fn tick_with_steps(
     memory: &mut Memory,
     step: &mut impl FnMut(&str) -> bool,
 ) -> Option<bool> {
+    let mut health = Health {
+        observed: project::now(),
+        ..Health::default()
+    };
+    if !step("project discovery") {
+        return None;
+    }
     let (_awake, slept) = match crate::awake::enter(&ctx.root, true) {
         Ok(clock) => clock,
         Err(error) => {
-            log.line(&format!("awake clock: {error:#}; deferring pass"));
+            health.failure(
+                &ctx.root,
+                log,
+                format!("awake clock: {error:#}; deferring pass"),
+            );
             return Some(false);
         }
     };
@@ -707,16 +890,57 @@ fn tick_with_steps(
     memory.machine_views.clear();
     // Import box seals before local timers or waiting starts are considered.
     // A dark wake must not turn missing connectivity into lane state changes.
-    let projects: Vec<Project> = project::list_slugs(&ctx.root)
-        .iter()
-        .filter_map(|slug| Project::load(&ctx.root, slug).ok())
-        .collect();
+    let (slugs, errors) = project::list_slugs_with_errors(&ctx.root);
+    health.projects = slugs.len();
+    for error in errors {
+        health.failure(&ctx.root, log, format!("{error:#}"));
+    }
+    let mut projects = Vec::new();
+    for slug in slugs {
+        let Some(project) = load_for_tick(&ctx.root, &slug, &mut health, log) else {
+            continue;
+        };
+        // A partial lane list must not look like an idle project. Defer only
+        // this project; do not mutate unreadable records or create new work.
+        let (_, errors) = OBSERVATION_RECORDS.with(|records| {
+            records
+                .borrow_mut()
+                .read(thread::threads_dir(&project), |id| {
+                    thread::load(&project, id).map(|_| ()).with_context(|| {
+                        format!(
+                            "could not observe {}",
+                            thread::threads_dir(&project)
+                                .join(format!("{id}.toml"))
+                                .display()
+                        )
+                    })
+                })
+        });
+        let errors: Vec<_> = errors
+            .into_iter()
+            .filter(|error| !is_not_found(error))
+            .collect();
+        if !errors.is_empty() {
+            for error in errors {
+                health.failure(
+                    &ctx.root,
+                    log,
+                    format!(
+                        "{}: lane records: {error:#}",
+                        thread::threads_dir(&project).display()
+                    ),
+                );
+            }
+            continue;
+        }
+        projects.push(project);
+    }
     let project_refs: Vec<&Project> = projects.iter().collect();
     if !step("machine phase") {
         return None;
     }
     for error in machine_passes_with_steps(ctx, &project_refs, memory, log, step)? {
-        log.line(&format!("{error:#}"));
+        health.failure(&ctx.root, log, format!("{error:#}"));
     }
     // An offline box defers its projects, not unrelated projects whose
     // machines answered. Retain this decision during courier backoff too.
@@ -740,21 +964,33 @@ fn tick_with_steps(
         })
         .map(|project| project.slug.clone())
         .collect();
+    for slug in &deferred {
+        health.failure(
+            &ctx.root,
+            log,
+            format!("{slug}: session unavailable: remote machine observation deferred"),
+        );
+    }
     if !projects.is_empty()
         && deferred.len() == projects.len()
         && projects
             .iter()
             .all(|project| project.status() == Status::Active)
     {
+        health.publish(&ctx.root, log);
+        if !step("pass complete") {
+            return None;
+        }
         return Some(true);
     }
     let mut reachable = Vec::new();
     let mut readiness = BTreeMap::new();
-    for slug in project::list_slugs(&ctx.root) {
+    for discovered in &projects {
+        let slug = discovered.slug.clone();
         if !step(&format!("cheap project {slug}")) {
             return None;
         }
-        let Ok(project) = Project::load(&ctx.root, &slug) else {
+        let Some(project) = load_for_tick(&ctx.root, &slug, &mut health, log) else {
             continue;
         };
         if project.status() != Status::Active {
@@ -769,36 +1005,42 @@ fn tick_with_steps(
             continue;
         }
         if !resume_provider_starts(ctx, &project, &mut readiness, |error| {
-            log.line(&format!("{slug}: {error:#}"));
+            health.failure(&ctx.root, log, format!("{slug}: {error:#}"));
         }) {
             deferred.insert(slug);
             continue;
         }
-        match tick_cheap(
+        match tick_cheap_observed(
             ctx,
             &project,
             memory.tick == 1 || memory.tick.is_multiple_of(8),
+            &mut |detail| health.failure(&ctx.root, log, detail),
         ) {
             Ok(Some(seen)) => reachable.push((project, seen)),
             Ok(None) => {}
-            Err(error) => log.line(&format!("{slug}: {error:#}")),
+            Err(error) => health.failure(
+                &ctx.root,
+                log,
+                format!("{}: {error:#}", project.dir().display()),
+            ),
         }
     }
     // Courier imports sealed events and their report artifacts together.
     // Check reviews now, before remote state, launches, or plan work can
     // delay them. A lost local coordinator socket must not hide a box seal.
-    for slug in project::list_slugs(&ctx.root) {
+    for discovered in &projects {
+        let slug = &discovered.slug;
         if !step(&format!("reviews {slug}")) {
             return None;
         }
-        let Ok(project) = Project::load(&ctx.root, &slug) else {
+        let Some(project) = load_for_tick(&ctx.root, slug, &mut health, log) else {
             continue;
         };
         if project.status() == Status::Active
-            && !deferred.contains(&slug)
+            && !deferred.contains(slug)
             && let Err(error) = crate::review::tick(ctx, &project)
         {
-            log.line(&format!("{slug}: reviews: {error:#}"));
+            health.failure(&ctx.root, log, format!("{slug}: reviews: {error:#}"));
         }
     }
     if !step("slow phase") {
@@ -808,15 +1050,43 @@ fn tick_with_steps(
         if !step(&format!("slow project {}", project.slug)) {
             return None;
         }
+        if load_for_tick(&ctx.root, &project.slug, &mut health, log).is_none() {
+            continue;
+        }
         let (errors, completed) = tick_slow_with_steps(ctx, project, seen, memory, step);
         for error in errors {
-            log.line(&format!("{}: {error:#}", project.slug));
+            health.failure(&ctx.root, log, format!("{}: {error:#}", project.slug));
         }
         if !completed {
             return None;
         }
     }
+    health.publish(&ctx.root, log);
+    if !step("pass complete") {
+        return None;
+    }
     Some(!reachable.is_empty() || !deferred.is_empty())
+}
+
+fn load_for_tick(root: &Path, slug: &str, health: &mut Health, log: &Log) -> Option<Project> {
+    match Project::load(root, slug) {
+        Ok(project) => Some(project),
+        // An authorized deletion can race any phase. It is absence, not a
+        // broken observation, and no writer here may recreate that project.
+        Err(error) if is_not_found(&error) => None,
+        Err(error) => {
+            health.failure(root, log, format!("{error:#}"));
+            None
+        }
+    }
+}
+
+fn is_not_found(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        cause
+            .downcast_ref::<std::io::Error>()
+            .is_some_and(|error| error.kind() == std::io::ErrorKind::NotFound)
+    })
 }
 
 fn record_failed_observation(entries: &[(Project, Vec<thread::Thread>)], detail: &str, log: &Log) {
@@ -2636,20 +2906,58 @@ pub(crate) fn socket_inode(path: &std::path::Path) -> u64 {
 
 /// Returns `Ok(None)` when the project's session cannot be reached: then no
 /// state is read, so nothing is ever reported as gone.
+#[cfg(test)]
 fn tick_cheap(ctx: &Ctx, project: &Project, refresh_tokens: bool) -> Result<Option<Seen>> {
+    tick_cheap_observed(ctx, project, refresh_tokens, &mut |_| {})
+}
+
+fn tick_cheap_observed(
+    ctx: &Ctx,
+    project: &Project,
+    refresh_tokens: bool,
+    unavailable: &mut impl FnMut(String),
+) -> Result<Option<Seen>> {
     let binding = project.coordinator_lock()?;
-    let Some(record) = project.coordinator() else {
-        return Ok(None);
+    let path = project.state_dir().join("coordinator.json");
+    let record: project::Coordinator = match read_evidence(&path) {
+        Ok(record) => record,
+        Err(error) if is_not_found(&error) => {
+            unavailable(format!(
+                "{}: session unavailable: no coordinator binding",
+                path.display()
+            ));
+            return Ok(None);
+        }
+        Err(error) => return Err(error),
     };
     if record.socket.is_empty() || !Path::new(&record.socket).exists() {
+        unavailable(format!(
+            "{}: session unavailable: coordinator socket {} is absent",
+            project.dir().display(),
+            record.socket
+        ));
         return Ok(None);
     }
     let herdr = Herdr::new(ctx.env.herdr_bin(), &record.socket, ctx.runner);
-    let Ok(agents) = herdr.agent_list() else {
-        return Ok(None);
+    let agents = match herdr.agent_list() {
+        Ok(agents) => agents,
+        Err(error) => {
+            unavailable(format!(
+                "session unavailable: {}: agent list: {error:#}",
+                record.socket
+            ));
+            return Ok(None);
+        }
     };
-    let Ok(panes) = herdr.pane_list() else {
-        return Ok(None);
+    let panes = match herdr.pane_list() {
+        Ok(panes) => panes,
+        Err(error) => {
+            unavailable(format!(
+                "session unavailable: {}: pane list: {error:#}",
+                record.socket
+            ));
+            return Ok(None);
+        }
     };
     let slug = &project.slug;
     let prefix = coordinator::current_prefix(&ctx.root)?;
@@ -3222,6 +3530,287 @@ fn tick_slow_with_steps(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn missing_observations_name_the_path_while_another_project_advances() {
+        use crate::scenarios::{World, agent_json};
+        for fault in ["discovery", "load", "directory", "record"] {
+            let world = World::new();
+            let healthy = world.project("healthy", "a.sock");
+            let broken = world.project("broken", "b.sock");
+            *world.panes.borrow_mut() = format!("[{}]", world.coordinator_pane(&healthy));
+            *world.agents.borrow_mut() = format!(
+                "[{}]",
+                agent_json(
+                    "w1",
+                    "w1:t1",
+                    "w1:p1",
+                    &healthy.canonical_dir().to_string_lossy(),
+                    "hp-healthy-coordinator",
+                    "idle"
+                )
+            );
+            let path = match fault {
+                "discovery" | "load" => broken.project_md(),
+                "directory" => thread::threads_dir(&broken),
+                _ => thread::threads_dir_for_write(&broken)
+                    .unwrap()
+                    .join("t-0001.toml"),
+            };
+            match fault {
+                "discovery" => {
+                    std::fs::remove_file(&path).unwrap();
+                    // ELOOP is deterministic, including when tests run as root.
+                    std::os::unix::fs::symlink("PROJECT.md", &path).unwrap();
+                }
+                "directory" => std::fs::write(&path, "not a directory").unwrap(),
+                "record" => std::fs::write(&path, "not = [valid TOML").unwrap(),
+                _ => {}
+            }
+            let ctx = world.ctx();
+            let log = Log {
+                path: log_path(&world.root),
+            };
+            let mut memory = Memory::new(&ctx);
+            let mut injected = false;
+            assert_eq!(
+                tick_with_steps(&ctx, &log, &mut memory, &mut |step| {
+                    if fault == "load" && step == "cheap project broken" && !injected {
+                        std::fs::remove_file(&path).unwrap();
+                        std::fs::create_dir(&path).unwrap();
+                        injected = true;
+                    }
+                    true
+                }),
+                Some(true)
+            );
+            assert!(
+                !healthy.coordinator().unwrap().last_agent_seen_at.is_empty(),
+                "{fault}: healthy coordinator did not advance"
+            );
+            let health: Health = read_evidence(&health_path(&world.root)).unwrap();
+            assert!(
+                health
+                    .failures
+                    .iter()
+                    .any(|failure| failure.contains(&path.display().to_string())),
+                "{fault}: {:?}",
+                health.failures
+            );
+            let (status, text) = health_report(&world.root);
+            assert_eq!(status, Some(false), "{text}");
+            assert!(text.contains(&path.display().to_string()), "{text}");
+            assert!(
+                std::fs::read_to_string(log_path(&world.root))
+                    .unwrap()
+                    .contains(&path.display().to_string())
+            );
+            // Reading root health does not require loading the broken project.
+            if fault == "discovery" || fault == "load" {
+                assert!(Project::load(&world.root, "broken").is_err());
+            }
+        }
+    }
+
+    #[test]
+    fn repaired_lane_records_clear_the_failure_on_the_next_observation() {
+        let world = crate::scenarios::World::new();
+        let project = world.project("demo", "a.sock");
+        let lane =
+            thread::allocate(&project, |lane| lane.status = thread::Status::Resolved).unwrap();
+        let path = thread::threads_dir(&project).join(format!("{}.toml", lane.id));
+        let original = std::fs::read_to_string(&path).unwrap();
+        std::fs::write(&path, "bad = [").unwrap();
+        let ctx = world.ctx();
+        let mut memory = Memory::new(&ctx);
+        tick_for_test(&ctx, &mut memory);
+        let health: Health = read_evidence(&health_path(&world.root)).unwrap();
+        assert!(
+            health
+                .failures
+                .iter()
+                .any(|failure| failure.contains("does not parse"))
+        );
+        // In-place repair changes the file, not the directory stamp.
+        std::fs::write(&path, original).unwrap();
+        tick_for_test(&ctx, &mut memory);
+        let health: Health = read_evidence(&health_path(&world.root)).unwrap();
+        assert!(
+            !health
+                .failures
+                .iter()
+                .any(|failure| failure.contains("does not parse"))
+        );
+    }
+
+    #[test]
+    fn deletion_between_discovery_and_work_does_not_resurrect_records() {
+        let world = crate::scenarios::World::new();
+        let project = world.project("demo", "a.sock");
+        thread::allocate(&project, |_| {}).unwrap();
+        let ctx = world.ctx();
+        let mut memory = Memory::new(&ctx);
+        let log = Log {
+            path: log_path(&world.root),
+        };
+        assert_eq!(
+            tick_with_steps(&ctx, &log, &mut memory, &mut |step| {
+                if step == "cheap project demo" {
+                    std::fs::remove_dir_all(project.dir()).unwrap();
+                }
+                true
+            }),
+            Some(false)
+        );
+        assert!(!project.dir().exists());
+        let health: Health = read_evidence(&health_path(&world.root)).unwrap();
+        assert!(health.failures.is_empty(), "{:?}", health.failures);
+        assert!(project::list_slugs_with_errors(&world.root).0.is_empty());
+    }
+
+    #[test]
+    fn empty_roots_and_unreadable_roots_are_not_the_same_observation() {
+        let home = tempfile::tempdir().unwrap();
+        let root = home.path().join("root");
+        let (slugs, errors) = project::list_slugs_with_errors(&root);
+        assert!(slugs.is_empty() && errors.is_empty());
+        std::fs::create_dir(&root).unwrap();
+        let (slugs, errors) = project::list_slugs_with_errors(&root);
+        assert!(slugs.is_empty() && errors.is_empty());
+        std::fs::remove_dir(&root).unwrap();
+        std::fs::write(&root, "not a directory").unwrap();
+        let (slugs, errors) = project::list_slugs_with_errors(&root);
+        assert!(slugs.is_empty());
+        assert_eq!(errors.len(), 1);
+        assert!(format!("{:#}", errors[0]).contains(&root.display().to_string()));
+    }
+
+    #[test]
+    fn an_unavailable_session_is_visible_without_declaring_its_lane_gone() {
+        let world = crate::scenarios::World::new();
+        let project = world.project("demo", "a.sock");
+        let lane = thread::allocate(&project, |lane| lane.status = thread::Status::Open).unwrap();
+        std::fs::remove_file(project.coordinator().unwrap().socket).unwrap();
+        let ctx = world.ctx();
+        let mut memory = Memory::new(&ctx);
+        assert!(!tick_for_test(&ctx, &mut memory));
+        assert_eq!(
+            thread::load(&project, &lane.id).unwrap().status,
+            thread::Status::Open
+        );
+        let health: Health = read_evidence(&health_path(&world.root)).unwrap();
+        assert!(
+            health.failures.iter().any(
+                |failure| failure.contains("session unavailable") && failure.contains("a.sock")
+            )
+        );
+    }
+
+    #[test]
+    fn same_version_stall_recent_progress_and_released_lock_are_distinct() {
+        let root = tempfile::tempdir().unwrap();
+        let info = Info {
+            version: crate::VERSION.into(),
+            pid: 123,
+            started: "this-run".into(),
+            ..Info::default()
+        };
+        let mut holder = File::options()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(lock_path(root.path()))
+            .unwrap();
+        holder.lock().unwrap();
+        holder
+            .write_all(serde_json::to_string(&info).unwrap().as_bytes())
+            .unwrap();
+        let mut progress = Progress {
+            pid: info.pid,
+            started: info.started.clone(),
+            sequence: 4,
+            step: "cheap project demo".into(),
+            updated: jiff::Timestamp::from_second(
+                jiff::Timestamp::now().as_second() - INSTALL_REPLACE_WAIT.as_secs() as i64 - 1,
+            )
+            .unwrap()
+            .to_string(),
+        };
+        project::write_json(&progress_path(root.path()), &progress).unwrap();
+        project::write_json(
+            &health_path(root.path()),
+            &Health {
+                observed: project::now(),
+                ..Health::default()
+            },
+        )
+        .unwrap();
+        let (status, detail) = health_report(root.path());
+        assert_eq!(status, Some(false));
+        assert!(
+            detail.contains("stalled") && detail.contains("sequence 4"),
+            "{detail}"
+        );
+        let mut spawned = false;
+        let error = ensure_free(root.path(), false, |_| {
+            spawned = true;
+            Ok(())
+        })
+        .unwrap_err();
+        assert!(error.to_string().contains("stalled"));
+        assert!(!spawned && !stop_path(root.path()).exists());
+        progress.sequence += 1;
+        progress.step = "pass complete".into();
+        progress.updated = jiff::Timestamp::now().to_string();
+        project::write_json(&progress_path(root.path()), &progress).unwrap();
+        assert_eq!(health_report(root.path()).0, Some(true));
+        ensure_free(root.path(), false, |_| {
+            spawned = true;
+            Ok(())
+        })
+        .unwrap();
+        assert!(!spawned);
+        // Historical progress remains readable, but cannot prove responsiveness.
+        std::fs::write(
+            progress_path(root.path()),
+            r#"{"pid":123,"started":"this-run","sequence":5,"step":"pass complete"}"#,
+        )
+        .unwrap();
+        assert!(
+            health_report(root.path())
+                .1
+                .contains("responsiveness unknown")
+        );
+        holder.unlock().unwrap();
+        assert!(
+            health_report(root.path())
+                .1
+                .contains("not running (lock released)")
+        );
+        ensure_free(root.path(), true, |_| {
+            spawned = true;
+            Ok(())
+        })
+        .unwrap();
+        assert!(spawned);
+    }
+
+    #[test]
+    fn an_unreadable_lock_never_authorizes_a_competing_ticker() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir(lock_path(root.path())).unwrap();
+        assert!(matches!(lock_state(root.path()), LockState::Unknown(_)));
+        let mut spawned = false;
+        assert!(
+            ensure_free(root.path(), false, |_| {
+                spawned = true;
+                Ok(())
+            })
+            .is_err()
+        );
+        assert!(!spawned);
+        assert!(health_report(root.path()).1.contains("ownership unknown"));
+    }
 
     #[test]
     fn sleep_does_not_expire_provider_progress_or_outage_timers() {
@@ -5037,7 +5626,8 @@ mod tests {
             .unwrap();
         file.lock().unwrap();
         file.write_all(br#"{"version":"old","pid":1}"#).unwrap();
-        ensure(&ctx).unwrap();
+        let error = ensure(&ctx).unwrap_err().to_string();
+        assert!(error.contains("responsiveness unknown"), "{error}");
         assert!(!stop_path(&root).exists(), "ensure writes no stop file");
         drop(file);
     }
@@ -5060,11 +5650,12 @@ mod tests {
             .open(lock_path(path))
             .unwrap();
         file.lock().unwrap();
-        ensure_free(path, false, |_| {
+        let error = ensure_free(path, false, |_| {
             starts += 1;
             Ok(())
         })
-        .unwrap();
+        .unwrap_err();
+        assert!(error.to_string().contains("responsiveness unknown"));
         assert_eq!(starts, 1);
     }
 
@@ -5094,7 +5685,7 @@ mod tests {
         file.write_all(br#"{"version":"v9","pid":1}"#).unwrap();
         match lock_state(root.path()) {
             LockState::Held(info) => assert_eq!(info.version, "v9"),
-            LockState::Free => panic!("lock should be held"),
+            state => panic!("lock should be held: {state:?}"),
         }
         drop(file);
         // Another test may fork a child at this instant; until that child execs,
@@ -5186,6 +5777,7 @@ mod tests {
                 started: "pass-1".into(),
                 sequence: 4,
                 step: "machine oci".into(),
+                ..Progress::default()
             },
         )
         .unwrap();
@@ -5235,6 +5827,7 @@ mod tests {
             started: info.started.clone(),
             sequence: 1,
             step: "cheap project demo".into(),
+            ..Progress::default()
         };
         project::write_json(&progress_path(root.path()), &progress).unwrap();
         let path = progress_path(root.path());
@@ -6060,7 +6653,9 @@ mod tests {
             .unwrap();
         }
         let changed = measure(&mut memory);
-        assert_eq!(changed, (4, 0));
+        // Four changed live records are read by the work snapshot and by the
+        // stamp-only health validator; settled history is not opened again.
+        assert_eq!(changed, (8, 0));
         println!(
             "3000 settled + 4 live: old scan pattern {before_threads} thread / {before_events} event opens; warm full pass {idle:?}; four changed live records {changed:?}"
         );

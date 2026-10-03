@@ -421,7 +421,13 @@ fn ticker_start_before_the_first_project_confirms_a_running_loop() {
     );
     assert!(created.status.success());
     for status in [before, after] {
-        assert!(String::from_utf8_lossy(&status.stdout).contains("ticker: running"));
+        let text = String::from_utf8_lossy(&status.stdout);
+        assert!(text.contains("pid:"), "{text}");
+        assert!(
+            text.contains("recent progress") || text.contains("responsiveness unknown"),
+            "{text}"
+        );
+        assert!(!text.contains("not running (lock released)"), "{text}");
     }
     assert!(!home.path().join(".config").exists());
 }
