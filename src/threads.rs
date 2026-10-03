@@ -1224,7 +1224,6 @@ fn place_ade_worktree(
     let branch = thread::branch_name(&project.slug, &record.id, &record.title);
     let task = std::fs::read_to_string(thread::task_path(project, &record.id)).unwrap_or_default();
     let planned = Path::new(&record.repo).join(".worktrees").join(&record.id);
-    crate::claude_trust::check_folder(ctx, &record.launch.kind, record.is_remote(), &planned)?;
     let stub = Thread {
         thread_dir: thread::thread_dir(&planned.to_string_lossy(), &project.slug, &record.id),
         ..record.clone()
@@ -7441,16 +7440,24 @@ mod tests {
     }
 
     #[test]
-    fn claude_and_agy_picks_use_the_mac_without_box_readiness_checks() {
+    fn untrusted_managed_claude_worktree_and_agy_use_the_mac_without_box_readiness_checks() {
         let (fx, _remote) = box_fixture();
         write_config(
             &fx,
             &format!("{ROUTED_BOX_CONFIG}{}", crate::remote::TEST_MACHINE),
         );
         stub_box(&fx);
+        let config = fx.world.home.path().join(".claude.json");
+        std::fs::write(&config, r#"{"projects":{}}"#).unwrap();
         let repo = Some(fx.repo.to_string_lossy().into_owned());
         let claude = start(&fx.world.ctx(), "demo", start_args(repo.clone(), None)).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(config).unwrap(),
+            r#"{"projects":{}}"#
+        );
         assert_eq!(claude.launch.recipe_id, "test_claude");
+        assert_eq!(claude.kind, Kind::Worktree);
+        assert!(!claude.worktree_path.is_empty());
         assert!(claude.machine.is_empty());
         assert_eq!(claude.launch.machine, "local");
 
