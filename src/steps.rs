@@ -14,6 +14,8 @@ use crate::project::{self, Project};
 use crate::thread::{self, Status, Thread};
 use crate::{events, inbox};
 
+pub(crate) mod goal_check;
+
 pub(crate) const TICKER_PROMPT_PREFIX: &str =
     "[herdr-ade ticker: automated, not the user, approves nothing]";
 pub(crate) const DONE_RETENTION_DAYS: u64 = 30;
@@ -166,6 +168,7 @@ fn prime_unread(ctx: &Ctx, project: &Project) -> Result<()> {
             line: &line,
             event: None,
             digest: Some(cursor.revision),
+            goal: None,
         }),
         wake_now(),
     )? {
@@ -275,12 +278,6 @@ pub(crate) struct State {
     pub(crate) session_item_written: bool,
     /// Coordinator pane whose live lanes were last reconciled by the ticker.
     pub(crate) lanes_parented_to: String,
-    /// One plan nudge per idle stretch. A new lane, plan revision or human
-    /// request re-arms it, even when the lane finished between ticker passes.
-    pub(crate) plan_nudged: bool,
-    pub(crate) plan_revision: u64,
-    pub(crate) plan_lane_ids: Vec<String>,
-    pub(crate) plan_request: String,
 }
 
 pub(crate) fn load_state(project: &Project) -> State {
@@ -542,6 +539,7 @@ fn deliver_notice(ctx: &Ctx, project: &Project, event: &crate::contracts::Event)
             line: &line,
             event: Some(&event.id),
             digest: None,
+            goal: None,
         }),
         wake_now(),
     )? && !crate::events::states(project, &event.id)?
@@ -566,12 +564,14 @@ struct NoticeBatch {
     events: Vec<String>,
     wake_lines: Vec<String>,
     digests: Vec<u64>,
+    goals: Vec<(String, String)>,
 }
 
 struct NoticeInput<'a> {
     line: &'a str,
     event: Option<&'a str>,
     digest: Option<u64>,
+    goal: Option<&'a str>,
 }
 
 fn batch_path(project: &Project) -> std::path::PathBuf {
@@ -592,6 +592,27 @@ pub(crate) fn deliver_coordinator_prompt(
     coordinator_notice_at(project, herdr, pane, Some(line), wake_now())
 }
 
+pub(crate) fn deliver_goal_check(
+    project: &Project,
+    herdr: &Herdr<'_>,
+    pane: &str,
+    token: &str,
+    line: &str,
+) -> Result<bool> {
+    coordinator_enqueue_at(
+        project,
+        herdr,
+        pane,
+        Some(NoticeInput {
+            line,
+            event: None,
+            digest: None,
+            goal: Some(token),
+        }),
+        wake_now(),
+    )
+}
+
 fn coordinator_notice_at(
     project: &Project,
     herdr: &Herdr<'_>,
@@ -607,6 +628,7 @@ fn coordinator_notice_at(
             line,
             event: None,
             digest: None,
+            goal: None,
         }),
         now,
     )
@@ -621,10 +643,11 @@ fn coordinator_enqueue_at(
 ) -> Result<bool> {
     let _writer = crate::prompt::writer_lock(project)?;
     let Some(agent) = herdr.agent_list()?.into_iter().find(|a| {
-        project
-            .coordinator()
-            .is_some_and(|c| c.pane_id == pane && crate::coordinator::agent_matches(&c, a))
-            && a.promptable()
+        project.coordinator().is_some_and(|c| {
+            c.closed_by_rolf_at.is_empty()
+                && c.pane_id == pane
+                && crate::coordinator::agent_matches(&c, a)
+        }) && a.promptable()
     }) else {
         return Ok(false);
     };
@@ -634,7 +657,7 @@ fn coordinator_enqueue_at(
     }
     let path = batch_path(project);
     let mut batch: NoticeBatch = project::read_json(&path).unwrap_or_default();
-    if let Some(notice) = notice
+    if let Some(notice) = notice.as_ref().filter(|n| n.goal.is_none())
         && notice
             .event
             .is_none_or(|id| !batch.events.iter().any(|old| old == id))
@@ -653,8 +676,35 @@ fn coordinator_enqueue_at(
         }
         save_batch(project, &batch)?;
     }
-    if !batch.lines.is_empty() && (!agent.ready() || now.saturating_sub(batch.first_at) >= 120) {
-        let text = batch.lines.join("\n");
+    if let Some(notice) = notice.as_ref()
+        && let Some(token) = notice.goal
+    {
+        if batch.lines.is_empty() && batch.goals.is_empty() {
+            batch.first_at = now;
+        }
+        if !batch.goals.iter().any(|(old, _)| old == token) {
+            batch.goals.push((token.into(), notice.line.into()));
+            save_batch(project, &batch)?;
+        }
+        goal_check::queued(project, token)?;
+    }
+    let before = batch.goals.len();
+    batch
+        .goals
+        .retain(|(token, _)| goal_check::current(project, token));
+    if batch.goals.len() != before {
+        save_batch(project, &batch)?;
+    }
+    if (!batch.lines.is_empty() || !batch.goals.is_empty())
+        && (!agent.ready() || now.saturating_sub(batch.first_at) >= 120)
+    {
+        let text = batch
+            .lines
+            .iter()
+            .chain(batch.goals.iter().map(|(_, line)| line))
+            .cloned()
+            .collect::<Vec<_>>()
+            .join("\n");
         crate::prompt::mark_automated_prompt(project, pane, &text)?;
         if let Err(error) = herdr.agent_prompt(pane, &text) {
             // Acceptance into the outbox is durable even if transport fails.
@@ -680,6 +730,10 @@ fn coordinator_enqueue_at(
                 project::write_json(&wake_path(project), &cursor)?;
             }
         }
+        for (token, line) in &batch.goals {
+            goal_check::delivered(project, token, &agent, now)?;
+            record_wake(project, line)?;
+        }
         for line in &batch.wake_lines {
             record_wake(project, line)?;
         }
@@ -693,7 +747,9 @@ pub(crate) fn flush_coordinator_notices(ctx: &Ctx, project: &Project) -> Result<
     let Some(c) = project.coordinator() else {
         return Ok(());
     };
-    if project::read_json::<NoticeBatch>(&batch_path(project)).is_none_or(|b| b.lines.is_empty()) {
+    if project::read_json::<NoticeBatch>(&batch_path(project))
+        .is_none_or(|b| b.lines.is_empty() && b.goals.is_empty())
+    {
         return Ok(());
     }
     let herdr = Herdr::new(ctx.env.herdr_bin(), &c.socket, ctx.runner);

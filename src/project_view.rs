@@ -373,12 +373,39 @@ impl View {
         }
         let mut seal_rows = BTreeMap::new();
         let mut needs_you = Vec::new();
+        if let Some(line) = crate::steps::goal_check::attention(project) {
+            needs_you.push(line);
+        }
+        let explicit_parties: BTreeMap<_, _> = crate::steps::goal_check::load(project)
+            .waits
+            .into_iter()
+            .flat_map(|(wait, _)| match wait {
+                crate::steps::goal_check::Disposition::Wait { tasks, party, .. } => tasks
+                    .into_iter()
+                    .flat_map(move |id| {
+                        crate::task::load(project, &id)
+                            .ok()
+                            .into_iter()
+                            .flat_map(|task| task.attempts)
+                            .map(|id| (id, party.clone()))
+                            .collect::<Vec<_>>()
+                    })
+                    .collect::<Vec<_>>(),
+                _ => vec![],
+            })
+            .collect();
         let mut work = Vec::new();
         for row in lanes
             .iter()
             .filter(|row| history == Some(usize::MAX) || row.group != Group::Resolved)
         {
             let t = &row.thread;
+            let personal_wait = |text: &str| {
+                explicit_parties.get(&t.id).map_or_else(
+                    || personal_wait(text),
+                    |party| party.eq_ignore_ascii_case("Rolf"),
+                )
+            };
             if (t.status == Status::Failed
                 || !t.provider_wait_started.is_empty()
                 || row.group == Group::WaitingOnYou)
