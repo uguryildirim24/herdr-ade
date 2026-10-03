@@ -518,105 +518,120 @@ pub(crate) fn counts(project: &Project) -> Result<(usize, usize)> {
     ))
 }
 
-/// `ha plan show [--json]`. Missing returns revision zero and `present:
-/// false`; a normal call reports a goal that drifted from `PROJECT.md`.
-pub(crate) fn show(ctx: &Ctx, slug: &str, json: bool) -> Result<String> {
+/// One evidence snapshot for both the Rundown `data.result` and human view.
+pub(crate) struct Show {
+    plan: Plan,
+    present: bool,
+    goal: String,
+    tasks: Vec<crate::task::Task>,
+    holds: BTreeMap<String, FailedCheckHold>,
+}
+
+pub(crate) fn show(ctx: &Ctx, slug: &str) -> Result<Show> {
     let project = Project::load(&ctx.root, slug)?;
-    let mut plan = load(&project)?;
+    let loaded = load(&project)?;
+    let present = loaded.is_some();
+    let goal = project_goal(&project);
+    let mut plan = loaded.unwrap_or_else(|| Plan {
+        schema: 1,
+        goal: goal.clone(),
+        ..Plan::default()
+    });
     let evidence = crate::task::EvidenceSnapshot::load(&project);
-    if let Some(card) = &mut plan {
-        project_states_with_evidence(&project, card, &evidence);
-    }
-    let holds = plan
-        .as_ref()
-        .map(|card| failed_check_holds(&project, card, &evidence))
-        .unwrap_or_default();
-    if json {
-        let view = match &plan {
-            Some(plan) => {
-                let mut value = serde_json::to_value(plan)?;
-                value["present"] = serde_json::json!(true);
-                for step in value["steps"].as_array_mut().into_iter().flatten() {
-                    add_hold_json(step, &holds);
-                    if let Some(subtasks) = step
-                        .get_mut("subtasks")
-                        .and_then(|value| value.as_array_mut())
-                    {
-                        for sub in subtasks {
-                            add_hold_json(sub, &holds);
-                        }
-                    }
+    project_states_with_evidence(&project, &mut plan, &evidence);
+    let holds = failed_check_holds(&project, &plan, &evidence);
+    Ok(Show {
+        plan,
+        present,
+        goal,
+        tasks: crate::task::list_with_errors(&project).0,
+        holds,
+    })
+}
+
+impl serde::Serialize for Show {
+    fn serialize<S: serde::Serializer>(
+        &self,
+        serializer: S,
+    ) -> std::result::Result<S::Ok, S::Error> {
+        use serde::ser::Error;
+        let mut value = serde_json::to_value(&self.plan).map_err(S::Error::custom)?;
+        value["present"] = self.present.into();
+        for step in value["steps"].as_array_mut().into_iter().flatten() {
+            add_hold_json(step, &self.holds);
+            if let Some(subtasks) = step
+                .get_mut("subtasks")
+                .and_then(|value| value.as_array_mut())
+            {
+                for sub in subtasks {
+                    add_hold_json(sub, &self.holds);
                 }
-                value
             }
-            None => serde_json::json!({
-                "present": false,
-                "schema": 1,
-                "revision": 0,
-                "next_step": 0,
-                "goal": project_goal(&project),
-                "does": "",
-                "steps": [],
-            }),
-        };
-        return Ok(format!("{}\n", serde_json::to_string_pretty(&view)?));
+        }
+        serde::Serialize::serialize(&value, serializer)
     }
-    let Some(plan) = plan else {
-        return Ok("no plan is written down yet (revision 0)\n".into());
-    };
-    let mut out = String::new();
-    out.push_str(&format!("revision {}\n", plan.revision));
-    if plan.goal != project_goal(&project) {
-        out.push_str("goal: differs from PROJECT.md; run `plan set` to copy it again\n");
-    }
-    out.push_str(&format!("goal: {}\n", plan.goal));
-    let outcome = format!("{} {}", plan.what_you_get, plan.does);
-    let outcome = outcome.trim();
-    out.push_str(&format!(
-        "what you get at the end: {}\n",
-        if outcome.is_empty() {
-            "not written down yet"
-        } else {
-            outcome
+}
+
+impl Show {
+    pub(crate) fn message(&self) -> String {
+        if !self.present {
+            return "no plan is written down yet (revision 0)\n".into();
         }
-    ));
-    out.push_str("steps:\n");
-    if plan.steps.is_empty() {
-        out.push_str("  (none)\n");
-    }
-    for (indent, step) in plan.steps.iter().flat_map(|s| {
-        std::iter::once(("  ", s)).chain(s.subtasks.iter().map(|sub| ("      ", sub)))
-    }) {
-        let mut refs = String::new();
-        let linked_tasks: Vec<String> = crate::task::list_with_errors(&project)
-            .0
-            .into_iter()
-            .filter(|task| {
-                task.plan_step.as_deref() == Some(step.id.as_str()) || step.tasks.contains(&task.id)
-            })
-            .map(|task| task.id)
-            .collect();
-        if !linked_tasks.is_empty() {
-            refs.push_str(&format!(" tasks {}", linked_tasks.join(", ")));
+        let plan = &self.plan;
+        let mut out = format!("revision {}\n", plan.revision);
+        if plan.goal != self.goal {
+            out.push_str("goal: differs from PROJECT.md; run `plan set` to copy it again\n");
         }
-        if !step.threads.is_empty() {
-            refs.push_str(&format!(" threads {}", step.threads.join(", ")));
-        }
-        if !step.after.is_empty() {
-            refs.push_str(&format!(" after {}", step.after.join(", ")));
-        }
+        out.push_str(&format!("goal: {}\n", plan.goal));
+        let outcome = format!("{} {}", plan.what_you_get, plan.does);
+        let outcome = outcome.trim();
         out.push_str(&format!(
-            "{indent}{:<7} {}  {}{}\n",
-            step.state.word(),
-            step.id,
-            step.text,
-            refs
+            "what you get at the end: {}\n",
+            if outcome.is_empty() {
+                "not written down yet"
+            } else {
+                outcome
+            }
         ));
-        if let Some(hold) = holds.get(&step.id) {
-            out.push_str(&format!("{indent}  {}\n", hold.message()));
+        out.push_str("steps:\n");
+        if plan.steps.is_empty() {
+            out.push_str("  (none)\n");
         }
+        for (indent, step) in plan.steps.iter().flat_map(|s| {
+            std::iter::once(("  ", s)).chain(s.subtasks.iter().map(|sub| ("      ", sub)))
+        }) {
+            let mut refs = String::new();
+            let linked_tasks: Vec<String> = self
+                .tasks
+                .iter()
+                .filter(|task| {
+                    task.plan_step.as_deref() == Some(step.id.as_str())
+                        || step.tasks.contains(&task.id)
+                })
+                .map(|task| task.id.clone())
+                .collect();
+            for (label, ids) in [
+                ("tasks", &linked_tasks),
+                ("threads", &step.threads),
+                ("after", &step.after),
+            ] {
+                if !ids.is_empty() {
+                    refs.push_str(&format!(" {label} {}", ids.join(", ")));
+                }
+            }
+            out.push_str(&format!(
+                "{indent}{:<7} {}  {}{}\n",
+                step.state.word(),
+                step.id,
+                step.text,
+                refs
+            ));
+            if let Some(hold) = self.holds.get(&step.id) {
+                out.push_str(&format!("{indent}  {}\n", hold.message()));
+            }
+        }
+        out
     }
-    Ok(out)
 }
 
 /// Check current evidence, never the persisted state, before a task launches.
@@ -1140,6 +1155,36 @@ mod tests {
     }
 
     #[test]
+    fn show_renders_one_snapshot_and_preserves_the_missing_card_contract() {
+        let fx = fixture();
+        let ctx = fx.world.ctx();
+        let missing = show(&ctx, "demo").unwrap();
+        assert_eq!(
+            serde_json::to_value(&missing).unwrap(),
+            serde_json::json!({
+                "present": false, "schema": 1, "revision": 0, "next_step": 0,
+                "goal": project_goal(&fx.project), "does": "", "steps": []
+            })
+        );
+        assert_eq!(
+            missing.message(),
+            "no plan is written down yet (revision 0)\n"
+        );
+        set(&ctx, "demo", "First outcome", None).unwrap();
+        add(&fx, "First step", 1);
+        let snapshot = show(&ctx, "demo").unwrap();
+        let message = snapshot.message();
+        let data = serde_json::to_value(&snapshot).unwrap();
+        set(&ctx, "demo", "New outcome", None).unwrap();
+        step_edit(&ctx, "demo", "s-1", "New step", None).unwrap();
+        assert_eq!(snapshot.message(), message);
+        assert_eq!(serde_json::to_value(&snapshot).unwrap(), data);
+        assert!(message.contains("First outcome") && message.contains("First step"));
+        assert_eq!(data["steps"][0]["text"], "First step");
+        assert_eq!(data["does"], "First outcome");
+    }
+
+    #[test]
     fn omitted_expect_uses_locked_revision_and_json_shows_it() {
         let fx = fixture();
         set(&fx.world.ctx(), "demo", "It shows the result.", None).unwrap();
@@ -1154,7 +1199,7 @@ mod tests {
         .unwrap();
         assert_eq!(plan.revision, 2);
         let json: serde_json::Value =
-            serde_json::from_str(&show(&fx.world.ctx(), "demo", true).unwrap()).unwrap();
+            serde_json::to_value(show(&fx.world.ctx(), "demo").unwrap()).unwrap();
         assert_eq!(json["revision"], 2);
         assert!(set(&fx.world.ctx(), "demo", "It runs the task.", Some(0)).is_err());
     }
@@ -1233,8 +1278,9 @@ mod tests {
         .unwrap()
         .0;
         assert!(
-            show(&ctx, "demo", false)
+            show(&ctx, "demo")
                 .unwrap()
+                .message()
                 .contains(&old.what_you_get)
         );
         let outcome =
@@ -1243,7 +1289,7 @@ mod tests {
         assert_eq!(changed.steps, old.steps);
         assert_eq!(changed.does, outcome);
         assert!(changed.kind.is_empty() && changed.what_you_get.is_empty());
-        assert!(show(&ctx, "demo", false).unwrap().contains(outcome));
+        assert!(show(&ctx, "demo").unwrap().message().contains(outcome));
         assert_eq!(load(&fx.project).unwrap().unwrap(), changed);
     }
 
@@ -1468,8 +1514,7 @@ mod tests {
             "+++\nverdict = \"FAIL\"\n+++\nneeds work\n",
         );
         crate::thread::update(&fx.project, &critic, |t| t.merged_sha = sha.clone()).unwrap();
-        let shown: serde_json::Value =
-            serde_json::from_str(&show(&ctx, "demo", true).unwrap()).unwrap();
+        let shown: serde_json::Value = serde_json::to_value(show(&ctx, "demo").unwrap()).unwrap();
         assert_eq!(shown["steps"][1]["state"], "running");
         let error = check_prerequisites(&fx.project, "job-0003")
             .unwrap_err()
@@ -1535,7 +1580,7 @@ mod tests {
                 let report = "+++\nverdict = \"FAIL\"\n+++\nneeds work\n";
                 let event_id = fx.seal_done(&critic, 1, 1, &sha, report);
                 let shown: serde_json::Value =
-                    serde_json::from_str(&show(&ctx, "demo", true).unwrap()).unwrap();
+                    serde_json::to_value(show(&ctx, "demo").unwrap()).unwrap();
                 assert_eq!(shown["steps"][0]["state"], "running");
                 let artifact_path = fx
                     .project
@@ -1561,14 +1606,14 @@ mod tests {
                     _ => unreachable!(),
                 }
                 let shown: serde_json::Value =
-                    serde_json::from_str(&show(&ctx, "demo", true).unwrap()).unwrap();
+                    serde_json::to_value(show(&ctx, "demo").unwrap()).unwrap();
                 assert_eq!(shown["steps"][0]["state"], "running", "{binding}: {fault}");
                 let diagnostic = match fault {
                     "missing" => "brief_artifact_missing",
                     "mismatch" => "brief_artifact_mismatch",
                     _ => "invalid UTF-8",
                 };
-                assert!(show(&ctx, "demo", false).unwrap().contains(diagnostic));
+                assert!(show(&ctx, "demo").unwrap().message().contains(diagnostic));
                 assert!(
                     shown["steps"][0]["failed_check_hold"]["checks"][0]["diagnostic"]
                         .as_str()
@@ -1684,8 +1729,7 @@ mod tests {
         crate::task::drop_task(&fx.project, "job-0003", "No longer needed").unwrap();
         // Both the display and the launch gate must use the same projection,
         // even when the persisted card has not yet been synced.
-        let shown: serde_json::Value =
-            serde_json::from_str(&show(&ctx, "demo", true).unwrap()).unwrap();
+        let shown: serde_json::Value = serde_json::to_value(show(&ctx, "demo").unwrap()).unwrap();
         assert_eq!(shown["steps"][0]["state"], "done");
         check_prerequisites(&fx.project, "job-0004").unwrap();
     }

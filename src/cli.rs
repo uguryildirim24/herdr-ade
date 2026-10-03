@@ -365,6 +365,18 @@ enum GoalCheckCommand {
     },
 }
 
+#[derive(Args)]
+struct PlanStepTarget {
+    /// Project slug
+    #[arg(value_name = "PROJECT")]
+    slug: String,
+    /// Step id
+    id: String,
+    /// Expected plan revision; omitted uses the latest revision
+    #[arg(long)]
+    expect: Option<u64>,
+}
+
 #[derive(Subcommand)]
 enum PlanStepCommand {
     /// Add a step, optionally bound to stable tasks
@@ -388,38 +400,25 @@ enum PlanStepCommand {
     },
     /// Replace one step's sentence
     Edit {
-        /// Project slug
-        #[arg(value_name = "PROJECT")]
-        slug: String,
-        /// Step id
-        id: String,
+        #[command(flatten)]
+        target: PlanStepTarget,
         /// Replacement text
         text: String,
-        /// Expected plan revision; omitted uses the latest revision
-        #[arg(long)]
-        expect: Option<u64>,
     },
     /// Add required work to a step
     Link {
-        /// Project slug
-        #[arg(value_name = "PROJECT")]
-        slug: String,
-        id: String,
+        #[command(flatten)]
+        target: PlanStepTarget,
         /// Stable task ids to link to this step
         #[arg(long = "task", value_name = "ID")]
         tasks: Vec<String>,
         #[arg(long, value_name = "STEP")]
         after: Vec<String>,
-        /// Expected plan revision; omitted uses the latest revision
-        #[arg(long)]
-        expect: Option<u64>,
     },
     /// Remove required work from a step
     Unlink {
-        /// Project slug
-        #[arg(value_name = "PROJECT")]
-        slug: String,
-        id: String,
+        #[command(flatten)]
+        target: PlanStepTarget,
         /// Stable task ids to unlink from this step
         #[arg(long = "task", value_name = "ID")]
         tasks: Vec<String>,
@@ -428,91 +427,151 @@ enum PlanStepCommand {
         /// Why this step or link is removed
         #[arg(long)]
         reason: String,
-        /// Expected plan revision; omitted uses the latest revision
-        #[arg(long)]
-        expect: Option<u64>,
     },
     /// Remove one step (identifiers are never reused)
     Remove {
-        /// Project slug
-        #[arg(value_name = "PROJECT")]
-        slug: String,
-        id: String,
-        /// Expected plan revision; omitted uses the latest revision
-        #[arg(long)]
-        expect: Option<u64>,
+        #[command(flatten)]
+        target: PlanStepTarget,
     },
     /// Change display order only
     Move {
-        /// Project slug
-        #[arg(value_name = "PROJECT")]
-        slug: String,
-        id: String,
+        #[command(flatten)]
+        target: PlanStepTarget,
         /// Step id that should follow this one
         #[arg(long, value_name = "ID")]
         before: String,
-        /// Expected plan revision; omitted uses the latest revision
-        #[arg(long)]
-        expect: Option<u64>,
     },
 }
 
-fn run_project_commands(ctx: &Ctx, command: Command) -> Result<()> {
+#[derive(serde::Serialize)]
+struct ReportReference<'a> {
+    thread: &'a str,
+    path: String,
+    sealed: bool,
+}
+
+#[derive(serde::Serialize)]
+struct TaskShow<'a> {
+    task: &'a crate::task::View,
+    reports: Vec<ReportReference<'a>>,
+    attestation: Option<crate::contracts::Attestation>,
+}
+
+enum ThreadResult<'a> {
+    Start {
+        thread: &'a crate::thread::Thread,
+        task: &'a str,
+        note: Option<String>,
+    },
+    Adopt(&'a crate::thread::Thread),
+}
+
+impl ThreadResult<'_> {
+    fn emit(&self) -> Result<()> {
+        let thread = match self {
+            Self::Start { thread, .. } | Self::Adopt(thread) => thread,
+        };
+        let mut data =
+            serde_json::json!({ "id": thread.id, "kind": thread.kind, "pane_id": thread.pane_id });
+        match self {
+            Self::Start { .. } => {
+                data["state"] = serde_json::to_value(thread.status)?;
+                data["branch"] = thread.branch.clone().into();
+                data["machine"] = thread_machine(thread).into();
+                data["placement_reason"] = thread.placement_reason.clone().into();
+            }
+            Self::Adopt(_) => data["prompt_pending"] = thread.prompt_pending.into(),
+        }
+        // These commands historically print JSON-shaped prose. Build it from
+        // the same data, before adding the envelope-only task and note.
+        let mut message = format!("{data}\n");
+        if let Self::Start { task, note, .. } = self {
+            if !task.is_empty() {
+                data["task"] = (*task).into();
+            }
+            if let Some(note) = note {
+                data["note"] = note.clone().into();
+                message.push_str(&format!("{note}\n"));
+            }
+        }
+        crate::output::success(None, &data, &message, "")
+    }
+}
+
+fn thread_machine(thread: &crate::thread::Thread) -> &str {
+    if thread.machine.is_empty() {
+        "local"
+    } else {
+        &thread.machine
+    }
+}
+
+#[derive(serde::Serialize)]
+struct PlanMutation<'a> {
+    operation: &'a str,
+    revision: u64,
+    step: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    before: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    record: Option<&'a crate::contracts::PlanStep>,
+    plan: &'a crate::contracts::Plan,
+}
+
+fn run_plan_command(ctx: &Ctx, command: PlanCommand) -> Result<()> {
     use crate::plan;
     match command {
-        Command::Plan { command } => match command {
-            PlanCommand::Check { slug, command } => {
-                use crate::steps::goal_check::{self, Disposition};
-                let project = Project::load(&ctx.root, &slug)?;
-                goal_check::reconcile(&project, None, jiff::Timestamp::now().as_second() as u64)?;
-                let (disposition, evidence) = match command {
-                    GoalCheckCommand::Action { task, evidence } => {
-                        (Disposition::Action { task }, evidence)
-                    }
-                    GoalCheckCommand::Close { tasks, evidence } => {
-                        let outcome = plan::load(&project)?.map_or(String::new(), |p| p.does);
-                        (Disposition::Closed { tasks, outcome }, evidence)
-                    }
-                    GoalCheckCommand::Wait {
+        PlanCommand::Check { slug, command } => {
+            use crate::steps::goal_check::{self, Disposition};
+            let project = Project::load(&ctx.root, &slug)?;
+            goal_check::reconcile(&project, None, jiff::Timestamp::now().as_second() as u64)?;
+            let (disposition, evidence) = match command {
+                GoalCheckCommand::Action { task, evidence } => {
+                    (Disposition::Action { task }, evidence)
+                }
+                GoalCheckCommand::Close { tasks, evidence } => {
+                    let outcome = plan::load(&project)?.map_or(String::new(), |p| p.does);
+                    (Disposition::Closed { tasks, outcome }, evidence)
+                }
+                GoalCheckCommand::Wait {
+                    party,
+                    condition,
+                    tasks,
+                    evidence,
+                } => (
+                    Disposition::Wait {
+                        tasks,
                         party,
                         condition,
-                        tasks,
-                        evidence,
-                    } => (
-                        Disposition::Wait {
-                            tasks,
-                            party,
-                            condition,
-                        },
-                        evidence,
-                    ),
-                };
-                goal_check::record(&project, disposition, &evidence)?;
-                crate::output::insert(
-                    "goal_check",
-                    serde_json::to_value(goal_check::load(&project))?,
-                );
-                println!("goal check disposition recorded");
-                Ok(())
+                    },
+                    evidence,
+                ),
+            };
+            goal_check::record(&project, disposition, &evidence)?;
+            crate::output::insert(
+                "goal_check",
+                serde_json::to_value(goal_check::load(&project))?,
+            );
+            println!("goal check disposition recorded");
+            Ok(())
+        }
+        PlanCommand::Show { slug } => {
+            crate::review::classify_old_seals(ctx, &Project::load(&ctx.root, &slug)?, true)?;
+            let result = plan::show(ctx, &slug)?;
+            #[derive(serde::Serialize)]
+            struct ShownPlan<'a> {
+                result: &'a plan::Show,
             }
-            PlanCommand::Show { slug } => {
-                crate::review::classify_old_seals(ctx, &Project::load(&ctx.root, &slug)?, true)?;
-                let text = plan::show(ctx, &slug, false)?;
-                if crate::output::structured() {
-                    let value: serde_json::Value =
-                        serde_json::from_str(&plan::show(ctx, &slug, true)?)?;
-                    crate::output::insert("result", value);
-                }
-                print!("{text}");
-                Ok(())
-            }
-            PlanCommand::Set { slug, does, expect } => {
-                let p = plan::set(ctx, &slug, &does, expect)?;
-                crate::output::insert("revision", p.revision);
-                println!("plan revision {} set", p.revision);
-                Ok(())
-            }
-            PlanCommand::Step { command } => match command {
+            crate::output::success(None, &ShownPlan { result: &result }, &result.message(), "")
+        }
+        PlanCommand::Set { slug, does, expect } => {
+            let p = plan::set(ctx, &slug, &does, expect)?;
+            crate::output::insert("revision", p.revision);
+            println!("plan revision {} set", p.revision);
+            Ok(())
+        }
+        PlanCommand::Step { command } => {
+            let (p, id, operation, before) = match command {
                 PlanStepCommand::Add {
                     slug,
                     text,
@@ -531,147 +590,88 @@ fn run_project_commands(ctx: &Ctx, command: Command) -> Result<()> {
                             (p, id)
                         }
                     };
-                    crate::output::success(
-                        None,
-                        &serde_json::json!({
-                            "operation": "added",
-                            "revision": p.revision,
-                            "step": id,
-                            "record": plan::all_steps(&p).find(|step| step.id == id),
-                            "plan": p,
-                        }),
-                        &format!("plan revision {}: added {id}\n", p.revision),
-                        "",
-                    )
+                    (p, id, "added", None)
                 }
                 PlanStepCommand::Edit {
-                    slug,
-                    id,
+                    target: PlanStepTarget { slug, id, expect },
                     text,
-                    expect,
                 } => {
                     let p = plan::step_edit(ctx, &slug, &id, &text, expect)?;
-                    crate::output::success(
-                        None,
-                        &serde_json::json!({
-                            "operation": "edited",
-                            "revision": p.revision,
-                            "step": id,
-                            "record": plan::all_steps(&p).find(|step| step.id == id),
-                            "plan": p,
-                        }),
-                        &format!("plan revision {}: edited {id}\n", p.revision),
-                        "",
-                    )
+                    (p, id, "edited", None)
                 }
                 PlanStepCommand::Link {
-                    slug,
-                    id,
+                    target: PlanStepTarget { slug, id, expect },
                     tasks,
                     after,
-                    expect,
                 } => {
                     let p = plan::step_link(ctx, &slug, &id, tasks, after, expect)?;
-                    crate::output::success(
-                        None,
-                        &serde_json::json!({
-                            "operation": "linked",
-                            "revision": p.revision,
-                            "step": id,
-                            "record": plan::all_steps(&p).find(|step| step.id == id),
-                            "plan": p,
-                        }),
-                        &format!("plan revision {}: linked {id}\n", p.revision),
-                        "",
-                    )
+                    (p, id, "linked", None)
                 }
                 PlanStepCommand::Unlink {
-                    slug,
-                    id,
+                    target: PlanStepTarget { slug, id, expect },
                     tasks,
                     after,
                     reason,
-                    expect,
                 } => {
                     let p = plan::step_unlink(ctx, &slug, &id, tasks, after, &reason, expect)?;
-                    crate::output::success(
-                        None,
-                        &serde_json::json!({
-                            "operation": "unlinked",
-                            "revision": p.revision,
-                            "step": id,
-                            "record": plan::all_steps(&p).find(|step| step.id == id),
-                            "plan": p,
-                        }),
-                        &format!("plan revision {}: unlinked {id}\n", p.revision),
-                        "",
-                    )
+                    (p, id, "unlinked", None)
                 }
-                PlanStepCommand::Remove { slug, id, expect } => {
+                PlanStepCommand::Remove {
+                    target: PlanStepTarget { slug, id, expect },
+                } => {
                     let p = plan::step_remove(ctx, &slug, &id, expect)?;
-                    crate::output::success(
-                        None,
-                        &serde_json::json!({
-                            "operation": "removed",
-                            "revision": p.revision,
-                            "step": id,
-                            "plan": p,
-                        }),
-                        &format!("plan revision {}: removed {id}\n", p.revision),
-                        "",
-                    )
+                    (p, id, "removed", None)
                 }
                 PlanStepCommand::Move {
-                    slug,
-                    id,
+                    target: PlanStepTarget { slug, id, expect },
                     before,
-                    expect,
                 } => {
                     let p = plan::step_move(ctx, &slug, &id, &before, expect)?;
-                    crate::output::success(
-                        None,
-                        &serde_json::json!({
-                            "operation": "moved",
-                            "revision": p.revision,
-                            "step": id,
-                            "before": before,
-                            "record": plan::all_steps(&p).find(|step| step.id == id),
-                            "plan": p,
-                        }),
-                        &format!("plan revision {}: moved {id}\n", p.revision),
-                        "",
-                    )
+                    (p, id, "moved", Some(before))
                 }
-            },
-            PlanCommand::Sync { slug } => {
-                match plan::sync(ctx, &slug)? {
-                    plan::SyncOutcome::Missing => {
-                        crate::output::set_outcome("plan_missing");
-                        println!("no plan is written down yet")
+            };
+            let result = PlanMutation {
+                operation,
+                revision: p.revision,
+                step: &id,
+                before: before.as_deref(),
+                record: plan::all_steps(&p).find(|step| step.id == id),
+                plan: &p,
+            };
+            crate::output::success(
+                None,
+                &result,
+                &format!(
+                    "plan revision {}: {} {}\n",
+                    result.revision, result.operation, result.step
+                ),
+                "",
+            )
+        }
+        PlanCommand::Sync { slug } => {
+            match plan::sync(ctx, &slug)? {
+                plan::SyncOutcome::Missing => {
+                    crate::output::set_outcome("plan_missing");
+                    println!("no plan is written down yet")
+                }
+                plan::SyncOutcome::Unchanged { revision, holds } => {
+                    crate::output::set_outcome("unchanged");
+                    crate::output::insert("revision", revision);
+                    if !holds.is_empty() {
+                        crate::output::insert("failed_check_holds", serde_json::to_value(&holds)?);
                     }
-                    plan::SyncOutcome::Unchanged { revision, holds } => {
-                        crate::output::set_outcome("unchanged");
-                        crate::output::insert("revision", revision);
-                        if !holds.is_empty() {
-                            crate::output::insert(
-                                "failed_check_holds",
-                                serde_json::to_value(&holds)?,
-                            );
-                        }
-                        println!("plan revision {revision}: no step state changed");
-                        for (id, hold) in holds {
-                            println!("{id}: {}", hold.message());
-                        }
-                    }
-                    plan::SyncOutcome::Changed { revision } => {
-                        crate::output::insert("revision", revision);
-                        println!("plan revision {revision}: step states refreshed")
+                    println!("plan revision {revision}: no step state changed");
+                    for (id, hold) in holds {
+                        println!("{id}: {}", hold.message());
                     }
                 }
-                Ok(())
+                plan::SyncOutcome::Changed { revision } => {
+                    crate::output::insert("revision", revision);
+                    println!("plan revision {revision}: step states refreshed")
+                }
             }
-        },
-        _ => unreachable!("run_project_commands only receives project commands"),
+            Ok(())
+        }
     }
 }
 
@@ -1482,8 +1482,7 @@ fn dispatch_with_start(
                 let project = Project::load(&ctx.root, &slug)?;
                 crate::review::classify_old_seals(&ctx, &project, true)?;
                 let view = crate::task::view(&project, crate::task::load(&project, &id)?);
-                let attestation = crate::task::attestation(&project, &view.record);
-                let reports: Vec<_> = view
+                let reports = view
                     .record
                     .attempts
                     .iter()
@@ -1491,34 +1490,38 @@ fn dispatch_with_start(
                         let thread = crate::thread::load(&project, id).ok()?;
                         let path = crate::thread::report_reference(&project, &thread)?;
                         let sealed = crate::thread::sealed_report_path(&project, &thread).is_some();
-                        Some(serde_json::json!({ "thread": id, "path": path, "sealed": sealed }))
+                        Some(ReportReference {
+                            thread: id,
+                            path,
+                            sealed,
+                        })
                     })
                     .collect();
-                let mut message = crate::task::render(&project, &view);
-                for report in &reports {
+                let result = TaskShow {
+                    task: &view,
+                    reports,
+                    attestation: crate::task::attestation(&project, &view.record),
+                };
+                let mut message = crate::task::render(&project, result.task);
+                for report in &result.reports {
                     message.push_str(&format!(
                         "{} ({}): {}\n",
-                        if report["sealed"].as_bool().unwrap_or(false) {
+                        if report.sealed {
                             "final report"
                         } else {
                             "historical report (not completion)"
                         },
-                        report["thread"].as_str().unwrap_or_default(),
-                        report["path"].as_str().unwrap_or_default()
+                        report.thread,
+                        report.path
                     ));
                 }
-                if let Some(attestation) = &attestation {
+                if let Some(attestation) = &result.attestation {
                     message.push_str(&format!(
                         "attested: {}: {}\n",
                         attestation.coordinator, attestation.reason
                     ));
                 }
-                crate::output::success(
-                    Some("shown"),
-                    &serde_json::json!({ "task": view, "reports": reports, "attestation": attestation }),
-                    &message,
-                    "",
-                )
+                crate::output::success(Some("shown"), &result, &message, "")
             }
             TaskCommand::List { slug } => {
                 let project = Project::load(&ctx.root, &slug)?;
@@ -1655,21 +1658,7 @@ fn dispatch_with_start(
                         review_id: String::new(),
                     },
                 )?;
-                if !task_id.is_empty() {
-                    crate::output::insert("task", task_id);
-                }
-                crate::output::insert("id", thread.id.clone());
-                crate::output::insert("kind", serde_json::to_value(thread.kind)?);
-                crate::output::insert("branch", thread.branch.clone());
-                crate::output::insert("pane_id", thread.pane_id.clone());
-                let machine = if thread.machine.is_empty() {
-                    "local"
-                } else {
-                    &thread.machine
-                };
-                crate::output::insert("machine", machine);
-                crate::output::insert("placement_reason", thread.placement_reason.clone());
-                crate::output::insert("state", serde_json::to_value(thread.status)?);
+                let machine = thread_machine(&thread);
                 let mut note = mac_only_brief_note(&ctx.config_dir, &project, machine, &brief_text);
                 if thread.prompt_pending && !thread.pane_id.is_empty() {
                     let pending = "brief pending; the ticker delivers it when the agent registers";
@@ -1678,15 +1667,12 @@ fn dispatch_with_start(
                         None => pending.to_string(),
                     });
                 }
-                if let Some(note) = &note {
-                    crate::output::insert("note", note.clone());
+                ThreadResult::Start {
+                    thread: &thread,
+                    task: &task_id,
+                    note,
                 }
-                let result = serde_json::json!({ "id": thread.id, "state": thread.status, "kind": thread.kind, "branch": thread.branch, "pane_id": thread.pane_id, "machine": machine, "placement_reason": thread.placement_reason });
-                println!("{result}");
-                if let Some(note) = note {
-                    println!("{note}");
-                }
-                Ok(())
+                .emit()
             }
             ThreadCommand::Retry { slug, id, reason } => {
                 let result = threads::retry(&ctx, &slug, &id, &reason)?;
@@ -1808,15 +1794,7 @@ fn dispatch_with_start(
                     task,
                     adopt::AdeAdopt { workflow, passive },
                 )?;
-                crate::output::insert("id", thread.id.clone());
-                crate::output::insert("kind", serde_json::to_value(thread.kind)?);
-                crate::output::insert("pane_id", thread.pane_id.clone());
-                crate::output::insert("prompt_pending", thread.prompt_pending);
-                println!(
-                    "{}",
-                    serde_json::json!({ "id": thread.id, "kind": thread.kind, "pane_id": thread.pane_id, "prompt_pending": thread.prompt_pending })
-                );
-                Ok(())
+                ThreadResult::Adopt(&thread).emit()
             }
             ThreadCommand::List { slug } => threads::print_list(&ctx, &slug),
             ThreadCommand::Show { slug, id } => {
@@ -1919,7 +1897,7 @@ fn dispatch_with_start(
             let result = doctor::run_timed_from(&ctx, &session.into(), timings, cli_started)?;
             doctor::finish(&ctx, &result)
         }
-        command @ Command::Plan { .. } => run_project_commands(&ctx, command),
+        Command::Plan { command } => run_plan_command(&ctx, command),
         Command::Review {
             slug,
             repo,
@@ -2001,6 +1979,192 @@ fn dispatch_with_start(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn result(fx: &crate::testkit::Fx, args: &[&str]) -> serde_json::Value {
+        let matches = Cli::command()
+            .try_get_matches_from(std::iter::once("ha").chain(args.iter().copied()))
+            .unwrap();
+        let (command, data) = machine_command(&matches);
+        crate::output::begin(true, command.clone(), machine_outcome(&command), data);
+        dispatch_with_start(
+            fx.world.ctx(),
+            Cli::from_arg_matches(&matches).unwrap().command,
+            None,
+        )
+        .unwrap();
+        crate::output::captured_success()
+    }
+
+    #[test]
+    fn plan_mutations_share_the_same_receipt_and_sentence() {
+        let fx = crate::testkit::fixture();
+        result(&fx, &["plan", "set", "demo", "--does", "Deliver it"]);
+        let cases: &[(&[&str], &str, &str)] = &[
+            (&["add", "demo", "First"], "added", "s-1"),
+            (&["add", "demo", "Second"], "added", "s-2"),
+            (&["add", "demo", "Child", "--under", "s-1"], "added", "s-3"),
+            (
+                &["edit", "demo", "s-3", "Changed", "--expect", "4"],
+                "edited",
+                "s-3",
+            ),
+            (&["link", "demo", "s-3", "--after", "s-2"], "linked", "s-3"),
+            (
+                &[
+                    "unlink",
+                    "demo",
+                    "s-3",
+                    "--after",
+                    "s-2",
+                    "--reason",
+                    "Not needed",
+                ],
+                "unlinked",
+                "s-3",
+            ),
+            (&["move", "demo", "s-2", "--before", "s-1"], "moved", "s-2"),
+            (&["remove", "demo", "s-3"], "removed", "s-3"),
+        ];
+        for (index, (args, operation, id)) in cases.iter().enumerate() {
+            let args: Vec<_> = ["plan", "step"]
+                .into_iter()
+                .chain(args.iter().copied())
+                .collect();
+            let receipt = result(&fx, &args);
+            let data = &receipt["data"];
+            assert_eq!(receipt["outcome"], "plan_changed");
+            assert!(receipt.get("reason").is_none());
+            assert_eq!(data["operation"], *operation);
+            assert_eq!(data["step"], *id);
+            assert_eq!(data["revision"], index + 2);
+            assert_eq!(data["plan"]["revision"], data["revision"]);
+            assert_eq!(
+                receipt["message"],
+                format!("plan revision {}: {operation} {id}\n", index + 2)
+            );
+            if *operation == "removed" {
+                assert!(data.get("record").is_none());
+            } else {
+                assert_eq!(data["record"]["id"], *id);
+            }
+            if *operation == "moved" {
+                assert_eq!(data["before"], "s-1");
+            } else {
+                assert!(data.get("before").is_none());
+            }
+        }
+        let shown = result(&fx, &["plan", "show", "demo"]);
+        assert_eq!(shown["data"]["result"]["revision"], 9);
+        assert_eq!(shown["data"]["result"]["steps"][0]["id"], "s-2");
+    }
+
+    #[test]
+    fn thread_start_and_adopt_render_their_facts_without_reconstruction() {
+        use crate::thread::{Kind, Status, Thread};
+        let mut thread = Thread {
+            id: "t-1".into(),
+            status: Status::Open,
+            kind: Kind::Worktree,
+            branch: "lane/1".into(),
+            pane_id: "w1:p1".into(),
+            placement_reason: "selected".into(),
+            ..Thread::default()
+        };
+        for (machine, task, note) in [
+            ("", "", None),
+            ("oci", "job-1", Some("brief pending".to_string())),
+        ] {
+            thread.machine = machine.into();
+            crate::output::begin(
+                true,
+                "thread start".into(),
+                "started".into(),
+                BTreeMap::new(),
+            );
+            ThreadResult::Start {
+                thread: &thread,
+                task,
+                note: note.clone(),
+            }
+            .emit()
+            .unwrap();
+            let receipt = crate::output::captured_success();
+            let facts = serde_json::json!({"id":"t-1", "state":"open", "kind":"worktree", "branch":"lane/1", "pane_id":"w1:p1", "machine":if machine.is_empty() { "local" } else { machine }, "placement_reason":"selected"});
+            let mut data = facts.clone();
+            if !task.is_empty() {
+                data["task"] = task.into();
+            }
+            if let Some(note) = &note {
+                data["note"] = note.clone().into();
+            }
+            assert_eq!(receipt["data"], data);
+            assert_eq!(
+                receipt["message"],
+                format!(
+                    "{facts}\n{}",
+                    note.map(|note| format!("{note}\n")).unwrap_or_default()
+                )
+            );
+            assert_eq!(receipt["outcome"], "started");
+        }
+        thread.kind = Kind::Adopted;
+        thread.prompt_pending = true;
+        crate::output::begin(
+            true,
+            "thread adopt".into(),
+            "adopted".into(),
+            BTreeMap::new(),
+        );
+        ThreadResult::Adopt(&thread).emit().unwrap();
+        let receipt = crate::output::captured_success();
+        let data = serde_json::json!({"id":"t-1", "kind":"adopted", "pane_id":"w1:p1", "prompt_pending":true});
+        assert_eq!(receipt["data"], data);
+        assert_eq!(receipt["message"], format!("{data}\n"));
+        assert_eq!(receipt["outcome"], "adopted");
+    }
+
+    #[test]
+    fn task_show_keeps_sealed_and_historical_reports_distinct() {
+        let fx = crate::testkit::fixture();
+        let (historical, _) = fx.lane(1);
+        let (sealed, sha) = fx.lane(2);
+        let path = crate::thread::home_report_path(&fx.project, &historical);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, "old report").unwrap();
+        fx.seal_done(&sealed, 1, 1, &sha, "final report");
+        let task = crate::task::Task {
+            id: "job-0001".into(),
+            title: "Reports".into(),
+            authority: vec!["request:historical".into()],
+            acceptance: vec!["Reports remain readable".into()],
+            attempts: vec![historical.clone(), sealed.clone()],
+            ..crate::task::Task::default()
+        };
+        let dir = fx.project.state_dir().join("tasks");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("job-0001.toml"), toml::to_string(&task).unwrap()).unwrap();
+        let receipt = result(&fx, &["task", "show", "demo", "job-0001"]);
+        assert_eq!(receipt["outcome"], "shown");
+        assert!(receipt["data"]["attestation"].is_null());
+        let reports = receipt["data"]["reports"].as_array().unwrap();
+        assert_eq!(reports.len(), 2);
+        for (report, id, sealed) in [
+            (&reports[0], historical, false),
+            (&reports[1], sealed, true),
+        ] {
+            assert_eq!(report["thread"], id);
+            assert_eq!(report["sealed"], sealed);
+            let label = if sealed {
+                "final report"
+            } else {
+                "historical report (not completion)"
+            };
+            assert!(receipt["message"].as_str().unwrap().contains(&format!(
+                "{label} ({id}): {}\n",
+                report["path"].as_str().unwrap()
+            )));
+        }
+    }
 
     #[test]
     fn lane_description_is_the_title_and_flags_match_other_actions() {
