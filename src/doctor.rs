@@ -295,16 +295,10 @@ fn run_native_probe(
                 .and_then(serde_json::Value::as_bool)
                 .is_some())
     {
-        let provider_failure = value
-            .get("provider_failure")
-            .and_then(serde_json::Value::as_bool)
-            .unwrap_or(false);
         return Ok(crate::runner::Output {
             code: Some(if ok { 0 } else { 1 }),
             stderr: if ok {
                 String::new()
-            } else if provider_failure {
-                "authentication failed (cached provider refusal)".into()
             } else {
                 value
                     .get("detail")
@@ -334,6 +328,7 @@ fn run_native_probe(
             "checked_unix": now,
             "ok": output.success(),
             "provider_failure": provider_failure,
+            "detail": output.error_text(),
         });
         let staged = cache_dir.join(format!(
             ".native-{}-{}",
@@ -379,7 +374,7 @@ fn box_native_probe_script(
          if [ $((probe_now-probe_then)) -le {ttl} ]; then probe_status=$(cat \"$probe_cache\" 2>/dev/null || true); fi\n\
          if [ -z \"$probe_status\" ]; then\n\
            if ! command -v {program} >/dev/null 2>&1; then probe_status=missing;\n\
-           elif timeout 8s {command} >/dev/null 2>&1; then probe_status=ok;\n\
+           elif timeout 8s {command} >&2; then probe_status=ok;\n\
            else probe_status=failed; fi\n\
            mkdir -p \"$probe_dir\"\n\
            printf '%s\\n' \"$probe_status\" > \"$probe_cache.tmp.$$\"\n\
@@ -397,6 +392,12 @@ fn box_native_probe_script(
 /// Whether the chosen recipe can run on this Mac. This is the same provider
 /// or login probe the doctor owns, not a placement-specific capability table.
 pub(crate) fn recipe_ready_local(ctx: &Ctx, launch: &crate::contracts::Launch) -> Result<()> {
+    crate::adapters::dependency_ready(&ctx.root, crate::contracts::MACHINE_LOCAL, launch, || {
+        recipe_ready_local_probe(ctx, launch)
+    })
+}
+
+fn recipe_ready_local_probe(ctx: &Ctx, launch: &crate::contracts::Launch) -> Result<()> {
     let adapter = crate::adapters::declaration(&ctx.config_dir, &launch.kind)?;
     if adapter.doctor.readiness == "pi" {
         let provider = crate::pi::launch::flag_value(&launch.args, "--provider")
@@ -434,6 +435,21 @@ pub(crate) fn recipe_ready_local(ctx: &Ctx, launch: &crate::contracts::Launch) -
 /// lane PATH, so `command -v` and the login command measure the environment a
 /// fresh lane receives. Pi keeps using `herdr-pi check`, as the doctor does.
 pub(crate) fn recipe_ready_on_box(
+    ctx: &Ctx,
+    profile: &crate::contracts::MachineProfile,
+    launch: &crate::contracts::Launch,
+) -> Result<()> {
+    let machine = if profile.id.is_empty() {
+        &profile.label
+    } else {
+        &profile.id
+    };
+    crate::adapters::dependency_ready(&ctx.root, machine, launch, || {
+        recipe_ready_on_box_probe(ctx, profile, launch)
+    })
+}
+
+fn recipe_ready_on_box_probe(
     ctx: &Ctx,
     profile: &crate::contracts::MachineProfile,
     launch: &crate::contracts::Launch,
@@ -2406,7 +2422,7 @@ recipe = "claude_fable_xhigh"
     }
 
     #[test]
-    fn a_cached_native_failure_still_names_the_stored_sign_in_without_provider_output() {
+    fn a_cached_native_failure_preserves_the_adapter_evidence() {
         let home = tempfile::tempdir().unwrap();
         let root = home.path().join("root");
         std::fs::create_dir_all(&root).unwrap();
@@ -2433,18 +2449,23 @@ recipe = "claude_fable_xhigh"
         assert!(first.contains("subscription expired"), "{first}");
         let cache_path = std::fs::read_dir(ctx.root.join(".readiness"))
             .unwrap()
-            .next()
-            .unwrap()
-            .unwrap()
-            .path();
+            .flatten()
+            .map(|entry| entry.path())
+            .find(|path| {
+                path.file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .starts_with("native-")
+            })
+            .unwrap();
         let cache = std::fs::read_to_string(cache_path).unwrap();
-        assert!(!cache.contains("subscription expired"), "{cache}");
+        assert!(cache.contains("subscription expired"), "{cache}");
 
         let cached = recipe_ready_local(&ctx, &launch).unwrap_err().to_string();
         let cache: serde_json::Value = serde_json::from_str(&cache).unwrap();
         assert_eq!(cache["provider_failure"], true);
         assert_eq!(cache["ok"], false);
-        assert!(!cached.contains("subscription expired"), "{cached}");
+        assert_eq!(cached, first);
         assert_eq!(runner.count("claude"), 1);
         let calls = runner.calls.borrow();
         let probe = calls.iter().find(|call| call.program == "claude").unwrap();
@@ -2452,7 +2473,7 @@ recipe = "claude_fable_xhigh"
     }
 
     #[test]
-    fn a_timed_out_native_probe_is_unknown_and_is_not_cached() {
+    fn a_timed_out_native_probe_shares_unknown_without_claiming_authentication_failure() {
         let home = tempfile::tempdir().unwrap();
         let root = home.path().join("root");
         std::fs::create_dir_all(&root).unwrap();
@@ -2482,8 +2503,17 @@ recipe = "claude_fable_xhigh"
         };
 
         for _ in 0..2 {
-            assert!(recipe_ready_local(&ctx, &launch).is_err());
+            let error = recipe_ready_local(&ctx, &launch).unwrap_err().to_string();
+            assert!(error.contains("provider status is unknown"));
+            assert!(!error.contains("authentication failed"));
         }
+        assert_eq!(runner.count("claude"), 1);
+        crate::adapters::expire_dependency_probe(
+            &ctx.root,
+            crate::contracts::MACHINE_LOCAL,
+            &launch,
+        );
+        assert!(recipe_ready_local(&ctx, &launch).is_err());
         assert_eq!(runner.count("claude"), 2);
         assert!(!ctx.root.join(".readiness/native-claude.json").exists());
     }

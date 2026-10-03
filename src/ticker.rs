@@ -954,49 +954,25 @@ fn tick_with_steps(
     for error in machine_passes_with_steps(ctx, &project_refs, memory, log, step)? {
         health.failure(&ctx.root, log, format!("{error:#}"));
     }
-    // An offline box defers its projects, not unrelated projects whose
-    // machines answered. Retain this decision during courier backoff too.
-    let mut deferred: BTreeSet<String> = projects
-        .iter()
-        .filter(|project| {
-            thread::list_live(project).iter().any(|lane| {
-                lane.is_remote()
-                    && !lane.parked
-                    && (matches!(lane.status, thread::Status::Open | thread::Status::Starting)
-                        || (lane.status == thread::Status::Failed
-                            && lane.error.starts_with("brief_delivery_failed:"))
-                        || lane.recovery_pending)
-                    && memory
-                        .machines
-                        .get(lane.machine_route())
-                        .is_some_and(|machine| {
-                            crate::remote::is_unreachable(&machine.outage.last_error)
-                        })
-            })
-        })
-        .map(|project| project.slug.clone())
-        .collect();
-    for slug in &deferred {
-        health.failure(
-            &ctx.root,
-            log,
-            format!("{slug}: session unavailable: remote machine observation deferred"),
-        );
-    }
-    if !projects.is_empty()
-        && deferred.len() == projects.len()
-        && projects
-            .iter()
-            .all(|project| project.status() == Status::Active)
-    {
-        health.publish(&ctx.root, log);
-        if !step("pass complete") {
-            return None;
-        }
-        return Some(true);
-    }
+    // Courier failure holds only that machine's actions. Local observation,
+    // accepted seals, reviews and goal checks still run in the same project.
     let mut reachable = Vec::new();
     let mut readiness = BTreeMap::new();
+    for project in &projects {
+        for lane in thread::list_live(project)
+            .into_iter()
+            .filter(|lane| lane.is_remote())
+        {
+            if let Some(machine) = memory.machines.get(lane.machine_route())
+                && crate::remote::is_unreachable(&machine.outage.last_error)
+            {
+                readiness.insert(
+                    crate::adapters::dependency_key(lane.machine_route(), &lane.launch),
+                    Err(machine.outage.last_error.clone()),
+                );
+            }
+        }
+    }
     for discovered in &projects {
         let slug = discovered.slug.clone();
         if !step(&format!("cheap project {slug}")) {
@@ -1013,15 +989,9 @@ fn tick_with_steps(
             }
             continue;
         }
-        if deferred.contains(&slug) {
-            continue;
-        }
-        if !resume_provider_starts(ctx, &project, &mut readiness, |error| {
+        resume_provider_starts(ctx, &project, &mut readiness, |error| {
             health.failure(&ctx.root, log, format!("{slug}: {error:#}"));
-        }) {
-            deferred.insert(slug);
-            continue;
-        }
+        });
         match tick_cheap_observed(
             ctx,
             &project,
@@ -1049,8 +1019,27 @@ fn tick_with_steps(
             continue;
         };
         if project.status() == Status::Active
-            && !deferred.contains(slug)
-            && let Err(error) = crate::review::tick(ctx, &project)
+            && let Err(error) = crate::review::tick_observed(ctx, &project, |review| {
+                // A missing remote verdict is not evidence of reviewer loss.
+                // Other repositories' local piles still advance below it.
+                !review
+                    .reviewer
+                    .as_deref()
+                    .and_then(|id| thread::load(&project, id).ok())
+                    .is_some_and(|lane| {
+                        lane.is_remote()
+                            && memory
+                                .machines
+                                .get(lane.machine_route())
+                                .is_some_and(|machine| !machine.outage.last_error.is_empty())
+                            && crate::events::latest_done_event(
+                                &crate::events::for_thread(&project, &lane.id),
+                                &lane.id,
+                                lane.attempt.max(1),
+                            )
+                            .is_none()
+                    })
+            })
         {
             health.failure(&ctx.root, log, format!("{slug}: reviews: {error:#}"));
         }
@@ -1077,7 +1066,7 @@ fn tick_with_steps(
     if !step("pass complete") {
         return None;
     }
-    Some(!reachable.is_empty() || !deferred.is_empty())
+    Some(!reachable.is_empty() || !memory.machines.is_empty())
 }
 
 fn load_for_tick(root: &Path, slug: &str, health: &mut Health, log: &Log) -> Option<Project> {
@@ -1281,6 +1270,23 @@ fn machine_passes_with_steps(
         // when the in-memory outage tracker cannot emit `Recovered`.
         if outcome.is_ok() {
             clear_lost_connections(&entries, log);
+            match threads::dependency_machine(ctx, &machine) {
+                Ok(dependency_machine) => {
+                    for (_, lanes) in &entries {
+                        for lane in lanes {
+                            errors.extend(
+                                crate::adapters::machine_reconnected(
+                                    &ctx.root,
+                                    &dependency_machine,
+                                    &lane.launch,
+                                )
+                                .err(),
+                            );
+                        }
+                    }
+                }
+                Err(error) => errors.push(error),
+            }
         }
         write_machine_outages(&entries, &machine, event.as_ref(), memory, &mut errors);
         for (project, _) in &entries {
@@ -1347,16 +1353,7 @@ pub(crate) fn tick_project_with(ctx: &Ctx, project: &Project, memory: &mut Memor
     for error in machine_passes(ctx, &[project], memory, &log) {
         log.line(&format!("{error:#}"));
     }
-    if memory
-        .machines
-        .values()
-        .any(|machine| crate::remote::is_unreachable(&machine.outage.last_error))
-    {
-        return Ok(true);
-    }
-    if !resume_provider_starts(ctx, project, &mut BTreeMap::new(), |_| {}) {
-        return Ok(true);
-    }
+    resume_provider_starts(ctx, project, &mut BTreeMap::new(), |_| {});
     match tick_cheap(ctx, project, true)? {
         Some(seen) => match tick_slow(ctx, project, &seen, memory).into_iter().next() {
             Some(error) => Err(error),
@@ -1393,7 +1390,7 @@ pub(crate) fn resume_provider_starts(
         } else {
             crate::contracts::MACHINE_LOCAL
         };
-        let key = (machine.to_string(), lane.launch.recipe_id.clone());
+        let key = crate::adapters::dependency_key(machine, &lane.launch);
         let ready = cache.entry(key).or_insert_with(|| {
             let result = if lane.is_remote() {
                 threads::box_launch_ready_for(ctx, machine, &lane.launch)
@@ -1407,7 +1404,23 @@ pub(crate) fn resume_provider_starts(
                 reachable = false;
                 continue;
             }
-            if thread::seconds_since(&lane.provider_wait_started, jiff::Timestamp::now()) >= 3600 {
+            let dependency_machine = match threads::dependency_machine(ctx, machine) {
+                Ok(machine) => machine,
+                Err(error) => {
+                    report(error);
+                    continue;
+                }
+            };
+            let machine = dependency_machine.as_str();
+            if let Err(error) =
+                crate::adapters::notify_auth(&ctx.root, project, machine, &lane.launch)
+            {
+                report(error);
+            }
+            if !crate::adapters::reset_pending(&ctx.root, machine, &lane.launch)
+                && thread::seconds_since(&lane.provider_wait_started, jiff::Timestamp::now())
+                    >= 3600
+            {
                 let reason = format!(
                     "provider_wait_expired: recipe `{}` on `{}` was not ready after one hour; {}",
                     lane.launch.recipe_id,
@@ -1419,7 +1432,7 @@ pub(crate) fn resume_provider_starts(
                     project,
                     &lane.id,
                     &reason,
-                    crate::contracts::FailureClass::Provider,
+                    crate::adapters::dependency_failure_class(&ctx.root, machine, &lane.launch),
                     false,
                 ) {
                     report(error);
@@ -1503,9 +1516,9 @@ fn startup_failure(input: &LaunchPass<'_>, thread: &thread::Thread, detail: &str
     Ok(())
 }
 
-fn connection_error(screen: &str) -> Option<&'static str> {
+fn connection_error(screen: &str) -> bool {
     let screen = screen.to_ascii_lowercase();
-    if [
+    [
         "websocket closed",
         "unable to reach the model provider",
         "connection lost",
@@ -1523,17 +1536,6 @@ fn connection_error(screen: &str) -> Option<&'static str> {
     ]
     .iter()
     .any(|text| screen.contains(text))
-    {
-        Some(
-            if screen.contains("provider") || screen.contains("service unavailable") {
-                "provider"
-            } else {
-                "connection"
-            },
-        )
-    } else {
-        None
-    }
 }
 
 /// Close only the delivered follow-ups overtaking this exact seal. An unknown
@@ -1736,6 +1738,47 @@ fn progress_notice_lines(notices: &ProgressNotices, lane: &str, pane: &str) -> V
     lines
 }
 
+fn resume_session(
+    project: &Project,
+    herdr: &Herdr<'_>,
+    t: &thread::Thread,
+    recent: Vec<String>,
+    prompt: &str,
+) -> Result<()> {
+    thread::update(project, &t.id, |record| {
+        record.connection_waiting = true;
+        record.error = "connection_resume_uncertain: delivery may have taken effect; reconcile the bound pane before resending".into();
+        record.connection_resumes = recent;
+    })?;
+    match herdr.agent_prompt(&t.pane_id, prompt) {
+        Ok(()) => {
+            thread::update(project, &t.id, |record| {
+                record.connection_waiting = false;
+                record.error.clear();
+                record.connection_resumes.push(project::now());
+            })?;
+            Ok(())
+        }
+        Err(error) => {
+            if threads::prompt_refused_before_submission(&error) {
+                thread::update(project, &t.id, |record| {
+                    record.connection_waiting = false;
+                    record.error.clear();
+                })?;
+            } else {
+                crate::inbox::write(
+                    project,
+                    "lane-connection",
+                    &t.id,
+                    "Resume delivery may have taken effect; reconcile this exact pane before resending. No new attempt was started.",
+                    "",
+                )?;
+            }
+            Err(error.into())
+        }
+    }
+}
+
 fn thread_pass(
     input: &LaunchPass<'_>,
     prefix: &str,
@@ -1846,6 +1889,11 @@ fn thread_pass(
             }
             continue;
         }
+        // No recorded terminal is not a missing process. Placement owns this
+        // lane; a startup timestamp alone supplies no identity to reconcile.
+        if t.pane_id.is_empty() {
+            continue;
+        }
         let mut live = thread::live_state(t, agents, panes, now);
         if !t.pane_id.is_empty() {
             pass.recorded_panes += 1;
@@ -1933,24 +1981,63 @@ fn thread_pass(
                 continue;
             }
         }
-        // A CLI that lost its transport can still have a live, idle session.
-        // Resume that session instead of replacing the process or consuming a
-        // launch retry. Only the CLI's own visible error is evidence of loss.
+        // Dependency evidence parks only affected actions. Keep the exact live
+        // session; a shared readiness probe precedes any in-place resume.
         if state == "idle"
             && t.status == thread::Status::Open
             && !t.prompt_pending
             && t.bootstrap == "acknowledged"
             && !t.connection_waiting
             && t.report_hash.is_empty()
-            && crate::events::latest_done_event(
+            && crate::events::latest_event(
                 &crate::events::for_thread(project, &t.id),
                 &t.id,
                 t.attempt.max(1),
             )
             .is_none()
             && let Ok(screen) = herdr.pane_read_text(&t.pane_id, "visible")
-            && let Some(kind) = connection_error(&screen)
+            && let Some((detail, evidence)) =
+                crate::adapters::terminal_dependency(&screen).or_else(|| {
+                    connection_error(&screen).then(|| {
+                        (
+                            screen.clone(),
+                            crate::adapters::DependencyEvidence {
+                                kind: "connectivity".into(),
+                                reset_at: None,
+                            },
+                        )
+                    })
+                })
         {
+            let machine = if t.is_remote() {
+                t.machine_route()
+            } else {
+                crate::contracts::MACHINE_LOCAL
+            };
+            let dependency_machine = threads::dependency_machine(ctx, machine)?;
+            let machine = dependency_machine.as_str();
+            if t.provider_failure_kind.as_deref() != Some(&evidence.kind) {
+                crate::adapters::observe_dependency(
+                    &ctx.root, machine, &t.launch, &detail, &evidence,
+                )?;
+                thread::update(project, &t.id, |record| {
+                    record.provider_failure_kind = Some(evidence.kind.clone());
+                    record.failure_class = match evidence.kind.as_str() {
+                        "auth" | "quota" => crate::contracts::FailureClass::Provider,
+                        "connectivity" => crate::contracts::FailureClass::LostConnection,
+                        _ => crate::contracts::FailureClass::Unknown,
+                    };
+                })?;
+            }
+            crate::adapters::notify_auth(&ctx.root, project, machine, &t.launch)?;
+            let ready = if t.is_remote() {
+                threads::box_launch_ready_for(ctx, machine, &t.launch)
+            } else {
+                crate::doctor::recipe_ready_local(ctx, &t.launch)
+            };
+            if ready.is_err() {
+                continue;
+            }
             let recent: Vec<_> = t
                 .connection_resumes
                 .iter()
@@ -1961,33 +2048,44 @@ fn thread_pass(
                 thread::update(project, &t.id, |record| {
                     record.connection_resumes = recent;
                     record.connection_waiting = true;
-                    record.failure_class = crate::contracts::FailureClass::LostConnection;
-                    record.provider_failure_kind = (kind == "provider").then(|| kind.into());
                     record.last_group = thread::Group::WaitingOnYou.token().into();
                 })?;
                 crate::inbox::write(
                     project,
-                    "lane-connection",
+                    "lane-dependency",
                     &t.id,
-                    "Connection recovery paused after three in-place resumes within an hour; check the lane pane.",
+                    "Dependency recovery paused after three in-place resumes within an hour; diagnose this lane without restarting its work budget.",
                     "",
                 )?;
                 continue;
             }
             if recent
                 .last()
-                .is_none_or(|at| thread::seconds_since(at, now) >= 60)
+                .is_some_and(|at| thread::seconds_since(at, now) < 60)
             {
-                // Herdr sends to this exact pane; no new session or attempt.
-                herdr.agent_prompt(&t.pane_id, "The connection dropped. Continue the current task in this session from where you stopped; do not start a new attempt.")?;
-                thread::update(project, &t.id, |record| {
-                    record.connection_resumes = recent;
-                    record.connection_resumes.push(project::now());
-                    record.failure_class = crate::contracts::FailureClass::LostConnection;
-                    record.provider_failure_kind = (kind == "provider").then(|| kind.into());
-                })?;
                 continue;
             }
+            resume_session(
+                project,
+                herdr,
+                t,
+                recent,
+                "The dependency is reachable again. Continue the current task in this session; do not start a new attempt or repeat completed work or uncertain effects.",
+            )?;
+            continue;
+        }
+        if state == "working"
+            && (t.provider_failure_kind.is_some()
+                || t.error.starts_with("connection_resume_uncertain:"))
+        {
+            thread::update(project, &t.id, |record| {
+                record.provider_failure_kind = None;
+                if record.error.starts_with("connection_resume_uncertain:") {
+                    record.connection_waiting = false;
+                    record.error.clear();
+                    record.connection_resumes.push(project::now());
+                }
+            })?;
         }
         let mut delivered = false;
         if t.bootstrap == "resuming" && ready {
@@ -2392,6 +2490,7 @@ fn thread_pass(
         // A missing pane or a previously identified agent back at a shell is
         // news. An omitted name while a process still runs remains unknown.
         let process_gone = !t.is_remote()
+            && !after.pane_id.is_empty()
             && thread::can_check_gone(&after, now)
             && !threads::attempt_sealed(project, &after)
             && (!live.pane_exists
@@ -3072,7 +3171,9 @@ fn tick_cheap_observed(
     // A reused pane id after a server restart is not the original process.
     let bound_pane =
         pane_alive && (record.server_socket_inode == 0 || record.server_socket_inode == inode);
-    if let Err(error) = coordinator::recover(project, &herdr, &record, agent.as_ref(), bound_pane) {
+    if let Err(error) =
+        coordinator::recover(ctx, project, &herdr, &record, agent.as_ref(), bound_pane)
+    {
         first_error = first_error.or(Some(error));
     }
     let coordinator_recorded = usize::from(!record.pane_id.is_empty());
@@ -3225,7 +3326,12 @@ fn clean_managed_project_tabs(
 }
 
 /// Reconcile the outcome obligation independently of transport and running work.
-fn goal_check_nudge(project: &Project, herdr: &Herdr<'_>, agents: &[Agent]) -> Result<()> {
+fn goal_check_nudge(
+    ctx: &Ctx,
+    project: &Project,
+    herdr: &Herdr<'_>,
+    agents: &[Agent],
+) -> Result<()> {
     let coordinator = project.coordinator();
     let agent = coordinator
         .as_ref()
@@ -3242,6 +3348,22 @@ fn goal_check_nudge(project: &Project, herdr: &Herdr<'_>, agents: &[Agent]) -> R
         return Ok(());
     }
     if let Some((token, line)) = steps::goal_check::notice(project) {
+        if crate::adapters::dependency_waiting(
+            &ctx.root,
+            crate::contracts::MACHINE_LOCAL,
+            &coordinator.launch,
+        ) {
+            let ready = crate::doctor::recipe_ready_local(ctx, &coordinator.launch);
+            crate::adapters::notify_auth(
+                &ctx.root,
+                project,
+                crate::contracts::MACHINE_LOCAL,
+                &coordinator.launch,
+            )?;
+            if ready.is_err() {
+                return Ok(());
+            }
+        }
         steps::deliver_goal_check(project, herdr, &coordinator.pane_id, &token, &line)?;
     }
     Ok(())
@@ -3391,7 +3513,7 @@ fn tick_slow_with_steps(
     );
     errors.extend(crate::threads::park_completed(ctx, project).err());
     stop_after_state!("goal check");
-    errors.extend(goal_check_nudge(project, &herdr, &seen.agents).err());
+    errors.extend(goal_check_nudge(ctx, project, &herdr, &seen.agents).err());
     inbox::prune_done(project, steps::DONE_RETENTION_DAYS);
     if state != before {
         errors.extend(steps::save_state(project, &state).err());
@@ -3705,7 +3827,7 @@ mod tests {
         })
         .unwrap();
         let mut cache = BTreeMap::from([(
-            (crate::contracts::MACHINE_LOCAL.into(), "pi_example".into()),
+            (crate::contracts::MACHINE_LOCAL.into(), ":".into()),
             Err("pi_not_ready: provider still warming up".into()),
         )]);
         assert!(resume_provider_starts(
@@ -3777,11 +3899,195 @@ mod tests {
         assert_eq!(failed.status, thread::Status::Failed);
         assert_eq!(failed.launch_attempts, 0);
         assert_eq!(failed.attempt, 0);
+        assert_eq!(
+            failed.failure_class,
+            crate::contracts::FailureClass::Unknown
+        );
         assert!(
             failed.error.contains("provider_wait_expired"),
             "{}",
             failed.error
         );
+    }
+
+    #[test]
+    fn provider_outage_shares_one_probe_without_a_restart_fleet_or_new_work_budget() {
+        let world = crate::scenarios::World::new();
+        let first = world.project("first", "a.sock");
+        let second = world.project("second", "b.sock");
+        let mut lanes = Vec::new();
+        for (project, recipe) in [(&first, "one"), (&second, "two")] {
+            let lane = thread::allocate(project, |t| {
+                t.status = thread::Status::Open;
+                t.attempt = 4;
+                t.launch.kind = "claude".into();
+                t.launch.recipe_id = recipe.into();
+                t.launch.work_retries = 2;
+                t.launch.same_recipe_retries = 3;
+                t.provider_wait_started = project::now();
+            })
+            .unwrap();
+            lanes.push((project, lane));
+        }
+        let runner = FakeRunner::new();
+        let ready = std::rc::Rc::new(std::cell::Cell::new(false));
+        let flag = ready.clone();
+        runner.on_fn(
+            |cmd| cmd.program == "claude",
+            move |_| {
+                Ok(if flag.get() {
+                    ok("OK")
+                } else {
+                    fail(1, "Usage limit reached")
+                })
+            },
+        );
+        let ctx = Ctx {
+            runner: &runner,
+            ..world.ctx()
+        };
+        let probes = || {
+            runner
+                .calls
+                .borrow()
+                .iter()
+                .filter(|cmd| cmd.program == "claude")
+                .count()
+        };
+        for _ in 0..2 {
+            for project in [&first, &second] {
+                resume_provider_starts(&ctx, project, &mut BTreeMap::new(), |error| {
+                    panic!("{error:#}")
+                });
+            }
+        }
+        assert_eq!(probes(), 1);
+        assert!(lanes.iter().all(|(project, lane)| {
+            !thread::load(project, &lane.id)
+                .unwrap()
+                .provider_wait_started
+                .is_empty()
+        }));
+        ready.set(true);
+        crate::adapters::expire_dependency_probe(
+            &world.root,
+            crate::contracts::MACHINE_LOCAL,
+            &lanes[0].1.launch,
+        );
+        for project in [&first, &second] {
+            resume_provider_starts(&ctx, project, &mut BTreeMap::new(), |error| {
+                panic!("{error:#}")
+            });
+        }
+        assert_eq!(probes(), 2);
+        for (project, before) in lanes {
+            let after = thread::load(project, &before.id).unwrap();
+            assert!(after.provider_wait_started.is_empty());
+            assert_eq!(after.attempt, before.attempt);
+            assert_eq!(after.launch, before.launch);
+        }
+        assert_eq!(runner.count("agent start"), 0);
+        assert_eq!(runner.count("agent prompt"), 0);
+    }
+
+    #[test]
+    fn a_recorded_future_reset_outlives_the_lane_wait_timeout() {
+        let world = crate::scenarios::World::new();
+        let project = world.project("demo", "a.sock");
+        let lane = thread::allocate(&project, |t| {
+            t.role = "reviewer".into();
+            t.launch.kind = "claude".into();
+            t.provider_wait_started = "2020-01-01T00:00:00Z".into();
+        })
+        .unwrap();
+        let evidence = crate::adapters::DependencyEvidence {
+            kind: "quota".into(),
+            reset_at: Some(
+                "2099-01-01T00:00:00Z"
+                    .parse::<jiff::Timestamp>()
+                    .unwrap()
+                    .as_second(),
+            ),
+        };
+        crate::adapters::observe_dependency(
+            &world.root,
+            crate::contracts::MACHINE_LOCAL,
+            &lane.launch,
+            "Usage limit reached",
+            &evidence,
+        )
+        .unwrap();
+        resume_provider_starts(&world.ctx(), &project, &mut BTreeMap::new(), |error| {
+            panic!("{error:#}")
+        });
+        let held = thread::load(&project, &lane.id).unwrap();
+        assert_eq!(held.status, lane.status);
+        assert_eq!(held.provider_wait_started, lane.provider_wait_started);
+        assert_eq!(held.launch, lane.launch);
+        assert_eq!(world.runner.count("agent start"), 0);
+    }
+
+    #[test]
+    fn uncertain_session_resume_is_not_replayed_and_live_activity_reconciles_it() {
+        let world = crate::scenarios::World::new();
+        let project = world.project("demo", "a.sock");
+        let lane = world.thread(&project, world.home.path(), |t| {
+            t.bootstrap = "acknowledged".into();
+            t.launch.kind = "claude".into();
+        });
+        world.runner.on("pane read", ok("WebSocket closed"));
+        world.runner.on(
+            "agent prompt",
+            fail(1, "transport disconnected after submission"),
+        );
+        let ctx = world.ctx();
+        let herdr = Herdr::new("herdr", "", &world.runner);
+        let panes = [Pane {
+            pane_id: lane.pane_id.clone(),
+            tab_id: lane.tab_id.clone(),
+            workspace_id: lane.workspace_id.clone(),
+            cwd: lane.cwd.clone(),
+        }];
+        let poll = |state: &str| {
+            let current = thread::load(&project, &lane.id).unwrap();
+            thread_pass(
+                &LaunchPass {
+                    ctx: &ctx,
+                    project: &project,
+                    herdr: &herdr,
+                    threads: &[current],
+                    agents: &[Agent {
+                        pane_id: lane.pane_id.clone(),
+                        tab_id: lane.tab_id.clone(),
+                        workspace_id: lane.workspace_id.clone(),
+                        cwd: lane.cwd.clone(),
+                        name: lane.agent_name.clone(),
+                        agent_status: state.into(),
+                        ..Default::default()
+                    }],
+                    panes: &panes,
+                },
+                "ha",
+                None,
+                false,
+                None,
+            )
+        };
+        poll("idle").unwrap();
+        crate::adapters::expire_dependency_probe(
+            &world.root,
+            crate::contracts::MACHINE_LOCAL,
+            &lane.launch,
+        );
+        assert!(poll("idle").is_err());
+        poll("idle").unwrap();
+        assert_eq!(world.runner.count("agent prompt"), 1);
+        assert!(thread::load(&project, &lane.id).unwrap().connection_waiting);
+        poll("working").unwrap();
+        let current = thread::load(&project, &lane.id).unwrap();
+        assert!(!current.connection_waiting);
+        assert_eq!(current.connection_resumes.len(), 1);
+        assert_eq!(current.attempt, lane.attempt);
     }
 
     #[test]
@@ -4742,9 +5048,11 @@ mod tests {
         let runner = FakeRunner::new();
         runner.on("pane read", ok("WebSocket closed\n"));
         runner.on("agent prompt", ok(r#"{"result":{}}"#));
+        runner.on_fn(|cmd| cmd.program == "claude", |_| Ok(ok("OK")));
         let record = thread::allocate(&fixture.project, |t| {
             t.status = thread::Status::Open;
             t.bootstrap = "acknowledged".into();
+            t.launch.kind = "claude".into();
             t.launch_attempts = 1;
             t.pane_id = "w2:p1".into();
             t.tab_id = "w2:t1".into();
@@ -4794,6 +5102,13 @@ mod tests {
             )
             .unwrap();
         };
+        poll();
+        assert_eq!(runner.count("agent prompt"), 0);
+        crate::adapters::expire_dependency_probe(
+            &fixture.root,
+            crate::contracts::MACHINE_LOCAL,
+            &record.launch,
+        );
         poll();
         assert_eq!(runner.count("agent prompt"), 1);
         let saved = thread::load(&fixture.project, &record.id).unwrap();
@@ -5213,7 +5528,7 @@ mod tests {
         })
         .unwrap();
         let mut ready = BTreeMap::from([(
-            (crate::contracts::MACHINE_LOCAL.into(), String::new()),
+            crate::adapters::dependency_key(crate::contracts::MACHINE_LOCAL, &lane.launch),
             Ok(()),
         )]);
         resume_provider_starts(&ctx, &project, &mut ready, |error| panic!("{error:#}"));
@@ -6133,13 +6448,23 @@ mod tests {
         assert_eq!(revived.last_group, "working");
     }
 
+    fn nudge_context<'a>(f: &'a Fixture, runner: &'a FakeRunner) -> Ctx<'a> {
+        Ctx {
+            env: &f.env,
+            root: f.root.clone(),
+            config_dir: f.root.join("cfg"),
+            runner,
+            detached_ticker: false,
+        }
+    }
+
     fn nudge_pass(f: &Fixture, runner: &FakeRunner, agents: &[Agent]) {
         let herdr = Herdr::new(
             f.env.herdr_bin(),
             &f.project.coordinator().unwrap().socket,
             runner,
         );
-        goal_check_nudge(&f.project, &herdr, agents).unwrap();
+        goal_check_nudge(&nudge_context(f, runner), &f.project, &herdr, agents).unwrap();
         steps::flush_notices_for_test(&f.project, &herdr);
     }
 
@@ -6160,6 +6485,63 @@ mod tests {
             ..Default::default()
         };
         (f, runner, agent)
+    }
+
+    #[test]
+    fn goal_check_and_notice_delivery_hold_only_the_coordinators_failed_dependency() {
+        let (f, runner, agent) = nudge_setup();
+        runner.on_fn(|cmd| cmd.program == "claude", |_| Ok(ok("OK")));
+        f.project
+            .update_coordinator(|c| c.launch.kind = "claude".into())
+            .unwrap();
+        let launch = f.project.coordinator().unwrap().launch;
+        let mut evidence = crate::adapters::DependencyEvidence {
+            kind: "quota".into(),
+            reset_at: Some(
+                "2099-01-01T00:00:00Z"
+                    .parse::<jiff::Timestamp>()
+                    .unwrap()
+                    .as_second(),
+            ),
+        };
+        crate::adapters::observe_dependency(
+            &f.root,
+            crate::contracts::MACHINE_LOCAL,
+            &launch,
+            "Usage limit reached",
+            &evidence,
+        )
+        .unwrap();
+        nudge_pass(&f, &runner, std::slice::from_ref(&agent));
+        assert_eq!(runner.count("agent prompt"), 0);
+        assert!(
+            steps::goal_check::notice(&f.project).is_some(),
+            "diagnosis remains owed, not consumed by the outage"
+        );
+        evidence.reset_at = Some(0);
+        crate::adapters::observe_dependency(
+            &f.root,
+            crate::contracts::MACHINE_LOCAL,
+            &launch,
+            "Usage limit reached",
+            &evidence,
+        )
+        .unwrap();
+        crate::adapters::expire_dependency_probe(&f.root, crate::contracts::MACHINE_LOCAL, &launch);
+        for _ in 0..2 {
+            nudge_pass(&f, &runner, std::slice::from_ref(&agent));
+        }
+        assert_eq!(runner.count("agent prompt"), 1);
+        assert_eq!(
+            runner
+                .calls
+                .borrow()
+                .iter()
+                .filter(|cmd| cmd.program == "claude")
+                .count(),
+            1
+        );
+        assert_eq!(runner.count("agent start"), 0);
     }
 
     #[test]
@@ -6236,7 +6618,7 @@ mod tests {
             &f.project.coordinator().unwrap().socket,
             &runner,
         );
-        goal_check_nudge(&unbound, &herdr, &[agent.clone()]).unwrap();
+        goal_check_nudge(&ctx, &unbound, &herdr, &[agent.clone()]).unwrap();
         f.project
             .update_coordinator(|c| c.closed_by_rolf_at = project::now())
             .unwrap();
@@ -6275,7 +6657,13 @@ mod tests {
         crate::prompt::record_test_request(&f.project, "q-new", "Reconsider the outcome").unwrap();
         let c = f.project.coordinator().unwrap();
         let herdr = Herdr::new(f.env.herdr_bin(), &c.socket, &runner);
-        goal_check_nudge(&f.project, &herdr, std::slice::from_ref(&agent)).unwrap();
+        goal_check_nudge(
+            &nudge_context(&f, &runner),
+            &f.project,
+            &herdr,
+            std::slice::from_ref(&agent),
+        )
+        .unwrap();
         f.project
             .update_coordinator(|c| c.closed_by_rolf_at = project::now())
             .unwrap();

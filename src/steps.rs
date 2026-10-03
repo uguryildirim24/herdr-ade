@@ -641,6 +641,15 @@ fn coordinator_enqueue_at(
     notice: Option<NoticeInput<'_>>,
     now: u64,
 ) -> Result<bool> {
+    if project.coordinator().is_some_and(|record| {
+        crate::adapters::dependency_waiting(
+            &project.root,
+            crate::contracts::MACHINE_LOCAL,
+            &record.launch,
+        )
+    }) {
+        return Ok(false);
+    }
     let _writer = crate::prompt::writer_lock(project)?;
     let Some(agent) = herdr.agent_list()?.into_iter().find(|a| {
         project.coordinator().is_some_and(|c| {

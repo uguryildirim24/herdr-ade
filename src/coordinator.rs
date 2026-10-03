@@ -17,8 +17,7 @@ use crate::{inbox, ticker};
 
 pub(crate) const TOKEN_TTL: Duration = Duration::from_secs(300);
 
-const RESUME: &str =
-    "Continue the task you were working on; do not repeat work that is already complete.";
+const RESUME: &str = "Continue the task you were working on; do not repeat completed work. Effects with unknown outcomes may have taken effect; reconcile them before repeating them.";
 
 #[derive(Default, Serialize, Deserialize)]
 #[serde(default)]
@@ -72,60 +71,27 @@ pub(crate) fn paused_by_provider(project: &Project, record: &Coordinator) -> boo
     !recovery(project, record).fingerprint.is_empty()
 }
 
-// Claude Code's limit/error wording is not part of the adapter contract. Only
-// a terminal error line in the visible bottom buffer is sufficient evidence;
-// quoted errors in tool output and earlier scrollback are deliberately ignored.
-fn provider_error(screen: &str) -> Option<(String, i64, &'static str)> {
-    let lines: Vec<_> = screen
-        .lines()
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .collect();
-    let last = lines.last()?;
-    let line = if last.starts_with(['❯', '›', '>']) && lines.len() > 1 {
-        lines[lines.len() - 2]
-    } else {
-        last
-    };
-    let lower = line.to_ascii_lowercase();
-    let kind = if lower.starts_with("you've hit your limit")
-        || lower.starts_with("you have hit your limit")
-        || lower.starts_with("usage limit reached")
-    {
-        "limit"
-    } else if lower.starts_with("api error:") || lower.starts_with("api error (") {
-        "api"
-    } else {
-        return None;
-    };
-    let reset = if kind == "limit" {
-        line.split_whitespace()
-            .filter(|token| token.starts_with("20") && token.contains('T'))
-            .find_map(|token| {
-                token
-                    .trim_matches(|c: char| c == ')' || c == ',' || c == '.')
-                    .parse::<jiff::Timestamp>()
-                    .ok()
-            })
-            .map(|t| t.as_second())
-    } else {
-        None
-    };
-    let now = jiff::Timestamp::now().as_second();
-    Some((
-        line.to_owned(),
-        reset.filter(|at| *at > now).unwrap_or(now + 300),
-        kind,
-    ))
-}
-
 /// Recover only the exact binding, never a replacement pane or session.
 pub(crate) fn recover(
+    ctx: &Ctx,
     project: &Project,
     herdr: &Herdr,
     record: &Coordinator,
     agent: Option<&Agent>,
     pane_alive: bool,
+) -> Result<()> {
+    recover_observed(project, herdr, record, agent, pane_alive, || {
+        crate::doctor::recipe_ready_local(ctx, &record.launch)
+    })
+}
+
+fn recover_observed(
+    project: &Project,
+    herdr: &Herdr,
+    record: &Coordinator,
+    agent: Option<&Agent>,
+    pane_alive: bool,
+    probe: impl FnOnce() -> Result<()>,
 ) -> Result<()> {
     let _binding = project.coordinator_lock()?;
     if !current_binding(project, record)
@@ -161,13 +127,13 @@ pub(crate) fn recover(
         return Ok(());
     }
     if let Some(agent) = agent {
-        if !agent.ready() || record.prime_pending || record.launch.kind != "claude" {
+        if !agent.ready() || record.prime_pending {
             return Ok(());
         }
         let Ok(screen) = herdr.pane_read_text(&record.pane_id, "visible") else {
             return Ok(());
         };
-        let Some((fingerprint, retry_at, kind)) = provider_error(&screen) else {
+        let Some((fingerprint, evidence)) = crate::adapters::terminal_dependency(&screen) else {
             // A completed turn clears the incident; a later failure is new.
             if !state.fingerprint.is_empty() {
                 state.fingerprint.clear();
@@ -179,17 +145,35 @@ pub(crate) fn recover(
             return Ok(());
         };
         if state.fingerprint != fingerprint && !state.retried {
+            crate::adapters::observe_dependency(
+                &project.root,
+                crate::contracts::MACHINE_LOCAL,
+                &record.launch,
+                &fingerprint,
+                &evidence,
+            )?;
+            crate::adapters::notify_auth(
+                &project.root,
+                project,
+                crate::contracts::MACHINE_LOCAL,
+                &record.launch,
+            )?;
             state.fingerprint = fingerprint;
-            state.retry_at = retry_at;
+            state.retry_at = evidence
+                .reset_at
+                .unwrap_or(jiff::Timestamp::now().as_second() + 60);
             save_recovery(project, &state)?;
             inbox::write(
                 project,
                 "coordinator-provider",
                 &project.slug,
                 &format!(
-                    "Coordinator {} paused by provider until {}; retrying this session once then. If the provider still refuses, check its pane; no new session was started.",
+                    "Coordinator {} paused by provider: {}. Recheck the shared dependency before resuming this session once; no new session was started.",
                     project.slug,
-                    jiff::Timestamp::from_second(retry_at)?
+                    evidence
+                        .reset_at
+                        .map(|at| format!("reset at {at}"))
+                        .unwrap_or_else(|| "reset unknown".into())
                 ),
                 "",
             )?;
@@ -206,12 +190,21 @@ pub(crate) fn recover(
                     "coordinator-provider-refusal",
                     &project.slug,
                     &format!(
-                        "Coordinator {}: {kind} error persists after one retry; check its pane. No new session was started.",
-                        project.slug
+                        "Coordinator {}: {} error persists after one retry; check its pane. No new session was started.",
+                        project.slug, evidence.kind
                     ),
                     "",
                 )?;
             }
+            return Ok(());
+        }
+        if probe().is_err() {
+            crate::adapters::notify_auth(
+                &project.root,
+                project,
+                crate::contracts::MACHINE_LOCAL,
+                &record.launch,
+            )?;
             return Ok(());
         }
         let _writer = crate::prompt::writer_lock(project)?;
@@ -1322,6 +1315,18 @@ fn acknowledge_bootstrap(project: &Project) -> Result<()> {
 mod tests {
     use super::*;
 
+    // These process/transport regressions supply successful readiness evidence;
+    // adapter tests exercise the shared wait and real probe disposition.
+    fn recover(
+        project: &Project,
+        herdr: &Herdr,
+        record: &Coordinator,
+        agent: Option<&Agent>,
+        pane_alive: bool,
+    ) -> Result<()> {
+        recover_observed(project, herdr, record, agent, pane_alive, || Ok(()))
+    }
+
     #[test]
     fn coordinator_start_surfaces_a_missing_command_without_the_ready_window() {
         use crate::runner::fake::{FakeRunner, fail, ok};
@@ -1379,15 +1384,24 @@ mod tests {
 
     #[test]
     fn provider_errors_only_match_the_terminal_line() {
-        assert!(provider_error("API Error: 500 Internal Server Error\n❯ \n").is_some());
+        use crate::adapters::terminal_dependency;
+        assert!(terminal_dependency("API Error: 500 Internal Server Error\n❯ \n").is_some());
         assert!(
-            provider_error("You've hit your limit · resets 2099-01-01T00:00:00Z\n❯ \n")
-                .is_some_and(
-                    |(_, at, kind)| at > jiff::Timestamp::now().as_second() && kind == "limit"
-                )
+            terminal_dependency("You've hit your limit · resets 2099-01-01T00:00:00Z\n❯ \n")
+                .is_some_and(|(_, evidence)| evidence
+                    .reset_at
+                    .is_some_and(|at| at > jiff::Timestamp::now().as_second())
+                    && evidence.kind == "quota")
         );
-        assert!(provider_error("API Error: 500\nassistant response\n❯ \n").is_none());
-        assert!(provider_error("tool: API Error: 500").is_none());
+        assert!(
+            terminal_dependency("Usage limit reached\n❯ \n")
+                .unwrap()
+                .1
+                .reset_at
+                .is_none()
+        );
+        assert!(terminal_dependency("API Error: 500\nassistant response\n❯ \n").is_none());
+        assert!(terminal_dependency("tool: API Error: 500").is_none());
     }
 
     #[test]
@@ -1426,6 +1440,59 @@ mod tests {
         recover(&project, &herdr, &record, Some(&agent), true).unwrap();
         recover(&project, &herdr, &record, Some(&agent), true).unwrap();
         assert_eq!(runner.count("agent prompt"), 1);
+    }
+
+    #[test]
+    fn non_claude_coordinator_uses_shared_readiness_and_keeps_unknown_reset_unknown() {
+        use crate::runner::fake::{FakeRunner, ok};
+        let world = crate::scenarios::World::new();
+        let project = world.project("demo", "a.sock");
+        project
+            .update_coordinator(|c| c.launch.kind = "agy".into())
+            .unwrap();
+        let record = project.coordinator().unwrap();
+        let agent = Agent {
+            agent_status: "idle".into(),
+            ..Default::default()
+        };
+        let runner = FakeRunner::new();
+        runner.on("pane read", ok("Usage limit reached\n❯"));
+        runner.on_fn(|cmd| cmd.program == "agy", |_| Ok(ok("OK")));
+        runner.on("agent prompt", ok(r#"{"result":{}}"#));
+        let ctx = Ctx {
+            runner: &runner,
+            ..world.ctx()
+        };
+        let herdr = Herdr::new("herdr", &record.socket, &runner);
+        super::recover(&ctx, &project, &herdr, &record, Some(&agent), true).unwrap();
+        assert_eq!(runner.count("agent prompt"), 0);
+        assert!(
+            inbox::unhandled(&project)
+                .iter()
+                .any(|item| item.summary.contains("reset unknown"))
+        );
+        let mut saved = recovery(&project, &record);
+        saved.retry_at = 0;
+        save_recovery(&project, &saved).unwrap();
+        crate::adapters::expire_dependency_probe(
+            &world.root,
+            crate::contracts::MACHINE_LOCAL,
+            &record.launch,
+        );
+        super::recover(&ctx, &project, &herdr, &record, Some(&agent), true).unwrap();
+        // Another action consumes the same successful probe, not another CLI call.
+        crate::doctor::recipe_ready_local(&ctx, &record.launch).unwrap();
+        assert_eq!(
+            runner
+                .calls
+                .borrow()
+                .iter()
+                .filter(|cmd| cmd.program == "agy")
+                .count(),
+            1
+        );
+        assert_eq!(runner.count("agent prompt"), 1);
+        assert_eq!(runner.count("agent start"), 0);
     }
 
     #[test]

@@ -319,13 +319,23 @@ pub fn start(ctx: &Ctx, slug: &str, args: StartArgs) -> Result<Thread> {
             let machine = explicit_machine
                 .or(default.as_deref())
                 .unwrap_or(crate::contracts::MACHINE_LOCAL);
+            let profile = if machine == crate::contracts::MACHINE_LOCAL {
+                None
+            } else {
+                Some(remote::machine_profile(
+                    ctx.runner,
+                    &ctx.env.herdr_bin(),
+                    &ctx.config_dir,
+                    machine,
+                )?)
+            };
             (
                 Placement {
-                    machine: if machine == crate::contracts::MACHINE_LOCAL {
-                        String::new()
-                    } else {
-                        machine.to_string()
-                    },
+                    machine: profile
+                        .as_ref()
+                        .map(|p| p.label.clone())
+                        .unwrap_or_default(),
+                    machine_id: profile.map(|p| p.id).unwrap_or_default(),
                     ..Placement::default()
                 },
                 Some(format!("{error:#}")),
@@ -638,7 +648,9 @@ fn resolve_placement(
 fn provider_readiness_error(error: &str) -> bool {
     error.contains("recipe_unavailable:")
         && !crate::remote::is_unreachable(error)
-        && error.contains("pi_not_ready")
+        && (error.contains("pi_not_ready")
+            || error.contains("readiness probe")
+            || error.contains("provider rejected"))
         && !error.contains("box_repo_")
         && !error.contains("machine_held:")
         && !error.contains("machine_kind_unavailable:")
@@ -677,6 +689,21 @@ fn box_launch_ready(
 ) -> Result<()> {
     crate::doctor::recipe_ready_on_box(ctx, profile, launch)
         .with_context(|| format!("recipe `{}` on `{}`", launch.recipe_id, profile.label))
+}
+
+/// Canonical dependency identity also covers old pre-placement records that
+/// saved only a label. Renaming a profile must not renew a provider incident.
+pub(crate) fn dependency_machine(ctx: &Ctx, machine: &str) -> Result<String> {
+    if machine == crate::contracts::MACHINE_LOCAL {
+        return Ok(machine.into());
+    }
+    let profile =
+        remote::machine_profile(ctx.runner, &ctx.env.herdr_bin(), &ctx.config_dir, machine)?;
+    Ok(if profile.id.is_empty() {
+        profile.label
+    } else {
+        profile.id
+    })
 }
 
 /// Recipe readiness on a remote machine, measured there rather than against
@@ -1426,6 +1453,27 @@ pub fn place_recovery(ctx: &Ctx, project: &Project, record: &Thread) -> Result<(
         return Ok(());
     }
     crate::plan::check_attempt_prerequisites(project, &record.id)?;
+    if record.recovery_pending
+        && matches!(
+            record.failure_class,
+            crate::contracts::FailureClass::Provider
+                | crate::contracts::FailureClass::LostConnection
+        )
+    {
+        let machine = if record.is_remote() {
+            record.machine_route()
+        } else {
+            crate::contracts::MACHINE_LOCAL
+        };
+        let ready = if record.is_remote() {
+            box_launch_ready_for(ctx, machine, &record.launch)
+        } else {
+            crate::doctor::recipe_ready_local(ctx, &record.launch)
+        };
+        let dependency_machine = dependency_machine(ctx, machine)?;
+        crate::adapters::notify_auth(&ctx.root, project, &dependency_machine, &record.launch)?;
+        ready?;
+    }
     if record.launch_attempts >= thread::MAX_LAUNCH_ATTEMPTS {
         fail_start(
             ctx,
@@ -7694,9 +7742,15 @@ mod tests {
             &mut std::collections::BTreeMap::new(),
             |error| panic!("{error:#}"),
         );
-        assert_eq!(fx.world.runner.count("herdr-pi check") - before, 1);
+        assert_eq!(fx.world.runner.count("herdr-pi check") - before, 0);
+        // The observation survives another pass, not merely its local map.
         thread::update(&fx.project, &other.id, |t| t.status = Status::Resolved).unwrap();
         ready.set(true);
+        crate::adapters::expire_dependency_probe(
+            &fx.world.root,
+            waiting.machine_route(),
+            &waiting.launch,
+        );
         crate::ticker::resume_provider_starts(
             &fx.world.ctx(),
             &fx.project,
