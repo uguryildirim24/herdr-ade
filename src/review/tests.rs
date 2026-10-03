@@ -547,6 +547,7 @@ fn empty_commit_seals_as_no_change_without_starting_a_pile() {
         &fx.project,
         crate::ops::Reservation {
             thread: &id,
+            pane: &lane.pane_id,
             attempt: 1,
             kind: crate::contracts::OpKind::Done,
             recipient: crate::contracts::Recipient {

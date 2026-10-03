@@ -3011,16 +3011,7 @@ fn resolve_with_views(
         t.status = Status::Resolved;
         t.resolved_reason = "manual".into();
         t.prompt_pending = false;
-    })?;
-    thread::update(&project, id, |t| {
-        t.cleanup_pending = removal_refusal
-            .as_ref()
-            .is_some_and(|r| r.starts_with("linked_files_not_kept:"));
-        t.cleanup_reason = if t.cleanup_pending {
-            removal_refusal.clone().unwrap_or_default()
-        } else {
-            String::new()
-        };
+        t.cleanup_pending = true;
     })?;
     if let Ok(Some(view)) = views.for_thread(ctx, &project, &resolved) {
         clear_thread_tokens(&view.herdr, &resolved);
@@ -3032,6 +3023,16 @@ fn resolve_with_views(
     };
     remove_finished_build_folder(ctx, &project, &resolved)?;
     remove_scratch_session(ctx, &resolved)?;
+    let resolved = thread::update(&project, id, |t| {
+        t.cleanup_pending = removal_refusal
+            .as_ref()
+            .is_some_and(|r| r.starts_with("linked_files_not_kept:"));
+        t.cleanup_reason = if t.cleanup_pending {
+            removal_refusal.clone().unwrap_or_default()
+        } else {
+            String::new()
+        };
+    })?;
     let pane = if args.keep_pane {
         "kept_open"
     } else if pane_closed {
@@ -3051,11 +3052,7 @@ fn resolve_with_views(
     refresh_plan(ctx, &project);
     Ok(ResolveOutcome {
         thread: id.to_string(),
-        state: if resolved.cleanup_pending
-            || removal_refusal
-                .as_ref()
-                .is_some_and(|r| r.starts_with("linked_files_not_kept:"))
-        {
+        state: if resolved.cleanup_pending {
             "cleanup_pending"
         } else {
             "resolved"
@@ -7777,6 +7774,52 @@ mod tests {
                 .worktree_path
                 .starts_with(&fx.repo.to_string_lossy().to_string())
         );
+    }
+
+    #[test]
+    fn failed_resolve_tail_keeps_cleanup_pending_until_retry_finishes() {
+        use crate::runner::fake::{FakeRunner, fail, ok};
+        let world = crate::scenarios::World::new();
+        let project = world.project("demo", "a.sock");
+        let lane = thread::allocate(&project, |t| {
+            t.kind = Kind::Adopted;
+            t.status = Status::Open;
+            t.cwd = world.home.path().to_string_lossy().into_owned();
+        })
+        .unwrap();
+        let runner = FakeRunner::new();
+        runner.on("session list", ok(&format!(r#"{{"sessions":[{{"name":"scratch-{}","running":false,"socket_path":"/scratch.sock"}}]}}"#, lane.id)));
+        runner.on("agent list", ok(r#"{"result":{"agents":[]}}"#));
+        runner.on("pane list", ok(r#"{"result":{"panes":[]}}"#));
+        let failing = std::rc::Rc::new(std::cell::Cell::new(true));
+        let flag = failing.clone();
+        runner.on_fn(
+            |cmd| cmd.display().contains("session delete"),
+            move |_| {
+                Ok(if flag.get() {
+                    fail(1, "busy")
+                } else {
+                    ok("{}")
+                })
+            },
+        );
+        let mut ctx = world.ctx();
+        ctx.runner = &runner;
+        let outcome = resolve_automatically(&ctx, &project, &lane.id, "finished");
+        assert_eq!(outcome.state, "cleanup_pending");
+        assert!(thread::load(&project, &lane.id).unwrap().cleanup_pending);
+        assert!(
+            outcome
+                .copy_notes
+                .iter()
+                .any(|note| note.contains("could not delete scratch session")),
+            "{outcome:?}"
+        );
+        failing.set(false);
+        retry_pending_cleanup(&ctx, &project).unwrap();
+        assert!(!thread::load(&project, &lane.id).unwrap().cleanup_pending);
+        let outcome = resolve(&ctx, "demo", &lane.id, &ResolveArgs::default()).unwrap();
+        assert_eq!(outcome.state, "resolved");
     }
 
     #[test]

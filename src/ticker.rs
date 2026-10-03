@@ -693,7 +693,6 @@ fn tick_with_steps(
     let projects: Vec<Project> = project::list_slugs(&ctx.root)
         .iter()
         .filter_map(|slug| Project::load(&ctx.root, slug).ok())
-        .filter(|project| project.status() == Status::Active)
         .collect();
     let project_refs: Vec<&Project> = projects.iter().collect();
     if !step("machine phase") {
@@ -724,7 +723,12 @@ fn tick_with_steps(
         })
         .map(|project| project.slug.clone())
         .collect();
-    if !projects.is_empty() && deferred.len() == projects.len() {
+    if !projects.is_empty()
+        && deferred.len() == projects.len()
+        && projects
+            .iter()
+            .all(|project| project.status() == Status::Active)
+    {
         return Some(true);
     }
     let mut reachable = Vec::new();
@@ -1801,7 +1805,10 @@ fn thread_pass(
                     }
                 }
             }
-        } else if !t.prompt_pending && t.bootstrap == "acknowledged" && ready {
+        } else if !t.prompt_pending
+            && (t.kind == thread::Kind::Adopted || t.bootstrap == "acknowledged")
+            && ready
+        {
             // Serialize queue drainage with brief delivery and other callers.
             // A matching bootstrap receipt proves the brief was consumed, not
             // that typing into a newly reopened process will start a turn.
@@ -1812,7 +1819,8 @@ fn thread_pass(
                     || current.pane_id != t.pane_id
                     || current.attempt != t.attempt
                     || current.prompt_pending
-                    || current.bootstrap != "acknowledged"
+                    || (current.kind != thread::Kind::Adopted
+                        && current.bootstrap != "acknowledged")
                 {
                     break;
                 }
@@ -3764,6 +3772,79 @@ mod tests {
             assert_eq!(world.runner.count("tab close"), 0);
             assert_eq!(world.runner.count("workspace close"), 0);
         }
+    }
+
+    #[test]
+    fn paused_project_imports_a_box_seal_and_parks_without_starting_work() {
+        use crate::contracts::{DonePayload, Event, EventPayload, Recipient};
+        let world = crate::scenarios::World::new();
+        let project = world.project("demo", "a.sock");
+        project.set_status(Status::Paused).unwrap();
+        let lane = thread::allocate(&project, |t| {
+            t.status = thread::Status::Open;
+            t.machine = "box".into();
+            t.machine_id = "box".into();
+            t.pane_id = "w2:p1".into();
+            t.tab_id = "w2:t1".into();
+            t.workspace_id = "w2".into();
+        })
+        .unwrap();
+        let report = b"finished on the box\n";
+        let artifact = thread::sha256_hex(report);
+        let event = Event {
+            id: format!("{}-1-1", lane.id),
+            op: format!("{}-1-1", lane.id),
+            thread: lane.id.clone(),
+            attempt: 1,
+            created: project::now(),
+            recipient: Recipient {
+                pane: "w1:p1".into(),
+                coordinator_attempt: 1,
+            },
+            payload: EventPayload {
+                done: Some(DonePayload {
+                    sha: "abc".into(),
+                    report_path: ".reports/lane.md".into(),
+                    artifact: artifact.clone(),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+        };
+        let bytes = toml::to_string(&event).unwrap().into_bytes();
+        let hash = thread::sha256_hex(&bytes);
+        let manifest = format!(
+            "boot\tboot-1\nagents\t{{\"result\":{{\"agents\":[]}}}}\npanes\t{{\"result\":{{\"panes\":[]}}}}\n\
+             event\tdemo\t{0}\t/box/demo/.state/events/{0}.toml\t{hash}\t/box/demo/.state/artifacts/{artifact}\t{artifact}\n\
+             receipt\tdemo\t{0}\t{hash}\t{artifact}\n",
+            event.id
+        );
+        world.runner.on(
+            "machine list --json",
+            ok(r#"[{"id":"box","label":"box","target":"box","session":"default","enabled":true}]"#),
+        );
+        world
+            .runner
+            .on_fn(|cmd| cmd.program == "ssh", move |_| Ok(ok(&manifest)));
+        let id = event.id.clone();
+        world.runner.on_fn(
+            |cmd| cmd.program == "scp",
+            move |cmd| {
+                let dir = PathBuf::from(cmd.args.last().unwrap().trim_end_matches('/'));
+                std::fs::create_dir_all(&dir)?;
+                std::fs::write(dir.join(format!("{id}.toml")), &bytes)?;
+                std::fs::write(dir.join(&artifact), report)?;
+                Ok(ok(""))
+            },
+        );
+        let ctx = world.ctx();
+        let mut memory = Memory::new(&ctx);
+        tick_for_test(&ctx, &mut memory);
+        assert_eq!(crate::events::list(&project).len(), 1);
+        assert!(thread::load(&project, &lane.id).unwrap().parked);
+        assert_eq!(project.status(), Status::Paused);
+        assert_eq!(world.runner.count("agent start"), 0);
+        assert_eq!(world.runner.count("agent prompt"), 0);
     }
 
     #[test]
@@ -6023,6 +6104,15 @@ mod tests {
 
     #[test]
     fn follow_ups_queued_during_start_arrive_after_the_brief_in_order() {
+        queued_follow_ups_drain(false);
+    }
+
+    #[test]
+    fn adopted_start_drains_follow_ups_without_a_bootstrap_receipt() {
+        queued_follow_ups_drain(true);
+    }
+
+    fn queued_follow_ups_drain(adopted: bool) {
         let f = fixture(false);
         let runner = FakeRunner::new();
         runner.on("agent prompt", ok(r#"{"result":{}}"#));
@@ -6037,6 +6127,9 @@ mod tests {
         let lane = thread::allocate(&f.project, |lane| {
             lane.status = thread::Status::Open;
             lane.prompt_pending = true;
+            if adopted {
+                lane.kind = thread::Kind::Adopted;
+            }
             lane.launch.ready_timeout_ms = 300_000;
             lane.workspace_id = "w1".into();
             lane.tab_id = "w1:t2".into();
@@ -6134,10 +6227,12 @@ mod tests {
 
         // Transporting the brief is not enough. The matching skill receipt is
         // the ordering gate for follow-ups.
-        thread::update(&f.project, &lane.id, |lane| {
-            lane.bootstrap = "acknowledged".into()
-        })
-        .unwrap();
+        if !adopted {
+            thread::update(&f.project, &lane.id, |lane| {
+                lane.bootstrap = "acknowledged".into()
+            })
+            .unwrap();
+        }
         let pass = run_pass();
         assert!(pass.error.is_none());
 
@@ -6152,7 +6247,12 @@ mod tests {
             "--timeout {}",
             crate::herdr::AGENT_START_TIMEOUT.as_millis()
         ))));
-        assert!(prompts[0].contains("skill lane"), "{}", prompts[0]);
+        assert_eq!(
+            prompts[0].contains("skill lane"),
+            !adopted,
+            "{}",
+            prompts[0]
+        );
         assert!(
             prompts[1].contains("check the first gate"),
             "{}",

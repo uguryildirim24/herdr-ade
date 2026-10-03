@@ -54,8 +54,18 @@ pub(crate) fn list(project: &Project) -> Vec<Op> {
         .filter_map(|name| name.strip_suffix(".toml").map(str::to_owned))
         .filter_map(|id| load(project, &id).ok())
         .collect();
-    ops.sort_by(|a, b| a.op.cmp(&b.op));
+    ops.sort_by(|a, b| submission_id_order(&a.op, &b.op));
     ops
+}
+
+/// Compare generated submission sequences numerically; historical IDs remain sortable.
+pub(crate) fn submission_id_order(a: &str, b: &str) -> std::cmp::Ordering {
+    fn key(id: &str) -> (&str, u64) {
+        id.rsplit_once('-')
+            .and_then(|(prefix, n)| Some((prefix, n.parse().ok()?)))
+            .unwrap_or((id, 0))
+    }
+    key(a).cmp(&key(b)).then_with(|| a.cmp(b))
 }
 
 fn write_op(project: &Project, op: &Op) -> Result<()> {
@@ -66,6 +76,7 @@ fn write_op(project: &Project, op: &Op) -> Result<()> {
 /// The complete payload of one `ha done` or `ha waiting`.
 pub(crate) struct Reservation<'a> {
     pub(crate) thread: &'a str,
+    pub(crate) pane: &'a str,
     pub(crate) attempt: u32,
     pub(crate) kind: OpKind,
     pub(crate) recipient: Recipient,
@@ -94,6 +105,7 @@ pub(crate) fn reserve(project: &Project, r: Reservation<'_>) -> Result<Op> {
 fn reserve_inner(project: &Project, r: Reservation<'_>, report_hash: Option<&str>) -> Result<Op> {
     let Reservation {
         thread,
+        pane,
         attempt,
         kind,
         recipient,
@@ -101,11 +113,11 @@ fn reserve_inner(project: &Project, r: Reservation<'_>, report_hash: Option<&str
         helper_pid,
     } = r;
     let _lock = project.lock()?;
-    let mut existing: Vec<Op> = list(project)
+    let existing: Vec<Op> = list(project)
         .into_iter()
         .filter(|op| op.thread == thread && op.attempt == attempt)
         .collect();
-    existing.sort_by(|a, b| a.op.cmp(&b.op));
+    let pane = Some(pane.to_string());
     // The lane record is authoritative for a requested correction. The
     // barrier can still be present after a fresh done, before review;
     // in that case retrying that fresh op must remain idempotent.
@@ -132,6 +144,7 @@ fn reserve_inner(project: &Project, r: Reservation<'_>, report_hash: Option<&str
             && op.kind == kind
             && op.requested == requested
             && op.recipient == recipient
+            && op.pane == pane
             && report_hash.is_none_or(|hash| {
                 if op.state == OpState::Reserved {
                     op.report_hash.as_deref() == Some(hash)
@@ -180,6 +193,7 @@ fn reserve_inner(project: &Project, r: Reservation<'_>, report_hash: Option<&str
         kind,
         recipient,
         helper_pid,
+        pane,
         requested,
         event: id,
         state: OpState::Reserved,
@@ -626,20 +640,7 @@ fn tick_op(ctx: &Ctx, project: &Project, op: &Op) -> Result<()> {
             abandon(project, &op.op)?;
         }
         // X2: seal from the op's own payload when the bindings still match.
-        OpState::Staged => {
-            let coordinator = project.coordinator();
-            let valid = current.as_ref().is_ok_and(|thread| {
-                thread.attempt.max(1) == op.attempt && thread.pane_id != op.recipient.pane
-            }) && coordinator.as_ref().is_some_and(|record| {
-                record.pane_id == op.recipient.pane
-                    && record.attempt() == op.recipient.coordinator_attempt
-            });
-            if valid {
-                let _ = seal(project, &op.op, |_| Ok(()))?;
-            } else {
-                abandon(project, &op.op)?;
-            }
-        }
+        OpState::Staged => recover_staged(project, op, false)?,
         _ => {}
     }
     Ok(())
@@ -678,16 +679,62 @@ fn recover_box_op(ctx: &Ctx, project: &Project, op: &Op) -> Result<()> {
                 abandon(project, &op.op)?;
             }
         }
-        OpState::Staged => {
-            let valid = load_box_card(project, &op.thread)
-                .is_some_and(|card| card.attempt == op.attempt && card.recipient == op.recipient);
-            if valid {
-                seal(project, &op.op, |_| Ok(()))?;
-            } else {
-                abandon(project, &op.op)?;
-            }
-        }
+        OpState::Staged => recover_staged(project, op, true)?,
         _ => {}
+    }
+    Ok(())
+}
+
+/// Called only inside seal's project lock, shared by the helper and recovery.
+pub(crate) fn validate_binding(project: &Project, op: &Op, on_box: bool) -> Result<String> {
+    let (attempt, pane, recipient) = if on_box {
+        let card =
+            load_box_card(project, &op.thread).context("stale_attempt: lane card is missing")?;
+        if card.project != project.slug || card.thread != op.thread {
+            bail!("stale_attempt: lane card identity changed");
+        }
+        (card.attempt, card.pane_id, card.recipient)
+    } else {
+        let lane = crate::thread::load(project, &op.thread)?;
+        if lane.is_remote() || lane.resolved_reason == "cancelled" {
+            bail!("stale_attempt: lane was moved or cancelled");
+        }
+        let coordinator = project
+            .coordinator()
+            .context("recipient_unavailable: project has no coordinator binding")?;
+        (
+            lane.attempt.max(1),
+            lane.pane_id,
+            Recipient {
+                coordinator_attempt: coordinator.attempt(),
+                pane: coordinator.pane_id,
+            },
+        )
+    };
+    if attempt != op.attempt
+        || pane.is_empty()
+        || pane == op.recipient.pane
+        || op.pane.as_ref().is_some_and(|captured| captured != &pane)
+    {
+        bail!("stale_attempt: lane placement changed before seal");
+    }
+    if recipient != op.recipient {
+        bail!("recipient_changed: coordinator binding changed before seal");
+    }
+    Ok(pane)
+}
+
+fn recover_staged(project: &Project, op: &Op, on_box: bool) -> Result<()> {
+    let mut invalid = false;
+    let result = seal(project, &op.op, |candidate| {
+        let result = validate_binding(project, candidate, on_box);
+        invalid = result.is_err();
+        result.map(|_| ())
+    });
+    if invalid {
+        abandon(project, &op.op)?;
+    } else {
+        result?;
     }
     Ok(())
 }
@@ -835,6 +882,7 @@ mod tests {
             project,
             Reservation {
                 thread: "t-0088",
+                pane: "w1:p2",
                 attempt: 1,
                 kind: OpKind::Done,
                 recipient: recipient.clone(),
@@ -1007,6 +1055,7 @@ mod tests {
             project,
             Reservation {
                 thread,
+                pane: "w1:p2",
                 attempt: 1,
                 kind: OpKind::Done,
                 recipient: recipient.clone(),
@@ -1032,6 +1081,7 @@ mod tests {
                 &project,
                 Reservation {
                     thread: "t-0001",
+                    pane: "w1:p2",
                     attempt: 1,
                     kind: OpKind::Done,
                     recipient: recipient.clone(),
@@ -1057,6 +1107,129 @@ mod tests {
         assert_ne!(first.op, second.op);
         stage_done(&project, &second.op, root.path(), &runner).unwrap();
         seal(&project, &second.op, |_| Ok(())).unwrap();
+    }
+
+    #[test]
+    fn report_reversion_after_sequence_ten_creates_a_new_submission() {
+        let (root, project, runner, recipient) = fixture();
+        let mut seals = Vec::new();
+        for n in 1..=10 {
+            std::fs::write(root.path().join("report.md"), format!("report {n}\n")).unwrap();
+            let mut event = done_again(&project, root.path(), &runner, &recipient, "t-0001");
+            event.created = "2026-09-18T00:00:00Z".into();
+            seals.push(event);
+        }
+        let mut old_attempt = seals[9].clone();
+        old_attempt.attempt = 0;
+        old_attempt.created = "2099-01-01T00:00:00Z".into();
+        seals.push(old_attempt);
+        std::fs::write(root.path().join("report.md"), "report 9\n").unwrap();
+        assert_eq!(
+            done_again(&project, root.path(), &runner, &recipient, "t-0001").id,
+            "t-0001-1-11"
+        );
+        assert_eq!(
+            events::latest_done_event(&seals, "t-0001", 1).unwrap().id,
+            "t-0001-1-10"
+        );
+        assert_eq!(
+            submission_id_order("historical-a", "historical-b"),
+            std::cmp::Ordering::Less
+        );
+    }
+
+    #[test]
+    fn rebound_placement_cannot_seal_from_a_captured_helper_or_recovery_op() {
+        for (on_box, rebind_before_reserve) in
+            [(false, false), (false, true), (true, false), (true, true)]
+        {
+            let world = crate::scenarios::World::new();
+            let project = world.project("demo", "a.sock");
+            let lane = crate::thread::allocate(&project, |t| {
+                t.status = crate::thread::Status::Open;
+                t.attempt = 1;
+                t.pane_id = "old:pane".into();
+            })
+            .unwrap();
+            let recipient = Recipient {
+                pane: "w1:p1".into(),
+                coordinator_attempt: project.coordinator().unwrap().attempt(),
+            };
+            let mut card = crate::contracts::LaneCard {
+                project: project.slug.clone(),
+                thread: lane.id.clone(),
+                attempt: 1,
+                pane_id: lane.pane_id.clone(),
+                recipient: recipient.clone(),
+                ..Default::default()
+            };
+            let card_path = project
+                .record_dir("lanes")
+                .join(format!("{}.toml", lane.id));
+            if on_box {
+                project.record_dir_for_write("lanes").unwrap();
+                std::fs::write(&card_path, toml::to_string(&card).unwrap()).unwrap();
+            }
+            let mut rebind = || {
+                if on_box {
+                    let _lock = project.lock().unwrap();
+                    card.pane_id = "new:pane".into();
+                    std::fs::write(&card_path, toml::to_string(&card).unwrap()).unwrap();
+                } else {
+                    crate::thread::update(&project, &lane.id, |t| t.pane_id = "new:pane".into())
+                        .unwrap();
+                }
+            };
+            if rebind_before_reserve {
+                rebind();
+            }
+            let op = reserve(
+                &project,
+                Reservation {
+                    thread: &lane.id,
+                    pane: &lane.pane_id,
+                    attempt: 1,
+                    kind: OpKind::Waiting,
+                    recipient,
+                    requested: Requested::Waiting {
+                        text: "finished waiting".into(),
+                        class: crate::contracts::FailureClass::Unknown,
+                        provider_kind: None,
+                    },
+                    helper_pid: 1,
+                },
+            )
+            .unwrap();
+            let staged = stage_waiting(&project, &op.op).unwrap();
+            // Old records still load without the newly captured placement.
+            let mut historical = toml::Value::try_from(&staged).unwrap();
+            historical.as_table_mut().unwrap().remove("pane");
+            assert!(
+                toml::from_str::<Op>(&toml::to_string(&historical).unwrap())
+                    .unwrap()
+                    .pane
+                    .is_none()
+            );
+            // Placement moved after the helper's snapshot, either before
+            // reservation or before seal. Attempt and recipient stayed the same.
+            if !rebind_before_reserve {
+                rebind();
+            }
+            assert!(
+                seal(&project, &op.op, |candidate| validate_binding(
+                    &project, candidate, on_box
+                )
+                .map(|_| ()))
+                .is_err()
+            );
+            if on_box {
+                recover_box_op(&world.ctx(), &project, &staged).unwrap();
+            } else {
+                tick_op(&world.ctx(), &project, &staged).unwrap();
+            }
+            assert_eq!(load(&project, &op.op).unwrap().state, OpState::Abandoned);
+            assert!(events::list(&project).is_empty());
+        }
     }
 
     #[test]
@@ -1087,6 +1260,7 @@ mod tests {
             &project,
             Reservation {
                 thread: "t-0001",
+                pane: "w1:p2",
                 attempt: 1,
                 kind: OpKind::Done,
                 recipient,
@@ -1116,6 +1290,7 @@ mod tests {
             &project,
             Reservation {
                 thread: "t-0001",
+                pane: "w1:p2",
                 attempt: 1,
                 kind: OpKind::Waiting,
                 recipient: recipient.clone(),
@@ -1129,6 +1304,7 @@ mod tests {
                 &project,
                 Reservation {
                     thread: "t-0001",
+                    pane: "w1:p2",
                     attempt: 1,
                     kind: OpKind::Waiting,
                     recipient: recipient.clone(),
@@ -1144,6 +1320,7 @@ mod tests {
             &project,
             Reservation {
                 thread: "t-0001",
+                pane: "w1:p2",
                 attempt: 1,
                 kind: OpKind::Waiting,
                 recipient,
@@ -1167,6 +1344,7 @@ mod tests {
             &project,
             Reservation {
                 thread: "t-0001",
+                pane: "w1:p2",
                 attempt: 1,
                 kind: OpKind::Waiting,
                 recipient,
@@ -1194,6 +1372,7 @@ mod tests {
             &project,
             Reservation {
                 thread: "t-0001",
+                pane: "w1:p2",
                 attempt: 1,
                 kind: OpKind::Waiting,
                 recipient,
@@ -1279,6 +1458,7 @@ mod tests {
             &project,
             Reservation {
                 thread: "t-0001",
+                pane: "w1:p2",
                 attempt: 1,
                 kind: OpKind::Done,
                 recipient: recipient.clone(),
@@ -1305,6 +1485,7 @@ mod tests {
             &project2,
             Reservation {
                 thread: "t-0001",
+                pane: "w1:p2",
                 attempt: 1,
                 kind: OpKind::Done,
                 recipient,
@@ -1365,6 +1546,7 @@ mod tests {
             &project,
             Reservation {
                 thread: "t-0001",
+                pane: "w1:p2",
                 attempt: 1,
                 kind: OpKind::Done,
                 recipient: recipient.clone(),
@@ -1389,6 +1571,7 @@ mod tests {
             &project,
             Reservation {
                 thread: "t-0001",
+                pane: "w1:p2",
                 attempt: 1,
                 kind: OpKind::Done,
                 recipient,
@@ -1431,6 +1614,7 @@ mod tests {
             &project,
             Reservation {
                 thread: "t-0001",
+                pane: "w1:p2",
                 attempt: 1,
                 kind: OpKind::Done,
                 recipient,
@@ -1457,6 +1641,7 @@ mod tests {
             &project,
             Reservation {
                 thread: "t-0001",
+                pane: "w1:p2",
                 attempt: 1,
                 kind: OpKind::Waiting,
                 recipient,
@@ -1522,6 +1707,7 @@ mod tests {
             &project,
             Reservation {
                 thread: "t-0001",
+                pane: "w2:p1",
                 attempt: 1,
                 kind: OpKind::Waiting,
                 recipient: recipient.clone(),
@@ -1545,6 +1731,7 @@ mod tests {
             &project,
             Reservation {
                 thread: "t-0002",
+                pane: "w2:p1",
                 attempt: 1,
                 kind: OpKind::Waiting,
                 recipient,
@@ -1616,6 +1803,7 @@ mod tests {
             &project,
             Reservation {
                 thread: &lane.id,
+                pane: &lane.pane_id,
                 attempt: 1,
                 kind: OpKind::Waiting,
                 recipient,

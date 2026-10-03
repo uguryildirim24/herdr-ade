@@ -64,6 +64,7 @@ pub(crate) fn done(ctx: &Ctx, report: &str, sha: &str) -> Result<()> {
         &binding.project,
         ops::Reservation {
             thread: &binding.thread.id,
+            pane: &binding.thread.pane_id,
             attempt,
             kind: OpKind::Done,
             recipient,
@@ -145,6 +146,7 @@ fn seal_message(
         &binding.project,
         ops::Reservation {
             thread: &binding.thread.id,
+            pane: &binding.thread.pane_id,
             attempt,
             kind: if failed {
                 OpKind::Failed
@@ -204,7 +206,11 @@ fn recipient(project: &Project) -> Result<Recipient> {
 }
 
 fn validate_current(binding: &Binding, attempt: u32, op: &crate::contracts::Op) -> Result<()> {
-    if binding.thread.attempt.max(1) != attempt || binding.thread.pane_id != pane_id()? {
+    let current_pane = ops::validate_binding(&binding.project, op, binding.card.is_some())?;
+    if binding.thread.attempt.max(1) != attempt
+        || binding.thread.pane_id != current_pane
+        || current_pane != pane_id()?
+    {
         bail!("stale_attempt: lane binding changed before seal");
     }
     let recipient = binding.recipient()?;
