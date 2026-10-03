@@ -68,11 +68,17 @@ struct Progress {
     updated: String,
 }
 
-#[derive(Default, Serialize, Deserialize)]
+#[derive(Clone, Default, Serialize, Deserialize)]
 struct Health {
     observed: String,
     projects: usize,
     failures: Vec<String>,
+    #[serde(default)]
+    status: Vec<String>,
+    // Partial passes publish gaps immediately but only a completed pass logs
+    // the state transition. Keep the last logged set across stops/restarts.
+    #[serde(default)]
+    logged: Option<(Vec<String>, Vec<String>)>,
 }
 
 thread_local! {
@@ -87,24 +93,88 @@ fn health_path(root: &Path) -> PathBuf {
 }
 
 impl Health {
+    fn begin(root: &Path, projects: usize) -> Self {
+        let previous: Self = read_evidence(&health_path(root)).unwrap_or_default();
+        Self {
+            observed: project::now(),
+            projects,
+            logged: previous
+                .logged
+                .or(Some((previous.failures, previous.status))),
+            ..Self::default()
+        }
+    }
+
+    fn closed(&mut self, root: &Path, log: &Log, project: &Project) {
+        let detail = format!(
+            "{}: coordinator closed; reviews skipped until open",
+            project.dir().display()
+        );
+        if !self.status.contains(&detail) {
+            self.status.push(detail);
+        }
+        self.publish_partial(root, log);
+    }
+
     fn failure(&mut self, root: &Path, log: &Log, detail: String) {
-        log.line(&detail);
-        self.failures.push(detail);
+        if !self.failures.contains(&detail) {
+            self.failures.push(detail);
+        }
+        self.publish_partial(root, log);
+    }
+
+    fn publish_partial(&self, root: &Path, log: &Log) {
         // Publish immediately: a later blocked step must not hide this failure.
         // Only a completed pass can clear prior failures; ensure and partial
         // passes have not reobserved the records which produced them.
         let mut evidence = read_evidence::<Health>(&health_path(root)).unwrap_or_default();
         evidence.observed = self.observed.clone();
         evidence.projects = self.projects;
+        evidence.logged = self.logged.clone();
         for failure in &self.failures {
             if !evidence.failures.contains(failure) {
                 evidence.failures.push(failure.clone());
             }
         }
-        evidence.publish(root, log);
+        for status in &self.status {
+            if !evidence.status.contains(status) {
+                evidence.status.push(status.clone());
+            }
+        }
+        evidence.write(root, log);
+    }
+
+    fn log_changes(&self, log: &Log) {
+        let before: BTreeSet<_> = self
+            .logged
+            .iter()
+            .flat_map(|(failures, status)| failures.iter().chain(status))
+            .collect();
+        let current: BTreeSet<_> = self.failures.iter().chain(&self.status).collect();
+        let mut changes: Vec<_> = current.difference(&before).map(|s| (*s).clone()).collect();
+        changes.extend(before.difference(&current).map(|s| format!("cleared: {s}")));
+        if !changes.is_empty() {
+            log.line(&format!(
+                "observation state changed: {}",
+                changes.join("; ")
+            ));
+        }
     }
 
     fn publish(&self, root: &Path, log: &Log) {
+        self.log_changes(log);
+        let mut evidence = self.clone();
+        evidence.logged = Some((self.failures.clone(), self.status.clone()));
+        evidence.write(root, log);
+    }
+
+    fn finish_partial(root: &Path, log: &Log) {
+        if let Ok(evidence) = read_evidence::<Health>(&health_path(root)) {
+            evidence.publish(root, log);
+        }
+    }
+
+    fn write(&self, root: &Path, log: &Log) {
         if let Err(error) = project::write_json(&health_path(root), self) {
             log.line(&format!("could not publish root health: {error:#}"));
         }
@@ -170,6 +240,9 @@ pub(crate) fn health_report(root: &Path) -> (Option<bool>, String) {
                 "; last observation {}: {} project(s)",
                 health.observed, health.projects
             ));
+            if !health.status.is_empty() {
+                detail.push_str(&format!("; {}", health.status.join("; ")));
+            }
             if !health.failures.is_empty() {
                 healthy = Some(false);
                 detail.push_str(&format!(
@@ -312,14 +385,11 @@ pub(crate) fn ensure(ctx: &Ctx) -> Result<()> {
         let log = Log {
             path: log_path(root),
         };
-        let mut health = Health {
-            observed: project::now(),
-            projects: slugs.len(),
-            ..Health::default()
-        };
+        let mut health = Health::begin(root, slugs.len());
         for error in errors {
             health.failure(root, &log, format!("{error:#}"));
         }
+        Health::finish_partial(root, &log);
         // Do not turn failed discovery into an empty-root success. Even with
         // no readable projects, start the normal loop so it can retry.
     } else if slugs.is_empty() && lock_state(root) == LockState::Free {
@@ -797,11 +867,7 @@ pub(crate) fn run(ctx: &Ctx) -> Result<()> {
         );
         log.line(&notice);
         let (slugs, errors) = project::list_slugs_with_errors(root);
-        let mut health = Health {
-            observed: project::now(),
-            projects: slugs.len(),
-            ..Health::default()
-        };
+        let mut health = Health::begin(root, slugs.len());
         for error in errors {
             health.failure(root, &log, format!("{error:#}"));
         }
@@ -814,6 +880,7 @@ pub(crate) fn run(ctx: &Ctx) -> Result<()> {
                 health.failure(root, &log, format!("{slug}: recovery notice: {error:#}"));
             }
         }
+        Health::finish_partial(root, &log);
     }
     let mut progress = Progress {
         pid: info.pid,
@@ -875,10 +942,7 @@ fn tick_with_steps(
     memory: &mut Memory,
     step: &mut impl FnMut(&str) -> bool,
 ) -> Option<bool> {
-    let mut health = Health {
-        observed: project::now(),
-        ..Health::default()
-    };
+    let mut health = Health::begin(&ctx.root, 0);
     if !step("project discovery") {
         return None;
     }
@@ -890,6 +954,7 @@ fn tick_with_steps(
                 log,
                 format!("awake clock: {error:#}; deferring pass"),
             );
+            Health::finish_partial(&ctx.root, log);
             return Some(false);
         }
     };
@@ -989,6 +1054,17 @@ fn tick_with_steps(
             }
             continue;
         }
+        match coordinator_binding(&project) {
+            Ok(None) => {
+                health.closed(&ctx.root, log, &project);
+                continue;
+            }
+            Ok(Some(_)) => {}
+            Err(error) => {
+                health.failure(&ctx.root, log, format!("{error:#}"));
+                continue;
+            }
+        }
         resume_provider_starts(ctx, &project, &mut readiness, |error| {
             health.failure(&ctx.root, log, format!("{slug}: {error:#}"));
         });
@@ -1018,30 +1094,64 @@ fn tick_with_steps(
         let Some(project) = load_for_tick(&ctx.root, slug, &mut health, log) else {
             continue;
         };
-        if project.status() == Status::Active
-            && let Err(error) = crate::review::tick_observed(ctx, &project, |review| {
-                // A missing remote verdict is not evidence of reviewer loss.
-                // Other repositories' local piles still advance below it.
-                !review
-                    .reviewer
-                    .as_deref()
-                    .and_then(|id| thread::load(&project, id).ok())
-                    .is_some_and(|lane| {
-                        lane.is_remote()
-                            && memory
-                                .machines
-                                .get(lane.machine_route())
-                                .is_some_and(|machine| !machine.outage.last_error.is_empty())
-                            && crate::events::latest_done_event(
-                                &crate::events::for_thread(&project, &lane.id),
-                                &lane.id,
-                                lane.attempt.max(1),
-                            )
-                            .is_none()
-                    })
-            })
-        {
-            health.failure(&ctx.root, log, format!("{slug}: reviews: {error:#}"));
+        if project.status() != Status::Active {
+            continue;
+        }
+        let closed = match coordinator_binding(&project) {
+            Ok(record) => record.is_none(),
+            Err(error) => {
+                health.failure(&ctx.root, log, format!("{error:#}"));
+                continue;
+            }
+        };
+        if closed {
+            health.closed(&ctx.root, log, &project);
+            // Seals remain facts even when no coordinator is open. Consume an
+            // arrived verdict, but otherwise skip the session-dependent pass.
+            match crate::review::list(&project) {
+                Ok(reviews) if reviews.iter().any(|review| sealed_review(&project, review)) => {}
+                Ok(_) => continue,
+                Err(error) => {
+                    health.failure(&ctx.root, log, format!("{slug}: reviews: {error:#}"));
+                    continue;
+                }
+            }
+        }
+        if let Err(error) = crate::review::tick_observed(ctx, &project, |review| {
+            if closed && !sealed_review(&project, review) {
+                return false;
+            }
+            // A missing remote verdict is not evidence of reviewer loss.
+            // Other repositories' local piles still advance below it.
+            !review
+                .reviewer
+                .as_deref()
+                .and_then(|id| thread::load(&project, id).ok())
+                .is_some_and(|lane| {
+                    lane.is_remote()
+                        && memory
+                            .machines
+                            .get(lane.machine_route())
+                            .is_some_and(|machine| !machine.outage.last_error.is_empty())
+                        && crate::events::latest_done_event(
+                            &crate::events::for_thread(&project, &lane.id),
+                            &lane.id,
+                            lane.attempt.max(1),
+                        )
+                        .is_none()
+                })
+        }) {
+            // Checking an arrived verdict may expose the next pile. Its
+            // session-dependent start waits for open, rather than becoming a
+            // recurring observation error. All other errors stay loud.
+            if !closed
+                || error.to_string()
+                    != format!(
+                        "the herdr session of `{slug}` is not reachable; run `open {slug}` first"
+                    )
+            {
+                health.failure(&ctx.root, log, format!("{slug}: reviews: {error:#}"));
+            }
         }
     }
     if !step("slow phase") {
@@ -1067,6 +1177,18 @@ fn tick_with_steps(
         return None;
     }
     Some(!reachable.is_empty() || !memory.machines.is_empty())
+}
+
+fn sealed_review(project: &Project, review: &crate::review::Review) -> bool {
+    !review.phase.closed()
+        && review
+            .reviewer
+            .as_deref()
+            .and_then(|id| thread::load(project, id).ok())
+            .is_some_and(|lane| {
+                crate::review::sealed(&crate::events::for_thread(project, &lane.id), &lane)
+                    .is_some()
+            })
 }
 
 fn load_for_tick(root: &Path, slug: &str, health: &mut Health, log: &Log) -> Option<Project> {
@@ -3109,8 +3231,20 @@ pub(crate) fn socket_inode(path: &std::path::Path) -> u64 {
     std::fs::metadata(path).map_or(0, |meta| meta.ino())
 }
 
-/// Returns `Ok(None)` when the project's session cannot be reached: then no
-/// state is read, so nothing is ever reported as gone.
+/// No binding or an empty socket is a closed coordinator, not a lost session.
+/// Read strictly: an unreadable binding is still an observation gap.
+pub(crate) fn coordinator_binding(project: &Project) -> Result<Option<project::Coordinator>> {
+    let path = project.state_dir().join("coordinator.json");
+    match read_evidence::<project::Coordinator>(&path) {
+        Ok(record) if record.socket.is_empty() => Ok(None),
+        Ok(record) => Ok(Some(record)),
+        Err(error) if is_not_found(&error) => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+
+/// Returns `Ok(None)` for a closed or unreachable session. Without a live
+/// observation, nothing is ever reported as gone.
 #[cfg(test)]
 fn tick_cheap(ctx: &Ctx, project: &Project, refresh_tokens: bool) -> Result<Option<Seen>> {
     tick_cheap_observed(ctx, project, refresh_tokens, &mut |_| {})
@@ -3123,19 +3257,10 @@ fn tick_cheap_observed(
     unavailable: &mut impl FnMut(String),
 ) -> Result<Option<Seen>> {
     let binding = project.coordinator_lock()?;
-    let path = project.state_dir().join("coordinator.json");
-    let record: project::Coordinator = match read_evidence(&path) {
-        Ok(record) => record,
-        Err(error) if is_not_found(&error) => {
-            unavailable(format!(
-                "{}: session unavailable: no coordinator binding",
-                path.display()
-            ));
-            return Ok(None);
-        }
-        Err(error) => return Err(error),
+    let Some(record) = coordinator_binding(project)? else {
+        return Ok(None);
     };
-    if record.socket.is_empty() || !Path::new(&record.socket).exists() {
+    if !Path::new(&record.socket).exists() {
         unavailable(format!(
             "{}: session unavailable: coordinator socket {} is absent",
             project.dir().display(),
@@ -3640,6 +3765,204 @@ fn tick_slow_with_steps(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn closed_coordinators_have_one_status_without_recurring_errors() {
+        for missing_binding in [false, true] {
+            let world = crate::scenarios::World::new();
+            let project = world.project("demo", "a.sock");
+            let lane = thread::allocate(&project, |lane| {
+                lane.status = thread::Status::Open;
+                lane.repo = "/repo".into();
+            })
+            .unwrap();
+            // This is the noisy case: automatic review is enabled and a
+            // changed lane is ready, but Rolf has not opened its coordinator.
+            project::write_atomic(&project.state_dir().join("reviews-enabled"), b"enabled\n")
+                .unwrap();
+            crate::events::seal_create_if_absent(
+                &project,
+                &crate::contracts::Event {
+                    id: format!("{}-1-1", lane.id),
+                    op: format!("{}-1-1", lane.id),
+                    thread: lane.id.clone(),
+                    attempt: 1,
+                    recipient: Default::default(),
+                    created: project::now(),
+                    usage: None,
+                    payload: crate::contracts::EventPayload {
+                        done: Some(crate::contracts::DonePayload {
+                            has_changes: Some(true),
+                            sha: "sealed-sha".into(),
+                            artifact: thread::store_artifact(&project, b"sealed report").unwrap(),
+                            ..Default::default()
+                        }),
+                        ..Default::default()
+                    },
+                },
+            )
+            .unwrap();
+            if missing_binding {
+                std::fs::remove_file(project.state_dir().join("coordinator.json")).unwrap();
+            } else {
+                project
+                    .update_coordinator(|record| record.socket.clear())
+                    .unwrap();
+            }
+            let ctx = world.ctx();
+            let mut memory = Memory::new(&ctx);
+            let log = Log {
+                path: log_path(&world.root),
+            };
+            for _ in 0..3 {
+                assert!(!tick(&ctx, &log, &mut memory));
+                let health: Health = read_evidence(&health_path(&world.root)).unwrap();
+                assert!(health.failures.is_empty(), "{:?}", health.failures);
+                assert_eq!(health.status.len(), 1);
+                let (healthy, detail) = health_report(&world.root);
+                assert_ne!(healthy, Some(false), "{detail}");
+                assert_eq!(detail.matches("coordinator closed").count(), 1);
+                assert!(detail.contains("reviews skipped"));
+                assert_eq!(
+                    thread::load(&project, &lane.id).unwrap().status,
+                    thread::Status::Open
+                );
+            }
+            let log = std::fs::read_to_string(log_path(&world.root)).unwrap();
+            assert_eq!(
+                log.matches("observation state changed:").count(),
+                1,
+                "{log}"
+            );
+            assert!(!log.contains("session unavailable"), "{log}");
+            assert_eq!(world.runner.count("agent list"), 0);
+            assert_eq!(world.runner.count("pane list"), 0);
+            assert_eq!(world.runner.count("git"), 0);
+            assert!(crate::review::list(&project).unwrap().is_empty());
+            assert!(
+                crate::events::latest_done_event(
+                    &crate::events::for_thread(&project, &lane.id),
+                    &lane.id,
+                    1
+                )
+                .is_some()
+            );
+
+            // Closing the coordinator does not hide unreadable lane records.
+            let path = thread::threads_dir(&project).join(format!("{}.toml", lane.id));
+            project::write_atomic(&path, b"bad = [").unwrap();
+            tick_for_test(&ctx, &mut memory);
+            let health: Health = read_evidence(&health_path(&world.root)).unwrap();
+            assert!(
+                health
+                    .failures
+                    .iter()
+                    .any(|failure| failure.contains(&path.display().to_string()))
+            );
+        }
+    }
+
+    #[test]
+    fn observation_state_changes_log_once_including_recovery_and_restart() {
+        let world = crate::scenarios::World::new();
+        let project = world.project("demo", "a.sock");
+        let socket = project.coordinator().unwrap().socket;
+        std::fs::remove_file(&socket).unwrap();
+        project
+            .update_coordinator(|record| record.socket.clear())
+            .unwrap();
+        let ctx = world.ctx();
+        let mut memory = Memory::new(&ctx);
+        let log = Log {
+            path: log_path(&world.root),
+        };
+        for (state, expected) in [("closed", 1), ("missing", 2), ("closed", 3)] {
+            project
+                .update_coordinator(|record| {
+                    record.socket = if state == "missing" {
+                        socket.clone()
+                    } else {
+                        String::new()
+                    };
+                })
+                .unwrap();
+            for _ in 0..2 {
+                tick(&ctx, &log, &mut memory);
+                // Deduplication is durable, not dependent on in-memory cadence.
+                memory = Memory::new(&ctx);
+                let log = std::fs::read_to_string(log_path(&world.root)).unwrap();
+                assert_eq!(
+                    log.matches("observation state changed:").count(),
+                    expected,
+                    "{log}"
+                );
+                let health: Health = read_evidence(&health_path(&world.root)).unwrap();
+                assert_eq!(health.failures.is_empty(), state == "closed");
+                if state == "missing" {
+                    assert_eq!(health_report(&world.root).0, Some(false));
+                    assert!(
+                        health
+                            .failures
+                            .iter()
+                            .any(|failure| failure.contains(&socket))
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn partial_observation_keeps_health_loud_and_logs_once_after_completion() {
+        let root = tempfile::tempdir().unwrap();
+        let log = Log {
+            path: log_path(root.path()),
+        };
+        // Historical health has no status or log snapshot.
+        project::write_atomic(
+            &health_path(root.path()),
+            br#"{"observed":"old","projects":1,"failures":[]}"#,
+        )
+        .unwrap();
+        let mut health = Health::begin(root.path(), 1);
+        health.failure(root.path(), &log, "demo: unreadable binding".into());
+        assert_eq!(health_report(root.path()).0, Some(false));
+        drop(health); // A stop/restart before pass completion must not lose the log transition.
+        for _ in 0..2 {
+            let mut health = Health::begin(root.path(), 1);
+            health.failure(root.path(), &log, "demo: unreadable binding".into());
+            health.publish(root.path(), &log);
+        }
+        let text = std::fs::read_to_string(log_path(root.path())).unwrap();
+        assert_eq!(
+            text.matches("observation state changed:").count(),
+            1,
+            "{text}"
+        );
+        Health::begin(root.path(), 1).publish(root.path(), &log);
+        let text = std::fs::read_to_string(log_path(root.path())).unwrap();
+        assert_eq!(
+            text.matches("observation state changed:").count(),
+            2,
+            "{text}"
+        );
+        assert!(text.contains("cleared: demo: unreadable binding"));
+    }
+
+    #[test]
+    fn unreadable_coordinator_bindings_are_not_closed() {
+        let world = crate::scenarios::World::new();
+        let project = world.project("demo", "a.sock");
+        let path = project.state_dir().join("coordinator.json");
+        std::fs::write(&path, "{bad").unwrap();
+        let ctx = world.ctx();
+        let mut memory = Memory::new(&ctx);
+        tick_for_test(&ctx, &mut memory);
+        let health: Health = read_evidence(&health_path(&world.root)).unwrap();
+        assert!(health.status.is_empty());
+        assert_eq!(health.failures.len(), 1);
+        assert!(health.failures[0].contains(&path.display().to_string()));
+        assert_eq!(health_report(&world.root).0, Some(false));
+    }
 
     #[test]
     fn missing_observations_name_the_path_while_another_project_advances() {
