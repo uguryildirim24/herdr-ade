@@ -141,6 +141,27 @@ pub(crate) fn answer(ctx: &Ctx, project: &Project, t: &Thread, herdr: &Herdr<'_>
         Dialog::Old => herdr.pane_submit_text(&t.pane_id, "1")?,
         Dialog::New => {
             herdr.pane_send_keys(&t.pane_id, "Down")?;
+            // Down can return before Claude redraws. Wait only for the exact
+            // Yes highlight in the visible screen, never in scrollback.
+            if let Err(error) = herdr.call(
+                &[
+                    "pane",
+                    "wait-output",
+                    &t.pane_id,
+                    "--source",
+                    "visible",
+                    "--regex",
+                    r"(?m)^[ \t]*❯ Yes, I trust this folder[ \t]*\r?$",
+                    "--timeout",
+                    "1000",
+                ],
+                std::time::Duration::from_secs(6),
+            ) {
+                if error.code == "timeout" {
+                    return Ok(true);
+                }
+                return Err(error.into());
+            }
             let screen = herdr.pane_read_text(&t.pane_id, "visible")?;
             if screen
                 .lines()
@@ -157,7 +178,7 @@ pub(crate) fn answer(ctx: &Ctx, project: &Project, t: &Thread, herdr: &Herdr<'_>
 mod tests {
     use super::*;
     use crate::project::{self, Repo};
-    use crate::runner::fake::{FakeRunner, ok};
+    use crate::runner::fake::{FakeRunner, fail, ok};
     use crate::thread::Status;
 
     #[test]
@@ -261,9 +282,13 @@ mod tests {
 
     #[test]
     fn safety_check_only_enters_after_verified_yes_for_the_exact_worktree() {
-        for (right_path, highlight) in
-            [(true, "yes"), (false, "yes"), (true, "no"), (true, "other")]
-        {
+        for (right_path, highlight) in [
+            (true, "yes"),
+            (false, "yes"),
+            (true, "no"),
+            (true, "other"),
+            (true, "timeout"),
+        ] {
             let (tmp, project, t) = managed_lane();
             let saved = thread::allocate(&project, |record| {
                 *record = t.clone();
@@ -284,6 +309,31 @@ mod tests {
                 move |_| Ok(ok(&screens.borrow_mut().pop_front().unwrap())),
             );
             fake.on("pane get", ok(&format!(r#"{{"result":{{"pane":{{"pane_id":"w1:p2","tab_id":"w1:t2","workspace_id":"w1","cwd":"{}"}}}}}}"#, t.cwd)));
+            fake.on_fn(
+                |cmd| cmd.display().contains("pane wait-output"),
+                move |cmd| {
+                    assert_eq!(
+                        &cmd.args[cmd.args.len() - 9..],
+                        &[
+                            "pane",
+                            "wait-output",
+                            "w1:p2",
+                            "--source",
+                            "visible",
+                            "--regex",
+                            r"(?m)^[ \t]*❯ Yes, I trust this folder[ \t]*\r?$",
+                            "--timeout",
+                            "1000",
+                        ][..]
+                    );
+                    assert_eq!(cmd.timeout, std::time::Duration::from_secs(6));
+                    Ok(if highlight == "timeout" {
+                        fail(1, r#"{"error":{"code":"timeout","message":"timed out waiting for output match"}}"#)
+                    } else {
+                        ok(r#"{"result":{}}"#)
+                    })
+                },
+            );
             let project_for_key = project.clone();
             let id = t.id.clone();
             fake.on_fn(
@@ -313,6 +363,8 @@ mod tests {
                 .filter_map(|cmd| {
                     if cmd.display().contains("pane read") {
                         Some("read")
+                    } else if cmd.display().contains("pane wait-output") {
+                        Some("wait")
                     } else if cmd.display().contains("pane send-keys") {
                         Some(cmd.args.last().unwrap().as_str())
                     } else {
@@ -323,9 +375,11 @@ mod tests {
             let expected = if !right_path {
                 vec!["read", "read"]
             } else if highlight == "yes" {
-                vec!["read", "Down", "read", "Enter"]
+                vec!["read", "Down", "wait", "read", "Enter"]
+            } else if highlight == "timeout" {
+                vec!["read", "Down", "wait"]
             } else {
-                vec!["read", "Down", "read"]
+                vec!["read", "Down", "wait", "read"]
             };
             assert_eq!(
                 actions, expected,
