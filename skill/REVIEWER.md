@@ -29,4 +29,4 @@ gates = [{ command = "<exact selected command>", exit = 0 }]
 
 Use `gates = []` when no gate is selected. List gates in policy order. The body explains findings and contains the gate output. Do not commit the report into the code repository.
 
-Finish with `ha done --report <report path from your brief> --sha <your HEAD>`. The report must be inside your git folder. On a cloud box this publishes only your reviewer branch and verifies its remote ref; on the Mac it does not publish. The harness fast-forwards, pushes, installs where needed, and closes the merged lanes. Never move the integration branch yourself.
+Commit repository changes if any, leave runtime deliverables untracked, then finish with `ha done`. It uses the recorded report and exact HEAD; the report must be inside your git folder. On a cloud box this publishes only your reviewer branch and verifies its remote ref; on the Mac it does not publish. The harness fast-forwards, pushes, installs where needed, and closes the merged lanes. Never move the integration branch yourself.

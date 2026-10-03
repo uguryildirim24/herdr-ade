@@ -22,14 +22,12 @@ This seals a `work_failed` event. The harness follows the matched routing rule's
 
 ## Finish
 
-Run `ha done` only when the task's acceptance is met; if blocked or acceptance is not met, run `ha waiting "<what blocks it>"` instead, because a done seal counts as finished and opens the steps after it.
+Run `ha done` only when acceptance is met. Use `ha waiting "<what is missing>"` for missing input, or `ha failed "<what failed, what you tried, and the evidence>"` for a failed approach.
 
-Commit changed files and write the report at the path named by your brief. If the task changed no files, no commit is needed: pass the current HEAD to `ha done`.
-Pass that same path to `done`: an absolute path or a path relative to the
-git folder is accepted, but the report must be a file inside that folder.
+Commit repository changes if any; leave runtime deliverables untracked. Write the report at the path named by your brief, inside the recorded git folder. No empty commit is needed: `ha done` uses that report and the recorded checkout's exact HEAD. Explicit `--report '<path>'` and `--sha <commit-sha>` override these defaults with the same validation.
 
 ```text
-ha done --report <report path from the brief> --sha <commit sha>
+ha done
 ```
 
 If you must stop for input, keep your work and run:
@@ -46,6 +44,6 @@ A brief that says you run on a named cloud box runs on a saved machine, not on t
 
 - The code branch is pinned to an exact Mac commit. The frozen brief arrives separately in `.herdr-project/<project>-<id>/brief.md`; it is never committed to the code repository.
 - Every kind logs in once per machine. If your kind is not signed in on the box, stop and run `ha waiting "<kind> is not signed in on the box"`; never copy a Mac credential across.
-- Commit your code, then run `ha done`. It publishes your lane branch to the recorded remote and verifies the ref before sealing. If publishing fails, it tells you what went wrong; retry `ha done` after the issue is resolved.
+- Commit repository changes if any, then run `ha done`. It publishes your lane branch to the recorded remote and verifies the ref before sealing. If publishing fails, it tells you what went wrong; retry `ha done` after the issue is resolved.
 - `ha done`, `ha waiting` and `ha failed` seal locally on the box. They do not deliver to the coordinator; the Mac courier carries the sealed event home.
 - After a reboot or a resize the old attempt is GONE. The coordinator restarts you from the exact start line in the brief; never resume a cold shell.

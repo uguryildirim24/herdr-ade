@@ -345,7 +345,7 @@ fn stage_done_inner(
     if !status.stdout.trim().is_empty() {
         return Err(crate::refusal::error(
             "worktree_dirty: ha done requires an empty git status; commit or remove the listed changes first",
-            format!("ha done --report {} --sha {sha}", report.display()),
+            "ha done",
         ));
     }
     let head = runner.run(
@@ -362,11 +362,7 @@ fn stage_done_inner(
                 "sha_mismatch: requested {sha}, HEAD is {}",
                 head.stdout.trim()
             ),
-            format!(
-                "ha done --report {} --sha {}",
-                report.display(),
-                head.stdout.trim()
-            ),
+            "ha done",
         ));
     }
     let tracked = runner.run(
@@ -407,6 +403,19 @@ fn stage_done_inner(
     if first != second {
         bail!("report_unstable: report bytes changed while staging");
     }
+    let local;
+    let (base, role, paths) = match card {
+        Some(card) => (&card.brief_commit, &card.role, &card.paths),
+        None => {
+            local = crate::thread::load(project, &op.thread)?;
+            (&local.base, &local.role, &local.paths)
+        }
+    };
+    if base.is_empty() {
+        bail!("lane base is missing; cannot classify changes");
+    }
+    let git = crate::repo::Git::new(runner, worktree);
+    validate_scope(&git, base, sha, role, paths)?;
     if let Some(card) = card {
         if card.thread != op.thread || card.attempt != op.attempt || card.recipient != op.recipient
         {
@@ -420,15 +429,7 @@ fn stage_done_inner(
             sha,
         )?;
     }
-    let base = match card {
-        Some(card) => card.brief_commit.clone(),
-        None => crate::thread::load(project, &op.thread)?.base,
-    };
-    if base.is_empty() {
-        bail!("lane base is missing; cannot classify changes");
-    }
-    let git = crate::repo::Git::new(runner, worktree);
-    let has_changes = git.trees_differ(&base, sha)?;
+    let has_changes = git.trees_differ(base, sha)?;
     let artifact = write_artifact(project, &first)?;
     advance_staged(
         project,
@@ -766,6 +767,50 @@ fn pid_alive(runner: &dyn Runner, pid: u32) -> bool {
         .is_ok_and(|output| output.success())
 }
 
+fn validate_scope(
+    git: &crate::repo::Git<'_>,
+    base: &str,
+    sha: &str,
+    role: &str,
+    paths: &[String],
+) -> Result<()> {
+    if paths.is_empty() || role == "reviewer" {
+        return Ok(());
+    }
+    let touched = git.run(&[
+        "log",
+        "--format=",
+        "--name-only",
+        "-z",
+        "--no-renames",
+        "--diff-merges=first-parent",
+        &format!("{base}..{sha}"),
+    ])?;
+    let outside: std::collections::BTreeSet<_> = touched
+        .split('\0')
+        .filter(|path| !path.is_empty())
+        .filter(|path| {
+            !paths
+                .iter()
+                .any(|glob| crate::gate_paths::matches(glob, path))
+        })
+        .collect();
+    if !outside.is_empty() {
+        return Err(crate::refusal::error(
+            format!(
+                "lane_paths_exceeded: commits touch files outside the writable paths:\n{}",
+                outside
+                    .iter()
+                    .map(|path| format!("- `{path}`"))
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            ),
+            "revert the out-of-scope changes from the lane's commits, or have the coordinator restart the lane with wider --paths",
+        ));
+    }
+    Ok(())
+}
+
 fn resolve_report(worktree: &Path, requested: &str) -> Result<PathBuf> {
     let requested = Path::new(requested);
     if !requested.is_absolute()
@@ -775,7 +820,7 @@ fn resolve_report(worktree: &Path, requested: &str) -> Result<PathBuf> {
     {
         return Err(crate::refusal::error(
             "report_path_invalid: report must stay in the worktree",
-            "ha done --report <path-inside-worktree> --sha <HEAD-sha>",
+            "ha done --report '<path-inside-worktree>'",
         ));
     }
     let path = if requested.is_absolute() {
@@ -786,7 +831,10 @@ fn resolve_report(worktree: &Path, requested: &str) -> Result<PathBuf> {
     if !path.is_file() {
         return Err(crate::refusal::error(
             format!("report_missing: {}", path.display()),
-            format!("ha done --report {} --sha <HEAD-sha>", path.display()),
+            format!(
+                "ha done --report {}",
+                crate::remote::quote(&path.to_string_lossy())
+            ),
         ));
     }
     let worktree = std::fs::canonicalize(worktree)
@@ -796,7 +844,7 @@ fn resolve_report(worktree: &Path, requested: &str) -> Result<PathBuf> {
     if !path.starts_with(&worktree) {
         return Err(crate::refusal::error(
             "report_path_invalid: report must stay in the worktree",
-            "ha done --report <path-inside-worktree> --sha <HEAD-sha>",
+            "ha done --report '<path-inside-worktree>'",
         ));
     }
     Ok(path)
@@ -1632,6 +1680,65 @@ mod tests {
     }
 
     #[test]
+    fn done_checks_local_commit_scope_including_both_rename_paths_and_reverts() {
+        use crate::testkit::{commit_file, git};
+        let fx = crate::testkit::fixture();
+        let base = commit_file(&fx.repo, "src/lane.rs", "initial\n", "base");
+        std::fs::create_dir(fx.repo.join("other")).unwrap();
+        git(&fx.repo, &["mv", "src/lane.rs", "other/lane.rs"]);
+        git(&fx.repo, &["commit", "-qm", "rename"]);
+        let renamed = git(&fx.repo, &["rev-parse", "HEAD"]);
+        let reads = crate::repo::Git::new(&RealRunner, &fx.repo);
+        for (paths, forbidden) in [("src/**", "other/lane.rs"), ("other/**", "src/lane.rs")] {
+            let error =
+                validate_scope(&reads, &base, &renamed, "lane", &[paths.into()]).unwrap_err();
+            assert!(error.to_string().contains(forbidden), "{error}");
+        }
+        validate_scope(&reads, &base, &renamed, "lane", &[]).unwrap();
+        validate_scope(&reads, &base, &renamed, "reviewer", &["src/**".into()]).unwrap();
+        git(&fx.repo, &["revert", "--no-edit", &renamed]);
+        let sha = git(&fx.repo, &["rev-parse", "HEAD"]);
+        std::fs::write(
+            fx.repo.join(".git/info/exclude"),
+            ".worktrees/\n.herdr-project/\n",
+        )
+        .unwrap();
+        let report = ".herdr-project/demo-t-0001/report.md";
+        std::fs::create_dir_all(fx.repo.join(report).parent().unwrap()).unwrap();
+        std::fs::write(fx.repo.join(report), "result\n").unwrap();
+        let lane = crate::thread::allocate(&fx.project, |t| {
+            t.base = base.clone();
+            t.paths = vec!["src/**".into()];
+        })
+        .unwrap();
+        let op = reserve_done(
+            &fx.project,
+            Reservation {
+                thread: &lane.id,
+                pane: "w1:p2",
+                attempt: 1,
+                kind: OpKind::Done,
+                recipient: Recipient {
+                    pane: "w1:p1".into(),
+                    coordinator_attempt: 1,
+                },
+                requested: Requested::Done {
+                    sha,
+                    report_path: report.into(),
+                },
+                helper_pid: 1,
+            },
+            &fx.repo,
+        )
+        .unwrap();
+        let error = stage_done(&fx.project, &op.op, &fx.repo, &RealRunner).unwrap_err();
+        assert!(crate::refusal::is(&error));
+        assert!(error.to_string().contains("other/lane.rs"));
+        assert_eq!(load(&fx.project, &op.op).unwrap().state, OpState::Reserved);
+        assert!(events::list(&fx.project).is_empty());
+    }
+
+    #[test]
     fn done_refuses_report_that_changes_between_reads() {
         let root = tempfile::tempdir().unwrap();
         let project = project::create(root.path(), "demo", "", vec![]).unwrap();
@@ -1731,6 +1838,7 @@ mod tests {
                 box_repo: "/box/repo".into(),
                 box_worktree: "/box/wt".into(),
                 brief_commit: "b0".into(),
+                paths: Vec::new(),
                 branch: format!("hp/demo/{thread}"),
                 publish_url: "https://github.com/uguryildirim24/herdr-ade.git".into(),
                 recipient: recipient.clone(),
