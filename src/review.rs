@@ -52,6 +52,9 @@ pub(crate) struct Verdict {
     pub candidate: String,
     #[serde(default)]
     pub without: BTreeMap<String, String>,
+    /// Historical declarations remain readable, but are never mechanical proof.
+    /// New checked verdicts replace these with ADE-observed results.
+    #[serde(default)]
     pub gates: Vec<GateRun>,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub gates_note: String,
@@ -804,7 +807,7 @@ fn start_locked(ctx: &Ctx, project: &Project, row: project::Repo) -> Result<Opti
 }
 fn task(project: &Project, review: &Review) -> String {
     let mut out = format!(
-        "Run `ha skill reviewer`. Review the whole repository pile {}. Your branch starts from candidate `{}` on integration base `{}`. Merge every included SHA below (some may already be merged); resolve conflicts, fix small issues, then run the selected gates once. Do not push or install.\n\n",
+        "Run `ha skill reviewer`. Review the whole repository pile {}. Your branch starts from candidate `{}` on integration base `{}`. Merge every included SHA below (some may already be merged); resolve conflicts, fix small issues, and judge each original acceptance criterion. ADE runs the path-selected gates on your sealed candidate, on your machine, before landing. Do not push or install.\n\n",
         review.id, review.candidate_branch, review.base
     );
     for member in &review.members {
@@ -833,7 +836,7 @@ fn task(project: &Project, review: &Review) -> String {
             gate.command, gate.env
         ));
     }
-    out.push_str(&format!("\nWrite a report with TOML front matter:\n+++\nreview = \"{}\"\nverdict = \"MERGE\" # or REJECT\ncandidate = \"<your exact HEAD>\"\ngates = [{{ command = \"<selected command>\", exit = 0 }}]\n# Optional: without = {{ t-0001 = \"one-line reason\" }}\n+++\n\nUse gates = [] if none are selected. If excluding lanes, rebuild from the integration base without those lanes before running gates; their commits must not remain ancestors of your candidate. Include gate output and findings. Commit repository changes if any, leave runtime deliverables untracked, then `ha done`. Output in another repository belongs in the report.\n", review.id));
+    out.push_str(&format!("\nWrite a report with TOML front matter:\n+++\nreview = \"{}\"\nverdict = \"MERGE\" # or REJECT\ncandidate = \"<your exact HEAD>\"\n# Gate execution receipts are recorded by ADE, not declared here.\n# Optional: without = {{ t-0001 = \"one-line reason\" }}\n+++\n\nIf excluding lanes, rebuild from the integration base without those lanes; their commits must not remain ancestors of your candidate. For every original required criterion, cite durable artifact/behavior evidence or say not established; gates alone do not prove semantics. Include findings and actual journey evidence. Commit repository changes if any, leave runtime deliverables untracked, then `ha done`. Output in another repository belongs in the report.\n", review.id));
     out
 }
 /// This text becomes part of the reviewer's own immutable launch brief. Never
@@ -959,6 +962,7 @@ fn prepare(ctx: &Ctx, project: &Project, review: &mut Review) -> Result<()> {
     save(project, review)
 }
 fn verdict(
+    ctx: &Ctx,
     project: &Project,
     review: &Review,
     event: &crate::contracts::Event,
@@ -1008,24 +1012,289 @@ fn verdict(
             );
         }
     }
-    let gates = selected(
-        &review.gates,
-        &files(git, &review.base, &verdict.candidate)?,
-    );
-    if verdict.gates.iter().any(|run| run.exit != 0)
-        || gates.iter().any(|gate| {
-            !verdict
-                .gates
-                .iter()
-                .any(|run| run.command == gate.command && run.exit == 0)
-        })
-    {
-        bail!(
-            "verdict must report each candidate-selected gate with exit 0; all extra gates must pass"
-        );
-    }
+    // Self-reported exits are discarded. Semantics still belong to the one
+    // reviewer; mechanical proof comes only from the existing execution path.
+    verdict.gates = observed_gates(ctx, project, review, &verdict.candidate, git)?;
     Ok(verdict)
 }
+/// ADE-owned execution evidence, separate from the reviewer-authored report.
+/// A nonzero checker, lost transport, timeout or incomplete log establishes no
+/// acceptance result; none is classified as a failed implementation.
+#[derive(Debug, Serialize, Deserialize)]
+struct GateReceipt {
+    review: String,
+    base: String,
+    candidate: String,
+    gate: project::Gate,
+    machine: String,
+    cwd: String,
+    environment: BTreeMap<String, String>,
+    started: String,
+    exit: Option<i32>,
+    timed_out: bool,
+    complete: bool,
+    error: String,
+    stdout: String,
+    stderr: String,
+    stdout_hash: String,
+    stderr_hash: String,
+}
+
+#[derive(Serialize)]
+struct GateSelection<'a> {
+    candidate: &'a str,
+    base: &'a str,
+    note: &'a str,
+    changed_paths: Vec<String>,
+    selected: Vec<project::Gate>,
+    not_selected: Vec<project::Gate>,
+}
+
+fn log_hash(path: &std::path::Path) -> Result<String> {
+    use sha2::Digest;
+    use std::io::Read;
+    let mut file = std::fs::File::open(path)?;
+    let mut digest = sha2::Sha256::new();
+    let mut buffer = [0; 8192];
+    loop {
+        let count = file.read(&mut buffer)?;
+        if count == 0 {
+            break;
+        }
+        digest.update(&buffer[..count]);
+    }
+    Ok(format!("{:x}", digest.finalize()))
+}
+
+fn candidate_guard(candidate: &str) -> String {
+    format!(
+        "ade_candidate() {{ head=$(git rev-parse HEAD) && status=$(git status --porcelain) && [ \"$head\" = {} ] && [ -z \"$status\" ]; }}\nade_candidate || {{ echo 'candidate changed or dirty; result not established' >&2; exit 125; }}\n",
+        crate::remote::quote(candidate)
+    )
+}
+
+fn gate_command(
+    gate: &project::Gate,
+    candidate: &str,
+    cwd: &str,
+    environment: &BTreeMap<String, String>,
+    target: Option<&str>,
+) -> crate::runner::Cmd {
+    use crate::runner::Cmd;
+    let guard = candidate_guard(candidate);
+    let script = format!(
+        "cd {} || exit 125\n{guard}sh -c {}\nresult=$?\nade_candidate || {{ echo 'gate changed candidate; result not established' >&2; exit 125; }}\nexit \"$result\"",
+        crate::remote::quote(cwd),
+        crate::remote::quote(&gate.command)
+    );
+    // Capture uses the shared Runner, including process-group timeout and full
+    // streamed logs. SSH transports those same streams; no second executor.
+    let timeout = std::time::Duration::from_secs(1800);
+    if let Some(target) = target {
+        let assignments = environment
+            .iter()
+            .map(|(key, value)| crate::remote::quote(&format!("{key}={value}")))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let script = format!("env {assignments} sh -c {}", crate::remote::quote(&script));
+        Cmd::new("ssh", timeout)
+            .own_group()
+            .args([
+                "-o",
+                "ConnectTimeout=5",
+                "-o",
+                "BatchMode=yes",
+                "--",
+                target,
+            ])
+            .arg(format!("sh -c {}", crate::remote::quote(&script)))
+    } else {
+        let mut cmd = Cmd::new("sh", timeout)
+            .own_group()
+            .args(["-c", &script])
+            .cwd(cwd);
+        for (key, value) in environment {
+            cmd = cmd.env(key, value);
+        }
+        cmd
+    }
+}
+
+fn observed_gates(
+    ctx: &Ctx,
+    project: &Project,
+    review: &Review,
+    candidate: &str,
+    git: &Git<'_>,
+) -> Result<Vec<GateRun>> {
+    let changed_paths = files(git, &review.base, candidate)?;
+    let gates = selected(&review.gates, &changed_paths);
+    let evidence_dir = dir(project).join(&review.id);
+    std::fs::create_dir_all(&evidence_dir)?;
+    let selection = GateSelection {
+        candidate,
+        base: &review.base,
+        note: &review.gates_note,
+        changed_paths,
+        not_selected: review
+            .gates
+            .iter()
+            .filter(|gate| !gates.contains(gate))
+            .cloned()
+            .collect(),
+        selected: gates.clone(),
+    };
+    project::write_atomic(
+        &evidence_dir.join(format!("{candidate}-selection.toml")),
+        toml::to_string(&selection)?.as_bytes(),
+    )?;
+    if gates.is_empty() {
+        return Ok(Vec::new());
+    }
+    let reviewer = thread::load(
+        project,
+        review.reviewer.as_deref().context("reviewer missing")?,
+    )?;
+    let mut environment = BTreeMap::new();
+    let (machine, target) = if reviewer.is_remote() {
+        let profile = crate::remote::machine_profile(
+            ctx.runner,
+            &ctx.env.herdr_bin(),
+            &ctx.config_dir,
+            reviewer.machine_route(),
+        )?;
+        let declaration = crate::remote::machine_declaration(&ctx.config_dir, &profile.label)?;
+        environment.insert("PATH".into(), declaration.path);
+        (profile.id, Some(profile.target))
+    } else {
+        if let Some(path) = ctx.env.var("PATH") {
+            environment.insert("PATH".into(), path.to_owned());
+        }
+        (crate::contracts::MACHINE_LOCAL.to_owned(), None)
+    };
+    let cwd = &reviewer.worktree_path;
+    if cwd.is_empty() {
+        bail!("gate result not established: reviewer checkout missing");
+    }
+    let mut runs = Vec::new();
+    for (index, gate) in gates.into_iter().enumerate() {
+        let mut environment = environment.clone();
+        environment.extend(gate.env.clone());
+        let started = jiff::Timestamp::now().to_string();
+        let run_dir = evidence_dir.join(format!("{candidate}-{index}-{started}"));
+        std::fs::create_dir(&run_dir)?;
+        let logs = crate::runner::OutputLogs {
+            stdout: run_dir.join("stdout.log"),
+            stderr: run_dir.join("stderr.log"),
+        };
+        let cmd = gate_command(&gate, candidate, cwd, &environment, target.as_deref());
+        let capture = ctx
+            .runner
+            .capture(&cmd, ctx.runner.is_real().then_some(&logs));
+        let mut receipt = GateReceipt {
+            review: review.id.clone(),
+            base: review.base.clone(),
+            candidate: candidate.into(),
+            gate,
+            machine: machine.clone(),
+            cwd: cwd.clone(),
+            environment,
+            started,
+            exit: None,
+            timed_out: false,
+            complete: false,
+            error: String::new(),
+            stdout: logs
+                .stdout
+                .strip_prefix(project.state_dir())?
+                .to_string_lossy()
+                .into_owned(),
+            stderr: logs
+                .stderr
+                .strip_prefix(project.state_dir())?
+                .to_string_lossy()
+                .into_owned(),
+            stdout_hash: String::new(),
+            stderr_hash: String::new(),
+        };
+        match capture {
+            Ok(capture) => {
+                receipt.exit = capture.output.code;
+                receipt.timed_out = capture.output.timed_out;
+                receipt.complete = capture.complete();
+                receipt.error = [capture.stdout.error, capture.stderr.error]
+                    .into_iter()
+                    .flatten()
+                    .collect::<Vec<_>>()
+                    .join("; ");
+                if !ctx.runner.is_real() {
+                    project::write_atomic(&logs.stdout, capture.output.stdout.as_bytes())?;
+                    project::write_atomic(&logs.stderr, capture.output.stderr.as_bytes())?;
+                }
+            }
+            Err(error) => receipt.error = format!("{error:#}"),
+        }
+        receipt.stdout_hash = log_hash(&logs.stdout).unwrap_or_default();
+        receipt.stderr_hash = log_hash(&logs.stderr).unwrap_or_default();
+        receipt.complete &= !receipt.stdout_hash.is_empty() && !receipt.stderr_hash.is_empty();
+        let path = run_dir.join("receipt.toml");
+        project::write_atomic(&path, toml::to_string(&receipt)?.as_bytes())?;
+        if !receipt.matches(project, review, candidate, &cmd, &machine) {
+            bail!(
+                "gate result not established (checker/transport/output error): {}; exit {:?}, timed_out {}, complete {}, error {}; receipt {}",
+                receipt.gate.command,
+                receipt.exit,
+                receipt.timed_out,
+                receipt.complete,
+                receipt.error,
+                path.display()
+            );
+        }
+        runs.push(GateRun {
+            command: receipt.gate.command,
+            exit: 0,
+        });
+    }
+    Ok(runs)
+}
+
+impl GateReceipt {
+    fn matches(
+        &self,
+        project: &Project,
+        review: &Review,
+        candidate: &str,
+        command: &crate::runner::Cmd,
+        machine: &str,
+    ) -> bool {
+        self.review == review.id
+            && self.base == review.base
+            && self.candidate == candidate
+            && self.machine == machine
+            && review.gates.contains(&self.gate)
+            && self.exit == Some(0)
+            && !self.timed_out
+            && self.complete
+            && self.error.is_empty()
+            && command
+                == &gate_command(
+                    &self.gate,
+                    candidate,
+                    &self.cwd,
+                    &self.environment,
+                    if command.program == "ssh" {
+                        command.args.get(5).map(String::as_str)
+                    } else {
+                        None
+                    },
+                )
+            && log_hash(&project.state_dir().join(&self.stdout))
+                .is_ok_and(|hash| hash == self.stdout_hash)
+            && log_hash(&project.state_dir().join(&self.stderr))
+                .is_ok_and(|hash| hash == self.stderr_hash)
+    }
+}
+
 fn defer_members(project: &Project, review: &Review) -> Result<()> {
     for member in &review.members {
         if review.phase == Phase::Rejected || excluded(review, &member.thread) {
@@ -1174,7 +1443,7 @@ fn advance(ctx: &Ctx, project: &Project, review: &mut Review) -> Result<()> {
                 }
                 let git = Git::new(ctx.runner, &review.repo);
                 fetch_reviewer(ctx, project, review, &reviewer, event, &git)?;
-                match verdict(project, review, event, &git) {
+                match verdict(ctx, project, review, event, &git) {
                     Ok(checked) => {
                         review.verdict = Some(checked);
                         review.checked_event = event.id.clone();
@@ -1203,7 +1472,7 @@ fn advance(ctx: &Ctx, project: &Project, review: &mut Review) -> Result<()> {
         };
         let git = Git::new(ctx.runner, &review.repo);
         fetch_reviewer(ctx, project, review, &reviewer, event, &git)?;
-        let verdict = match verdict(project, review, event, &git) {
+        let verdict = match verdict(ctx, project, review, event, &git) {
             Ok(verdict) => verdict,
             Err(error) => {
                 review.verdict = None;
