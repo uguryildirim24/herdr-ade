@@ -1863,18 +1863,6 @@ fn machines_to_check(
 
 /// ADE repository mapping, selected adapter readiness and the configured disk
 /// floor. One read-only SSH snapshot.
-#[cfg(test)]
-fn box_rows(
-    runner: &dyn Runner,
-    _herdr_bin: &str,
-    config_dir: &Path,
-    profile: &crate::contracts::MachineProfile,
-    recipes: &BTreeMap<String, crate::contracts::Recipe>,
-    min_free_disk_gb: f64,
-) -> Vec<(Option<bool>, String, String)> {
-    box_rows_with_snapshot(runner, config_dir, profile, recipes, min_free_disk_gb, None)
-}
-
 fn box_rows_with_snapshot(
     runner: &dyn Runner,
     config_dir: &Path,
@@ -2086,7 +2074,7 @@ fn box_rows_with_snapshot(
         let key = format!("repo {box_path}");
         let value = fact(&key);
         rows.push((
-            env_bool(&value, &["ok"]),
+            Some(value == "ok"),
             format!("box {label} repo {box_path}"),
             format!("clone {value}"),
         ));
@@ -2095,7 +2083,7 @@ fn box_rows_with_snapshot(
         let kind = &probe.kind;
         let value = fact(&format!("login_{kind}"));
         rows.push((
-            env_bool(&value, &["ok"]),
+            Some(value == "ok"),
             format!("box {label} login {kind}"),
             if value == "ok" {
                 format!("{kind} reached its smallest model")
@@ -2145,7 +2133,7 @@ fn box_rows_with_snapshot(
     for (provider, model) in providers {
         let value = fact(&format!("pi_{provider}/{model}"));
         rows.push((
-            env_bool(&value, &["ok"]),
+            Some(value == "ok"),
             format!("box {label} pi {provider}/{model}"),
             format!("herdr-pi check {provider} --model {model}: {value}"),
         ));
@@ -2180,14 +2168,6 @@ fn parse_facts(text: &str) -> std::collections::BTreeMap<String, String> {
         .filter_map(|line| line.split_once('\t'))
         .map(|(key, value)| (key.to_string(), value.trim().to_string()))
         .collect()
-}
-
-fn env_bool(value: &str, ok: &[&str]) -> Option<bool> {
-    if ok.contains(&value) {
-        Some(true)
-    } else {
-        Some(false)
-    }
 }
 
 #[cfg(test)]
@@ -2304,10 +2284,6 @@ recipe = "claude_fable_xhigh"
         runner.on("session list --json", ok(r#"{"sessions":[]}"#));
         runner.on("git --version", ok("git version 2.50.0\n"));
         runner.on("df -Pk /", ok("Filesystem 1024-blocks Used Available Capacity Mounted on\n/dev/disk 200000000 1000000 199000000 1% /\n"));
-        runner.on_fn(
-            |cmd| cmd.program == "gh" && cmd.args == ["auth", "status"],
-            |_| Ok(fail(1, "not logged in")),
-        );
         runner.on("machine list --json", ok(machines));
         runner
     }
@@ -2663,17 +2639,17 @@ recipe = "claude_fable_xhigh"
         });
         *world.panes.borrow_mut() = format!(
             "[{}]",
-            crate::scenarios::pane_json(&lane.workspace_id, &lane.tab_id, &lane.pane_id, &lane.cwd)
+            crate::scenarios::pane_json("w2", "w2:t1", "w2:p1", &lane.cwd)
         );
         *world.agents.borrow_mut() = format!(
             "[{}]",
             crate::scenarios::agent_json(
-                &lane.workspace_id,
-                &lane.tab_id,
-                &lane.pane_id,
+                "w2",
+                "w2:t1",
+                "w2:p1",
                 &lane.cwd,
                 &lane.agent_name,
-                "idle",
+                "idle"
             )
         );
         crate::threads::resolve(
@@ -2750,15 +2726,16 @@ recipe = "claude_fable_xhigh"
             let root = home.path().join("root");
             let project = opened_project(home.path(), &root, "w1:p1", "coordinator");
             let lane = bound_lane(&project);
+            let socket = home
+                .path()
+                .join("retained.sock")
+                .to_string_lossy()
+                .into_owned();
             crate::thread::update(&project, &lane.id, |lane| {
                 lane.machine.clear();
                 lane.machine_id.clear();
                 lane.identity = crate::contracts::IdentityBinding {
-                    socket: home
-                        .path()
-                        .join("retained.sock")
-                        .to_string_lossy()
-                        .into_owned(),
+                    socket: socket.clone(),
                     pane_id: lane.pane_id.clone(),
                     tab_id: lane.tab_id.clone(),
                     workspace_id: lane.workspace_id.clone(),
@@ -2777,21 +2754,19 @@ recipe = "claude_fable_xhigh"
                 "pane process-info",
                 ok(&format!(r#"{{"result":{{"process_info":{process}}}}}"#)),
             );
-            let mut rows = Vec::new();
-            check_lane_bindings(
-                &mut String::new(),
-                &mut |_, status, _, detail| rows.push((status, detail)),
-                &root,
-                ("local", "local"),
-                ("herdr", &runner),
-                None,
-            );
-            assert_eq!(rows[0].0, expected, "{rows:?}");
-            let socket = home
-                .path()
-                .join("retained.sock")
-                .to_string_lossy()
-                .into_owned();
+            let observe = || {
+                let mut rows = Vec::new();
+                check_lane_bindings(
+                    &mut String::new(),
+                    &mut |_, status, _, detail| rows.push((status, detail)),
+                    &root,
+                    ("local", "local"),
+                    ("herdr", &runner),
+                    None,
+                );
+                rows
+            };
+            assert_eq!(observe()[0].0, expected);
             assert!(runner.calls.borrow().iter().all(|call| {
                 call.env
                     .contains(&("HERDR_SOCKET_PATH".into(), socket.clone()))
@@ -2799,18 +2774,9 @@ recipe = "claude_fable_xhigh"
             project
                 .update_coordinator(|record| record.socket.clear())
                 .unwrap();
-            let mut statuses = Vec::new();
-            check_lane_bindings(
-                &mut String::new(),
-                &mut |_, status, _, _| statuses.push(status),
-                &root,
-                ("local", "local"),
-                ("herdr", &runner),
-                None,
-            );
             assert_eq!(
-                statuses,
-                [expected],
+                observe()[0].0,
+                expected,
                 "closed coordinator still observes its lane"
             );
         }
@@ -2988,7 +2954,7 @@ recipe = "claude_fable_xhigh"
         let thread = crate::thread::allocate(&project, |thread| {
             thread.status = crate::thread::Status::Open;
             thread.machine = "buildbox".into();
-            thread.machine_id = "buildbox-id".into();
+            thread.machine_id = "abc".into();
             thread.title = "Review r1".into();
         })
         .unwrap();
@@ -3008,13 +2974,7 @@ recipe = "claude_fable_xhigh"
             detached_ticker: false,
         };
 
-        let profile = crate::contracts::MachineProfile {
-            id: "buildbox-id".into(),
-            label: "buildbox".into(),
-            target: "me@box".into(),
-            session: "default".into(),
-        };
-        let (leftovers, errors) = finished_build_folders(&ctx, &profile);
+        let (leftovers, errors) = finished_build_folders(&ctx, &box_profile());
 
         assert!(leftovers.is_empty(), "{leftovers:?}");
         assert!(errors.is_empty(), "{errors:?}");
@@ -3046,13 +3006,7 @@ recipe = "claude_fable_xhigh"
             detached_ticker: false,
         };
 
-        let profile = crate::contracts::MachineProfile {
-            id: "buildbox-id".into(),
-            label: "buildbox".into(),
-            target: "me@box".into(),
-            session: "default".into(),
-        };
-        let (leftovers, errors) = finished_build_folders(&ctx, &profile);
+        let (leftovers, errors) = finished_build_folders(&ctx, &box_profile());
 
         assert!(leftovers.is_empty(), "{leftovers:?}");
         assert!(!errors.is_empty(), "{errors:?}");
@@ -3219,13 +3173,13 @@ recipe = "claude_fable_xhigh"
                 ..Default::default()
             },
         );
-        let rows = box_rows(
+        let rows = box_rows_with_snapshot(
             &runner,
-            "herdr",
             config.path(),
             &box_profile(),
             &default_recipes(),
             12.0,
+            None,
         );
         assert_eq!(
             rows[0].2,
@@ -3301,14 +3255,8 @@ recipe = "claude_fable_xhigh"
                 },
             ),
         ]);
-        let rows = box_rows(
-            &runner,
-            "herdr",
-            config.path(),
-            &box_profile(),
-            &recipes,
-            12.0,
-        );
+        let rows =
+            box_rows_with_snapshot(&runner, config.path(), &box_profile(), &recipes, 12.0, None);
         for id in ["unknown", "mismatch"] {
             assert_eq!(
                 rows.iter()
@@ -3380,13 +3328,13 @@ recipe = "claude_fable_xhigh"
                 "pane_tool_claude\t",
             );
         runner.on("ssh", ok(&facts));
-        let rows = box_rows(
+        let rows = box_rows_with_snapshot(
             &runner,
-            "herdr",
             config.path(),
             &box_profile(),
             &default_recipes(),
             12.0,
+            None,
         );
         let find = |label: &str| {
             rows.iter()
@@ -3460,13 +3408,13 @@ recipe = "claude_fable_xhigh"
                 )
             };
             runner.on("ssh", ok(&facts));
-            let rows = box_rows(
+            let rows = box_rows_with_snapshot(
                 &runner,
-                "herdr",
                 config.path(),
                 &box_profile(),
                 &default_recipes(),
                 12.0,
+                None,
             );
             assert!(
                 rows.iter().all(|row| row.0 != Some(false)),
@@ -3550,13 +3498,13 @@ recipe = "claude_fable_xhigh"
 
     fn find_row(runner: &FakeRunner, label: &str) -> (Option<bool>, String, String) {
         let config = machine_config(&["pi"]);
-        box_rows(
+        box_rows_with_snapshot(
             runner,
-            "herdr",
             config.path(),
             &box_profile(),
             &default_recipes(),
             12.0,
+            None,
         )
         .into_iter()
         .find(|(_, name, _)| name == label)
