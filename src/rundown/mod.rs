@@ -17,7 +17,7 @@ pub(crate) fn ensure_tab(
     slug: &str,
     title: &str,
 ) -> Result<(), HerdrError> {
-    if !owned_tabs(herdr, workspace)?.is_empty() {
+    if !owned_tabs(herdr, workspace, false)?.is_empty() {
         return Ok(());
     }
     let project = format!("HERDR_RUNDOWN_PROJECT={slug}");
@@ -60,7 +60,11 @@ pub(crate) fn ensure_tab(
 /// Herdr's plugin focus reply is the existing API that proves a pane's
 /// plugin and entrypoint. Preserve focus; labels and executable names alone
 /// are not ownership evidence.
-fn owned_tabs(herdr: &Herdr, workspace: &str) -> Result<Vec<crate::herdr::Pane>, HerdrError> {
+fn owned_tabs(
+    herdr: &Herdr,
+    workspace: &str,
+    single_pane_only: bool,
+) -> Result<Vec<crate::herdr::Pane>, HerdrError> {
     let tabs = herdr.tab_list()?;
     if !tabs.iter().any(|tab| tab.workspace_id == workspace) {
         return Ok(Vec::new());
@@ -75,25 +79,29 @@ fn owned_tabs(herdr: &Herdr, workspace: &str) -> Result<Vec<crate::herdr::Pane>,
                 .iter()
                 .filter(|pane| pane.tab_id == tab.tab_id)
                 .collect();
-            // A tab close kills every session in it, even non-plugin panes.
-            if in_tab.len() != 1 {
+            // A split Rundown still exists, but its tab must never be closed.
+            if single_pane_only && in_tab.len() != 1 {
                 continue;
             }
-            let pane = in_tab[0];
-            let reply = match herdr.call(&["plugin", "pane", "focus", &pane.pane_id], CALL_TIMEOUT)
-            {
-                Ok(reply) => reply,
-                Err(error) if error.code == "plugin_pane_not_found" => continue,
-                Err(error) => return Err(error),
-            };
-            let proof = &reply["plugin_pane"];
-            if proof["plugin_id"] == PLUGIN
-                && proof["entrypoint"] == ENTRYPOINT
-                && proof["pane"]["pane_id"] == pane.pane_id
-                && proof["pane"]["tab_id"] == tab.tab_id
-                && proof["pane"]["workspace_id"] == workspace
-            {
-                owned.push(pane.clone());
+            for pane in in_tab {
+                let reply =
+                    match herdr.call(&["plugin", "pane", "focus", &pane.pane_id], CALL_TIMEOUT) {
+                        Ok(reply) => reply,
+                        Err(error) if error.code == "plugin_pane_not_found" => continue,
+                        Err(error) => return Err(error),
+                    };
+                let proof = &reply["plugin_pane"];
+                if proof["plugin_id"] == PLUGIN
+                    && proof["entrypoint"] == ENTRYPOINT
+                    && proof["pane"]["pane_id"] == pane.pane_id
+                    && proof["pane"]["tab_id"] == tab.tab_id
+                    && proof["pane"]["workspace_id"] == workspace
+                {
+                    owned.push(pane.clone());
+                    if !single_pane_only {
+                        return Ok(owned);
+                    }
+                }
             }
         }
         Ok(owned)
@@ -113,7 +121,7 @@ pub(crate) fn reopen_existing(ctx: &crate::paths::Ctx) -> anyhow::Result<()> {
             continue;
         };
         let herdr = Herdr::new(ctx.env.herdr_bin(), &coordinator.socket, ctx.runner);
-        let owned = owned_tabs(&herdr, &coordinator.workspace_id)?;
+        let owned = owned_tabs(&herdr, &coordinator.workspace_id, true)?;
         if owned.is_empty() {
             continue;
         }
@@ -192,6 +200,34 @@ mod tests {
         ] {
             assert!(opened.args.iter().any(|arg| arg == argument));
         }
+    }
+
+    #[test]
+    fn ensure_does_not_duplicate_a_rundown_that_has_a_split() {
+        let runner = FakeRunner::new();
+        runner.on(
+            "tab list",
+            ok(r#"{"result":{"tabs":[{"tab_id":"w1:t1","workspace_id":"w1","label":"Renamed"}]}}"#),
+        );
+        runner.on(
+            "pane list",
+            ok(r#"{"result":{"panes":[{"pane_id":"w1:p1","tab_id":"w1:t1","workspace_id":"w1"},{"pane_id":"w1:p2","tab_id":"w1:t1","workspace_id":"w1"}]}}"#),
+        );
+        runner.on(
+            "api snapshot",
+            ok(r#"{"result":{"snapshot":{"focused_tab_id":"w1:t1"}}}"#),
+        );
+        runner.on(
+            "plugin pane focus w1:p1",
+            ok(r#"{"result":{"plugin_pane":{"plugin_id":"herdr-ade","entrypoint":"rundown","pane":{"pane_id":"w1:p1","tab_id":"w1:t1","workspace_id":"w1"}}}}"#),
+        );
+        runner.on("tab focus w1:t1", ok(r#"{"result":{}}"#));
+        let herdr = Herdr::new("herdr", "scratch.sock", &runner);
+        ensure_tab(&herdr, "w1", Path::new("/ade"), "demo", "Demo").unwrap();
+        assert_eq!(runner.count("plugin pane open"), 0);
+        assert_eq!(runner.count("tab close"), 0);
+        assert_eq!(runner.count("plugin pane focus w1:p2"), 0);
+        assert_eq!(runner.count("tab focus w1:t1"), 1);
     }
 
     #[test]

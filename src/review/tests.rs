@@ -1509,7 +1509,13 @@ fn landing_recovers_ref_before_marker_and_install_failure_without_early_task_don
             &crate::task::EvidenceSnapshot::load(&fx.project)
         )
     );
+    // An explicit retry acknowledges the regression. A different install
+    // failure must not leave the old regression blocking later ticker passes.
+    let error = retry(&fx.world.ctx(), "demo", None).unwrap_err();
+    assert!(error.to_string().starts_with("harness_repos_missing"));
     let mut restored = load(&fx.project, &review.id).unwrap();
+    assert!(restored.install_result.is_empty());
+    assert!(restored.attention.is_empty());
     land_with_install(&fx.world.ctx(), &fx.project, &mut restored, || {
         Ok("installed on mac, oci, a2; plan counts unchanged; records load".into())
     })

@@ -1589,6 +1589,7 @@ pub(crate) fn retry(ctx: &Ctx, slug: &str, repo: Option<&str>) -> Result<Option<
     };
     if record.fast_forward || matches!(record.phase, Phase::Landing | Phase::Cancelling) {
         if record.install_result.starts_with("REGRESSION") {
+            record.install_result.clear();
             record.attention.clear();
             save(&home, &record)?;
         }
