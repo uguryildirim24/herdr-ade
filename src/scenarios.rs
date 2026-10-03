@@ -2234,6 +2234,12 @@ fn a_project_recipe_is_stored_and_used_again_for_a_coordinator_relaunch() {
         .to_string();
     assert!(error.contains("no request"), "{error}");
 
+    world.runner.on("tab list", ok(r#"{"result":{"tabs":[]}}"#));
+    world.runner.on(
+        "plugin pane open --plugin herdr-ade --entrypoint rundown",
+        ok(r#"{"result":{"plugin_pane":{"pane":{"tab_id":"w1:t2"}}}}"#),
+    );
+    world.runner.on("tab rename", ok(r#"{"result":{}}"#));
     options.recipe_basis = Some("request:authority/q-choice".into());
     crate::coordinator::open(&world.ctx(), "demo", &options).unwrap();
     let first = project.coordinator().unwrap();
@@ -2291,6 +2297,12 @@ fn open_reopens_a_closed_coordinator_and_a_new_message_requests_reopen() {
             r#"{"error":{"code":"timeout","message":"still starting"}}"#,
         ),
     );
+    world.runner.on("tab list", ok(r#"{"result":{"tabs":[]}}"#));
+    world.runner.on(
+        "plugin pane open --plugin herdr-ade --entrypoint rundown",
+        ok(r#"{"result":{"plugin_pane":{"pane":{"tab_id":"w2:t2"}}}}"#),
+    );
+    world.runner.on("tab rename", ok(r#"{"result":{}}"#));
     let options = coordinator::OpenOptions {
         session: crate::paths::SessionFlags {
             session: None,

@@ -15,7 +15,7 @@ Install Herdr ADE, configure task routing, then open a project for its coordinat
 herdr plugin install uguryildirim24/herdr-ade
 ```
 
-Herdr clones the repository, runs its locked release build, and registers the plugin's actions, panes, startup command, and pi helper.
+Herdr clones the repository, runs its locked release build, and registers ADE's actions, panes (including Rundown), and startup command.
 
 For terminal use, find the installed plugin's directory with `herdr plugin list`, then set `PLUGIN_ROOT` to that directory (replace the example path below):
 
@@ -33,10 +33,10 @@ If you use pi recipes, run `herdr-pi setup`, complete each required login with `
 
 ## 3. Create and open a project
 
-Use **Projects: new project** in Herdr, or run:
+Use **Projects: new project** in Herdr with a name and repository (`PATH[@MACHINE]`), or run:
 
 ```bash
-herdr-ade new "Billing" --goal "Ship the new billing page" --repo ~/dev/app
+herdr-ade new "Billing" --repo ~/dev/app
 herdr-ade open billing
 ```
 

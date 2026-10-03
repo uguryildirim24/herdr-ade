@@ -1326,15 +1326,6 @@ fn install_for(ctx: &Ctx, current: Option<(&str, &str)>) -> Result<InstallOutcom
         }
     }
     let mut warnings = Vec::new();
-    for (repo, kind) in repos.iter().zip(&kinds) {
-        if *kind == Kind::Plugin
-            && let Err(error) = crate::rundown::link_plugin(ctx, &repo.path)
-        {
-            warnings.push(format!(
-                "note: the Rundown tab plugin is not linked: {error:#}"
-            ));
-        }
-    }
 
     // Finish with this invocation's image even if its on-disk binary changed.
     let mut boxes = Vec::new();
