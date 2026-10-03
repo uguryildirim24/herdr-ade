@@ -1745,25 +1745,48 @@ fn resume_session(
     recent: Vec<String>,
     prompt: &str,
 ) -> Result<()> {
+    let _prompt = thread::prompt_lock(project, &t.id)?;
+    let can_resume = |record: &thread::Thread| {
+        record.attempt == t.attempt
+            && record.pane_id == t.pane_id
+            && record.status == thread::Status::Open
+            && !record.connection_waiting
+            && record.connection_resumes == t.connection_resumes
+    };
+    if !can_resume(&thread::load(project, &t.id)?) {
+        return Ok(());
+    }
+    let mut claimed = false;
     thread::update(project, &t.id, |record| {
+        if !can_resume(record) {
+            return;
+        }
         record.connection_waiting = true;
         record.error = "connection_resume_uncertain: delivery may have taken effect; reconcile the bound pane before resending".into();
         record.connection_resumes = recent;
+        claimed = true;
     })?;
+    if !claimed {
+        return Ok(());
+    }
     match herdr.agent_prompt(&t.pane_id, prompt) {
         Ok(()) => {
             thread::update(project, &t.id, |record| {
-                record.connection_waiting = false;
-                record.error.clear();
-                record.connection_resumes.push(project::now());
+                if record.attempt == t.attempt && record.pane_id == t.pane_id {
+                    record.connection_waiting = false;
+                    record.error.clear();
+                    record.connection_resumes.push(project::now());
+                }
             })?;
             Ok(())
         }
         Err(error) => {
             if threads::prompt_refused_before_submission(&error) {
                 thread::update(project, &t.id, |record| {
-                    record.connection_waiting = false;
-                    record.error.clear();
+                    if record.attempt == t.attempt && record.pane_id == t.pane_id {
+                        record.connection_waiting = false;
+                        record.error.clear();
+                    }
                 })?;
             } else {
                 crate::inbox::write(
@@ -3139,6 +3162,28 @@ fn tick_cheap_observed(
     }
     drop(binding);
 
+    // A shared incident can originate in another lane while this coordinator
+    // has no terminal error. Recheck it even when its goal is already queued
+    // or disposed; otherwise the notice outbox has no path out of the hold.
+    if record.closed_by_rolf_at.is_empty()
+        && agent.as_ref().is_some_and(Agent::promptable)
+        && crate::adapters::dependency_waiting(
+            &ctx.root,
+            crate::contracts::MACHINE_LOCAL,
+            &record.launch,
+        )
+    {
+        let _ = crate::doctor::recipe_ready_local(ctx, &record.launch);
+        if let Err(error) = crate::adapters::notify_auth(
+            &ctx.root,
+            project,
+            crate::contracts::MACHINE_LOCAL,
+            &record.launch,
+        ) {
+            first_error = first_error.or(Some(error));
+        }
+    }
+
     if let Err(error) = crate::threads::retry_pending_cleanup(ctx, project) {
         eprintln!("note: pending cleanup will retry: {error:#}");
     }
@@ -4088,6 +4133,29 @@ mod tests {
         assert!(!current.connection_waiting);
         assert_eq!(current.connection_resumes.len(), 1);
         assert_eq!(current.attempt, lane.attempt);
+    }
+
+    #[test]
+    fn stale_session_observations_cannot_duplicate_a_resume_or_touch_a_new_attempt() {
+        let world = crate::scenarios::World::new();
+        let project = world.project("demo", "a.sock");
+        let lane = world.thread(&project, world.home.path(), |_| {});
+        world.runner.on("agent prompt", ok(r#"{"result":{}}"#));
+        let herdr = Herdr::new("herdr", "", &world.runner);
+        for _ in 0..2 {
+            resume_session(&project, &herdr, &lane, vec![], "Continue").unwrap();
+        }
+        assert_eq!(world.runner.count("agent prompt"), 1);
+        let before = thread::load(&project, &lane.id).unwrap();
+        assert_eq!(before.connection_resumes.len(), 1);
+        let replacement = thread::update(&project, &lane.id, |record| {
+            record.attempt += 1;
+            record.connection_resumes.clear();
+        })
+        .unwrap();
+        resume_session(&project, &herdr, &before, vec![], "Continue").unwrap();
+        assert_eq!(world.runner.count("agent prompt"), 1);
+        assert_eq!(thread::load(&project, &lane.id).unwrap(), replacement);
     }
 
     #[test]
@@ -6542,6 +6610,74 @@ mod tests {
             1
         );
         assert_eq!(runner.count("agent start"), 0);
+    }
+
+    #[test]
+    fn shared_dependency_recovery_releases_an_already_queued_coordinator_goal() {
+        use crate::scenarios::{World, agent_json};
+        let world = World::new();
+        let project = world.project("demo", "a.sock");
+        project
+            .update_coordinator(|c| c.launch.kind = "claude".into())
+            .unwrap();
+        let c = project.coordinator().unwrap();
+        *world.agents.borrow_mut() = format!(
+            "[{}]",
+            agent_json(
+                &c.workspace_id,
+                &c.tab_id,
+                &c.pane_id,
+                &c.cwd,
+                &c.agent_name,
+                "idle"
+            )
+        );
+        *world.panes.borrow_mut() = format!("[{}]", world.coordinator_pane(&project));
+        world.runner.on("pane read", ok("❯ \n"));
+        world.runner.on("agent prompt", ok(r#"{"result":{}}"#));
+        let ctx = world.ctx();
+        let herdr = Herdr::new("herdr", &c.socket, &world.runner);
+        goal_check_nudge(&ctx, &project, &herdr, &herdr.agent_list().unwrap()).unwrap();
+        assert!(
+            steps::goal_check::notice(&project).is_none(),
+            "goal is already queued"
+        );
+        assert_eq!(world.runner.count("agent prompt"), 0);
+        crate::adapters::observe_dependency(
+            &world.root,
+            crate::contracts::MACHINE_LOCAL,
+            &c.launch,
+            "Usage limit reached",
+            &crate::adapters::DependencyEvidence {
+                kind: "quota".into(),
+                reset_at: None,
+            },
+        )
+        .unwrap();
+        tick_cheap(&ctx, &project, false).unwrap();
+        steps::flush_notices_for_test(&project, &herdr);
+        assert_eq!(world.runner.count("agent prompt"), 0);
+        crate::adapters::expire_dependency_probe(
+            &world.root,
+            crate::contracts::MACHINE_LOCAL,
+            &c.launch,
+        );
+        tick_cheap(&ctx, &project, false).unwrap();
+        for _ in 0..2 {
+            steps::flush_notices_for_test(&project, &herdr);
+        }
+        assert_eq!(world.runner.count("agent prompt"), 1);
+        assert_eq!(
+            world
+                .runner
+                .calls
+                .borrow()
+                .iter()
+                .filter(|cmd| cmd.program == "claude")
+                .count(),
+            1
+        );
+        assert_eq!(world.runner.count("agent start"), 0);
     }
 
     #[test]

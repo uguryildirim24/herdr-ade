@@ -615,7 +615,9 @@ fn resolve_placement(
                 if missing.contains("disk_low:") {
                     bail!("{missing}");
                 }
-                let provider_wait = missing.contains("pi_not_ready");
+                let provider_wait = missing.contains("pi_not_ready")
+                    || missing.contains("readiness probe")
+                    || missing.contains("provider rejected");
                 tried.push(serde_json::json!({
                     "machine":candidate, "ready":false, "missing":missing
                 }));
@@ -8572,6 +8574,44 @@ mod tests {
         )
         .unwrap();
         assert!(started.machine.is_empty());
+    }
+
+    #[test]
+    fn a_native_provider_failure_waits_on_the_selected_machine_without_fallback() {
+        let (fx, _) = box_fixture();
+        write_config(&fx, &lane_config());
+        fx.world.runner.on_fn(
+            |cmd| {
+                cmd.program == "ssh"
+                    && cmd
+                        .args
+                        .last()
+                        .is_some_and(|script| script.contains("command -v claude"))
+            },
+            |_| Ok(crate::runner::fake::fail(1, "Usage limit reached")),
+        );
+        stub_box(&fx);
+        let waiting = start(
+            &fx.world.ctx(),
+            "demo",
+            start_args(Some(fx.repo.to_string_lossy().into_owned()), None),
+        )
+        .unwrap();
+        assert_eq!(waiting.machine, "buildbox");
+        assert_eq!(waiting.machine_id, "buildbox-id");
+        assert!(!waiting.provider_wait_started.is_empty());
+        assert_eq!(waiting.launch_attempts, 0);
+        assert!(waiting.pane_id.is_empty());
+        assert!(
+            fx.world
+                .runner
+                .calls
+                .borrow()
+                .iter()
+                .all(|cmd| cmd.program != "claude")
+        );
+        assert_eq!(fx.world.runner.count("workspace create"), 0);
+        assert_eq!(fx.world.runner.count("tab create"), 0);
     }
 
     #[test]
