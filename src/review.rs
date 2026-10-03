@@ -1833,6 +1833,10 @@ struct PileHolds {
 fn holds_path(project: &Project) -> PathBuf {
     project.state_dir().join("pile-holds.json")
 }
+pub(crate) fn current_holds(project: &Project) -> Result<BTreeMap<String, String>> {
+    Ok(load_holds(project)?.current)
+}
+
 pub(crate) fn hold_notices(project: &Project) -> Result<Vec<crate::steps::Notice>> {
     Ok(load_holds(project)?.notices)
 }

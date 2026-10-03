@@ -5038,7 +5038,7 @@ pub fn rows(ctx: &Ctx, project: &Project) -> Vec<Row> {
             let mut result = row(&t, view.as_ref(), now);
             if result.note.starts_with("process gone:") && parkable(project, &t) {
                 result.group = Group::Parked;
-                result.note = "pane parked until requested".into();
+                result.note = "process gone: pane parked until requested".into();
             }
             result
         })
@@ -5167,7 +5167,7 @@ fn row(t: &Thread, view: Option<&SessionView>, now: jiff::Timestamp) -> Row {
     } else if !t.startup_wait_started.is_empty() {
         "starting (checking agent readiness)".to_string()
     } else if !live.pane_exists {
-        "process gone: pane or agent is gone without a report".to_string()
+        "process gone: pane or agent is absent".to_string()
     } else {
         live.agent_state
             .unwrap_or_else(|| "agent state unknown; pane still exists".into())

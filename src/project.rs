@@ -724,12 +724,12 @@ pub(crate) fn parse_repo_arg(arg: &str) -> Repo {
     }
 }
 
-fn markdown_item(id: &str, provenance: &str, text: &str) -> String {
+pub(crate) fn markdown_item(id: &str, provenance: &str, text: &str) -> String {
     let text = text.trim().replace('\n', "\n  ");
     format!("- `{id}` ({provenance}): {text}\n")
 }
 
-fn note_provenance(row: &crate::note::Row) -> String {
+pub(crate) fn note_provenance(row: &crate::note::Row) -> String {
     let authority = row
         .request
         .as_ref()
@@ -740,10 +740,6 @@ fn note_provenance(row: &crate::note::Row) -> String {
     } else {
         format!("{authority}; {}", row.tasks.join(", "))
     }
-}
-
-fn one_line(text: &str) -> String {
-    text.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
 fn latest_history(project: &Project) -> Option<String> {
@@ -758,308 +754,9 @@ fn latest_history(project: &Project) -> Option<String> {
     names.pop().map(|name| format!(".state/history/{name}/"))
 }
 
-pub(crate) fn running_stage(
-    thread: &crate::thread::Thread,
-    events: &[crate::contracts::Event],
-) -> String {
-    use crate::thread::Status;
-    // A sealed completion describes the attempt, not the current lifecycle.
-    // In particular a resolved lane must not keep saying it awaits pile review.
-    if thread.status == Status::Resolved {
-        return "resolved".into();
-    }
-    let completion = crate::events::latest_event(events, &thread.id, thread.attempt.max(1));
-    if thread.status == Status::Failed {
-        let reason = if thread.error.trim().is_empty() {
-            completion
-                .and_then(|event| event.payload.failed.as_ref())
-                .map(|failed| failed.text.as_str())
-                .unwrap_or("reason unknown")
-        } else {
-            &thread.error
-        };
-        return format!(
-            "failed: {}",
-            one_line(reason).chars().take(120).collect::<String>()
-        );
-    }
-    if let Some(event) = completion {
-        if let Some(failed) = &event.payload.failed {
-            return format!(
-                "failed: {}",
-                one_line(&failed.text).chars().take(120).collect::<String>()
-            );
-        }
-        if let Some(waiting) = &event.payload.waiting
-            && event.id != thread.answered_waiting_event
-        {
-            return format!(
-                "waiting: {}",
-                one_line(&waiting.text)
-                    .chars()
-                    .take(120)
-                    .collect::<String>()
-            );
-        }
-        if event.payload.done.is_some() {
-            return "done, waiting for pile review".into();
-        }
-    }
-    match thread.status {
-        Status::Starting => "starting".into(),
-        Status::Open if thread.prompt_pending => "starting".into(),
-        Status::Open if thread.last_state == "blocked" || thread.last_group == "idle" => {
-            "waiting at prompt".into()
-        }
-        Status::Open if thread.last_group == "working" || thread.last_state == "working" => {
-            "working".into()
-        }
-        Status::Open => "state unknown".into(),
-        Status::Failed | Status::Resolved => unreachable!(),
-    }
-}
-
 fn page_body(project: &Project, settings: &Settings) -> String {
-    page_body_with_history(project, settings, None)
-}
-
-/// The handoff uses the same live page renderer, without writing PROJECT.md.
-pub(crate) fn page_body_with_history(
-    project: &Project,
-    settings: &Settings,
-    history_limit: Option<usize>,
-) -> String {
-    let evidence = crate::task::EvidenceSnapshot::load(project);
-    let mut out = String::from("# Project\n\n");
-    out.push_str("## Goal and what Rolf gets\n\n");
-    if settings.goal.trim().is_empty() {
-        out.push_str("Goal: not written down.\n");
-    } else {
-        out.push_str(&format!("Goal: {}\n", settings.goal.trim()));
-    }
-    let mut plan = crate::plan::load(project).ok().flatten();
-    if let Some(plan) = &mut plan {
-        crate::plan::project_states_with_evidence(project, plan, &evidence);
-        if plan.what_you_get.is_empty() && plan.does.is_empty() {
-            out.push_str("What Rolf gets: not written down.\n");
-        } else {
-            out.push_str(&format!(
-                "What Rolf gets: {} {}\n",
-                plan.what_you_get.trim(),
-                plan.does.trim()
-            ));
-        }
-    } else {
-        out.push_str("What Rolf gets: not written down.\n");
-    }
-
-    let events = evidence.events();
-
-    if crate::prompt::long_input_hold(project) {
-        out.push_str("\nAutomated prompts have waited over 30 minutes for text in the coordinator's input line. They remain pending.\n");
-    }
-    out.push_str("\n## Running now\n\n");
-    let threads: Vec<_> = crate::thread::list(project)
-        .into_iter()
-        .filter(|thread| thread.status != crate::thread::Status::Resolved)
-        .collect();
-    let reviews: Vec<_> = crate::review::list(project)
-        .unwrap_or_default()
-        .into_iter()
-        .filter(|r| !r.phase.closed())
-        .collect();
-    if threads.is_empty() && reviews.is_empty() {
-        out.push_str("None.\n");
-    }
-    for thread in threads {
-        out.push_str(&format!(
-            "- Thread `{}`: {} ({}){}\n",
-            thread.id,
-            thread.title.trim(),
-            running_stage(&thread, events),
-            if thread.follow_ups.iter().any(|follow_up| follow_up.state
-                == crate::thread::FollowUpState::Queued
-                && follow_up.attempt == thread.attempt.max(1))
-            {
-                " — follow-up queued"
-            } else {
-                ""
-            }
-        ));
-        if let Some(event) = crate::events::latest_event(events, &thread.id, thread.attempt.max(1))
-            && event.id != thread.answered_waiting_event
-            && let Some(waiting) = &event.payload.waiting
-        {
-            out.push_str(&format!(
-                "  waiting on coordinator: {}\n",
-                one_line(&waiting.text)
-            ));
-        }
-    }
-    for review in reviews {
-        out.push_str(&format!(
-            "- Review `{}`: {:?} ({} lanes) — {}{}\n",
-            review.id,
-            review.phase,
-            review.members.len(),
-            review.landing_summary(),
-            review.gates_summary()
-        ));
-    }
-
-    out.push_str("\n## Plan\n\n");
-    match &plan {
-        Some(plan) if !plan.steps.is_empty() => {
-            let holds = crate::plan::failed_check_holds(project, plan, &evidence);
-            for step in &plan.steps {
-                out.push_str(&format!(
-                    "- `{}` [{}] {}\n",
-                    step.id,
-                    step.state.word(),
-                    step.text.trim()
-                ));
-                if let Some(hold) = holds.get(&step.id) {
-                    out.push_str(&format!("  {}\n", hold.message()));
-                }
-                for sub in &step.subtasks {
-                    out.push_str(&format!(
-                        "  - `{}` [{}] {}\n",
-                        sub.id,
-                        sub.state.word(),
-                        sub.text.trim()
-                    ));
-                    if let Some(hold) = holds.get(&sub.id) {
-                        out.push_str(&format!("    {}\n", hold.message()));
-                    }
-                }
-            }
-        }
-        _ => out.push_str("No steps are written down.\n"),
-    }
-
-    let (views, errors) = crate::task::views_with_evidence(project, &evidence);
-    out.push_str("\n## Open tasks\n\n");
-    let open: Vec<_> = views
-        .iter()
-        .filter(|view| !view.terminal_with_evidence(project, &evidence))
-        .collect();
-    if open.is_empty() && errors.is_empty() {
-        out.push_str("None.\n");
-    }
-    for view in &open {
-        out.push_str(&format!(
-            "- `{}` [{}] {} — next: {}\n",
-            view.record.id,
-            view.state.word(),
-            one_line(&view.record.title),
-            one_line(&view.next)
-        ));
-    }
-    for error in errors {
-        out.push_str(&format!("- Unreadable task: {error:#}\n"));
-    }
-
-    let mut notes = crate::note::active_rows(project);
-    crate::note::sort_newest_first(&mut notes);
-    let applies = |row: &&crate::note::Row| {
-        row.tasks.is_empty()
-            || row
-                .tasks
-                .iter()
-                .any(|task| open.iter().any(|view| view.record.id == *task))
-    };
-
-    out.push_str("\n## Task notes in force\n\n");
-    let task_notes: Vec<_> = notes
-        .iter()
-        .filter(|row| row.kind == "task note")
-        .filter(applies)
-        .collect();
-    if task_notes.is_empty() {
-        out.push_str("None.\n");
-    }
-    for row in task_notes {
-        out.push_str(&markdown_item(&row.id, &note_provenance(row), &row.text));
-    }
-
-    out.push_str("\n## Standing instructions in force\n\n");
-    let instructions: Vec<_> = notes
-        .iter()
-        .filter(|row| row.kind == "standing instruction")
-        .filter(applies)
-        .collect();
-    if instructions.is_empty() {
-        out.push_str("None.\n");
-    }
-    for row in instructions {
-        out.push_str(&markdown_item(&row.id, &note_provenance(row), &row.text));
-    }
-
-    out.push_str("\n## Facts in force\n\n");
-    let facts: Vec<_> = notes
-        .iter()
-        .filter(|row| row.kind == "memory")
-        .filter(applies)
-        .collect();
-    if facts.is_empty() {
-        out.push_str("None.\n");
-    }
-    for row in facts {
-        out.push_str(&markdown_item(&row.id, &note_provenance(row), &row.text));
-    }
-
-    out.push_str("\n## Recently finished or dropped tasks\n\n");
-    let mut finished: Vec<_> = views
-        .iter()
-        .filter(|view| view.terminal_with_evidence(project, &evidence))
-        .collect();
-    finished.sort_by(|a, b| b.record.created.cmp(&a.record.created));
-    if finished.is_empty() {
-        out.push_str("None.\n");
-    }
-    for view in finished
-        .into_iter()
-        .take(history_limit.unwrap_or(usize::MAX))
-    {
-        if history_limit.is_some() {
-            out.push_str(&format!(
-                "- `{}` [{}] {}\n",
-                view.record.id,
-                view.state.word(),
-                one_line(&view.record.title)
-            ));
-            continue;
-        }
-        out.push_str(&format!(
-            "- `{}` [{}] {}",
-            view.record.id,
-            view.state.word(),
-            view.record.title.trim()
-        ));
-        if !view.record.dropped.is_empty()
-            && let Some(evidence) = view.record.dropped.last()
-        {
-            out.push_str(&format!(" — dropped: {}", evidence.reason.trim()));
-        }
-        out.push('\n');
-        for attempt in &view.record.attempts {
-            if let Ok(thread) = crate::thread::load(project, attempt)
-                && let Some(report) = crate::thread::report_reference(project, &thread)
-            {
-                let label = if crate::thread::sealed_report_path(project, &thread).is_some() {
-                    "Final report"
-                } else {
-                    "Historical report (not completion)"
-                };
-                out.push_str(&format!("  {label} (`{attempt}`): `{report}`\n"));
-            }
-        }
-    }
-
-    if history_limit.is_some() {
-        out.push_str(&format!("\nAll work: `ha task list {}`.\n", project.slug));
-        return out;
-    }
+    let view = crate::project_view::View::capture(project, settings, None, None);
+    let mut out = format!("# Project\n{}", view.render(&[]));
     let history = latest_history(project).unwrap_or_else(|| "the hidden .state folder".into());
     out.push_str(&format!(
         "\n---\nView rebuilt at {}; history is kept in {}.\n",
@@ -1165,10 +862,21 @@ mod tests {
             )
             .unwrap();
         }
+        // Full history comes from records, not from a generated page that a
+        // current-work renderer would otherwise have to keep replaying.
+        let view = crate::project_view::View::capture(
+            &project,
+            &Settings::default(),
+            None,
+            Some(usize::MAX),
+        );
+        let history = view.render(&["Recently finished or dropped tasks"]);
+        assert!(history.contains("`job-0000` [dropped]"));
+        assert!(history.contains("`job-0010` [dropped]"));
         refresh_page(&project).unwrap();
         let page = std::fs::read_to_string(project.state_dir().join("page.md")).unwrap();
-        assert!(page.contains("`job-0000` [dropped]"));
-        assert!(page.contains("`job-0010` [dropped]"));
+        assert!(!page.contains("job-0000"));
+        assert!(!project.read_project_md().unwrap().1.contains("job-0000"));
     }
 
     #[test]

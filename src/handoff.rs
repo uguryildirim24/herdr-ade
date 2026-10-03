@@ -23,57 +23,44 @@ const CUT_ORDER: &[&str] = &[
     "Plan",
 ];
 
-struct Section {
-    name: String,
-    text: String,
-}
-
-fn sections(text: &str) -> Vec<Section> {
-    let mut rows = vec![Section {
-        name: String::new(),
-        text: String::new(),
-    }];
-    for line in text.split_inclusive('\n') {
-        if let Some(name) = line.strip_prefix("## ") {
-            rows.push(Section {
-                name: name.trim_end().into(),
-                text: String::new(),
-            });
-        }
-        rows.last_mut().unwrap().text.push_str(line);
-    }
-    rows
-}
+use crate::project_view::{Entry, Section, View};
 
 fn budget(mut rows: Vec<Section>, prefix: &str, slug: &str) -> String {
     let mut cut = Vec::new();
-    let render = |rows: &[Section], cut: &[&str]| {
-        let mut out = prefix.to_string();
-        for row in rows {
-            out.push_str(&row.text);
-        }
-        if !cut.is_empty() {
-            out.push_str(&format!(
+    let footer = |cut: &[&str]| {
+        if cut.is_empty() {
+            String::new()
+        } else {
+            format!(
                 "\n## Handoff cuts\n\nCut to fit the {CHAR_BUDGET}-character budget (lowest priority first): {}.\nSee omitted sections: `ha context {slug} --peek --full`; all work: `ha task list {slug}`.\n",
                 cut.join(", ")
-            ));
+            )
         }
-        out
     };
-    let mut out = render(&rows, &cut);
+    let fits = |rows: &[Section], cut: &[&str]| {
+        prefix.chars().count()
+            + rows.iter().map(Section::chars).sum::<usize>()
+            + footer(cut).chars().count()
+            <= CHAR_BUDGET
+    };
     for name in CUT_ORDER {
-        if out.chars().count() <= CHAR_BUDGET {
+        if fits(&rows, &cut) {
             break;
         }
         if let Some(index) = rows.iter().position(|row| row.name == *name) {
             rows.remove(index);
             cut.push(*name);
-            out = render(&rows, &cut);
         }
     }
-    // A fixed ceiling and unlimited protected input cannot both be satisfied.
-    // Keep the input intact and make the unavoidable overflow explicit.
-    if out.chars().count() > CHAR_BUDGET {
+    // Select sections against their exact rendered sizes before formatting.
+    let overflow = !fits(&rows, &cut);
+    let mut out = prefix.to_string();
+    for row in rows {
+        out.push_str(&row.render());
+    }
+    out.push_str(&footer(&cut));
+    // Protected input is never silently lost to the budget.
+    if overflow {
         out.push_str(&format!(
             "\nProtected content exceeds the {CHAR_BUDGET}-character budget; kept intact.\n"
         ));
@@ -82,20 +69,30 @@ fn budget(mut rows: Vec<Section>, prefix: &str, slug: &str) -> String {
 }
 
 fn snapshot(ctx: &Ctx, project: &Project, prefix: &str) -> Result<String> {
-    let mut rows = sections(&crate::coordinator::handoff_snapshot(ctx, project)?);
+    let mut rows = View::load(ctx, project, Some(10))?.sections;
+    rows.push(Section::new(
+        "Work history",
+        vec![Entry {
+            id: String::new(),
+            text: format!("All work: `ha task list {}`.", project.slug),
+        }],
+    ));
     // Never parse the messages (or session note) as Markdown sections: a
     // verbatim message may itself contain headings named after cuttable rows.
-    let mut messages = String::from("\n## Rolf's latest messages (verbatim, oldest first)\n\n");
+    let mut messages = String::new();
     for request in crate::prompt::handoff_requests(project) {
         messages.push_str(&format!(
             "### {} · {}\n\n{}\n\n",
             request.id, request.at, request.text
         ));
     }
-    rows.push(Section {
-        name: "Rolf's messages".into(),
-        text: messages,
-    });
+    rows.push(Section::new(
+        "Rolf's latest messages (verbatim, oldest first)",
+        vec![Entry {
+            id: String::new(),
+            text: messages,
+        }],
+    ));
     Ok(budget(rows, prefix, &project.slug))
 }
 
@@ -247,7 +244,7 @@ mod tests {
             .split("## Recently finished or dropped tasks")
             .nth(1)
             .unwrap()
-            .split("## Pile reviews")
+            .split("## Repositories")
             .next()
             .unwrap();
         assert_eq!(

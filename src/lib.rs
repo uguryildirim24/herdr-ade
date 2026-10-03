@@ -53,6 +53,7 @@ mod pi;
 mod pi_ade;
 mod plan;
 mod project;
+mod project_view;
 mod prompt;
 mod record_cache;
 mod recovery;

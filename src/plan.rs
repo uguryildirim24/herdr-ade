@@ -863,7 +863,10 @@ impl FailedCheckHold {
     }
 }
 
-fn add_hold_json(value: &mut serde_json::Value, holds: &BTreeMap<String, FailedCheckHold>) {
+pub(crate) fn add_hold_json(
+    value: &mut serde_json::Value,
+    holds: &BTreeMap<String, FailedCheckHold>,
+) {
     if let Some(hold) = value["id"].as_str().and_then(|id| holds.get(id)) {
         value["failed_check_hold"] = serde_json::json!({
             "checks": hold.checks,

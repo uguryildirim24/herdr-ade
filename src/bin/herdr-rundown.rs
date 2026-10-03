@@ -1,10 +1,10 @@
 //! `herdr-rundown`: the Rundown tab. One project's plan card as a calm to-do
-//! list: what the project is, its steps, and which are done.
+//! list: what is running, waiting or needs Rolf, alongside planned steps.
 //!
 //! `ha open` starts it as the `rundown` plugin pane with `HERDR_RUNDOWN_PROJECT`
 //! (the project), `HERDR_RUNDOWN_TITLE` (its display name) and
 //! `HERDR_ADE_ROOT` (the projects root). It reads the card through
-//! `herdr-ade --json plan show` and never writes a record. It never reads
+//! `herdr-ade --json overview` and never writes a record. It never reads
 //! `HERDR_PLUGIN_STATE_DIR`; it keeps no state at all.
 //!
 //! Updating stays cheap: once a second it compares the modification times of
@@ -14,6 +14,12 @@
 #[path = "../rundown/view.rs"]
 mod view;
 
+// The same bounded command runner as ADE, not a second child-process policy.
+#[allow(dead_code)]
+#[path = "../runner.rs"]
+mod runner;
+
+use runner::{Cmd, RealRunner, Runner};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode, Stdio};
@@ -56,11 +62,7 @@ impl Source {
             .map(PathBuf::from)
             .context("HERDR_ADE_ROOT is not set")?;
         // The herdr-ade built next to this binary, so both come from one commit.
-        let ade = std::env::current_exe()
-            .ok()
-            .and_then(|exe| exe.parent().map(|dir| dir.join("herdr-ade")))
-            .filter(|path| path.is_file())
-            .unwrap_or_else(|| PathBuf::from("herdr-ade"));
+        let ade = std::env::current_exe()?.with_file_name("herdr-ade");
         Ok(Source { slug, root, ade })
     }
 
@@ -75,6 +77,9 @@ impl Source {
             state.join("threads"),
             state.join("reviews"),
             state.join("events"),
+            state.join("pile-holds.json"),
+            state.join("coordinator-recovery.json"),
+            state.join("inbox"),
         ]
         .iter()
         .map(|path| modified(path))
@@ -82,19 +87,39 @@ impl Source {
     }
 
     fn card(&self, title: &str) -> Result<view::Card> {
-        let out = Command::new(&self.ade)
-            .arg("--root")
-            .arg(&self.root)
-            .args(["--json", "plan", "show", &self.slug])
-            .stdin(Stdio::null())
-            .stderr(Stdio::null())
-            .output()
+        let out = RealRunner
+            .run(
+                &Cmd::new(self.ade.to_string_lossy(), Duration::from_secs(15))
+                    .args([
+                        "--root",
+                        &self.root.to_string_lossy(),
+                        "--json",
+                        "overview",
+                        &self.slug,
+                    ])
+                    .own_group(),
+            )
             .with_context(|| format!("could not run {}", self.ade.display()))?;
-        if !out.status.success() {
-            bail!("plan show exited with {}", out.status);
+        if !out.success() {
+            let reply = serde_json::from_str::<serde_json::Value>(&out.stdout).ok();
+            let cause = reply
+                .as_ref()
+                .and_then(|reply| reply["reason"].as_str())
+                .map(str::to_string)
+                .unwrap_or_else(|| out.error_text());
+            if cause.is_empty() {
+                bail!("overview exited with {:?}", out.code);
+            }
+            bail!("{cause}");
         }
-        let reply: serde_json::Value = serde_json::from_slice(&out.stdout)?;
-        Ok(view::Card::from_plan(title, &reply)?)
+        let reply: serde_json::Value = serde_json::from_str(&out.stdout)?;
+        if let Some(error) = reply
+            .pointer("/data/result/plan/error")
+            .and_then(|v| v.as_str())
+        {
+            bail!("plan read failed: {error}");
+        }
+        Ok(view::Card::from_view(title, &reply)?)
     }
 }
 
@@ -136,23 +161,27 @@ fn run() -> Result<()> {
     write!(out, "\x1b[?1049h\x1b[?25l")?;
     out.flush()?;
 
-    let mut card: Option<view::Card> = None;
+    let mut card = view::Card {
+        title: title.clone(),
+        about: String::new(),
+        steps: vec![],
+        work: String::new(),
+        needs_you: String::new(),
+        actions: vec![],
+    };
     let mut note = String::new();
     let mut seen = None;
     let mut fetched = None::<Instant>;
-    let mut drawn = None::<(Option<view::Card>, String, (usize, usize))>;
+    let mut drawn = None::<(view::Card, String, (usize, usize))>;
     loop {
         let print = source.fingerprint();
         if seen.as_ref() != Some(&print) || fetched.is_none_or(|at| at.elapsed() >= FULL_REFRESH) {
             match source.card(&title) {
                 Ok(fresh) => {
-                    card = Some(fresh);
+                    card = fresh;
                     note.clear();
                 }
-                Err(_) if card.is_some() => {
-                    note = "Could not check for changes just now; trying again.".into()
-                }
-                Err(_) => note = "Getting the plan…".into(),
+                Err(error) => note = format!("{error:#}"),
             }
             // A failed read must retry on the next tick even if no record
             // changed; the minute-long refresh is for healthy cards only.
@@ -165,10 +194,7 @@ fn run() -> Result<()> {
         let state = (card.clone(), note.clone(), screen);
         if drawn.as_ref() != Some(&state) {
             let (rows, cols) = screen;
-            let lines = match &card {
-                Some(card) => view::render(card, cols, rows, &note),
-                None => vec![String::new(), format!("   {note}")],
-            };
+            let lines = view::render(&card, cols, rows, &note);
             write!(out, "\x1b[H\x1b[2J{}", lines.join("\r\n"))?;
             out.flush()?;
             drawn = Some(state);
