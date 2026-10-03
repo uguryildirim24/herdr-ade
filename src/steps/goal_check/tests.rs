@@ -279,6 +279,14 @@ fn evidence_backed_closure_stops_wakes_and_does_not_change_done_counts() {
     reconcile(&f.project, None, 20).unwrap();
     let before = crate::plan::load(&f.project).unwrap().unwrap();
     assert_eq!(before.steps[0].state, StepState::Done);
+    assert!(record(&f.project, close.clone(), "self-report alone").is_err());
+    crate::thread::update(&f.project, &lane, |t| {
+        t.status = crate::thread::Status::Resolved
+    })
+    .unwrap();
+    crate::threads::attest(&f.world.ctx(), "demo", &lane, &format!(
+        "[[acceptance]]\nthread = {lane:?}\nevent = {event:?}\ncriterion = 1\ncondition = \"The result is usable\"\nestablished = true\nevidence = \"report artifact: independently checked usable result\""
+    )).unwrap();
     record(
         &f.project,
         close,

@@ -2360,6 +2360,9 @@ pub fn attest(ctx: &Ctx, slug: &str, id: &str, reason: &str) -> Result<AttestOut
             format!("ha thread show {slug} {id}"),
         ));
     }
+    if let Some(outcome) = crate::task::attest_finished(ctx, &project, &record, reason)? {
+        return Ok(outcome);
+    }
     let attempt = record.attempt.max(1);
     if crate::events::checked(&project)?
         .iter()

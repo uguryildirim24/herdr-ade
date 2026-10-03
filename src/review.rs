@@ -569,7 +569,7 @@ pub(crate) fn lane_done(
     }
     sealed(events, lane).is_some_and(|e| changes(lane, e) == Some(false))
 }
-fn changes(lane: &Thread, event: &crate::contracts::Event) -> Option<bool> {
+pub(crate) fn changes(lane: &Thread, event: &crate::contracts::Event) -> Option<bool> {
     let sealed = event.payload.done.as_ref()?;
     if lane.changes_seal == event.id {
         lane.has_changes.or(sealed.has_changes)
@@ -836,7 +836,7 @@ fn task(project: &Project, review: &Review) -> String {
             gate.command, gate.env
         ));
     }
-    out.push_str(&format!("\nWrite a report with TOML front matter:\n+++\nreview = \"{}\"\nverdict = \"MERGE\" # or REJECT\ncandidate = \"<your exact HEAD>\"\n# Gate execution receipts are recorded by ADE, not declared here.\n# Optional: without = {{ t-0001 = \"one-line reason\" }}\n+++\n\nIf excluding lanes, rebuild from the integration base without those lanes; their commits must not remain ancestors of your candidate. For every original required criterion, cite durable artifact/behavior evidence or say not established; gates alone do not prove semantics. Include findings and actual journey evidence. Commit repository changes if any, leave runtime deliverables untracked, then `ha done`. Output in another repository belongs in the report.\n", review.id));
+    out.push_str(&format!("\nWrite a report with TOML front matter:\n+++\nreview = \"{}\"\nverdict = \"MERGE\" # or REJECT\ncandidate = \"<your exact HEAD>\"\n# Gate execution receipts are recorded by ADE, not declared here.\n# Optional: without = {{ t-0001 = \"one-line reason\" }}\n\n# Repeat for each included task's required criterion:\n[[acceptance]]\nthread = \"<member thread>\"\nevent = \"<member seal from the packet>\"\ncriterion = 1\ncondition = \"<exact original acceptance condition>\"\nestablished = true # false means not established; fix or exclude this member\nevidence = \"<durable artifact and behavior/journey references>\"\n+++\n\nIf excluding lanes, rebuild from the integration base without those lanes; their commits must not remain ancestors of your candidate. For every original required criterion, cite durable artifact/behavior evidence or say not established; gates alone do not prove semantics. Include findings and actual journey evidence. Commit repository changes if any, leave runtime deliverables untracked, then `ha done`. Output in another repository belongs in the report.\n", review.id));
     out
 }
 /// This text becomes part of the reviewer's own immutable launch brief. Never
@@ -870,6 +870,25 @@ fn member_packet(project: &Project, member: &Member) -> String {
             task.id,
             task.authority.join(", ")
         ));
+        if let Some(judgment) = &task.acceptance_review {
+            out.push_str(&format!(
+                "  Coordinator judgment snapshot: {} at {}; seal {}, report artifact {}\n",
+                judgment.coordinator, judgment.at, judgment.event, judgment.artifact
+            ));
+            for row in &judgment.criteria {
+                out.push_str(&format!(
+                    "  Criterion {} ({}): {} — {}\n",
+                    row.criterion,
+                    row.condition,
+                    if row.established && !row.evidence.trim().is_empty() {
+                        "established"
+                    } else {
+                        "not established"
+                    },
+                    row.evidence
+                ));
+            }
+        }
         for evidence in &task.installed {
             out.push_str(&format!(
                 "  Installation (not acceptance): {} at {}; machine {:?}, build {:?}\n",
@@ -1012,9 +1031,32 @@ fn verdict(
             );
         }
     }
+    let criteria = crate::task::report_criteria(&text)?;
+    let (tasks, errors) = crate::task::list_with_errors(project);
+    if !errors.is_empty() {
+        bail!("acceptance not established: unreadable task records");
+    }
+    for member in &review.members {
+        if verdict.without.contains_key(&member.thread) {
+            continue;
+        }
+        for task in tasks
+            .iter()
+            .filter(|task| task.attempts.last() == Some(&member.thread))
+        {
+            if !crate::task::criteria_established(task, &member.thread, &member.event, &criteria) {
+                bail!(
+                    "acceptance not established: {} needs artifact/behavior evidence for every required criterion; exclude it or get a fresh judgment",
+                    member.thread
+                );
+            }
+        }
+    }
     // Self-reported exits are discarded. Semantics still belong to the one
     // reviewer; mechanical proof comes only from the existing execution path.
-    verdict.gates = observed_gates(ctx, project, review, &verdict.candidate, git)?;
+    let mut execution = review.clone();
+    execution.verdict_event = event.id.clone();
+    verdict.gates = observed_gates(ctx, project, &execution, &verdict.candidate, git)?;
     Ok(verdict)
 }
 /// ADE-owned execution evidence, separate from the reviewer-authored report.
@@ -1023,10 +1065,14 @@ fn verdict(
 #[derive(Debug, Serialize, Deserialize)]
 struct GateReceipt {
     review: String,
+    #[serde(default)]
+    event: String,
     base: String,
     candidate: String,
     gate: project::Gate,
     machine: String,
+    #[serde(default)]
+    target: Option<String>,
     cwd: String,
     environment: BTreeMap<String, String>,
     started: String,
@@ -1120,37 +1166,14 @@ fn gate_command(
     }
 }
 
-fn observed_gates(
-    ctx: &Ctx,
-    project: &Project,
-    review: &Review,
-    candidate: &str,
-    git: &Git<'_>,
-) -> Result<Vec<GateRun>> {
-    let changed_paths = files(git, &review.base, candidate)?;
-    let gates = selected(&review.gates, &changed_paths);
-    let evidence_dir = dir(project).join(&review.id);
-    std::fs::create_dir_all(&evidence_dir)?;
-    let selection = GateSelection {
-        candidate,
-        base: &review.base,
-        note: &review.gates_note,
-        changed_paths,
-        not_selected: review
-            .gates
-            .iter()
-            .filter(|gate| !gates.contains(gate))
-            .cloned()
-            .collect(),
-        selected: gates.clone(),
-    };
-    project::write_atomic(
-        &evidence_dir.join(format!("{candidate}-selection.toml")),
-        toml::to_string(&selection)?.as_bytes(),
-    )?;
-    if gates.is_empty() {
-        return Ok(Vec::new());
-    }
+struct GateContext {
+    machine: String,
+    target: Option<String>,
+    cwd: String,
+    environment: BTreeMap<String, String>,
+}
+
+fn gate_context(ctx: &Ctx, project: &Project, review: &Review) -> Result<GateContext> {
     let reviewer = thread::load(
         project,
         review.reviewer.as_deref().context("reviewer missing")?,
@@ -1172,10 +1195,55 @@ fn observed_gates(
         }
         (crate::contracts::MACHINE_LOCAL.to_owned(), None)
     };
-    let cwd = &reviewer.worktree_path;
-    if cwd.is_empty() {
+    if reviewer.worktree_path.is_empty() {
         bail!("gate result not established: reviewer checkout missing");
     }
+    Ok(GateContext {
+        machine,
+        target,
+        cwd: reviewer.worktree_path,
+        environment,
+    })
+}
+
+fn observed_gates(
+    ctx: &Ctx,
+    project: &Project,
+    review: &Review,
+    candidate: &str,
+    git: &Git<'_>,
+) -> Result<Vec<GateRun>> {
+    let changed_paths = files(git, &review.base, candidate)?;
+    let gates = selected(&review.gates, &changed_paths);
+    let evidence_dir = dir(project).join(&review.id);
+    std::fs::create_dir_all(&evidence_dir)?;
+    std::fs::File::open(dir(project))?.sync_all()?;
+    let selection = GateSelection {
+        candidate,
+        base: &review.base,
+        note: &review.gates_note,
+        changed_paths,
+        not_selected: review
+            .gates
+            .iter()
+            .filter(|gate| !gates.contains(gate))
+            .cloned()
+            .collect(),
+        selected: gates.clone(),
+    };
+    project::write_atomic(
+        &evidence_dir.join(format!("{candidate}-selection.toml")),
+        toml::to_string(&selection)?.as_bytes(),
+    )?;
+    if gates.is_empty() {
+        return Ok(Vec::new());
+    }
+    let GateContext {
+        machine,
+        target,
+        cwd,
+        environment,
+    } = gate_context(ctx, project, review)?;
     let mut runs = Vec::new();
     for (index, gate) in gates.into_iter().enumerate() {
         let mut environment = environment.clone();
@@ -1183,20 +1251,23 @@ fn observed_gates(
         let started = jiff::Timestamp::now().to_string();
         let run_dir = evidence_dir.join(format!("{candidate}-{index}-{started}"));
         std::fs::create_dir(&run_dir)?;
+        std::fs::File::open(&evidence_dir)?.sync_all()?;
         let logs = crate::runner::OutputLogs {
             stdout: run_dir.join("stdout.log"),
             stderr: run_dir.join("stderr.log"),
         };
-        let cmd = gate_command(&gate, candidate, cwd, &environment, target.as_deref());
+        let cmd = gate_command(&gate, candidate, &cwd, &environment, target.as_deref());
         let capture = ctx
             .runner
             .capture(&cmd, ctx.runner.is_real().then_some(&logs));
         let mut receipt = GateReceipt {
             review: review.id.clone(),
+            event: review.verdict_event.clone(),
             base: review.base.clone(),
             candidate: candidate.into(),
             gate,
             machine: machine.clone(),
+            target: target.clone(),
             cwd: cwd.clone(),
             environment,
             started,
@@ -1268,6 +1339,7 @@ impl GateReceipt {
         machine: &str,
     ) -> bool {
         self.review == review.id
+            && self.event == review.verdict_event
             && self.base == review.base
             && self.candidate == candidate
             && self.machine == machine
@@ -1282,17 +1354,75 @@ impl GateReceipt {
                     candidate,
                     &self.cwd,
                     &self.environment,
-                    if command.program == "ssh" {
-                        command.args.get(5).map(String::as_str)
-                    } else {
-                        None
-                    },
+                    self.target.as_deref(),
                 )
             && log_hash(&project.state_dir().join(&self.stdout))
                 .is_ok_and(|hash| hash == self.stdout_hash)
             && log_hash(&project.state_dir().join(&self.stderr))
                 .is_ok_and(|hash| hash == self.stderr_hash)
     }
+}
+
+/// Recheck durable execution proof at the merge boundary, including after a
+/// crash. A cached exit=0 verdict is not a receipt, and missing/corrupt logs
+/// cannot be promoted to success by a landing retry.
+fn verify_gate_receipts(
+    ctx: &Ctx,
+    project: &Project,
+    review: &Review,
+    candidate: &str,
+    git: &Git<'_>,
+) -> Result<()> {
+    let gates = selected(&review.gates, &files(git, &review.base, candidate)?);
+    if gates.is_empty() {
+        return Ok(());
+    }
+    let GateContext {
+        machine,
+        target,
+        cwd,
+        environment,
+    } = gate_context(ctx, project, review)?;
+    let entries = std::fs::read_dir(dir(project).join(&review.id))
+        .context("gate result not established: matching ADE execution receipts missing")?;
+    let mut receipts = Vec::<GateReceipt>::new();
+    for entry in entries {
+        let entry = entry?;
+        if !entry
+            .file_name()
+            .to_string_lossy()
+            .starts_with(&format!("{candidate}-"))
+        {
+            continue;
+        }
+        let path = entry.path().join("receipt.toml");
+        if path.is_file() {
+            receipts.push(toml::from_str(&std::fs::read_to_string(path)?)?);
+        }
+    }
+    for gate in gates {
+        let mut environment = environment.clone();
+        environment.extend(gate.env.clone());
+        let cmd = gate_command(&gate, candidate, &cwd, &environment, target.as_deref());
+        let receipt = receipts
+            .iter()
+            .filter(|receipt| {
+                receipt.event == review.verdict_event
+                    && receipt.candidate == candidate
+                    && receipt.gate == gate
+                    && receipt.machine == machine
+            })
+            .max_by_key(|receipt| receipt.started.parse::<jiff::Timestamp>().ok());
+        if !receipt
+            .is_some_and(|receipt| receipt.matches(project, review, candidate, &cmd, &machine))
+        {
+            bail!(
+                "gate result not established: {} has no matching complete passing ADE receipt for this seal/candidate/environment",
+                gate.command
+            );
+        }
+    }
+    Ok(())
 }
 
 fn defer_members(project: &Project, review: &Review) -> Result<()> {
@@ -1642,6 +1772,7 @@ fn land_with_install(
         .candidate
         .clone();
     if !review.fast_forward {
+        verify_gate_receipts(ctx, project, review, &candidate, &git)?;
         let _git_lock = crate::git::lock(ctx.runner, &review.repo)?;
         let head = git
             .branch_head(&review.integration)?
@@ -1908,6 +2039,27 @@ pub(crate) fn retry(ctx: &Ctx, slug: &str, repo: Option<&str>) -> Result<Option<
             record.install_result.clear();
             record.attention.clear();
             save(&home, &record)?;
+        }
+        if !record.fast_forward && record.phase == Phase::Landing {
+            let git = Git::new(ctx.runner, &record.repo);
+            let candidate = record
+                .verdict
+                .as_ref()
+                .context("landing verdict missing")?
+                .candidate
+                .clone();
+            if verify_gate_receipts(ctx, &home, &record, &candidate, &git).is_err() {
+                // An explicit retry may replace lost/old mechanical evidence,
+                // but it still validates the original semantic seal and runs
+                // on the same machine/candidate. Never fabricate a receipt.
+                let event = crate::events::load(&home, &record.verdict_event)?;
+                let checked = verdict(ctx, &home, &record, &event, &git)?;
+                if checked.verdict != "MERGE" {
+                    bail!("landing seal is not MERGE");
+                }
+                record.verdict = Some(checked);
+                save(&home, &record)?;
+            }
         }
         advance(ctx, &home, &mut record)?;
         return Ok(Some(record));

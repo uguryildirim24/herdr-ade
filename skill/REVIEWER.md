@@ -23,9 +23,18 @@ verdict = "MERGE" # or REJECT
 candidate = "<your exact full HEAD SHA>"
 # Optional, for MERGE without these lanes:
 # without = { t-0001 = "One-line reason" }
+
+# Repeat for every required criterion of every included task:
+[[acceptance]]
+thread = "<member thread>"
+event = "<member seal from the packet>"
+criterion = 1
+condition = "<exact original acceptance condition>"
+established = true # false for partial/missing evidence
+evidence = "<durable artifact and behavior/journey references>"
 +++
 ```
 
-The body explains findings and maps each original required criterion to durable artifact/behavior evidence or **not established**. Gate-free policy and gates not selected by the final paths stay explicit in ADE's selection record; do not broaden the allowlist. Do not commit the report into the code repository.
+The body explains findings and the requested journey, including behavior that must stay. Each included task needs one `[[acceptance]]` row per required criterion, with the exact condition and member seal. A missing/partial/empty judgment cannot MERGE that member: fix it or exclude it. Semantic judgment is yours, not a test-exit inference. Gate-free policy and gates not selected by the final paths stay explicit in ADE's selection record; do not broaden the allowlist. Do not commit the report into the code repository.
 
 Commit repository changes if any, leave runtime deliverables untracked, then finish with `ha done`. It uses the recorded report and exact HEAD; the report must be inside your git folder. On a cloud box this publishes only your reviewer branch and verifies its remote ref; on the Mac it does not publish. The harness fast-forwards, pushes, installs where needed, and closes the merged lanes. Never move the integration branch yourself.

@@ -109,6 +109,31 @@ impl Chain {
         id
     }
 
+    // The judge's decision is an injected boundary, just like the courier seal;
+    // criterion recording and closure enforcement use the real coordinator CLI.
+    fn accept(&self, n: u32, established: bool, evidence: &str) {
+        let lane = format!("t-{n:04}");
+        let path = format!("threads/{lane}.toml");
+        let mut record: toml::Value =
+            toml::from_str(&std::fs::read_to_string(self.state.join(&path)).unwrap()).unwrap();
+        record["status"] = toml::Value::String("resolved".into());
+        self.write(&path, &toml::to_string(&record).unwrap());
+        self.write(
+            "coordinator.json",
+            &json!({"pane_id":"w1:p1", "agent_name":"independent-coordinator", "generation":1})
+                .to_string(),
+        );
+        let task: toml::Value = toml::from_str(
+            &std::fs::read_to_string(self.state.join(format!("tasks/job-{n:04}.toml"))).unwrap(),
+        )
+        .unwrap();
+        let condition = task["acceptance"][0].as_str().unwrap();
+        let reason = format!(
+            "[[acceptance]]\nthread = {lane:?}\nevent = \"{lane}-1-1\"\ncriterion = 1\ncondition = {condition:?}\nestablished = {established}\nevidence = {evidence:?}"
+        );
+        self.ok(&["thread", "attest", "demo", &lane, "--reason", &reason]);
+    }
+
     fn seal(&self, n: u32, report: Option<&str>, failed: bool) -> Option<String> {
         let report = report?;
         let lane = format!("t-{n:04}");
@@ -188,6 +213,11 @@ fn cli_articulates_revises_extends_and_closes_preserving_accepted_results() {
         "goal_check",
     );
     let research_hash = f.seal(1, Some("S2 appendix inaccessible; S3 offline. Critique: a full-read summary would invent evidence; use a coverage ledger."), false).unwrap();
+    f.accept(
+        1,
+        true,
+        "Research artifact: coordinator checked honest endpoint accounting and the scope revision",
+    );
     f.ok(&["plan", "sync", "demo"]);
     f.ok(&[
         "plan",
@@ -199,6 +229,12 @@ fn cli_articulates_revises_extends_and_closes_preserving_accepted_results() {
     ]);
     f.ok(&["plan", "check", "demo", "action", &build, "--evidence", "Contrary inspected evidence invalidated the full-read assumption; keep the accepted research"]);
     let ledger_hash = f.seal(2, Some(GOOD), false).unwrap();
+    assert_eq!(judge_ledger(Some(GOOD)), Some(true));
+    f.accept(
+        2,
+        true,
+        "Ledger artifact: independent grader confirmed S1 complete, S2 partial, S3 unavailable",
+    );
     f.ok(&["plan", "sync", "demo"]);
     let initial = f.plan()["steps"].as_array().unwrap().clone();
     assert!(initial.iter().all(|s| s["state"].as_str() == Some("done")));
@@ -244,6 +280,7 @@ fn cli_articulates_revises_extends_and_closes_preserving_accepted_results() {
     let delivered = std::fs::read_to_string(f.state.join("artifacts").join(&ledger_hash)).unwrap();
     assert_eq!(judge_ledger(Some(&delivered)), Some(true));
     f.seal(3, Some("Offline acceptance: three assigned sources, each accounted for once. S2 stays partial, S3 stays unavailable; no additional features required."), false);
+    f.accept(3, true, "Offline recheck artifact: coordinator confirmed every source accounted for without invented completeness");
     f.ok(&["plan", "sync", "demo"]);
     f.ok(&[
         "plan",
@@ -372,11 +409,21 @@ fn grader_witnesses_distinguish_outcome_from_no_change_completion() {
             f.refused(&close, "terminal acceptance-bearing evidence");
             assert_ne!(f.plan()["steps"][0]["state"].as_str(), Some("done"));
         } else {
-            // Known qualification gap: G1 is a scheduling/anchor guard, not a
-            // semantic judge. Even the inadequate no-change report can close.
-            // Keep this witness visible for R2; never count it as goal success.
-            f.ok(&close);
-            assert_eq!(f.check()["disposition"]["kind"], "closed");
+            // A no-change seal is a finish fact, never independent acceptance.
+            f.refused(&close, "acceptance not established");
+            assert_eq!(f.plan()["steps"][0]["state"].as_str(), Some("done"));
+            f.accept(
+                1,
+                judgment == Some(true),
+                "Independent ledger grader: S2 appendix inaccessible; S3 endpoint offline",
+            );
+            if judgment == Some(true) {
+                f.ok(&close);
+                assert_eq!(f.check()["disposition"]["kind"], "closed");
+            } else {
+                f.refused(&close, "acceptance not established");
+                assert_ne!(f.check()["disposition"]["kind"], "closed");
+            }
         }
     }
 }

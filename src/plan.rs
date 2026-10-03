@@ -667,7 +667,53 @@ pub(crate) fn check_prerequisites(project: &Project, job: &str) -> Result<()> {
                     project.slug
                 );
             }
+            require_step_acceptance(project, prerequisite, &evidence)?;
         }
+    }
+    Ok(())
+}
+
+/// Completion counts remain finish/delivery facts. Launching work that relies
+/// on a result additionally needs its criterion judgment; partial research is
+/// not an accepted prerequisite merely because its plan step says done.
+fn require_step_acceptance(
+    project: &Project,
+    step: &PlanStep,
+    evidence: &crate::task::EvidenceSnapshot,
+) -> Result<()> {
+    let (tasks, errors) = crate::task::list_with_errors(project);
+    if !errors.is_empty() {
+        bail!("plan_prerequisite: acceptance not established: unreadable tasks");
+    }
+    let bound: Vec<_> = tasks
+        .iter()
+        .filter(|task| {
+            task.dropped.is_empty()
+                && (step.tasks.contains(&task.id)
+                    || task.plan_step.as_deref() == Some(&step.id)
+                    || task
+                        .attempts
+                        .last()
+                        .is_some_and(|id| step.threads.contains(id)))
+        })
+        .collect();
+    for task in &bound {
+        crate::task::require_accepted(project, task, evidence)
+            .map_err(|error| anyhow::anyhow!("plan_prerequisite: step {}: {error}", step.id))?;
+    }
+    for id in &step.threads {
+        if bound.iter().any(|task| task.attempts.last() == Some(id)) {
+            continue;
+        }
+        let lane = thread::load(project, id)?;
+        if lane.merged_sha.is_empty() || !lane.merged_review.is_empty() {
+            bail!(
+                "plan_prerequisite: acceptance not established: {id} needs a request-backed task and criterion evidence"
+            );
+        }
+    }
+    for sub in &step.subtasks {
+        require_step_acceptance(project, sub, evidence)?;
     }
     Ok(())
 }
