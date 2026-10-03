@@ -5,7 +5,7 @@
 // A provider error does not reach the model, so the model cannot report it.
 // This extension is the deterministic reporter: a settled
 // provider failure becomes `herdr:blocked` on the pane (never idle, never
-// `done`) plus one typed `ha failed` event per class per ten minutes.
+// `done`) with the result of its typed `ha failed` report.
 //
 // It never runs a login, never retries, and never runs `ha done`.
 // @ts-nocheck
@@ -56,7 +56,6 @@ function hook(binding, payload) {
 }
 
 const CLASSES = ["limit", "login", "unreachable", "error"];
-const THROTTLE_MS = 10 * 60 * 1000;
 const DETAIL_MAX = 120;
 
 export default function (pi) {
@@ -64,7 +63,6 @@ export default function (pi) {
   const reasons = new Map();
   let pendingError = null; // { message, status }
   let lastStatus = null;
-  const lastSentAt = new Map(); // class -> epoch ms
   pi.on("input", async (event, ctx) => {
     // sendUserMessage corrections are extension delivery, not Rolf's words.
     if (event.source === "extension") return;
@@ -137,8 +135,9 @@ export default function (pi) {
 
   function raise(key, label) {
     const wasEmpty = reasons.size === 0;
+    const previous = reasons.get(key);
     reasons.set(key, label);
-    if (wasEmpty) {
+    if (wasEmpty || previous !== label) {
       emit(true, label);
     }
   }
@@ -163,26 +162,20 @@ export default function (pi) {
 
   // Only an ADE lane (HERDR_ADE_LAUNCH set) reports; the pane's `blocked`
   // state is raised either way.
-  async function runWaiting(label, cls, provider) {
-    const env = process.env || {};
-    if (!env.HERDR_ADE_LAUNCH) {
-      return;
-    }
-    const now = Date.now();
-    const sentAt = lastSentAt.get(cls) || 0;
-    if (now - sentAt < THROTTLE_MS) {
-      return;
-    }
-    lastSentAt.set(cls, now);
-    const text = `${provider} ${cls}: ${first120(label)}`;
+  async function reportFailure(label, cls, text) {
+    if (!process.env.HERDR_ADE_LAUNCH) return label;
     try {
-      await pi.exec(
+      const result = await pi.exec(
         ADE_BINARY,
         ["--root", ADE_ROOT, "failed", "--class", "provider", "--provider-kind", cls, text],
         { timeout: 5000 },
       );
-    } catch {
-      // A failed report never stops pi; the pane is blocked either way.
+      if (result.code !== 0 || result.killed) {
+        throw new Error(`ha failed exited ${result.code}${result.killed ? " (terminated)" : ""}: ${result.stderr.trim() || result.stdout.trim()}`);
+      }
+      return `${label}; recovery recorded`;
+    } catch (error) {
+      return `${label}; recovery recording unconfirmed: ${error}`;
     }
   }
 
@@ -248,8 +241,7 @@ export default function (pi) {
     const label = pendingError.status
       ? `${provider} ${cls} HTTP ${pendingError.status}: ${detail}`
       : `${provider} ${cls}: ${detail}`;
-    raise("provider", label);
-    await runWaiting(detail, cls, provider);
+    raise("provider", await reportFailure(label, cls, `${provider} ${cls}: ${detail}`));
   });
 
   // Typing in the pane is the recovery: it clears the block, and the model

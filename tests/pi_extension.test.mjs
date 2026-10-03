@@ -9,7 +9,7 @@ import { join, resolve } from 'node:path';
 const binary = resolve(process.env.CARGO_TARGET_DIR || 'target', 'debug/herdr-ade');
 const source = readFileSync(new URL('../extensions/herdr-pi-guard.ts', import.meta.url), 'utf8');
 
-async function fixture({bound = true} = {}) {
+async function fixture({bound = true, exec = async () => ({code: 0, stdout: '', stderr: '', killed: false})} = {}) {
   const temp = mkdtempSync(join(tmpdir(), 'ade-pi-hook-'));
   const cwd = join(temp, 'untrusted-checkout');
   const root = join(temp, 'ade-state');
@@ -34,11 +34,12 @@ async function fixture({bound = true} = {}) {
   const handlers = new Map();
   const sent = [];
   const execs = [];
+  const blocked = [];
   const pi = {
     on(name, fn) { handlers.set(name, [...(handlers.get(name) || []), fn]); },
     sendUserMessage(text) { sent.push(text); },
-    async exec(program, args) { execs.push({program, args}); },
-    events: {emit() {}},
+    async exec(program, args, options) { execs.push({program, args, options}); return exec(program, args, options); },
+    events: {emit(name, payload) { if (name === 'herdr:blocked') blocked.push(payload); }},
   };
   const notices = [];
   const ctx = {cwd, isProjectTrusted: () => false, sessionManager: {getSessionId: () => 'pi-session-1'}, hasUI: true, ui: {notify(text) { notices.push(text); }}};
@@ -47,7 +48,7 @@ async function fixture({bound = true} = {}) {
   if (bound) process.env.HERDR_ADE_LAUNCH = 'demo/coordinator/1/hash';
   else delete process.env.HERDR_ADE_LAUNCH;
   guard(pi);
-  return {ctx, sent, execs, notices, hostileLog, hostileFile, root, state,
+  return {ctx, sent, execs, blocked, notices, hostileLog, hostileFile, root, state,
     async emit(name, event) {
       const results = [];
       for (const fn of handlers.get(name) || []) results.push(await fn(event, ctx));
@@ -93,14 +94,56 @@ test('real ADE coordinator binding delivers the prompt despite hostile checkout 
   } finally { f.close(); }
 });
 
-test('provider failure still reports the lane using the installed ADE binary', async () => {
-  const f = await fixture({bound: false});
+test('provider failure waits for the installed ADE report before labeling it recorded', async () => {
+  let finish;
+  const result = new Promise(resolve => { finish = resolve; });
+  const f = await fixture({bound: false, exec: () => result});
   try {
     process.env.HERDR_ADE_LAUNCH = 'demo/t-0001/1/hash';
     await f.emit('agent_end', {messages: [{role: 'assistant', stopReason: 'error', errorMessage: 'provider unavailable'}]});
-    await f.emit('agent_settled', {});
+    const settled = f.emit('agent_settled', {});
+    assert.deepEqual(f.blocked, []);
+    assert.deepEqual(f.execs, [{program: binary, args: ['--root', f.root, 'failed', '--class', 'provider', '--provider-kind', 'error', 'pi error: provider unavailable'], options: {timeout: 5000}}]);
+    finish({code: 0, stdout: 'sealed', stderr: '', killed: false});
+    await settled;
     assert.deepEqual(f.sent, []);
-    assert.deepEqual(f.execs, [{program: binary, args: ['--root', f.root, 'failed', '--class', 'provider', '--provider-kind', 'error', 'pi error: provider unavailable']}]);
+    assert.deepEqual(f.blocked, [{active: true, label: 'pi error: provider unavailable; recovery recorded'}]);
+    await f.emit('agent_settled', {});
+    assert.equal(f.execs.length, 2, 'identical reports rely on ADE idempotency, not a local throttle');
+  } finally { f.close(); }
+});
+
+test('failed reports keep the provider cause and command error, then update on recovery', async () => {
+  let result;
+  const f = await fixture({bound: false, exec: async () => {
+    if (result instanceof Error) throw result;
+    return result;
+  }});
+  try {
+    process.env.HERDR_ADE_LAUNCH = 'demo/t-0001/1/hash';
+    await f.emit('after_provider_response', {status: 429});
+    await f.emit('agent_end', {messages: [{role: 'assistant', stopReason: 'error', errorMessage: 'quota exhausted'}]});
+    for (const [outcome, commandError] of [
+      [{code: 1, stdout: 'sealed locally', stderr: 'delivery failed', killed: false}, 'ha failed exited 1: delivery failed'],
+      [{code: 2, stdout: 'command error on stdout', stderr: '', killed: false}, 'ha failed exited 2: command error on stdout'],
+      [{code: 0, stdout: '', stderr: 'timeout', killed: true}, 'ha failed exited 0 (terminated): timeout'],
+      [new Error('spawn ENOENT'), 'spawn ENOENT'],
+    ]) {
+      result = outcome;
+      await f.emit('agent_settled', {});
+      const {active, label} = f.blocked.at(-1);
+      assert.equal(active, true);
+      assert.ok(label.startsWith('pi limit HTTP 429: quota exhausted; recovery recording unconfirmed: '), label);
+      assert.ok(label.includes(commandError), label);
+      assert.doesNotMatch(label, /no seal|not sealed|recovery recorded/);
+    }
+    assert.equal(f.execs.length, 4);
+    result = {code: 0, stdout: '', stderr: '', killed: false};
+    await f.emit('agent_settled', {});
+    assert.equal(f.execs.length, 5);
+    assert.deepEqual(f.blocked.at(-1), {active: true, label: 'pi limit HTTP 429: quota exhausted; recovery recorded'});
+    await f.emit('agent_start', {});
+    assert.deepEqual(f.blocked.at(-1), {active: false});
   } finally { f.close(); }
 });
 

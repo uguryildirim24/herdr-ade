@@ -3,8 +3,8 @@
 use anyhow::Result;
 use std::path::Path;
 
+/// Project folders lack the managed-worktree proof required to answer a dialog.
 /// Only a readable, valid Claude config can establish that a folder is untrusted.
-/// Claude trusts descendants of accepted project paths, including worktrees.
 pub(crate) fn check_folder(ctx: &Ctx, kind: &str, remote: bool, folder: &Path) -> Result<()> {
     if kind != "claude" || remote {
         return Ok(());
@@ -144,7 +144,7 @@ mod tests {
     use crate::thread::Status;
 
     #[test]
-    fn config_trust_inherits_from_parent_and_only_refuses_claude() {
+    fn project_folder_trust_inherits_from_parent_and_only_refuses_claude() {
         let home = tempfile::tempdir().unwrap();
         let env = crate::paths::Env::for_test(home.path(), &[]);
         let ctx = Ctx {
@@ -154,8 +154,8 @@ mod tests {
             runner: &crate::runner::RealRunner,
             detached_ticker: false,
         };
-        let repo = home.path().join("repo");
-        let folder = repo.join(".worktrees/t-0001");
+        let repo = home.path().join("project");
+        let folder = repo.join("threads/t-0001");
         let config = home.path().join(".claude.json");
         assert!(check_folder(&ctx, "claude", false, &folder).is_ok());
         std::fs::write(&config, "not json").unwrap();
