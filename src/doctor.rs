@@ -1206,19 +1206,29 @@ fn report_with_checks(
         if let Some(warning) = crate::thread::memory_use(&project).warning() {
             check(&mut out, None, &format!("{label} memory"), warning);
         }
-        let Some(record) = project.coordinator() else {
-            check(
-                &mut out,
-                Some(true),
-                &label,
-                format!("{}; never opened", project.status()),
-            );
-            continue;
+        let record = match crate::ticker::coordinator_binding(&project) {
+            Ok(Some(record)) => record,
+            Ok(None) => {
+                check(
+                    &mut out,
+                    Some(true),
+                    &label,
+                    format!(
+                        "{}; coordinator closed; reviews skipped until open",
+                        project.status()
+                    ),
+                );
+                continue;
+            }
+            Err(error) => {
+                check(&mut out, Some(false), &label, format!("{error:#}"));
+                continue;
+            }
         };
         if !Path::new(&record.socket).exists() {
             check(
                 &mut out,
-                None,
+                Some(false),
                 &label,
                 format!(
                     "recorded socket {} no longer exists; `open --rebind` moves it",
@@ -1231,7 +1241,7 @@ fn report_with_checks(
         match herdr.pane_list() {
             Err(error) => check(
                 &mut out,
-                None,
+                Some(false),
                 &label,
                 format!("session at {} unreachable: {error}", record.socket),
             ),
@@ -2505,6 +2515,68 @@ recipe = "claude_fable_xhigh"
             })
             .unwrap();
         project
+    }
+
+    #[test]
+    fn project_checks_distinguish_closed_coordinators_from_observation_gaps() {
+        for state in ["unbound", "empty", "missing", "unreadable", "unreachable"] {
+            let home = tempfile::tempdir().unwrap();
+            let root = home.path().join("root");
+            let config = home.path().join("cfg");
+            write_routing_config(&config);
+            let project = opened_project(home.path(), &root, "w1:p1", "coordinator");
+            let socket = project.coordinator().unwrap().socket;
+            let binding = project.state_dir().join("coordinator.json");
+            match state {
+                "unbound" => std::fs::remove_file(&binding).unwrap(),
+                "empty" => {
+                    project
+                        .update_coordinator(|record| record.socket.clear())
+                        .unwrap();
+                }
+                "missing" => std::fs::remove_file(&socket).unwrap(),
+                "unreadable" => std::fs::write(&binding, "{bad").unwrap(),
+                _ => {}
+            }
+            let env = Env::for_test(home.path(), &[]);
+            let runner = runner_with_herdr("herdr 0.9.0");
+            runner.on(
+                "pane list",
+                if state == "unreachable" {
+                    fail(1, "socket connection refused")
+                } else {
+                    ok(r#"{"result":{"panes":[]}}"#)
+                },
+            );
+            let (_, _, checks) = report_with_checks(
+                &env,
+                &root,
+                &config,
+                &SessionFlags::default(),
+                &runner,
+                None,
+            );
+            let rows: Vec<_> = checks
+                .iter()
+                .filter(|check| check.label == "project demo")
+                .collect();
+            assert_eq!(rows.len(), 1, "{state}: {rows:?}");
+            let row = rows[0];
+            if matches!(state, "unbound" | "empty") {
+                assert_eq!(row.status, "ok", "{state}: {row:?}");
+                assert!(row.detail.contains("coordinator closed"), "{row:?}");
+                assert!(row.detail.contains("reviews skipped"), "{row:?}");
+            } else {
+                assert_eq!(row.status, "failed", "{state}: {row:?}");
+                assert!(!row.detail.contains("coordinator closed"), "{row:?}");
+                let expected_path = if state == "unreadable" {
+                    binding.to_string_lossy().into_owned()
+                } else {
+                    socket
+                };
+                assert!(row.detail.contains(&expected_path), "{row:?}");
+            }
+        }
     }
 
     #[test]
