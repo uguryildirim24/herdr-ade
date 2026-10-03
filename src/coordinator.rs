@@ -935,9 +935,8 @@ impl ContextCursor {
                 (item.id, format!("[{}] {}{detail}", item.kind, item.summary))
             })
             .collect();
-        let standing = project
-            .read_project_md()
-            .map(|(_, body)| {
+        let standing = std::fs::read_to_string(project.state_dir().join("page.md"))
+            .map(|body| {
                 let sections = split_sections(&body);
                 [
                     "## Task notes in force",
@@ -1769,10 +1768,8 @@ mod tests {
         let event = fx.seal_waiting(&lane, 1, 1, "Need a choice.");
         crate::project::refresh_page(&fx.project).unwrap();
         assert!(
-            fx.project
-                .read_project_md()
+            std::fs::read_to_string(fx.project.state_dir().join("page.md"))
                 .unwrap()
-                .1
                 .contains("Need a choice.")
         );
         let (before, _) = digest(&fx.world.ctx(), &fx.project, "ha").unwrap();

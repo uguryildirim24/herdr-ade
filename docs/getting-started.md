@@ -7,6 +7,7 @@ Install Herdr ADE, configure task routing, then open a project for its coordinat
 - macOS or Linux with [Herdr](https://herdr.dev) 0.9.1 or newer. Check both the client and running server with `herdr status`; restart a stale server after an update.
 - Rust 1.89 or newer, Cargo, a C compiler, and Git.
 - Access to `uguryildirim24/herdr-ade` and an agent CLI used by one of your configured recipes.
+- For project deletion on every affected machine: `/usr/bin/trash` on macOS; `gio` (used as `gio trash`) or `trash-put` on Linux. ADE checks these before any deletion effect and never falls back to permanent file removal.
 - Optional: `gh` for GitHub operations, and SSH plus `rsync` for lanes on another machine.
 
 ## 2. Install the plugin
@@ -42,7 +43,7 @@ herdr-ade open billing
 
 The default project root is `~/.herdr-ade`. `new` creates the project record; `open` creates or focuses its Herdr workspace and coordinator. Use `open <project> --recipe <id> --basis request:<id>` when Rolf chooses a configured coordinator recipe for that project; process relaunches keep the recipe and request. The coordinator reads its skill and current digest before answering.
 
-Edit only the front matter of the new `PROJECT.md` for repositories and project settings. Its body is the binary-written current page. Add facts and standing instructions with `herdr-ade note add <project> "<text>" --kind memory|instruction --request <request-id> [--task <job>]` so each fact has one provenanced home and can be explicitly replaced. Recipe selection lives in the editable `[routing]` table in `config.toml`.
+Edit the front matter of `PROJECT.md` for repositories and project settings. The harness never replaces this file. The current page is generated separately at `.state/page.md`; existing project bodies remain untouched and are not imported as notes. Add facts and standing instructions with `herdr-ade note add <project> "<text>" --kind memory|instruction --request <request-id> [--task <job>]` so each fact has one provenanced home and can be explicitly replaced. Recipe selection lives in the editable `[routing]` table in `config.toml`.
 
 ## 4. Start work
 

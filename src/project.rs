@@ -724,19 +724,6 @@ pub(crate) fn parse_repo_arg(arg: &str) -> Repo {
     }
 }
 
-fn project_md_prefix(bytes: &[u8]) -> Result<&[u8]> {
-    if !bytes.starts_with(b"+++\n") {
-        bail!("PROJECT.md must start with a `+++` line");
-    }
-    let end = bytes[4..]
-        .windows(5)
-        .position(|window| window == b"\n+++\n")
-        .map(|index| index + 4 + 5)
-        .or_else(|| bytes.ends_with(b"\n+++").then_some(bytes.len()))
-        .context("PROJECT.md front matter has no closing `+++` line")?;
-    Ok(&bytes[..end])
-}
-
 fn markdown_item(id: &str, provenance: &str, text: &str) -> String {
     let text = text.trim().replace('\n', "\n  ");
     format!("- `{id}` ({provenance}): {text}\n")
@@ -1082,23 +1069,20 @@ pub(crate) fn page_body_with_history(
     out
 }
 
-/// Rebuilds only the binary-owned body. The coordinator-owned front matter is
-/// compared immediately before the atomic replacement, so an edit is never
-/// overwritten with an older copy.
+/// PROJECT.md belongs to the editor. Only the separate generated view is
+/// replaced; existing front matter and historical bodies remain untouched.
 pub(crate) fn refresh_page(project: &Project) -> Result<()> {
+    refresh_page_with(project, write_atomic)
+}
+
+fn refresh_page_with(
+    project: &Project,
+    publish: impl FnOnce(&Path, &[u8]) -> Result<()>,
+) -> Result<()> {
     let _lock = lock_file(&project.state_dir().join("page.lock"))?;
-    let before = std::fs::read(project.project_md())?;
-    let prefix = project_md_prefix(&before)?.to_vec();
-    let (settings, _) = parse_project_md(std::str::from_utf8(&before)?)?;
+    let (settings, _) = project.read_project_md()?;
     let body = page_body(project, &settings);
-    let current = std::fs::read(project.project_md())?;
-    if project_md_prefix(&current)? != prefix {
-        bail!("project_page_changed: PROJECT.md front matter changed while its page was rebuilt");
-    }
-    let mut page = prefix;
-    page.push(b'\n');
-    page.extend_from_slice(body.as_bytes());
-    write_atomic(&project.project_md(), &page)
+    publish(&project.state_dir().join("page.md"), body.as_bytes())
 }
 
 /// Creates the folder and skeleton files. The only code path that creates a
@@ -1147,7 +1131,7 @@ pub(crate) fn create(root: &Path, name: &str, goal: &str, repos: Vec<Repo>) -> R
     // skeleton is never picked up by `list` or the ticker.
     write_atomic(
         &project.project_md(),
-        format!("+++\n# Repository gates: {{ command = \"...\", paths = [\"src/**\"] }}. Omit paths to always run.\n# Paths are repository-relative: * and ? match within a segment; ** is a whole directory segment.\n{front}+++\n").as_bytes(),
+        format!("+++\n# Repository gates: {{ command = \"...\", paths = [\"src/**\"] }}. Omit paths to always run.\n# Paths are repository-relative: * and ? match within a segment; ** is a whole directory segment.\n{front}+++\n\nSettings are hand-edited here. The generated current page is [.state/page.md](.state/page.md).\n").as_bytes(),
     )?;
     refresh_page(&project)?;
     Ok(project)
@@ -1182,7 +1166,7 @@ mod tests {
             .unwrap();
         }
         refresh_page(&project).unwrap();
-        let (_, page) = project.read_project_md().unwrap();
+        let page = std::fs::read_to_string(project.state_dir().join("page.md")).unwrap();
         assert!(page.contains("`job-0000` [dropped]"));
         assert!(page.contains("`job-0010` [dropped]"));
     }
@@ -1311,7 +1295,7 @@ mod tests {
         )
         .unwrap();
 
-        let page = std::fs::read_to_string(project.project_md()).unwrap();
+        let page = std::fs::read_to_string(project.state_dir().join("page.md")).unwrap();
         let open = page
             .split_once("## Open tasks\n\n")
             .unwrap()
@@ -1390,31 +1374,54 @@ mod tests {
     }
 
     #[test]
-    fn page_rewrite_keeps_front_matter_bytes_and_never_reads_its_body_as_a_note() {
+    fn page_rewrite_never_replaces_settings_or_imports_historical_body() {
         let root = tempfile::tempdir().unwrap();
         let project = create(root.path(), "demo", "First goal.", vec![]).unwrap();
-        let before = std::fs::read(project.project_md()).unwrap();
-        let prefix = project_md_prefix(&before).unwrap();
-        let edited = String::from_utf8(prefix.to_vec()).unwrap().replace(
+        let before = std::fs::read_to_string(project.project_md()).unwrap();
+        let edited = before.replace(
             "goal = \"First goal.\"",
             "# kept exactly\ngoal = \"Edited goal.\"",
-        );
-        std::fs::write(
-            project.project_md(),
-            format!("{edited}\n# Hand-written body must disappear.\n"),
-        )
-        .unwrap();
+        ) + "\n# Historical body stays untouched.\n";
+        std::fs::write(project.project_md(), &edited).unwrap();
 
         refresh_page(&project).unwrap();
 
-        let after = std::fs::read(project.project_md()).unwrap();
-        assert_eq!(project_md_prefix(&after).unwrap(), edited.as_bytes());
-        assert!(
-            !String::from_utf8(after)
-                .unwrap()
-                .contains("Hand-written body")
+        assert_eq!(
+            std::fs::read_to_string(project.project_md()).unwrap(),
+            edited
         );
+        let page = std::fs::read_to_string(project.state_dir().join("page.md")).unwrap();
+        assert!(page.contains("Edited goal."));
+        assert!(!page.contains("Historical body"));
         assert!(crate::note::active_rows(&project).is_empty());
+    }
+
+    #[test]
+    fn settings_edit_immediately_before_page_rename_is_not_overwritten() {
+        let root = tempfile::tempdir().unwrap();
+        let project = create(root.path(), "demo", "First goal.", vec![]).unwrap();
+        let edited = std::fs::read_to_string(project.project_md())
+            .unwrap()
+            .replace("First goal.", "Saved while publishing.");
+        refresh_page_with(&project, |path, contents| {
+            let tmp = path.with_extension("tmp");
+            std::fs::write(&tmp, contents)?;
+            // External editor saves after rendering and just before rename.
+            std::fs::write(project.project_md(), &edited)?;
+            std::fs::rename(tmp, path)?;
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(project.project_md()).unwrap(),
+            edited
+        );
+        refresh_page(&project).unwrap();
+        assert!(
+            std::fs::read_to_string(project.state_dir().join("page.md"))
+                .unwrap()
+                .contains("Saved while publishing.")
+        );
     }
 
     #[test]
