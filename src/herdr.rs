@@ -104,7 +104,7 @@ impl<'a> Herdr<'a> {
 
     /// `HERDR_SESSION` is removed so an inherited value can never compete with
     /// the socket this project recorded.
-    pub(crate) fn cmd(&self, timeout: Duration) -> Cmd {
+    fn cmd(&self, timeout: Duration) -> Cmd {
         let cmd = Cmd::new(&self.bin, timeout)
             .env("HERDR_SOCKET_PATH", self.socket.to_string_lossy())
             .env_remove("HERDR_SESSION");
@@ -112,6 +112,17 @@ impl<'a> Herdr<'a> {
             Some(machine) => cmd.args(["--machine", machine]),
             None => cmd,
         }
+    }
+
+    fn require_session(&self) -> Result<(), HerdrError> {
+        // Forwarded calls select the saved machine's session, not a local socket.
+        if self.machine.is_none() && self.socket.as_os_str().is_empty() {
+            return Err(HerdrError {
+                code: "unreachable".into(),
+                message: "no coordinator session recorded".into(),
+            });
+        }
+        Ok(())
     }
 
     /// True when the socket file exists and the server answers.
@@ -351,6 +362,7 @@ impl<'a> Herdr<'a> {
         args: &[&str],
         timeout: Duration,
     ) -> Result<serde_json::Value, HerdrError> {
+        self.require_session()?;
         let cmd = self.cmd(timeout).args(args.iter().copied());
         let out = self.runner.run(&cmd).map_err(|e| HerdrError {
             code: "unreachable".into(),
@@ -520,6 +532,7 @@ impl<'a> Herdr<'a> {
     }
 
     fn pane_read(&self, pane: &str, source: &str, format: &str) -> Result<String, HerdrError> {
+        self.require_session()?;
         let out = self
             .runner
             .run(
@@ -589,6 +602,9 @@ impl<'a> Herdr<'a> {
         &self,
         starts: &[AgentStart<'_>],
     ) -> Vec<Result<Agent, HerdrError>> {
+        if let Err(error) = self.require_session() {
+            return starts.iter().map(|_| Err(error.clone())).collect();
+        }
         let prepared: Vec<_> = starts
             .iter()
             .map(|opts| self.agent_start_command(opts))
@@ -782,6 +798,39 @@ pub(crate) const SOURCE: &str = "herdr-ade";
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn no_recorded_session_refuses_every_local_command_before_running_herdr() {
+        let runner = crate::runner::fake::FakeRunner::new();
+        let herdr = Herdr::new("herdr", "", &runner);
+        for error in [
+            herdr.tab_list().unwrap_err(),
+            herdr.pane_read_text("w1:p1", "detection").unwrap_err(),
+            herdr
+                .agent_start_opts(&AgentStart {
+                    name: "lane",
+                    kind: "pi",
+                    pane: "w1:p1",
+                    agent_args: &[],
+                    launch_bin: None,
+                    parent: None,
+                    ready_timeout_ms: 1,
+                })
+                .unwrap_err(),
+        ] {
+            assert_eq!(error.message, "no coordinator session recorded");
+            assert_eq!(error.code, "unreachable");
+        }
+        assert!(!herdr.reachable());
+        assert!(runner.calls.borrow().is_empty());
+        // Closed local coordinators still have explicitly routed box work.
+        runner.on(
+            "--machine box tab list",
+            crate::runner::fake::ok(r#"{"result":{"tabs":[]}}"#),
+        );
+        assert!(herdr.on_machine("box").tab_list().unwrap().is_empty());
+        assert_eq!(runner.count("--machine box tab list"), 1);
+    }
 
     #[test]
     fn an_empty_reply_with_exit_zero_is_success_and_an_error_reply_is_not() {

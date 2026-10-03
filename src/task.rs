@@ -8,6 +8,10 @@
 #[path = "task/incident_tests.rs"]
 mod incident_tests;
 
+#[cfg(test)]
+#[path = "task/drop_tests.rs"]
+mod drop_tests;
+
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 
@@ -433,14 +437,49 @@ fn update_deferred(
     Ok(task)
 }
 
-pub(crate) fn drop_task(project: &Project, id: &str, reason: &str) -> Result<Task> {
+#[derive(Serialize)]
+pub(crate) struct DropOutcome {
+    pub(crate) task: Task,
+    pub(crate) lanes: Vec<crate::threads::ResolveOutcome>,
+}
+
+/// A retained terminal seal is not a landing, nor authority to delete unique work.
+pub(crate) fn sealed_unlanded(
+    lane: &crate::thread::Thread,
+    events: &[crate::contracts::Event],
+    reviews: &[crate::review::Review],
+) -> bool {
+    lane.status != crate::thread::Status::Resolved
+        && lane.merged_sha.is_empty()
+        && crate::review::lane_review_from(reviews, lane).is_none()
+        && crate::events::latest_event(events, &lane.id, lane.attempt.max(1)).is_some_and(|event| {
+            !crate::threads::follow_up_pending_for_seal(lane, Some(event))
+                && (event.payload.done.is_some()
+                    || (event.payload.waiting.is_some() && event.id != lane.answered_waiting_event))
+        })
+}
+
+pub(crate) fn drop_task(
+    ctx: &Ctx,
+    project: &Project,
+    id: &str,
+    reason: &str,
+) -> Result<DropOutcome> {
     if reason.trim().is_empty() {
         return Err(crate::refusal::error(
             "task_drop: --reason is required",
             "ha task drop <project> <job> --reason \"<reason>\"",
         ));
     }
-    update(project, id, |task| {
+    let record = load(project, id)?;
+    let attempts = record
+        .attempts
+        .iter()
+        .map(|id| crate::thread::load(project, id))
+        .collect::<Result<Vec<_>>>()?;
+    let events = crate::events::checked(project)?;
+    let reviews = crate::review::list(project)?;
+    let task = update(project, id, |task| {
         if !task.dropped.is_empty() {
             return Err(crate::refusal::error(
                 format!("task_drop_already: `{id}` is already dropped"),
@@ -452,7 +491,21 @@ pub(crate) fn drop_task(project: &Project, id: &str, reason: &str) -> Result<Tas
             reason: reason.trim().to_string(),
         });
         Ok(())
-    })
+    })?;
+    let lanes = attempts
+        .iter()
+        .filter(|lane| sealed_unlanded(lane, &events, &reviews))
+        .map(|lane| {
+            crate::threads::resolve_automatically(
+                ctx,
+                project,
+                &lane.id,
+                &format!("task {id} dropped: {}", reason.trim()),
+            )
+        })
+        .collect();
+    crate::threads::refresh_plan(ctx, project);
+    Ok(DropOutcome { task, lanes })
 }
 
 pub(crate) fn withdraw_acceptance(
