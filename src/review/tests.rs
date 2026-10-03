@@ -141,7 +141,7 @@ fn idle_reviewer_warns_once_and_a_new_verdict_lands() {
     watch_no_verdict(&fx.world.ctx(), &fx.project, &mut review).unwrap();
     let count = review.notices.len();
     assert_eq!(count, 1);
-    assert!(review.notices[0].line.contains("No merge was attempted"));
+    assert!(review.notices[0].line.contains("no merge attempted"));
     watch_no_verdict(&fx.world.ctx(), &fx.project, &mut review).unwrap();
     assert_eq!(review.notices.len(), count);
     let candidate = git(&fx.repo, &["rev-parse", &review.candidate_branch]);
@@ -806,7 +806,8 @@ fn whole_pile_lands_pushes_closes_and_prunes_once() {
     assert_eq!(review.phase, Phase::Complete);
     assert_eq!(review.notices.len(), 1);
     assert!(review.notices[0].line.contains("merged"));
-    assert!(review.notices[0].line.contains("pushed"));
+    assert!(review.notices[0].line.contains("publication verified"));
+    assert!(review.notices[0].line.contains("install not required"));
     assert!(review.fast_forward && review.push && review.install && review.close && review.prune);
     assert_eq!(git(&fx.repo, &["rev-parse", "main"]), candidate);
     assert_eq!(git(&remote, &["rev-parse", "main"]), candidate);
@@ -1001,12 +1002,11 @@ fn dead_reviewer_needs_coordinator_once_after_retries_end() {
     advance(&fx.world.ctx(), &fx.project, &mut review).unwrap();
     advance(&fx.world.ctx(), &fx.project, &mut review).unwrap();
     assert_eq!(review.notices.len(), 1);
-    assert!(review.notices[0].line.contains("needs you: reviewer"));
-    assert!(
-        review.notices[0]
-            .line
-            .contains("next: ha review retry demo")
-    );
+    assert!(review.notices[0].line.contains("needs attention: reviewer"));
+    assert!(review.notices[0].line.contains(&format!(
+        "next: ha review retry demo --repo {}",
+        crate::remote::quote(review.repo.as_str())
+    )));
 }
 
 #[test]
@@ -1466,7 +1466,11 @@ fn landing_recovers_ref_before_marker_and_install_failure_without_early_task_don
     save(&fx.project, &review).unwrap();
     // Crash after git accepted the FF but before fast_forward was recorded.
     git(&fx.repo, &["merge", "--ff-only", &candidate]);
-    assert!(cancel_record(&fx.world.ctx(), &fx.project, &mut review, "too late").is_err());
+    let refusal = cancel_record(&fx.world.ctx(), &fx.project, &mut review, "too late").unwrap_err();
+    assert_eq!(
+        crate::refusal::next(&refusal),
+        Some(review.command(&fx.project, "retry").as_str())
+    );
     assert!(review.fast_forward);
     assert!(
         land_with_install(&fx.world.ctx(), &fx.project, &mut review, || bail!(
@@ -1475,6 +1479,10 @@ fn landing_recovers_ref_before_marker_and_install_failure_without_early_task_don
         .is_err()
     );
     assert!(review.fast_forward && review.push && !review.install && !review.close);
+    assert_eq!(
+        review.landing_summary(),
+        "merged; no remote configured; install pending; continues automatically"
+    );
     assert_eq!(
         crate::task::view(&fx.project, task.clone()).state,
         crate::task::State::Merged
@@ -1488,6 +1496,10 @@ fn landing_recovers_ref_before_marker_and_install_failure_without_early_task_don
     let mut restored = load(&fx.project, &review.id).unwrap();
     land_with_install(&fx.world.ctx(), &fx.project, &mut restored, || Ok(())).unwrap();
     assert_eq!(restored.phase, Phase::Complete);
+    assert_eq!(
+        restored.landing_summary(),
+        "merged; no remote configured; install completed"
+    );
     assert_eq!(
         crate::task::view(&fx.project, task).state,
         crate::task::State::Installed

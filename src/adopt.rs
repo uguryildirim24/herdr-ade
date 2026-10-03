@@ -53,8 +53,7 @@ pub(crate) fn adoptable_agent(ctx: &Ctx, herdr: &Herdr, socket: &str, pane: &str
 
 #[derive(Debug, Clone, Default)]
 pub(crate) struct AdeAdopt {
-    pub(crate) plain: String,
-    pub(crate) role: Option<String>,
+    pub(crate) workflow: Option<String>,
     pub(crate) passive: bool,
 }
 
@@ -76,9 +75,8 @@ pub(crate) fn adopt(
     if title.trim().is_empty() {
         bail!("--title may not be empty");
     }
-    crate::threads::check_birth_plain(&ade.plain)?;
     let role = ade
-        .role
+        .workflow
         .as_deref()
         .filter(|r| !r.is_empty())
         .unwrap_or("lane");
@@ -129,7 +127,7 @@ pub(crate) fn adopt(
         t.tab_id = agent.tab_id.clone();
         t.pane_id = agent.pane_id.clone();
         t.role = role.to_string();
-        t.plain = ade.plain.trim().to_string();
+        t.plain = title.trim().to_string();
         t.passive = passive;
         t.attempt = 1;
         t.launch = project::launch_recipe(
@@ -286,8 +284,6 @@ pub(crate) fn adopt(
 pub(crate) struct AdoptWorkspace {
     pub(crate) name: String,
     pub(crate) goal: String,
-    /// The adopted thread's birth sentence (SPEC-ADE D17 item 6).
-    pub(crate) plain: String,
     pub(crate) pane: String,
     pub(crate) workspace_cwd: String,
     pub(crate) session: SessionFlags,
@@ -296,7 +292,6 @@ pub(crate) struct AdoptWorkspace {
 /// "Continue as a project": `new`, then `open`, then `thread adopt`. It
 /// refuses, before creating anything, under the same conditions as `thread adopt`.
 pub(crate) fn adopt_workspace(ctx: &Ctx, args: &AdoptWorkspace) -> Result<()> {
-    crate::threads::check_birth_plain(&args.plain)?;
     let session = paths::resolve_session(&args.session, ctx.env, ctx.runner)?;
     let socket = session.socket.to_string_lossy().into_owned();
     let herdr = Herdr::new(ctx.env.herdr_bin(), &session.socket, ctx.runner);
@@ -356,10 +351,7 @@ pub(crate) fn adopt_workspace(ctx: &Ctx, args: &AdoptWorkspace) -> Result<()> {
         &args.pane,
         &args.name,
         None,
-        AdeAdopt {
-            plain: args.plain.clone(),
-            ..AdeAdopt::default()
-        },
+        AdeAdopt::default(),
     )?;
     println!(
         "adopted pane {} as thread {} of `{}`",
@@ -376,10 +368,7 @@ mod tests {
     use crate::scenarios::{World, agent_json};
 
     fn lane() -> AdeAdopt {
-        AdeAdopt {
-            plain: "The lane does the work.".into(),
-            ..AdeAdopt::default()
-        }
+        AdeAdopt::default()
     }
 
     fn world_with_agent(state: &str, name: &str) -> (World, Project, String) {
@@ -508,7 +497,6 @@ mod tests {
             goal: String::new(),
             pane: "w9:p9".into(),
             workspace_cwd: String::new(),
-            plain: "The lane does the work.".into(),
             session: SessionFlags {
                 session: None,
                 socket: Some(socket),
@@ -528,14 +516,14 @@ mod tests {
             "Pro pane",
             None,
             AdeAdopt {
-                plain: "The critic reads the report.".into(),
-                role: Some("pro".into()),
+                workflow: Some("pro".into()),
                 passive: true,
             },
         )
         .unwrap();
         assert!(t.passive);
         assert_eq!(t.role, "pro");
+        assert_eq!(t.plain, "Pro pane");
         assert_eq!(world.runner.count("agent prompt"), 0);
         let calls = world.runner.calls.borrow();
         let parent = calls.iter().any(|c| {

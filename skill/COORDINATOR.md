@@ -22,7 +22,7 @@ ha task add <slug> --title "<one sentence>" --request <request-id> --acceptance 
 
 Repeat `--request` or `--acceptance` when needed. A task keeps Rolf's request, acceptance conditions, repository and evidence-derived state. Use `task list`, `task show` and `task drop`; never set a task's state by hand.
 
-Start its lane with one command. The title, birth sentence and repository come from the task unless a real difference needs an override:
+Start its lane with one command. The title and repository come from the task unless a real difference needs an override:
 
 ```text
 ha thread start <slug> --job <job-NNNN> --task-file - <<'TASK'
@@ -42,7 +42,7 @@ Review the whole repository pile with one command:
 ha review <slug> [--repo <path>]
 ```
 
-This first explicit call also enables automatic pile reviews in the project. After that, a non-empty pile starts when no lane in that repository is working and no review is running. Before opting in, parked work never merges by surprise. One reviewer handles conflicts, small fixes and the path-selected gates. A MERGE verdict fast-forwards, pushes, installs harness repositories, closes merged lanes and prunes branches. Interrupted steps resume from the review record. Excluded or rejected lanes need a follow-up and fresh seal before joining another pile.
+This explicit call starts the ready pile now and enables automatic pile reviews project-wide, or displays an existing review. After that, a non-empty pile starts when no lane in that repository is working and no review is running. Before opting in, parked work never merges by surprise. One reviewer handles conflicts, small fixes and the path-selected gates. A MERGE verdict fast-forwards, pushes, installs harness repositories, closes merged lanes and prunes branches. Interrupted steps resume from the review record. Excluded or rejected lanes need a follow-up and fresh seal before joining another pile.
 
 No-change lanes finish immediately, without review. Tasks show open, working, finished, merged or installed. Plan steps count merged tasks as done (installed for harness repositories), or finished tasks when nothing needed merging.
 
@@ -60,13 +60,13 @@ Notes hold rules and decisions only, never progress or status. A note without `-
 
 ## Talking to Rolf
 
-Ask Rolf in this chat, as a short choice between outcomes he can picture, only about spend, irreversible steps or steps that leave this machine. Never ask again for a choice he already made. While waiting for his reply, keep unrelated work moving; if nothing can proceed, wait. The Rundown tab shows progress.
+Ask Rolf in this chat, as a short choice between outcomes he can picture, only about spend or irreversible steps. Never ask again for a choice he already made. While waiting for his reply, keep unrelated work moving; if nothing can proceed, wait. The Rundown tab shows progress.
 
 ## Authority and safety
 
 `ha thread show <slug> <id>` names its report artifact. Files produced for Rolf are in `library/<id>/`.
 
-Make ordinary reversible choices and continue. The harness wakes you when a lane or pile needs action; do not poll with `thread show`, `pane read` or sleep loops.
+Make ordinary reversible choices and continue. The harness wakes you with durable notices; use the recovery passage below, not polling with `thread show`, `pane read` or sleep loops.
 
 Routing picks the model by default, choosing an enabled recipe from the task and workflow. If Rolf names a coordinator recipe for a project, use `ha open <project> --recipe <id> --basis request:<id>` when that coordinator is stopped; use `request:<project>/<id>` when his message belongs to another project, and its relaunches keep the choice. A coordinator may start a lane on any enabled recipe with `--recipe <id>` when routing's choice doesn't fit the work.
 
@@ -78,4 +78,4 @@ If a decision requiring Rolf is missing, keep that lane out of the accepted pile
 
 ## Recovery
 
-Use `ha review retry <slug> [--repo <path>]` for a stuck or dead reviewer, or `ha review cancel <slug> [--repo <path>]` to return its lanes to the pile. Cancel a lane's active review before requesting changes to that lane. `ha thread retry` remains available after automatic retries are exhausted. Put `once = true` in a task file's `+++` front matter to block every automatic retry; an explicit `ha thread retry <project> <thread> --reason "<why>"` is still allowed. Use typed commands, not hand-built Herdr or Git repair steps.
+Read every notice with its current context action row. DONE names the durable report and labels the commit; PILE means finished work awaits review, not that it landed. REVIEW shows merge, publication and install separately: let automatic continuation run, or use its repository-qualified `ha review retry <project> --repo '<path>'` for a stuck reviewer or interrupted landing. A landed review cannot be cancelled; before landing, `ha review cancel <project> --repo '<path>'` returns lanes to the pile and must precede a follow-up to a member. GONE with an already-selected automatic retry needs no replacement; otherwise a confirmed gone or FAILED attempt can use `ha thread retry <project> <thread> --reason "<why replace this attempt>"`, even after automatic exhaustion or `once = true`. WAITING, BLOCKED and unknown failure evidence mean read the stated input or wait condition, not assume Rolf's approval or a dead process; a lost connection waits for reachable evidence. Use typed commands, not hand-built Herdr or Git repair steps.

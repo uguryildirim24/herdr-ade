@@ -935,10 +935,11 @@ pub(crate) fn page_body_with_history(
     }
     for review in reviews {
         out.push_str(&format!(
-            "- Review `{}`: {:?} ({} lanes){}\n",
+            "- Review `{}`: {:?} ({} lanes) — {}{}\n",
             review.id,
             review.phase,
             review.members.len(),
+            review.landing_summary(),
             review.gates_summary()
         ));
     }

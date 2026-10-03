@@ -984,7 +984,7 @@ impl Group {
         match self {
             Group::ReadyForReview => "Ready for review",
             Group::Parked => "Parked",
-            Group::WaitingOnYou => "Waiting on you",
+            Group::WaitingOnYou => "Needs attention",
             Group::Unknown => "Unknown",
             Group::Working => "Working",
             Group::Idle => "Idle",

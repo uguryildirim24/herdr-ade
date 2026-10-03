@@ -68,6 +68,27 @@ fn new_project_popup_lists_the_repository_like_the_cli_and_leaves_the_goal_for_c
 }
 
 #[test]
+fn help_and_version_are_successful_displays_even_with_json() {
+    let home = tempfile::tempdir().unwrap();
+    for args in [
+        vec!["review", "--help", "--json"],
+        vec!["--version", "--json"],
+    ] {
+        let output = hp(home.path(), &args);
+        assert!(output.status.success(), "{args:?}: {output:?}");
+        assert!(output.stderr.is_empty(), "{args:?}: {output:?}");
+        let display = String::from_utf8(output.stdout).unwrap();
+        assert!(!display.contains("\"outcome\":\"refused\""), "{display}");
+        if args[0] == "review" {
+            assert!(
+                display.contains("enable automatic reviews for this project"),
+                "{display}"
+            );
+        }
+    }
+}
+
+#[test]
 fn notes_and_tasks_accept_a_request_from_another_project() {
     let home = tempfile::tempdir().unwrap();
     let root = home.path().join("root");

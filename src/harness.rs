@@ -308,7 +308,7 @@ impl InstallOutcome {
             }
         }
         if self.live_handoff_required {
-            message.push_str("the running server keeps its image; a live handoff is Rolf's call\n");
+            message.push_str("the running server keeps its image; live handoff pending\n");
         }
         message
     }

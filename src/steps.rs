@@ -527,7 +527,7 @@ fn deliver_notice(ctx: &Ctx, project: &Project, event: &crate::contracts::Event)
     let Some(_agent) = agent else {
         return Ok(());
     };
-    let mut line = crate::events::typed_line(event)?;
+    let mut line = crate::events::typed_line(project, event)?;
     if !queued.is_empty() {
         line.push_str(&format!(
             " Follow-up overtook this seal: {}. It can be restored at idle if HEAD, tree and report are unchanged; changed work needs a new seal.",
@@ -2762,7 +2762,7 @@ mod tests {
         deliver_events(&world.ctx(), &project).unwrap();
         assert_eq!(typed_lines(&world).len(), 1);
         assert!(typed_lines(&world)[0].contains(&format!(
-            "FAILED {}: provider_wait_expired — next: ha thread retry demo {}",
+            "FAILED {}: provider_wait_expired — next: ha thread retry demo {} --reason \"<why replace this attempt>\"",
             lane.id, lane.id
         )));
     }
@@ -3131,6 +3131,12 @@ mod tests {
         assert_eq!(retried.attempt, 2);
         assert_eq!(retried.launch.same_recipe_retries, 1);
         assert!(retried.recovery_pending);
+        assert!(retried.start_notices.iter().any(|n| {
+            n.line.contains("GONE")
+                && n.line.contains(
+                    "automatic same-recipe retry selected for attempt 2; wait for startup",
+                )
+        }));
         assert_eq!(runner.count("--machine abc pane list"), 1);
 
         // A stale first-attempt streak cannot count against the new pane.
@@ -3159,12 +3165,11 @@ mod tests {
         let exhausted = thread::load(&project, &lane.id).unwrap();
         assert_eq!(exhausted.status, thread::Status::Failed);
         assert!(!exhausted.recovery_pending);
-        assert!(
-            exhausted
-                .start_notices
-                .iter()
-                .any(|n| n.line.starts_with(&format!("FAILED {}:", lane.id)))
-        );
+        assert!(exhausted.start_notices.iter().any(|n| {
+            n.line.starts_with(&format!("GONE {} attempt 2:", lane.id))
+                && n.line
+                    .contains(&crate::threads::retry_command("demo", &lane.id))
+        }));
     }
 
     #[test]

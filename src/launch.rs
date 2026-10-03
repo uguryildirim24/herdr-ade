@@ -308,16 +308,12 @@ pub fn resolve_failure(
     if work_contract(input.task, input.workflow)?.once {
         return Err(crate::refusal::error(
             format!(
-                "recovery_exhausted: {} runs once; attempt {} ended ({}) and is not retried automatically. Read its report, then ha thread retry {} <thread> --reason \"<why a new attempt is allowed>\" or ha thread cancel.",
+                "recovery_exhausted: {} runs once; attempt {} ended ({}) and is not retried automatically",
                 job_noun(input.workflow),
                 previous.attempt.max(1),
-                class.plain(),
-                project.slug
+                class.plain()
             ),
-            format!(
-                "ha thread retry {} <thread> --reason \"<why a new attempt is allowed>\" or ha thread cancel",
-                project.slug
-            ),
+            crate::threads::retry_command(&project.slug, "<thread>"),
         ));
     }
     match class {
@@ -335,7 +331,7 @@ pub fn resolve_failure(
                         "recovery_exhausted: the explicit lane recipe allowed {} retries; waiting for the coordinator",
                         config.routing.retries
                     ),
-                    "wait for the coordinator to choose a different recipe or cancel the lane",
+                    crate::threads::retry_command(&project.slug, "<thread>"),
                 ));
             }
             let mut same = previous.clone();
@@ -387,7 +383,7 @@ fn same_recipe_retry(
                 "recovery_exhausted: {} allowed {retries} same-recipe retries; waiting for the coordinator",
                 class.plain()
             ),
-            "wait for the coordinator to choose a different recipe or cancel the lane",
+            crate::threads::retry_command(&project.slug, "<thread>"),
         ));
     }
     let mut same = previous.clone();

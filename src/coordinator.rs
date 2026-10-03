@@ -861,10 +861,11 @@ impl ContextCursor {
             .into_iter()
             .map(|review| {
                 let detail = format!(
-                    "{:?} {} lanes — reviewer {}{}{}",
+                    "{:?} {} lanes — reviewer {}; {}{}{}",
                     review.phase,
                     review.members.len(),
                     review.reviewer.as_deref().unwrap_or("pending"),
+                    review.landing_summary(),
                     review.gates_summary(),
                     if review.attention.is_empty() {
                         String::new()
@@ -1535,11 +1536,12 @@ fn digest_snapshot(
     {
         let _ = writeln!(
             out,
-            "- {} [{:?}] {} lanes — reviewer {}{}{}",
+            "- {} [{:?}] {} lanes — reviewer {}; {}{}{}",
             review.id,
             review.phase,
             review.members.len(),
             review.reviewer.as_deref().unwrap_or("pending"),
+            review.landing_summary(),
             review.gates_summary(),
             if review.attention.is_empty() {
                 String::new()
