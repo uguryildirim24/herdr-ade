@@ -385,12 +385,17 @@ pub(crate) fn active_rows(project: &Project) -> Vec<Row> {
         .collect()
 }
 
+impl Row {
+    /// Scope is explicit authority, not a relevance judgment about the text.
+    pub(crate) fn applies_to(&self, task: Option<&str>) -> bool {
+        self.tasks.is_empty() || task.is_some_and(|id| self.tasks.iter().any(|t| t == id))
+    }
+}
+
 pub(crate) fn active_for(project: &Project, task: Option<&str>) -> Vec<Row> {
     active_rows(project)
         .into_iter()
-        .filter(|row| {
-            row.tasks.is_empty() || task.is_some_and(|id| row.tasks.iter().any(|t| t == id))
-        })
+        .filter(|row| row.applies_to(task))
         .collect()
 }
 
@@ -398,6 +403,68 @@ pub(crate) fn active_for(project: &Project, task: Option<&str>) -> Vec<Row> {
 mod tests {
     use super::*;
     use crate::testkit::fixture;
+
+    #[test]
+    fn explicit_scope_preserves_global_instructions_and_historical_records() {
+        let fx = fixture();
+        crate::prompt::record_test_request(&fx.project, "q-scope", "Keep task scopes explicit.")
+            .unwrap();
+        let tasks: Vec<_> = ["Research", "Build"]
+            .into_iter()
+            .map(|title| {
+                crate::task::add(
+                    &fx.project,
+                    title,
+                    vec!["request:q-scope".into()],
+                    vec!["Retain required evidence.".into()],
+                    None,
+                    None,
+                )
+                .unwrap()
+            })
+            .collect();
+        // A real pre-scope JSONL shape still loads; no new required field.
+        std::fs::write(path(&fx.project),
+            "{\"schema\":1,\"id\":\"n-0001\",\"kind\":\"instruction\",\"at\":\"2026-09-22\",\"request\":\"q-scope\",\"text\":\"Never copy credentials.\"}\n").unwrap();
+        let shared = add(
+            &fx.project,
+            Kind::Instruction,
+            "Do not call the Agent tool.",
+            "q-scope",
+            None,
+            tasks.iter().map(|t| t.id.clone()).collect(),
+        )
+        .unwrap();
+        let local = add(
+            &fx.project,
+            Kind::Memory,
+            "Research-only source evidence.",
+            "q-scope",
+            None,
+            vec![tasks[0].id.clone()],
+        )
+        .unwrap();
+        let retired = add(
+            &fx.project,
+            Kind::Instruction,
+            "Obsolete rule.",
+            "q-scope",
+            None,
+            vec![],
+        )
+        .unwrap();
+        retire(&fx.project, &retired.id, "q-scope", "No longer controls.").unwrap();
+        for task in [None, Some(tasks[0].id.as_str()), Some(tasks[1].id.as_str())] {
+            let rows = active_for(&fx.project, task);
+            assert!(rows.iter().any(|row| row.id == "n-0001"));
+            assert_eq!(rows.iter().any(|row| row.id == shared.id), task.is_some());
+            assert_eq!(
+                rows.iter().any(|row| row.id == local.id),
+                task == Some(tasks[0].id.as_str())
+            );
+            assert!(!rows.iter().any(|row| row.id == retired.id));
+        }
+    }
 
     #[test]
     fn corrupt_retirement_never_reactivates_an_instruction() {

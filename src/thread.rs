@@ -14,11 +14,8 @@ use crate::runner::{Cmd, Runner};
 pub(crate) const STARTING_TIMEOUT_SECS: i64 = 300;
 pub(crate) const BLOCKED_DEBOUNCE_SECS: i64 = 30;
 const NOT_READY_SECS: i64 = 60;
-/// The brief's memory-note budget. `compose_brief` stops adding dated notes
-/// past this, and `ha doctor` / `ha context` warn at it: the warning fires at
-/// the point where a brief starts dropping notes, and 32k is a small enough
-/// share of a lane's context to prune before it costs real tokens.
-pub(crate) const MEMORY_CAP_CHARS: usize = 32_000;
+/// Advisory only: explicitly scoped facts are never truncated.
+const MEMORY_WARNING_CHARS: usize = 32_000;
 const LIBRARY_CAP_KB: u64 = 50 * 1024;
 pub(crate) const MAX_LAUNCH_ATTEMPTS: u32 = 3;
 
@@ -738,9 +735,8 @@ pub(crate) fn with_lane_skill(prefix: &str, brief: &str) -> String {
     )
 }
 
-/// The largest dated-note payload carried by any current task's brief.
-/// `total_chars` includes notes the cap would drop, so the warning describes
-/// the attempted payload rather than only what fits.
+/// The largest explicitly scoped fact payload carried by a task's brief.
+/// Unscoped facts are delivered as a frozen attachment, not copied prose.
 #[derive(Debug, Clone, Default)]
 pub(crate) struct MemoryUse {
     notes: Vec<(String, String)>,
@@ -750,7 +746,7 @@ pub(crate) struct MemoryUse {
 impl MemoryUse {
     fn from_rows<'a>(rows: impl Iterator<Item = &'a crate::note::Row>) -> Self {
         let notes: Vec<_> = rows
-            .filter(|row| brief_carries_memory(row))
+            .filter(|row| brief_carries_memory(row) && !row.tasks.is_empty())
             .map(|row| (row.id.clone(), render_brief_row(row)))
             .collect();
         let total_chars = notes
@@ -760,13 +756,9 @@ impl MemoryUse {
         Self { notes, total_chars }
     }
 
-    fn over_budget(&self) -> bool {
-        self.total_chars > MEMORY_CAP_CHARS
-    }
-
-    /// The `ha doctor` / `ha context` warning, or `None` when every brief fits.
+    /// The existing `ha doctor` advisory; this never controls brief contents.
     pub(crate) fn warning(&self) -> Option<String> {
-        if !self.over_budget() {
+        if self.total_chars <= MEMORY_WARNING_CHARS {
             return None;
         }
         let parts = self
@@ -776,8 +768,8 @@ impl MemoryUse {
             .collect::<Vec<_>>()
             .join(", ");
         Some(format!(
-            "memory over budget: {} of {} characters ({parts}); replace stale dated notes",
-            self.total_chars, MEMORY_CAP_CHARS
+            "large scoped fact payload: {} characters ({parts}); all retained; replace stale dated notes",
+            self.total_chars
         ))
     }
 }
@@ -793,7 +785,7 @@ fn render_brief_row(row: &crate::note::Row) -> String {
 }
 
 fn brief_carries_instruction(row: &crate::note::Row) -> bool {
-    row.kind == "standing instruction" && row.at.is_some() && row.request.is_some()
+    row.kind == "standing instruction"
 }
 
 fn brief_carries_memory(row: &crate::note::Row) -> bool {
@@ -816,13 +808,7 @@ pub(crate) fn memory_use(project: &Project) -> MemoryUse {
     scopes
         .into_iter()
         .map(|task| {
-            let mut applicable: Vec<_> = rows
-                .iter()
-                .filter(|row| {
-                    row.tasks.is_empty()
-                        || task.is_some_and(|id| row.tasks.iter().any(|item| item == id))
-                })
-                .collect();
+            let mut applicable: Vec<_> = rows.iter().filter(|row| row.applies_to(task)).collect();
             applicable.sort_by(|a, b| b.at.cmp(&a.at).then_with(|| b.id.cmp(&a.id)));
             MemoryUse::from_rows(applicable.into_iter())
         })
@@ -873,26 +859,11 @@ fn compose_brief(input: &BriefInput) -> String {
     }
     brief.push_str("\n# Facts in force\n");
 
-    let mut used = 0;
-    let mut left_out = Vec::new();
     for (id, text) in input.facts {
-        let block = memory_block(id, text);
-        let size = block.chars().count();
-        if used + size <= MEMORY_CAP_CHARS {
-            used += size;
-            brief.push_str(&block);
-        } else {
-            left_out.push(id.as_str());
-        }
+        brief.push_str(&memory_block(id, text));
     }
     if input.facts.is_empty() {
-        brief.push_str("\nNone.\n");
-    }
-    if !left_out.is_empty() {
-        brief.push_str(&format!(
-            "\nNot included because dated facts are over {MEMORY_CAP_CHARS} characters: {}.\n",
-            left_out.join(", ")
-        ));
+        brief.push_str("\nNone scoped to this task.\n");
     }
 
     brief.push_str("\n# Repository, machine and pinned gates\n\n");
@@ -971,6 +942,8 @@ fn render_task(
 }
 
 /// Builds a frozen helper brief from the same current records as PROJECT.md.
+/// Unscoped factual prose is pinned as an artifact. Remote lanes also record
+/// it in the existing attachment map so placement stages a usable local path.
 pub(crate) fn brief_for(
     project: &Project,
     thread: &Thread,
@@ -1021,6 +994,43 @@ pub(crate) fn brief_for(
         brief.push_str(&format!(
             "- Attachment: `{}/attachments/{name}`\n",
             thread.thread_dir
+        ));
+    }
+    let unscoped: Vec<_> = active
+        .iter()
+        .filter(|row| brief_carries_memory(row) && row.tasks.is_empty())
+        .collect();
+    if !unscoped.is_empty() {
+        let details = unscoped
+            .iter()
+            .map(|row| memory_block(&row.id, &render_brief_row(row)))
+            .collect::<String>();
+        let hash = store_artifact(project, details.as_bytes())?;
+        let path = if thread.is_remote() {
+            let mut name = format!("brief-facts-{hash}.md");
+            update(project, &thread.id, |record| {
+                // Keep even a supplied attachment with the generated basename.
+                while record
+                    .attachments
+                    .get(&name)
+                    .is_some_and(|old| old != &hash)
+                {
+                    name.insert(0, '_');
+                }
+                record.attachments.insert(name.clone(), hash.clone());
+            })?;
+            Path::new(&thread.thread_dir).join("attachments").join(name)
+        } else {
+            project.state_dir().join("artifacts").join(hash)
+        };
+        brief.push_str(&format!(
+            "- Unscoped facts ({}): `{}`. Frozen text and provenance; consult when needed.\n",
+            unscoped
+                .iter()
+                .map(|row| row.id.as_str())
+                .collect::<Vec<_>>()
+                .join(", "),
+            path.display()
         ));
     }
     Ok(brief)
@@ -1965,24 +1975,46 @@ mod tests {
     }
 
     #[test]
-    fn memory_over_budget_warns_with_the_note_and_size() {
+    fn large_scoped_facts_warn_but_remain_in_the_brief() {
         let root = tempfile::tempdir().unwrap();
         let project = project::create(root.path(), "demo", "", vec![]).unwrap();
         crate::prompt::record_test_request(&project, "q-1", "Keep helper briefs focused.").unwrap();
+        let lane = allocate(&project, |_| {}).unwrap();
+        let task = crate::task::add(
+            &project,
+            "Keep required evidence",
+            vec!["request:q-1".into()],
+            vec!["Retain all scoped facts.".into()],
+            None,
+            None,
+        )
+        .unwrap();
+        crate::task::link_attempt(&project, &task.id, &lane.id).unwrap();
+        let text = "x".repeat(MEMORY_WARNING_CHARS + 1);
         let note = crate::note::add(
             &project,
             crate::note::Kind::Memory,
-            &"x".repeat(MEMORY_CAP_CHARS + 1),
+            &text,
             "q-1",
             None,
-            vec![],
+            vec![task.id.clone()],
         )
         .unwrap();
-
-        let use_ = memory_use(&project);
-        assert!(use_.over_budget());
-        let warning = use_.warning().unwrap();
+        let last = crate::note::add(
+            &project,
+            crate::note::Kind::Memory,
+            "Required final evidence.",
+            "q-1",
+            None,
+            vec![task.id.clone()],
+        )
+        .unwrap();
+        let warning = memory_use(&project).warning().unwrap();
         assert!(warning.contains(&note.id), "{warning}");
+        let brief = brief_for(&project, &lane, "Build from the required evidence.", false).unwrap();
+        assert!(brief.contains(&text));
+        assert!(brief.contains(&last.text));
+        assert!(!brief.contains("Not included"));
 
         crate::note::add(
             &project,
@@ -1990,10 +2022,271 @@ mod tests {
             "short",
             "q-1",
             Some(&note.id),
-            vec![],
+            vec![task.id],
         )
         .unwrap();
         assert!(memory_use(&project).warning().is_none());
+    }
+
+    #[test]
+    fn bounded_briefs_keep_scope_acceptance_instructions_and_retrievable_facts() {
+        for remote in [false, true] {
+            let fx = crate::testkit::fixture();
+            let project = &fx.project;
+            crate::prompt::record_test_request(
+                project,
+                "q-scope",
+                "Research the trust dialog, then repair startup.",
+            )
+            .unwrap();
+            let task = crate::task::add(
+                project,
+                "Trust dialog",
+                vec!["request:q-scope".into()],
+                vec![
+                    "Read both required sources; report unavailable coverage.".into(),
+                    "Answer only the exact managed-worktree trust dialog.".into(),
+                ],
+                None,
+                None,
+            )
+            .unwrap();
+            let other = crate::task::add(
+                project,
+                "Billing",
+                vec!["request:q-scope".into()],
+                vec!["Unrelated task.".into()],
+                None,
+                None,
+            )
+            .unwrap();
+            let lane = allocate(project, |t| {
+                t.machine = if remote { "oci" } else { "" }.into();
+                t.thread_dir = "/lane/.herdr-project/demo-t-0001".into();
+                t.paths = vec!["src/claude_trust.rs".into()];
+            })
+            .unwrap();
+            crate::task::link_attempt(project, &task.id, &lane.id).unwrap();
+            let global = crate::note::add(
+                project,
+                crate::note::Kind::Instruction,
+                "Never call the Agent tool or copy credentials.",
+                "q-scope",
+                None,
+                vec![],
+            )
+            .unwrap();
+            let scoped = crate::note::add(
+                project,
+                crate::note::Kind::Instruction,
+                "Preserve exact trust proof and verified deletes.",
+                "q-scope",
+                None,
+                vec![task.id.clone()],
+            )
+            .unwrap();
+            let required = crate::note::add(
+                project,
+                crate::note::Kind::Memory,
+                "Required evidence: src/claude_trust.rs and attachments/dialog.txt.",
+                "q-scope",
+                None,
+                vec![task.id.clone()],
+            )
+            .unwrap();
+            let incidental = crate::note::add(
+                project,
+                crate::note::Kind::Memory,
+                "Other task's incidental billing history.",
+                "q-scope",
+                None,
+                vec![other.id.clone()],
+            )
+            .unwrap();
+            let unscoped = crate::note::add(
+                project,
+                crate::note::Kind::Memory,
+                "Old global billing history, kept as reference only.",
+                "q-scope",
+                None,
+                vec![],
+            )
+            .unwrap();
+            for (id, text) in [
+                (&task.id, "Historical task source: dialog revision 2."),
+                (&other.id, "Other historical task note."),
+            ] {
+                let mut record = crate::task::load(project, id).unwrap();
+                record.notes.push(crate::task::DatedNote {
+                    id: String::new(),
+                    at: String::new(),
+                    request: String::new(),
+                    text: text.into(),
+                    replaces: None,
+                });
+                std::fs::write(
+                    project.record_dir("tasks").join(format!("{id}.toml")),
+                    toml::to_string(&record).unwrap(),
+                )
+                .unwrap();
+            }
+            let lead = "## Required source scope\nRead src/claude_trust.rs and attachments/dialog.txt in full.\nReport partial access honestly; retain the exact dialog and path.";
+            let view_before = crate::project_view::View::load(&fx.world.ctx(), project, None)
+                .unwrap()
+                .render(&[
+                    "Task notes in force",
+                    "Standing instructions in force",
+                    "Facts in force",
+                ]);
+            let brief = brief_for(project, &lane, lead, false).unwrap();
+            let view_after = crate::project_view::View::load(&fx.world.ctx(), project, None)
+                .unwrap()
+                .render(&[
+                    "Task notes in force",
+                    "Standing instructions in force",
+                    "Facts in force",
+                ]);
+            assert_eq!(
+                view_before, view_after,
+                "N2's handoff source is not reduced"
+            );
+            assert!(view_after.contains(&unscoped.text));
+            for text in [
+                lead,
+                &global.text,
+                &scoped.text,
+                &required.text,
+                "Historical task source: dialog revision 2.",
+            ] {
+                assert!(brief.contains(text), "{brief}");
+            }
+            for condition in &task.acceptance {
+                assert!(brief.contains(condition));
+            }
+            assert!(brief.contains("Research the trust dialog, then repair startup."));
+            assert!(!brief.contains(&incidental.text));
+            assert!(!brief.contains("Other historical task note."));
+            assert!(!brief.contains(&unscoped.text));
+            assert!(brief.contains(&unscoped.id));
+            assert!(brief.contains("Commit repository changes if any; leave runtime deliverables untracked; run `ha done`."));
+            assert!(!brief.contains("--sha"));
+            let frozen = if remote {
+                let saved = load(project, &lane.id).unwrap();
+                let (name, hash) = saved.attachments.iter().next().unwrap();
+                assert!(brief.contains(&format!("{}/attachments/{name}", lane.thread_dir)));
+                artifact(project, hash).unwrap()
+            } else {
+                let pointer = brief
+                    .lines()
+                    .find(|line| line.starts_with("- Unscoped facts"))
+                    .unwrap();
+                std::fs::read(pointer.split('`').nth(1).unwrap()).unwrap()
+            };
+            let frozen = String::from_utf8(frozen).unwrap();
+            assert!(frozen.contains(&unscoped.text));
+            assert!(frozen.contains("request:q-scope"));
+            assert!(!frozen.contains(&incidental.text));
+            crate::note::retire(
+                project,
+                &unscoped.id,
+                "q-scope",
+                "Superseded billing history.",
+            )
+            .unwrap();
+            // Retirement does not rewrite the already delivered reference.
+            assert!(frozen.contains(&unscoped.text));
+        }
+    }
+
+    #[test]
+    fn chainlm_trust_matched_briefs_preserve_acceptance_and_recovery_contract() {
+        let fx = crate::testkit::fixture();
+        crate::prompt::record_test_request(
+            &fx.project,
+            "q-chainlm",
+            "Repair chainlm's folder-trust startup interruption.",
+        )
+        .unwrap();
+        let task = crate::task::add(
+            &fx.project,
+            "Chainlm trust recovery",
+            vec!["request:q-chainlm".into()],
+            vec!["Only answer the managed worktree's exact trust dialog.".into()],
+            None,
+            None,
+        )
+        .unwrap();
+        let lane = allocate(&fx.project, |t| {
+            t.last_failure = "Folder trust blocked startup; preserved worktree.".into();
+            t.thread_dir = "/work/chainlm/.herdr-project/demo-t-0001".into();
+        })
+        .unwrap();
+        crate::task::link_attempt(&fx.project, &task.id, &lane.id).unwrap();
+        let recovery = crate::note::add(&fx.project, crate::note::Kind::Instruction,
+            "Never blind-answer trust; inspect exact dialog and managed path. Continue the preserved branch, never reset it.",
+            "q-chainlm", None, vec![]).unwrap();
+        let history = crate::note::add(
+            &fx.project,
+            crate::note::Kind::Memory,
+            &"Unrelated settled billing history. ".repeat(100),
+            "q-chainlm",
+            None,
+            vec![],
+        )
+        .unwrap();
+        let lead = "Read src/claude_trust.rs and the supplied dialog. Report unknown when exact trust evidence is missing.";
+        let reduced = brief_for(&fx.project, &lane, lead, true).unwrap();
+        let mut active = crate::note::active_for(&fx.project, Some(&task.id));
+        crate::note::sort_newest_first(&mut active);
+        // Reconstruct the pre-change brief's uncapped (<32k) fact payload,
+        // with the same task, base, source scope, restart and instructions.
+        let facts = active
+            .iter()
+            .filter(|row| brief_carries_memory(row))
+            .map(|row| (row.id.clone(), render_brief_row(row)))
+            .collect::<Vec<_>>();
+        let original = compose_brief(&BriefInput {
+            task: &render_task(&fx.project, &task, &active).unwrap(),
+            supplied_task: Some(lead),
+            instructions: &active
+                .iter()
+                .filter(|row| brief_carries_instruction(row))
+                .map(render_brief_row)
+                .collect::<Vec<_>>()
+                .join("\n\n"),
+            facts: &facts,
+            repository: "",
+            machine: "local",
+            gates: None,
+            restart: true,
+            report_path: &lane.report_path(),
+            library_path: &lane.library_path(),
+            paths: &[],
+        });
+        assert!(original.contains(&history.text));
+        assert!(!reduced.contains(&history.text));
+        assert!(reduced.len() < original.len());
+        eprintln!(
+            "chainlm trust matched fixture: brief bytes {} -> {}; acceptance, source scope, exact-trust and restart guidance retained",
+            original.len(),
+            reduced.len()
+        );
+        for brief in [&original, &reduced] {
+            for retained in [
+                &task.acceptance[0],
+                &recovery.text,
+                lead,
+                "Read its report at the report path below first, look at what is already on the branch, and continue from there.",
+                "Commit repository changes if any; leave runtime deliverables untracked; run `ha done`.",
+            ] {
+                assert!(brief.contains(retained));
+            }
+        }
+        let prompt = launch_prompt("ha", "demo", &lane);
+        assert!(
+            prompt.contains("Continue the preserved worktree; do not reset or discard changes.")
+        );
+        assert!(prompt.contains(&lane.last_failure));
     }
 
     fn local_thread(project: &Project, dir: &Path) -> Thread {
