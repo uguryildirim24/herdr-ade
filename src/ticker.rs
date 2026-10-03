@@ -1022,6 +1022,7 @@ fn tick_with_steps(
     // Courier failure holds only that machine's actions. Local observation,
     // accepted seals, reviews and goal checks still run in the same project.
     let mut reachable = Vec::new();
+    let mut closed_projects = Vec::new();
     let mut readiness = BTreeMap::new();
     for project in &projects {
         for lane in thread::list_live(project)
@@ -1057,6 +1058,7 @@ fn tick_with_steps(
         match coordinator_binding(&project) {
             Ok(None) => {
                 health.closed(&ctx.root, log, &project);
+                closed_projects.push(project);
                 continue;
             }
             Ok(Some(_)) => {}
@@ -1165,6 +1167,21 @@ fn tick_with_steps(
             continue;
         }
         let (errors, completed) = tick_slow_with_steps(ctx, project, seen, memory, step);
+        for error in errors {
+            health.failure(&ctx.root, log, format!("{}: {error:#}", project.slug));
+        }
+        if !completed {
+            return None;
+        }
+    }
+    // A closed local coordinator cannot invalidate a live courier snapshot.
+    // Keep remote lanes progressing without running local/session work or
+    // starting another review for this project.
+    for project in &closed_projects {
+        let herdr = Herdr::new(ctx.env.herdr_bin(), "", ctx.runner);
+        let mut errors = Vec::new();
+        let completed =
+            tick_remote_with_steps(ctx, project, &herdr, memory, &mut true, &mut errors, step);
         for error in errors {
             health.failure(&ctx.root, log, format!("{}: {error:#}", project.slug));
         }
@@ -3415,6 +3432,60 @@ fn remote_pass(
     Ok(())
 }
 
+/// Reconcile live courier views independently of coordinator availability.
+fn tick_remote_with_steps(
+    ctx: &Ctx,
+    project: &Project,
+    herdr: &Herdr<'_>,
+    memory: &Memory,
+    may_start: &mut bool,
+    errors: &mut Vec<anyhow::Error>,
+    step: &mut impl FnMut(&str) -> bool,
+) -> bool {
+    let remote_threads = open_threads(project, true);
+    let machines: BTreeSet<_> = remote_threads
+        .iter()
+        .map(|t| t.machine_route().to_string())
+        .collect();
+    for machine in machines {
+        if !step(&format!("remote state {machine}")) {
+            return false;
+        }
+        let Some(view) = memory.machine_views.get(&machine) else {
+            continue;
+        };
+        let view = match view {
+            Ok(view) => view,
+            Err(error) => {
+                errors.push(anyhow::anyhow!("{machine}: unreachable this tick: {error}"));
+                continue;
+            }
+        };
+        let threads: Vec<_> = remote_threads
+            .iter()
+            .filter(|t| t.machine_route() == machine)
+            .cloned()
+            .collect();
+        if let Err(error) = remote_pass(
+            &LaunchPass {
+                ctx,
+                project,
+                herdr,
+                threads: &threads,
+                agents: &[],
+                panes: &[],
+            },
+            &machine,
+            view,
+            may_start,
+            errors,
+        ) {
+            errors.push(anyhow::anyhow!("{machine}: {error}"));
+        }
+    }
+    true
+}
+
 /// Closes only a tab the ADE can prove it created and no process still owns.
 /// An unowned shell in a project-labelled workspace is advisory evidence, not
 /// authority to destroy someone else's foreground work.
@@ -3591,49 +3662,16 @@ fn tick_slow_with_steps(
             }
         };
     }
-    let remote_threads = open_threads(project, true);
-    let mut machines: Vec<String> = remote_threads
-        .iter()
-        .map(|t| t.machine_route().to_string())
-        .collect();
-    machines.sort();
-    machines.dedup();
-    for machine in machines {
-        if !step(&format!("remote state {machine}")) {
-            return (errors, false);
-        }
-        let Some(view) = memory.machine_views.get(&machine) else {
-            continue;
-        };
-        let view = match view {
-            Ok(view) => view,
-            Err(error) => {
-                errors.push(anyhow::anyhow!("{machine}: unreachable this tick: {error}"));
-                continue;
-            }
-        };
-        let threads: Vec<thread::Thread> = remote_threads
-            .iter()
-            .filter(|t| t.machine_route() == machine)
-            .cloned()
-            .collect();
-        match remote_pass(
-            &LaunchPass {
-                ctx,
-                project,
-                herdr: &herdr,
-                threads: &threads,
-                agents: &[],
-                panes: &[],
-            },
-            &machine,
-            view,
-            &mut may_start,
-            &mut errors,
-        ) {
-            Ok(()) => {}
-            Err(error) => errors.push(anyhow::anyhow!("{machine}: {error}")),
-        }
+    if !tick_remote_with_steps(
+        ctx,
+        project,
+        &herdr,
+        memory,
+        &mut may_start,
+        &mut errors,
+        step,
+    ) {
+        return (errors, false);
     }
 
     stop_after_state!("session notice");
@@ -3754,6 +3792,66 @@ mod tests {
                     .iter()
                     .any(|failure| failure.contains(&path.display().to_string()))
             );
+        }
+    }
+
+    #[test]
+    fn closed_coordinators_still_reconcile_live_remote_lanes() {
+        use crate::scenarios::{World, agent_json, pane_json};
+        for missing_binding in [false, true] {
+            let world = World::new();
+            let project = world.project("demo", "a.sock");
+            let lane = world.thread(&project, &world.home.path().join("lane"), |record| {
+                record.machine = "box".into();
+                record.machine_id = "box".into();
+                record.prompt_pending = false;
+                record.bootstrap = "acknowledged".into();
+                record.last_state = "idle".into();
+            });
+            if missing_binding {
+                std::fs::remove_file(project.state_dir().join("coordinator.json")).unwrap();
+            } else {
+                project
+                    .update_coordinator(|record| record.socket.clear())
+                    .unwrap();
+            }
+            let agent = agent_json(
+                &lane.workspace_id,
+                &lane.tab_id,
+                &lane.pane_id,
+                &lane.cwd,
+                &lane.agent_name,
+                "working",
+            );
+            let pane = pane_json(&lane.workspace_id, &lane.tab_id, &lane.pane_id, &lane.cwd);
+            let manifest = format!(
+                "boot\tboot-1\nagents\t{{\"result\":{{\"agents\":[{agent}]}}}}\npanes\t{{\"result\":{{\"panes\":[{pane}]}}}}\n"
+            );
+            world
+                .runner
+                .on_fn(|cmd| cmd.program == "ssh", move |_| Ok(ok(&manifest)));
+            world.runner.on(
+                "machine list --json",
+                ok(r#"[{"id":"box","label":"box","target":"box","session":"default","enabled":true}]"#),
+            );
+            let ctx = world.ctx();
+            let mut memory = Memory::new(&ctx);
+            let log = Log {
+                path: log_path(&world.root),
+            };
+            assert!(tick(&ctx, &log, &mut memory));
+            let current = thread::load(&project, &lane.id).unwrap();
+            assert_eq!(current.last_state, "working");
+            assert_eq!(current.last_group, "working");
+            assert_eq!(current.observation_source, "courier");
+            assert!(!current.last_observed.is_empty());
+            assert!(current.observation_error.is_empty());
+            let health: Health = read_evidence(&health_path(&world.root)).unwrap();
+            assert!(health.failures.is_empty(), "{:?}", health.failures);
+            assert_eq!(health.status.len(), 1);
+            assert!(coordinator_binding(&project).unwrap().is_none());
+            assert!(crate::review::list(&project).unwrap().is_empty());
+            assert_eq!(world.runner.count("agent start"), 0);
         }
     }
 
