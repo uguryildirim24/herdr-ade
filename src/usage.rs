@@ -54,33 +54,34 @@ pub(crate) fn summary(usage: Option<&Usage>) -> String {
 #[derive(Debug, Clone, Serialize)]
 pub(crate) struct Cost {
     pub(crate) known: Option<Usage>,
+    /// Coverage of the latest seal per attempt; earlier counters still contribute
+    /// to the known lower bound when a later seal has no usage.
     pub(crate) measured_attempts: usize,
     pub(crate) unknown_attempts: usize,
 }
 
 pub(crate) fn cost(events: &[&crate::contracts::Event]) -> Cost {
     let mut attempts = BTreeMap::new();
+    let mut lanes = BTreeMap::<&str, &Usage>::new();
     for event in events {
         let key = (&event.thread, event.attempt);
         let row = attempts.entry(key).or_insert(*event);
         if (&event.created, &event.id) > (&row.created, &row.id) {
             *row = event;
         }
-    }
-    let mut lanes = BTreeMap::<&str, &Usage>::new();
-    let mut measured = 0;
-    let mut unknown = 0;
-    for event in attempts.values() {
+        // Missing later counters change coverage, not already observed usage.
         if let Some(usage) = event.usage.as_ref().filter(|usage| usage.total > 0) {
             let row = lanes.entry(&event.thread).or_insert(usage);
             if usage.total > row.total {
                 *row = usage;
             }
-            measured += 1;
-        } else {
-            unknown += 1;
         }
     }
+    let measured = attempts
+        .values()
+        .filter(|event| event.usage.as_ref().is_some_and(|usage| usage.total > 0))
+        .count();
+    let unknown = attempts.len() - measured;
     let mut total = Usage::default();
     for usage in lanes.values() {
         if total.add(usage).is_err() {
@@ -92,7 +93,7 @@ pub(crate) fn cost(events: &[&crate::contracts::Event]) -> Cost {
         }
     }
     Cost {
-        known: (measured > 0).then_some(total),
+        known: (!lanes.is_empty()).then_some(total),
         measured_attempts: measured,
         unknown_attempts: unknown,
     }
@@ -101,7 +102,7 @@ pub(crate) fn cost(events: &[&crate::contracts::Event]) -> Cost {
 impl Cost {
     pub(crate) fn summary(&self) -> String {
         format!(
-            "{} reported lower bound (per-lane maximum; session overlap unknown); {} measured attempts, {} usage unknown",
+            "{} reported lower bound (per-lane maximum; session overlap unknown); {} measured attempts at latest seal, {} usage unknown at latest seal",
             summary(self.known.as_ref()),
             self.measured_attempts,
             self.unknown_attempts

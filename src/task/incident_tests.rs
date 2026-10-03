@@ -497,6 +497,15 @@ fn known_usage_is_attempt_deduplicated_and_partial_usage_is_not_zero() {
     assert_eq!(cost.known.unwrap().total, 100);
     assert_eq!(cost.measured_attempts, 1);
     assert_eq!(cost.unknown_attempts, 1);
+    // A later seal can lack counters without erasing an earlier known lower bound.
+    let mut later_unknown = known.clone();
+    later_unknown.id = "later-unknown".into();
+    later_unknown.created = "2026-10-03T07:05:00Z".into();
+    later_unknown.usage = None;
+    let partial = crate::usage::cost(&[&known, &later_unknown]);
+    assert_eq!(partial.known.unwrap().total, 100);
+    assert_eq!(partial.measured_attempts, 0); // the latest snapshot is unmeasured
+    assert_eq!(partial.unknown_attempts, 1);
     let mut resumed = known.clone();
     resumed.attempt = 2;
     resumed.usage.as_mut().unwrap().total = 150;
