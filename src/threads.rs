@@ -3643,182 +3643,162 @@ pub fn final_copy(ctx: &Ctx, project: &Project, record: &Thread) -> thread::Copi
 const LINKED_FILES_CAP: u64 = 200 * 1024 * 1024;
 
 fn report_destinations(report: &str) -> Vec<(std::ops::Range<usize>, String)> {
-    // Mask code without changing byte offsets: the ranges below still index the
-    // original report. Fences may use either CommonMark marker and any length.
-    let mut visible = report.as_bytes().to_vec();
-    let mut fence: Option<(u8, usize)> = None;
-    let mut offset = 0;
-    for line in report.split_inclusive('\n') {
-        let content = line.trim_end_matches(['\n', '\r']);
-        let indent = content.bytes().take_while(|b| *b == b' ').count();
-        let marker = content.as_bytes().get(indent).copied();
-        let run = marker.filter(|m| matches!(m, b'`' | b'~')).map_or(0, |m| {
-            content.as_bytes()[indent..]
-                .iter()
-                .take_while(|b| **b == m)
-                .count()
-        });
-        let rest = &content[indent + run..];
-        let close = fence.is_some_and(|(m, n)| {
-            indent <= 3 && marker == Some(m) && run >= n && rest.trim().is_empty()
-        });
-        let open = fence.is_none()
-            && indent <= 3
-            && matches!(marker, Some(b'`' | b'~'))
-            && run >= 3
-            && (marker != Some(b'`') || !rest.contains('`'));
-        if fence.is_some() || open {
-            visible[offset..offset + line.len()].fill(b' ');
-        }
-        if close {
-            fence = None;
-        } else if open {
-            fence = Some((marker.unwrap(), run));
-        }
-        offset += line.len();
-    }
-    let mut i = 0;
-    while i < visible.len() {
-        if visible[i] == b'`' {
-            let start = i;
-            while i < visible.len() && visible[i] == b'`' {
-                i += 1;
-            }
-            let count = i - start;
-            let mut end = i;
-            while end < visible.len() {
-                if visible[end] == b'`' {
-                    let mut next = end;
-                    while next < visible.len() && visible[next] == b'`' {
-                        next += 1;
-                    }
-                    if next - end == count {
-                        visible[start..next].fill(b' ');
-                        i = next;
-                        break;
-                    }
-                    end = next;
-                } else {
-                    end += 1;
-                }
-            }
-        } else {
-            i += 1;
-        }
-    }
-    let bytes = &visible;
+    use pulldown_cmark::{Event, LinkType, Parser, Tag, TagEnd};
+
+    let parser = Parser::new(report);
     let mut found = Vec::new();
-    let mut i = 0;
-    while i + 2 < bytes.len() {
-        // srcset is a list of image URLs, each with an optional descriptor.
-        // Treat every URL as a link, not the entire attribute as one path.
-        if bytes[i..].starts_with(b"srcset=") {
-            let mut start = i + b"srcset=".len();
-            let quote = match bytes.get(start) {
-                Some(b'\'' | b'"') => {
-                    let quote = bytes[start];
-                    start += 1;
-                    Some(quote)
+    // Definitions have their own spans, including unused definitions. Rewrite
+    // each once, not every reference use. Ignore escaped closing label brackets.
+    for (_, def) in parser.reference_definitions().iter() {
+        let source = &report[def.span.clone()];
+        let label_end = source
+            .match_indices("]:")
+            .find(|(i, _)| (i - source[..*i].trim_end_matches('\\').len()).is_multiple_of(2))
+            .unwrap()
+            .0;
+        found.push((
+            markdown_destination_range(report, def.span.start + label_end + 2, &def.dest),
+            def.dest.to_string(),
+        ));
+    }
+    let mut inline = Vec::new();
+    let mut child_end = 0;
+    // Feed only parser-recognized HTML to the attribute tokenizer, retaining
+    // byte offsets and continuity across multiline HTML blocks.
+    let mut html = vec![b' '; report.len()];
+    for (event, span) in parser.into_offset_iter() {
+        match event {
+            Event::Start(
+                Tag::Link {
+                    link_type: LinkType::Inline,
+                    dest_url,
+                    ..
                 }
-                _ => None,
-            };
-            let mut end = start;
-            while end < bytes.len()
-                && bytes[end] != b'\n'
-                && bytes[end] != b'\r'
-                && quote.is_none_or(|q| bytes[end] != q)
-                && (quote.is_some() || !matches!(bytes[end], b' ' | b'\t' | b'>'))
-            {
-                end += 1;
-            }
-            let mut pos = start;
-            while pos < end {
-                while pos < end && matches!(bytes[pos], b' ' | b'\t' | b',') {
-                    pos += 1;
-                }
-                let url_start = pos;
-                let data_url = bytes[pos..end].starts_with(b"data:");
-                while pos < end
-                    && !matches!(bytes[pos], b' ' | b'\t')
-                    && (data_url || bytes[pos] != b',')
-                {
-                    pos += 1;
-                }
-                if pos > url_start
-                    && report.is_char_boundary(url_start)
-                    && report.is_char_boundary(pos)
-                {
-                    found.push((url_start..pos, report[url_start..pos].to_string()));
-                }
-                // Ignore the resolution descriptor, then find the next URL.
-                while pos < end && bytes[pos] != b',' {
-                    pos += 1;
-                }
-            }
-            i = end;
-            continue;
-        }
-        // Inline links/images and reference definitions: [text](path),
-        // ![alt](path), and [label]: path. Preserve titles and fragments.
-        let html = [b"src=".as_slice(), b"href=".as_slice()]
-            .into_iter()
-            .find(|attr| bytes[i..].starts_with(attr));
-        let start = if let Some(attr) = html {
-            Some(i + attr.len())
-        } else if bytes[i] == b']' && bytes[i + 1] == b'(' {
-            Some(i + 2)
-        } else if bytes[i] == b']' && bytes[i + 1] == b':' {
-            let mut j = i + 2;
-            while j < bytes.len() && (bytes[j] == b' ' || bytes[j] == b'\t') {
-                j += 1;
-            }
-            Some(j)
-        } else {
-            None
-        };
-        if let Some(mut start) = start {
-            let quote = html.and_then(|_| match bytes.get(start) {
-                Some(b'\'' | b'"') => Some(bytes[start]),
-                _ => None,
-            });
-            if quote.is_some() {
-                start += 1;
-            }
-            let angle = bytes.get(start) == Some(&b'<');
-            if angle {
-                start += 1;
-            }
-            let mut end = start;
-            let mut depth = 0_u32;
-            while end < bytes.len() {
-                let b = bytes[end];
-                if quote == Some(b)
-                    || matches!(b, b'\n' | b'\r')
-                    || (quote.is_none() && !angle && matches!(b, b' ' | b'\t'))
-                    || (html.is_some() && quote.is_none() && b == b'>')
-                    || (angle && b == b'>')
-                {
-                    break;
-                }
-                if quote.is_none() && !angle && b == b')' {
-                    if depth == 0 {
-                        break;
-                    }
-                    depth -= 1;
-                } else if quote.is_none() && !angle && b == b'(' {
-                    depth += 1;
-                }
-                end += 1;
-            }
-            if end > start && report.is_char_boundary(start) && report.is_char_boundary(end) {
-                found.push((start..end, report[start..end].to_string()));
-                i = end;
+                | Tag::Image {
+                    link_type: LinkType::Inline,
+                    dest_url,
+                    ..
+                },
+            ) => {
+                child_end = span.start;
+                inline.push((span, dest_url));
                 continue;
             }
+            Event::End(TagEnd::Link | TagEnd::Image)
+                if inline.last().is_some_and(|(s, _)| *s == span) =>
+            {
+                let (_, dest) = inline.pop().unwrap();
+                // Child spans end before the closing label bracket; titles and
+                // code in labels cannot be mistaken for the destination.
+                let start = child_end + report[child_end..span.end].find("](").unwrap() + 2;
+                found.push((
+                    markdown_destination_range(report, start, &dest),
+                    dest.to_string(),
+                ));
+            }
+            Event::Html(text) | Event::InlineHtml(text) => {
+                let mut offset = span.start;
+                // Owned HTML has container prefixes removed. Each emitted
+                // line remains the exact suffix of its original source line.
+                for (source, line) in report[span.clone()]
+                    .split_inclusive('\n')
+                    .zip(text.split_inclusive('\n'))
+                {
+                    html[offset + source.len() - line.len()..offset + source.len()]
+                        .copy_from_slice(line.as_bytes());
+                    offset += source.len();
+                }
+            }
+            _ => (),
         }
-        i += 1;
+        child_end = span.end;
     }
+    html_destinations(std::str::from_utf8(&html).unwrap(), &mut found);
+    found.sort_by_key(|(range, _)| range.start);
     found
+}
+
+/// Locate only the URL token of a parser-validated link, keeping its title and
+/// delimiters intact. Recognition, code exclusion and decoding belong to Parser.
+fn markdown_destination_range(
+    report: &str,
+    mut start: usize,
+    dest: &pulldown_cmark::CowStr<'_>,
+) -> std::ops::Range<usize> {
+    // Unescaped destinations borrow the exact input token, including in lists
+    // and blockquotes whose continuation prefixes are absent from the URL.
+    if let pulldown_cmark::CowStr::Borrowed(raw) = dest {
+        let offset = raw.as_ptr() as usize - report.as_ptr() as usize;
+        return offset..offset + raw.len();
+    }
+    let bytes = report.as_bytes();
+    while bytes.get(start).is_some_and(u8::is_ascii_whitespace) {
+        start += 1;
+    }
+    let angle = bytes.get(start) == Some(&b'<');
+    start += usize::from(angle);
+    let mut end = start;
+    let mut depth = 0;
+    while let Some(&b) = bytes.get(end) {
+        match b {
+            b'\\' if bytes.get(end + 1).is_some_and(u8::is_ascii_punctuation) => end += 1,
+            b'>' if angle => break,
+            b'(' if !angle => depth += 1,
+            b')' if !angle && depth == 0 => break,
+            b')' if !angle => depth -= 1,
+            b if !angle && b.is_ascii_whitespace() => break,
+            _ => (),
+        }
+        end += 1;
+    }
+    start..end
+}
+
+fn html_destinations(report: &str, found: &mut Vec<(std::ops::Range<usize>, String)>) {
+    let mut emitter = html5gum::DefaultEmitter::<usize>::new_with_span();
+    emitter.naively_switch_states(true);
+    for token in html5gum::Tokenizer::new_with_emitter(report, emitter).flatten() {
+        let html5gum::Token::StartTag(tag) = token else {
+            continue;
+        };
+        for (name, value) in tag.attributes {
+            if !matches!(name.as_slice(), b"src" | b"href" | b"srcset") {
+                continue;
+            }
+            // Attribute spans include the name and one trailing delimiter
+            // (closing quote or unquoted separator), not just the decoded URL.
+            let end = value.span.end - 1;
+            let Some((_, raw)) = report[value.span.start..end].split_once('=') else {
+                continue;
+            };
+            let raw = raw.trim_ascii_start();
+            let raw = raw.strip_prefix(['\'', '"']).unwrap_or(raw);
+            let range = end - raw.len()..end;
+            if name.as_slice() != b"srcset" {
+                found.push((range, String::from_utf8_lossy(&value).into_owned()));
+            } else {
+                // Keep raw URL offsets; descriptors are not paths and data
+                // URLs may contain commas. Decode each candidate as HTML.
+                let mut rest = &report[range.clone()];
+                loop {
+                    rest = rest.trim_start_matches(|c: char| c.is_ascii_whitespace() || c == ',');
+                    if rest.is_empty() {
+                        break;
+                    }
+                    let data = rest.starts_with("data:");
+                    let len = rest
+                        .find(|c: char| c.is_ascii_whitespace() || (!data && c == ','))
+                        .unwrap_or(rest.len());
+                    let start = range.end - rest.len();
+                    let candidate = format!("<img src='{}'>", rest[..len].replace('\'', "&#39;"));
+                    let mut decoded = Vec::new();
+                    html_destinations(&candidate, &mut decoded);
+                    found.push((start..start + len, decoded.pop().unwrap().1));
+                    rest = rest[len..].split_once(',').map_or("", |(_, tail)| tail);
+                }
+            }
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -4425,18 +4405,12 @@ fn draft_has_existing_links(
 }
 
 fn preserve_report_links(ctx: &Ctx, project: &Project, record: &Thread) -> Result<()> {
-    if thread::sealed_report_path(project, record).is_none() {
-        if crate::events::for_thread(project, &record.id)
-            .into_iter()
-            .any(|event| {
-                event.thread == record.id
-                    && event.attempt == record.attempt.max(1)
-                    && event.payload.done.is_some()
-            })
-        {
-            bail!("the sealed report artifact is missing or damaged; worktree kept");
-        }
-        if record.is_remote() {
+    let events = crate::events::for_thread(project, &record.id);
+    let sealed = crate::events::latest_done_event(&events, &record.id, record.attempt.max(1))
+        .and_then(|event| event.payload.done.as_ref())
+        .map(|done| &done.artifact);
+    let Some(sealed) = sealed else {
+        let text = if record.is_remote() {
             let profile = remote::machine_profile(
                 ctx.runner,
                 &ctx.env.herdr_bin(),
@@ -4464,41 +4438,38 @@ fn preserve_report_links(ctx: &Ctx, project: &Project, record: &Thread) -> Resul
             match out.stdout.trim() {
                 "__HERDR_DRAFT_ABSENT__" => return Ok(()),
                 "__HERDR_DRAFT_PRESENT__" => {
-                    let bytes = linked_bytes(ctx, record, std::path::Path::new("report.md"))?;
-                    let text = String::from_utf8(bytes)?;
-                    if draft_has_existing_links(ctx, project, record, &text)? {
-                        bail!(
-                            "the box report links to files but has no sealed artifact; worktree kept"
-                        );
-                    }
-                    return Ok(());
+                    String::from_utf8(linked_bytes(ctx, record, Path::new("report.md"))?)?
                 }
                 _ => bail!("box report probe returned no presence answer; worktree kept"),
             }
-        }
-        let draft = std::path::Path::new(&record.thread_dir).join("report.md");
-        match std::fs::read_to_string(&draft) {
-            Ok(text) => {
-                if draft_has_existing_links(ctx, project, record, &text)? {
-                    bail!("the report links to files but has no sealed artifact; worktree kept");
-                }
+        } else {
+            let draft = Path::new(&record.thread_dir).join("report.md");
+            match std::fs::read_to_string(&draft) {
+                Ok(text) => text,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+                Err(error) => bail!(
+                    "could not inspect {}: {error}; worktree kept",
+                    draft.display()
+                ),
             }
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => (),
-            Err(error) => bail!(
-                "could not inspect {}: {error}; worktree kept",
-                draft.display()
-            ),
-        }
-        return Ok(());
+        };
+        return draft_has_existing_links(ctx, project, record, &text).and_then(|existing| {
+            if existing {
+                let machine = if record.is_remote() { "box " } else { "" };
+                bail!(
+                    "the {machine}report links to files but has no sealed artifact; worktree kept"
+                );
+            }
+            Ok(())
+        });
+    };
+    // Read and validate the seal, never an earlier rewritten report.
+    let path = crate::events::artifact_path(project, sealed);
+    if !std::fs::symlink_metadata(&path).is_ok_and(|info| info.is_file()) {
+        bail!("the sealed report artifact is missing or damaged; worktree kept");
     }
-    // Read the seal, not an earlier rewritten report, for repeatable retries.
-    let events = crate::events::for_thread(project, &record.id);
-    let sealed = crate::events::latest_done_event(&events, &record.id, record.attempt.max(1))
-        .and_then(|event| event.payload.done.as_ref())
-        .map(|done| done.artifact.clone())
-        .context("sealed report event is missing")?;
-    let bytes = std::fs::read(crate::events::artifact_path(project, &sealed))?;
-    if thread::sha256_hex(&bytes) != sealed {
+    let bytes = std::fs::read(path)?;
+    if thread::sha256_hex(&bytes) != *sealed {
         bail!("sealed report artifact is damaged: {sealed}");
     }
     let text = String::from_utf8(bytes)?;
@@ -4600,13 +4571,8 @@ fn preserve_report_links(ctx: &Ctx, project: &Project, record: &Thread) -> Resul
         })?;
     }
     let _lock = project.lock()?;
-    let library = project.dir().join("library");
-    let target = library.join(&record.id);
-    for dir in [&library, &target] {
-        if !dir.is_dir() {
-            std::fs::create_dir(dir)?;
-        }
-    }
+    let target = project.dir().join("library").join(&record.id);
+    std::fs::create_dir_all(&target)?;
     project::write_atomic(&target.join("report.md"), library_report.as_bytes())
 }
 
@@ -5629,7 +5595,7 @@ mod tests {
                 )
                 .unwrap();
             }
-            let report = "[Figure](../../figures/3d/gaba-dose/curves.svg#plot)\n";
+            let report = "[Figure](<../../figures/3d/gaba-dose/curves.svg#plot> \"title\")\n<a HREF = '../../figures/3d/gaba-dose/curves.svg#plot'>Figure</a>\n";
             std::fs::write(Path::new(&lane.thread_dir).join("report.md"), report).unwrap();
             seal_linked_report(&fx.project, &lane, report);
             let ctx = fx.world.ctx();
@@ -5654,10 +5620,7 @@ mod tests {
             .unwrap();
             assert_eq!(
                 library_report,
-                format!(
-                    "[Figure]({}/figures/3d/gaba-dose/curves.svg#plot)\n",
-                    fx.repo.display()
-                )
+                report.replace("../../figures/", &format!("{}/figures/", fx.repo.display()))
             );
             let figure_hash = thread::sha256_hex(b"<svg/>\n");
             assert!(!crate::events::artifact_path(&fx.project, &figure_hash).exists());
@@ -5802,7 +5765,8 @@ mod tests {
             for (name, bytes) in contents {
                 std::fs::write(root.join(name), bytes).unwrap();
             }
-            let report = "Screenshots: [library](library/#shots)\n";
+            let report =
+                "Screenshots: [library](<library/#shots> \"title\") `![literal](missing.png)`\n";
             std::fs::write(root.join("report.md"), report).unwrap();
             seal_linked_report(&project, &lane, report);
             world
@@ -5842,7 +5806,9 @@ mod tests {
             let library_report = std::fs::read_to_string(library.join("report.md")).unwrap();
             assert_eq!(
                 library_report,
-                format!("Screenshots: [library](../../.state/artifacts/{index_hash}#shots)\n")
+                format!(
+                    "Screenshots: [library](<../../.state/artifacts/{index_hash}#shots> \"title\") `![literal](missing.png)`\n"
+                )
             );
             assert_eq!(
                 std::fs::read_to_string(library.join("../../.state/artifacts").join(&index_hash))
@@ -6132,11 +6098,65 @@ mod tests {
 
     #[test]
     fn pasted_error_and_code_spans_do_not_create_report_links() {
-        let report = "Résumé: ![real](visible.png)\n```text\nError [ERR_MODULE_NOT_FOUND]: Cannot find package 'yaml' imported from ...\n![x](hidden.png)\n```\n~~~\n[missing]: also-hidden.png\n~~~\n`![inline](inline.png)` and ``[label]: invisible.png``\n";
+        let report = "Résumé: ![real](visible.png)\n```text\nError [ERR_MODULE_NOT_FOUND]: Cannot find package 'yaml' imported from ...\n![x](hidden.png)\n```\n~~~\n[missing]: also-hidden.png\n~~~\n`![inline](inline.png)` and ``[label]: invisible.png``\n\n    [indented](hidden.png)\n\n> ~~~\n> [nested](hidden.png)\n> ~~~\n\n\\[escaped](hidden.png)\nsrc=hidden.png [invalid]: hidden.png\n<!-- <img src='hidden.png'> -->\n";
         let links = report_destinations(report);
         assert_eq!(
             links.into_iter().map(|(_, dest)| dest).collect::<Vec<_>>(),
             vec!["visible.png"]
+        );
+    }
+
+    #[test]
+    fn report_url_spans_preserve_surrounding_markdown_and_html() {
+        for (report, expected) in [
+            (
+                "É [*x*](<a b#f> \"title ](x)\")",
+                "É [*x*](<KEPT#f> \"title ](x)\")",
+            ),
+            (
+                r"[![x](i)](dir/) [a](a\(b\))",
+                "[![x](KEPT)](KEPT) [a](KEPT)",
+            ),
+            (
+                "[r]: <a b> 't'\n\n[r] [r]\n",
+                "[r]: <KEPT> 't'\n\n[r] [r]\n",
+            ),
+            ("[unused]: path.png\n", "[unused]: KEPT\n"),
+            (r"[a\]:b]: path.png", r"[a\]:b]: KEPT"),
+            (
+                "<IMG data-src=x SRC = 'a&amp;b' href=dir/#f>",
+                "<IMG data-src=x SRC = 'KEPT' href=KEPT#f>",
+            ),
+            (
+                "<div>\n<img\n src=x srcset='a 1x,b 2x'>\n</div>",
+                "<div>\n<img\n src=KEPT srcset='KEPT 1x,KEPT 2x'>\n</div>",
+            ),
+            (
+                "<img srcset='data:x,a 1x,b&amp;c 2x'>",
+                "<img srcset='data:x,a 1x,KEPT 2x'>",
+            ),
+            (r"[x](a&amp;b.png) [x](a\(b\).png)", "[x](KEPT) [x](KEPT)"),
+            ("> <img\n> src='x'>\n", "> <img\n> src='KEPT'>\n"),
+            (
+                "<img\r\n SRC=é.png href=\"'x\">",
+                "<img\r\n SRC=KEPT href=\"KEPT\">",
+            ),
+            ("> [x]:\n> a.png\n\n> [x]\n", "> [x]:\n> KEPT\n\n> [x]\n"),
+        ] {
+            let mut rewritten = report.to_string();
+            for (range, dest) in report_destinations(report).into_iter().rev() {
+                if dest.starts_with("data:") {
+                    continue;
+                }
+                let suffix = dest.find('#').map_or("", |i| &dest[i..]);
+                rewritten.replace_range(range, &format!("KEPT{suffix}"));
+            }
+            assert_eq!(rewritten, expected, "{report}");
+        }
+        let decoded = report_destinations(r"[x](a\(b\).png) <img src='a&amp;b.png'>");
+        assert_eq!(
+            decoded.iter().map(|(_, d)| d.as_str()).collect::<Vec<_>>(),
+            ["a(b).png", "a&b.png"]
         );
     }
 
