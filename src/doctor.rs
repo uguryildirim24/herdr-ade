@@ -114,6 +114,17 @@ impl Runner for Timings<'_> {
         result
     }
 
+    fn capture(
+        &self,
+        cmd: &Cmd,
+        logs: Option<&crate::runner::OutputLogs>,
+    ) -> Result<crate::runner::Capture> {
+        let start = Instant::now();
+        let result = self.inner.capture(cmd, logs);
+        self.command(&command_name(cmd), start.elapsed());
+        result
+    }
+
     fn run_parallel(&self, commands: &[Cmd]) -> Vec<Result<Output>> {
         // Keep the underlying runner's concurrency and scripted-test semantics.
         let start = Instant::now();
@@ -179,7 +190,7 @@ struct NativeProbe {
 
 /// Selected inputs only: no routing policy or credential store crosses SSH.
 #[derive(Debug, Default, Serialize, Deserialize)]
-struct ProbePlan {
+pub(crate) struct ProbePlan {
     natives: Vec<(String, NativeProbe, u64)>,
     models: Vec<(String, String)>,
     pi_ids: BTreeMap<String, Vec<String>>,
@@ -196,7 +207,7 @@ struct SnapshotInput {
 }
 
 #[derive(Debug, Default, Serialize, Deserialize)]
-struct ProbeReport {
+pub(crate) struct ProbeReport {
     rows: Vec<crate::pi::doctor::Row>,
     snapshot: SnapshotObservation,
 }
@@ -308,7 +319,7 @@ fn pi_label(plan: &ProbePlan, label: &str) -> String {
 }
 
 fn progress(phase: &str, rows: &[crate::pi::doctor::Row]) {
-    if std::env::var_os("HERDR_ADE_DOCTOR_INPUT").is_some() {
+    if std::env::var_os("HERDR_ADE_BOX_INPUT").is_some() {
         crate::output::write_stdout(format_args!(
             "{}\n",
             serde_json::json!({"active": phase, "observations": rows})
@@ -317,7 +328,7 @@ fn progress(phase: &str, rows: &[crate::pi::doctor::Row]) {
 }
 
 /// Executed unchanged at home and on a saved machine. SSH only transports it.
-fn execute_plan(ctx: &Ctx, plan: &ProbePlan) -> Result<ProbeReport> {
+pub(crate) fn execute_plan(ctx: &Ctx, plan: &ProbePlan) -> Result<ProbeReport> {
     use crate::pi::doctor::Row;
     let mut report = ProbeReport::default();
     progress("disk", &report.rows);
@@ -395,7 +406,7 @@ fn execute_plan(ctx: &Ctx, plan: &ProbePlan) -> Result<ProbeReport> {
     Ok(report)
 }
 
-fn observe_list<T: serde::de::DeserializeOwned>(
+pub(crate) fn observe_list<T: serde::de::DeserializeOwned>(
     runner: &dyn Runner,
     bin: &str,
     verb: &str,
@@ -436,55 +447,17 @@ fn remote_plan(
     machine: &crate::remote::MachineDeclaration,
     plan: &ProbePlan,
 ) -> Result<ProbeReport> {
-    let script = crate::remote::with_path(
-        &machine.path,
-        &format!(
-            "HERDR_ADE_DOCTOR_INPUT=1 {} --root {} doctor",
-            crate::remote::quote(&machine.ade_bin),
-            crate::remote::quote(&machine.root),
-        ),
-    );
     // Pi has a 10s auth check plus a 30s live call, and setup/tool checks.
     let timeout = Duration::from_secs(150)
         + Duration::from_millis(plan.natives.iter().map(|(_, _, ms)| *ms).max().unwrap_or(0));
-    let out = crate::remote::ssh(
+    let report: ProbeReport = crate::box_helper::call(
         runner,
         &profile.target,
-        &script,
-        Some(&serde_json::to_string(plan)?),
+        machine,
+        crate::box_helper::Request::Doctor(serde_json::from_value(serde_json::to_value(plan)?)?),
         timeout,
+        None,
     )?;
-    if !out.success() {
-        let phase = out
-            .stdout
-            .lines()
-            .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
-            .filter_map(|value| {
-                value
-                    .get("active")
-                    .and_then(serde_json::Value::as_str)
-                    .map(str::to_string)
-            })
-            .next_back();
-        let mut detail = if out.timed_out {
-            format!(
-                "slow: snapshot timed out while running {}",
-                phase.as_deref().unwrap_or("unknown phase")
-            )
-        } else {
-            format!("unreachable: {}", out.error_text())
-        };
-        if out.stdout.contains("\"observations\"") {
-            detail.push_str(&format!("; partial observations: {}", out.stdout.trim()));
-        }
-        anyhow::bail!("{detail}");
-    }
-    let report: ProbeReport = out
-        .stdout
-        .lines()
-        .rev()
-        .find_map(|line| serde_json::from_str(line).ok())
-        .context("unreachable: machine returned no complete typed diagnostic report")?;
     let mut expected: Vec<String> = plan
         .natives
         .iter()
@@ -778,15 +751,6 @@ fn run_with_trace(
     session: &SessionFlags,
     timings: Option<&Timings<'_>>,
 ) -> Result<DoctorOutcome> {
-    if std::env::var_os("HERDR_ADE_DOCTOR_INPUT").is_some() {
-        let plan: ProbePlan = serde_json::from_reader(std::io::stdin().lock())?;
-        let report = execute_plan(ctx, &plan)?;
-        return Ok(DoctorOutcome {
-            healthy: true, // Transport succeeded; failed observations remain in the report.
-            checks: Vec::new(),
-            message: serde_json::to_string(&report)?,
-        });
-    }
     let (mut text, healthy, checks) = report_with_checks(
         ctx.env,
         &ctx.root,
@@ -1968,7 +1932,7 @@ recipe = "claude_fable_xhigh"
         remote.on_fn(
             |cmd| cmd.program == "ssh",
             move |cmd| {
-                let input: ProbePlan = serde_json::from_str(cmd.stdin.as_ref().unwrap()).unwrap();
+                let input = crate::box_helper::tests::doctor_input(cmd.stdin.as_ref().unwrap());
                 let bytes = cmd.stdin.as_ref().unwrap();
                 for excluded in ["routing", "credentials", "auth.json", "config.toml"] {
                     assert!(!bytes.contains(excluded), "{bytes}");
@@ -1978,7 +1942,7 @@ recipe = "claude_fable_xhigh"
                     ..target_world.ctx()
                 };
                 let report = execute_plan(&ctx, &input).unwrap();
-                Ok(ok(&serde_json::to_string(&report).unwrap()))
+                Ok(ok(&crate::box_helper::tests::ready(&report)))
             },
         );
         let report = remote_plan(
@@ -2035,10 +1999,12 @@ recipe = "claude_fable_xhigh"
             runner.on_fn(
                 |cmd| cmd.program == "ssh",
                 move |cmd| {
-                    let mut report: ProbeReport = serde_json::from_str(
+                    let value: serde_json::Value = serde_json::from_str(
                         &crate::testkit::diagnostic_output(cmd, 99_999_999, None).stdout,
                     )
                     .unwrap();
+                    let mut report: ProbeReport =
+                        serde_json::from_value(value["result"].clone()).unwrap();
                     let row = report
                         .rows
                         .iter_mut()
@@ -2047,7 +2013,7 @@ recipe = "claude_fable_xhigh"
                     row.level = crate::pi::doctor::Level::Fail;
                     row.evidence = evidence;
                     row.detail = "original target diagnostic".into();
-                    Ok(ok(&serde_json::to_string(&report).unwrap()))
+                    Ok(ok(&crate::box_helper::tests::ready(&report)))
                 },
             );
             let config = machine_config(&["pi"]);
@@ -2964,14 +2930,13 @@ recipe = "claude_fable_xhigh"
         let runner = FakeRunner::new();
         runner.on(
             "ssh",
-            ok(&serde_json::to_string(&ProbeReport {
+            ok(&crate::box_helper::tests::ready(ProbeReport {
                 snapshot: SnapshotObservation {
                     builds: Some(vec![format!("/home/agent/build/lanes/demo-{}", thread.id)]),
                     ..Default::default()
                 },
                 ..Default::default()
-            })
-            .unwrap()),
+            })),
         );
         let ctx = Ctx {
             env: &env,
@@ -3003,14 +2968,13 @@ recipe = "claude_fable_xhigh"
         let runner = FakeRunner::new();
         runner.on(
             "ssh",
-            ok(&serde_json::to_string(&ProbeReport {
+            ok(&crate::box_helper::tests::ready(ProbeReport {
                 snapshot: SnapshotObservation {
                     builds: Some(vec!["/home/agent/build/lanes/demo-t-0099".into()]),
                     ..Default::default()
                 },
                 ..Default::default()
-            })
-            .unwrap()),
+            })),
         );
         let ctx = Ctx {
             env: &env,
@@ -3200,10 +3164,12 @@ recipe = "claude_fable_xhigh"
             12.0,
             None,
         );
-        assert_eq!(
-            rows[0].2,
-            "slow: snapshot timed out while running herdr tabs"
+        assert!(
+            rows[0]
+                .2
+                .starts_with("slow: snapshot timed out while running herdr tabs")
         );
+        assert!(rows[0].2.contains("partial observations"));
     }
 
     fn default_recipes() -> BTreeMap<String, crate::contracts::Recipe> {
@@ -3320,7 +3286,7 @@ recipe = "claude_fable_xhigh"
     }
 
     fn box_facts() -> String {
-        serde_json::to_string(&box_report()).unwrap()
+        crate::box_helper::tests::ready(box_report())
     }
 
     fn box_profile() -> crate::contracts::MachineProfile {
@@ -3345,7 +3311,7 @@ recipe = "claude_fable_xhigh"
         row.level = crate::pi::doctor::Level::Fail;
         row.detail =
             "agy readiness could not run: binary missing; provider status is unknown".into();
-        runner.on("ssh", ok(&serde_json::to_string(&report).unwrap()));
+        runner.on("ssh", ok(&crate::box_helper::tests::ready(&report)));
         let rows = box_rows_with_snapshot(
             &runner,
             config.path(),
@@ -3437,14 +3403,15 @@ recipe = "claude_fable_xhigh"
                 rows.iter().all(|row| row.0 != Some(false)),
                 "{kinds:?}: {rows:?}"
             );
-            let request: ProbePlan =
-                serde_json::from_str(runner.calls.borrow()[0].stdin.as_ref().unwrap()).unwrap();
+            let request = crate::box_helper::tests::doctor_input(
+                runner.calls.borrow()[0].stdin.as_ref().unwrap(),
+            );
             assert_eq!(!request.models.is_empty(), kinds == ["pi"]);
             assert_eq!(!request.natives.is_empty(), kinds == ["claude"]);
             let calls = runner.calls.borrow();
             let call = calls.iter().find(|call| call.program == "ssh").unwrap();
             let script = call.args.join(" ");
-            assert!(script.contains("HERDR_ADE_DOCTOR_INPUT"));
+            assert!(script.contains("HERDR_ADE_BOX_INPUT"));
             assert!(!script.contains("command -v"));
             for excluded in ["routing", "credentials", "auth.json", "config.toml"] {
                 assert!(!call.stdin.as_ref().unwrap().contains(excluded));
@@ -3467,7 +3434,7 @@ recipe = "claude_fable_xhigh"
                 .find(|row| row.label == "disk")
                 .unwrap()
                 .level = level;
-            runner.on("ssh", ok(&serde_json::to_string(&report).unwrap()));
+            runner.on("ssh", ok(&crate::box_helper::tests::ready(&report)));
             let row = find_row(&runner, "box buildbox disk");
             assert_eq!(row.0, expected, "{row:?}");
             assert!(!row.2.contains("lane(s) fit"));
@@ -3485,7 +3452,7 @@ recipe = "claude_fable_xhigh"
             .unwrap();
         row.level = crate::pi::doctor::Level::Fail;
         row.detail = "first hit /usr/local/bin/pi".into();
-        runner.on("ssh", ok(&serde_json::to_string(&report).unwrap()));
+        runner.on("ssh", ok(&crate::box_helper::tests::ready(&report)));
         let row = find_row(&runner, "box buildbox wrapper on PATH");
         assert_eq!(row.0, Some(false));
         assert!(row.2.contains("/usr/local/bin/pi"), "{}", row.2);

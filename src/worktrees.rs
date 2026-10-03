@@ -6,15 +6,12 @@
 
 use std::collections::BTreeSet;
 use std::path::{Component, Path};
-use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use crate::project::Project;
 use crate::runner::Runner;
-
-const CHECK_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[derive(Debug, Default, Deserialize)]
 struct WorktreeConfig {
@@ -22,13 +19,13 @@ struct WorktreeConfig {
     disposable: Vec<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub(crate) struct DataPath {
     pub(crate) path: String,
     pub(crate) bytes: u64,
 }
 
-#[derive(Debug, Default, Clone, PartialEq, Eq)]
+#[derive(Debug, Default, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub(crate) struct Inspection {
     pub(crate) dirty: Vec<String>,
     pub(crate) ignored_data: Vec<DataPath>,
@@ -318,90 +315,52 @@ pub(crate) fn inspect_local_status(
     })
 }
 
-pub(crate) fn inspect_remote(
-    runner: &dyn Runner,
-    target: &str,
-    machine_path: &str,
-    path: &str,
-    disposable: &[String],
-    report_artifact_stored: bool,
-) -> Result<Inspection> {
-    const MARKER: &str = "__HERDR_NESTED_WORKTREES__";
-    let quoted = crate::remote::quote(path);
-    // NUL framing cannot collide with a status path: every porcelain record
-    // starts with its two-byte status and a space, and paths cannot contain NUL.
-    let script = crate::remote::with_path(
-        machine_path,
-        &format!(
-            "cd {quoted} && git status --porcelain --ignored --untracked-files=all -z && printf '\\0{MARKER}\\0' && find . -mindepth 2 -name .git -print0"
-        ),
-    );
-    let out = crate::remote::ssh(runner, target, &script, None, CHECK_TIMEOUT)?;
-    if !out.success() {
-        bail!("worktree_status_failed: {path}: {}", out.error_text());
-    }
-    let delimiter = format!("\0{MARKER}\0");
-    let (status, nested_text) = out
-        .stdout
-        .split_once(&delimiter)
-        .context("worktree inspection output was incomplete")?;
-    let (dirty, ignored) = parse_status(status);
-    let nested = nested_text
-        .split('\0')
-        .filter_map(|entry| entry.strip_prefix("./"))
-        .filter_map(|entry| entry.strip_suffix("/.git"))
-        .map(str::to_string)
-        .collect();
-    let mut ignored_data = Vec::new();
-    for relative in roots(ignored, nested, disposable, report_artifact_stored) {
-        let full = format!("{}/{}", path.trim_end_matches('/'), relative);
-        let script = crate::remote::with_path(
-            machine_path,
-            &format!("du -sk -- {}", crate::remote::quote(&full)),
-        );
-        let out = crate::remote::ssh(runner, target, &script, None, CHECK_TIMEOUT)?;
-        if !out.success() {
-            bail!("could not measure {full}: {}", out.error_text());
-        }
-        let kib = out
-            .stdout
-            .split_whitespace()
-            .next()
-            .context("du printed no size")?
-            .parse::<u64>()
-            .context("du printed an invalid size")?;
-        ignored_data.push(DataPath {
-            path: relative,
-            bytes: kib.saturating_mul(1024),
-        });
-    }
-    Ok(Inspection {
-        dirty,
-        ignored_data,
-    })
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn inspect_box(runner: &dyn Runner, path: &str) -> Result<Inspection> {
+        crate::box_helper::call(
+            runner,
+            "box",
+            &crate::remote::MachineDeclaration::default(),
+            crate::box_helper::Request::Inspect {
+                path: path.into(),
+                disposable: Vec::new(),
+                report_stored: false,
+            },
+            std::time::Duration::from_secs(30),
+            None,
+        )
+    }
 
     #[test]
     fn first_unstaged_status_path_reaches_local_and_box_inspection_verbatim() {
         use crate::runner::fake::{FakeRunner, ok};
 
         let root = tempfile::tempdir().unwrap();
-        let path = root.path().to_string_lossy();
+        let path = root.path().to_string_lossy().into_owned();
         let status = " M README.md\0 M scripts/circuit_tour.py\0";
         let runner = FakeRunner::new();
         runner.on("status --porcelain", ok(status));
         let local = inspect_local(&runner, &path, &path, &[], false).unwrap();
         assert_eq!(local.dirty, ["README.md", "scripts/circuit_tour.py"]);
         let box_runner = FakeRunner::new();
-        box_runner.on(
-            "status --porcelain",
-            ok(&format!("{status}\0__HERDR_NESTED_WORKTREES__\0")),
+        let env = crate::paths::Env::for_test(root.path(), &[]);
+        box_runner.on_fn(
+            |cmd| cmd.program == "ssh",
+            move |cmd| {
+                let ctx = crate::paths::Ctx {
+                    env: &env,
+                    root: root.path().into(),
+                    config_dir: root.path().into(),
+                    runner: &runner,
+                    detached_ticker: false,
+                };
+                crate::box_helper::tests::respond(&ctx, cmd.stdin.as_deref().unwrap())
+            },
         );
-        let boxed = inspect_remote(&box_runner, "box", "/bin", &path, &[], false).unwrap();
+        let boxed = inspect_box(&box_runner, &path).unwrap();
         assert_eq!(boxed.dirty, local.dirty);
     }
 
@@ -539,15 +498,31 @@ mod tests {
     fn remote_status_marker_filename_is_still_kept_as_data() {
         use crate::runner::fake::{FakeRunner, ok};
 
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(
+            root.path().join("__HERDR_NESTED_WORKTREES__"),
+            vec![0; 4096],
+        )
+        .unwrap();
         let runner = FakeRunner::new();
-        runner.on("du -sk", ok("4\t/wt/__HERDR_NESTED_WORKTREES__\n"));
-        runner.on(
-            "status --porcelain --ignored --untracked-files=all -z",
-            ok("!! __HERDR_NESTED_WORKTREES__\0\0__HERDR_NESTED_WORKTREES__\0"),
+        runner.on("status --porcelain", ok("!! __HERDR_NESTED_WORKTREES__\0"));
+        let transport = FakeRunner::new();
+        let env = crate::paths::Env::for_test(root.path(), &[]);
+        let path = root.path().to_string_lossy().into_owned();
+        transport.on_fn(
+            |cmd| cmd.program == "ssh",
+            move |cmd| {
+                let ctx = crate::paths::Ctx {
+                    env: &env,
+                    root: root.path().into(),
+                    config_dir: root.path().into(),
+                    runner: &runner,
+                    detached_ticker: false,
+                };
+                crate::box_helper::tests::respond(&ctx, cmd.stdin.as_deref().unwrap())
+            },
         );
-
-        let inspection =
-            inspect_remote(&runner, "box", "/custom/bin:/bin", "/wt", &[], false).unwrap();
+        let inspection = inspect_box(&transport, &path).unwrap();
 
         assert_eq!(
             inspection.ignored_data,

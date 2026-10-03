@@ -981,7 +981,7 @@ pub(crate) fn write_machine_outage(
 const COURIER_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// One envelope the box helper reported (SPEC-remote §4.3).
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub(crate) struct BoxEnvelope {
     pub(crate) slug: String,
     pub(crate) event: String,
@@ -995,7 +995,7 @@ pub(crate) struct BoxEnvelope {
 /// One completion receipt the box wrote at seal (D5): the event bytes and
 /// report bytes the box itself hashed. The Mac compares both with its own
 /// before the taken cursor advances.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub(crate) struct CompletionReceipt {
     pub(crate) slug: String,
     pub(crate) event: String,
@@ -1006,7 +1006,7 @@ pub(crate) struct CompletionReceipt {
 
 /// One bootstrap receipt the box wrote when its lane ran `skill lane` (D14).
 /// The courier carries it to the Mac, which marks the thread's receipt.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub(crate) struct BootstrapReceipt {
     pub(crate) slug: String,
     pub(crate) thread: String,
@@ -1015,7 +1015,7 @@ pub(crate) struct BootstrapReceipt {
 }
 
 /// A box lane's detection-source screen and branch head, read in the courier trip.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub(crate) struct LaneProgress {
     pub(crate) pane: String,
     pub(crate) screen: String,
@@ -1023,18 +1023,16 @@ pub(crate) struct LaneProgress {
 }
 
 /// What one box helper call returned, after the taken cursor it was asked for.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 pub(crate) struct CourierManifest {
     pub(crate) boot_id: String,
-    /// Box-local `herdr agent list` JSON; `None` when the box server did not
-    /// answer this pass.
-    pub(crate) agents: Option<String>,
-    /// Box-local `herdr pane list` JSON; `None` when it did not answer.
-    pub(crate) panes: Option<String>,
+    /// Box-local facts; `None` when the server did not answer this pass.
+    pub(crate) agents: Option<Vec<Agent>>,
+    pub(crate) panes: Option<Vec<Pane>>,
     pub(crate) envelopes: Vec<BoxEnvelope>,
     pub(crate) receipts: Vec<CompletionReceipt>,
     pub(crate) bootstraps: Vec<BootstrapReceipt>,
-    pub(crate) progress: BTreeMap<(String, String), LaneProgress>,
+    pub(crate) progress: Vec<((String, String), LaneProgress)>,
 }
 
 /// The stable identity a courier pass resolved and the live facts it read, so
@@ -1050,200 +1048,167 @@ pub(crate) struct CourierOutcome {
     pub(crate) progress: BTreeMap<(String, String), LaneProgress>,
 }
 
-/// The box-local helper: it recovers an interrupted box D5 operation, reads
-/// the box server's own live lists, and prints one tab-separated record per
-/// fact after the taken cursor it reads on stdin (SPEC-remote §4.3). It makes
-/// no `herdr --machine` bridge call; the courier's one SSH trip carries both
-/// the helper and the batched `scp`.
-const COURIER_HELPER: &str = r#"set -u
-root=__ROOT__
-PATH=__PATH__; export PATH
-herdr_bin=$(command -v herdr 2>/dev/null || true)
-ade_bin=__ADE_BIN__
-cursor=$(mktemp)
-trap 'rm -f "$cursor"' EXIT
-cat > "$cursor"
-printf 'boot\t%s\n' "$(cat /proc/sys/kernel/random/boot_id 2>/dev/null || true)"
-if ! "$ade_bin" --root "$root" recover >/dev/null; then
-  printf 'box recovery failed: %s\n' "$ade_bin" >&2
-  exit 1
-fi
-if [ -x "$herdr_bin" ]; then
-  a=$("$herdr_bin" --session __SESSION__ agent list 2>/dev/null | tr -d '\n')
-  p=$("$herdr_bin" --session __SESSION__ pane list 2>/dev/null | tr -d '\n')
-  if [ -n "$a" ]; then printf 'agents\t%s\n' "$a"; else printf 'agents\t-\n'; fi
-  if [ -n "$p" ]; then printf 'panes\t%s\n' "$p"; else printf 'panes\t-\n'; fi
-else
-  printf 'agents\t-\n'
-  printf 'panes\t-\n'
-fi
-[ -d "$root" ] || exit 0
-# Lane cards are already on the box. Read the same short detection buffer
-# herdr uses for status; hash it here instead of shipping screen contents.
-if [ -x "$herdr_bin" ] && [ -n "$a" ]; then
-  for card in "$root"/*/.state/lanes/*.toml; do
-    [ -f "$card" ] || continue
-    slug=${card%/.state/lanes/*}; slug=${slug##*/}
-    lane=${card##*/}; lane=${lane%.toml}
-    pane=$(sed -n 's/^pane_id = "\([^"]*\)"/\1/p' "$card" | head -n1)
-    wt=$(sed -n 's/^box_worktree = "\([^"]*\)"/\1/p' "$card" | head -n1)
-    branch=$(sed -n 's/^branch = "\([^"]*\)"/\1/p' "$card" | head -n1)
-    [ -n "$pane" ] || continue
-    case "$p" in *"\"$pane\""*) ;; *) continue;; esac
-    screen=$("$herdr_bin" --session __SESSION__ pane read "$pane" --source detection --format text 2>/dev/null) || continue
-    screen=$(printf '%s' "$screen" | sha256sum | cut -d' ' -f1)
-    head=-
-    if [ -n "$wt" ]; then
-      [ -n "$branch" ] || continue
-      head=$(git -C "$wt" rev-parse "refs/heads/$branch" 2>/dev/null) || continue
-    fi
-    printf 'progress\t%s\t%s\t%s\t%s\t%s\n' "$slug" "$lane" "$pane" "$screen" "$head"
-  done
-fi
-for dir in "$root"/*/.state/events; do
-  [ -d "$dir" ] || continue
-  slug=${dir%/.state/events}; slug=${slug##*/}
-  for f in "$dir"/*.toml; do
-    [ -f "$f" ] || continue
-    id=${f##*/}; id=${id%.toml}
-    case "$id" in .*) continue;; esac
-    key=$(printf '%s\t%s' "$slug" "$id")
-    if grep -Fqx "$key" "$cursor" 2>/dev/null; then continue; fi
-    h=$(sha256sum "$f" | cut -d' ' -f1)
-    a=$(sed -n 's/^artifact = "\([^"]*\)"/\1/p' "$f" | head -n1)
-    if [ -n "$a" ]; then
-      printf 'event\t%s\t%s\t%s\t%s\t%s\t%s\n' "$slug" "$id" "$f" "$h" "$root/$slug/.state/artifacts/$a" "$a"
-    else
-      printf 'event\t%s\t%s\t%s\t%s\t-\t-\n' "$slug" "$id" "$f" "$h"
-    fi
-    rec="$root/$slug/.state/receipts/$id.toml"
-    if [ -f "$rec" ]; then
-      eh=$(sed -n 's/^event_hash = "\([^"]*\)"/\1/p' "$rec" | head -n1)
-      ah=$(sed -n 's/^artifact_hash = "\([^"]*\)"/\1/p' "$rec" | head -n1)
-      printf 'receipt\t%s\t%s\t%s\t%s\n' "$slug" "$id" "$eh" "$ah"
-    fi
-  done
-done
-for f in "$root"/*/.state/bootstrap/*.json; do
-  [ -f "$f" ] || continue
-  slug=${f%%/.state/bootstrap/*}; slug=${slug##*/}
-  thread=${f##*/}; thread=${thread%.json}
-  brief=$(sed -n 's/.*"brief_hash"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$f" | head -n1)
-  pane=$(sed -n 's/.*"pane"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$f" | head -n1)
-  printf 'bootstrap\t%s\t%s\t%s\t%s\n' "$slug" "$thread" "$brief" "$pane"
-done
-"#;
-
-fn courier_helper(machine: &crate::remote::MachineDeclaration, session: &str) -> String {
-    COURIER_HELPER
-        .replace("__ROOT__", &crate::remote::quote(&machine.root))
-        .replace("__PATH__", &crate::remote::quote(&machine.path))
-        .replace("__ADE_BIN__", &crate::remote::quote(&machine.ade_bin))
-        .replace("__SESSION__", &crate::remote::quote(session))
-}
-
-/// Parses the helper's tab-separated output. An unknown record is refused so a
-/// helper version mismatch is loud, not silently empty.
-fn parse_courier_manifest(text: &str) -> Result<CourierManifest> {
-    let mut manifest = CourierManifest::default();
-    for line in text.lines().filter(|line| !line.trim().is_empty()) {
-        let fields: Vec<&str> = line.split('\t').collect();
-        match fields.as_slice() {
-            ["boot", id] => manifest.boot_id = (*id).to_string(),
-            ["agents", json] => {
-                if *json != "-" && !json.is_empty() {
-                    manifest.agents = Some((*json).to_string());
+/// Recover before observing immutable records; failed server lists stay unknown.
+pub(crate) fn box_manifest(
+    ctx: &Ctx,
+    session: &str,
+    taken: &[(String, String)],
+) -> Result<CourierManifest> {
+    crate::ops::recover_box(ctx).context("box recovery failed")?;
+    let bin = ctx.env.herdr_bin();
+    let mut manifest = CourierManifest {
+        boot_id: std::fs::read_to_string("/proc/sys/kernel/random/boot_id")
+            .unwrap_or_default()
+            .trim()
+            .into(),
+        agents: crate::doctor::observe_list(ctx.runner, &bin, "agent", "agents", session).ok(),
+        panes: crate::doctor::observe_list(ctx.runner, &bin, "pane", "panes", session).ok(),
+        ..Default::default()
+    };
+    let taken: BTreeSet<_> = taken.iter().cloned().collect();
+    for slug in project::list_slugs(&ctx.root) {
+        let project = Project::load(&ctx.root, &slug)?;
+        for (id, path) in box_records(&project.record_dir("events"), "toml")? {
+            if taken.contains(&(slug.clone(), id.clone())) {
+                continue;
+            }
+            let bytes = std::fs::read(&path)?;
+            let event: crate::contracts::Event = toml::from_str(std::str::from_utf8(&bytes)?)?;
+            let artifact = event
+                .payload
+                .done
+                .as_ref()
+                .map(|done| done.artifact.clone())
+                .unwrap_or_default();
+            manifest.envelopes.push(BoxEnvelope {
+                slug: slug.clone(),
+                event: id.clone(),
+                event_path: path.to_string_lossy().into_owned(),
+                event_hash: thread::sha256_hex(&bytes),
+                artifact_path: if artifact.is_empty() {
+                    String::new()
+                } else {
+                    project
+                        .record_dir("artifacts")
+                        .join(&artifact)
+                        .to_string_lossy()
+                        .into_owned()
+                },
+                artifact_hash: artifact,
+            });
+            let receipt = project.record_dir("receipts").join(format!("{id}.toml"));
+            match std::fs::read_to_string(receipt) {
+                Ok(text) => {
+                    let receipt: events::Receipt = toml::from_str(&text)?;
+                    manifest.receipts.push(CompletionReceipt {
+                        slug: slug.clone(),
+                        event: id,
+                        event_hash: receipt.event_hash,
+                        artifact_hash: receipt.artifact_hash,
+                    });
                 }
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => return Err(e.into()),
             }
-            ["panes", json] => {
-                if *json != "-" && !json.is_empty() {
-                    manifest.panes = Some((*json).to_string());
+        }
+        for (id, path) in box_records(&project.record_dir("bootstrap"), "json")? {
+            #[derive(Deserialize)]
+            struct Receipt {
+                brief_hash: String,
+                pane: String,
+            }
+            let receipt: Receipt = serde_json::from_slice(&std::fs::read(path)?)?;
+            manifest.bootstraps.push(BootstrapReceipt {
+                slug: slug.clone(),
+                thread: id,
+                brief_hash: receipt.brief_hash,
+                pane: receipt.pane,
+            });
+        }
+        if let Some(panes) = &manifest.panes {
+            for (id, path) in box_records(&project.record_dir("lanes"), "toml")? {
+                let card: crate::contracts::LaneCard =
+                    toml::from_str(&std::fs::read_to_string(path)?)?;
+                if !panes.iter().any(|pane| pane.pane_id == card.pane_id) {
+                    continue;
                 }
-            }
-            ["receipt", slug, event, event_hash, artifact_hash] => {
-                manifest.receipts.push(CompletionReceipt {
-                    slug: (*slug).to_string(),
-                    event: (*event).to_string(),
-                    event_hash: (*event_hash).to_string(),
-                    artifact_hash: (*artifact_hash).to_string(),
-                });
-            }
-            ["progress", slug, thread, pane, screen, head] => {
-                manifest.progress.insert(
-                    ((*slug).into(), (*thread).into()),
+                let Ok(screen) = ctx.runner.run(
+                    &crate::runner::Cmd::new(&bin, COURIER_TIMEOUT)
+                        .env("HERDR_SESSION", session)
+                        .args([
+                            "pane",
+                            "read",
+                            &card.pane_id,
+                            "--source",
+                            "detection",
+                            "--format",
+                            "text",
+                        ]),
+                ) else {
+                    continue;
+                };
+                if !screen.success() {
+                    continue;
+                }
+                let head = if card.box_worktree.is_empty() {
+                    String::new()
+                } else {
+                    if card.branch.is_empty() {
+                        continue;
+                    }
+                    let Ok(head) = crate::git::rev_parse(
+                        ctx.runner,
+                        &card.box_worktree,
+                        &format!("refs/heads/{}", card.branch),
+                    ) else {
+                        continue;
+                    };
+                    head
+                };
+                manifest.progress.push((
+                    (slug.clone(), id),
                     LaneProgress {
-                        pane: (*pane).into(),
-                        screen: (*screen).into(),
-                        head: if *head == "-" {
-                            String::new()
-                        } else {
-                            (*head).into()
-                        },
+                        pane: card.pane_id,
+                        screen: thread::sha256_hex(screen.stdout.trim_end_matches('\n').as_bytes()),
+                        head,
                     },
-                );
+                ));
             }
-            ["bootstrap", slug, thread, brief_hash, pane] => {
-                manifest.bootstraps.push(BootstrapReceipt {
-                    slug: (*slug).to_string(),
-                    thread: (*thread).to_string(),
-                    brief_hash: (*brief_hash).to_string(),
-                    pane: (*pane).to_string(),
-                });
-            }
-            [
-                "event",
-                slug,
-                event,
-                path,
-                hash,
-                artifact_path,
-                artifact_hash,
-            ] => {
-                manifest.envelopes.push(BoxEnvelope {
-                    slug: (*slug).to_string(),
-                    event: (*event).to_string(),
-                    event_path: (*path).to_string(),
-                    event_hash: (*hash).to_string(),
-                    artifact_path: if *artifact_path == "-" {
-                        String::new()
-                    } else {
-                        (*artifact_path).to_string()
-                    },
-                    artifact_hash: if *artifact_hash == "-" {
-                        String::new()
-                    } else {
-                        (*artifact_hash).to_string()
-                    },
-                });
-            }
-            _ => bail!("courier_manifest_invalid: {line}"),
         }
     }
     Ok(manifest)
 }
 
-fn basename(path: &str) -> &str {
-    path.rsplit('/').next().unwrap_or(path)
+fn box_records(
+    dir: &std::path::Path,
+    extension: &str,
+) -> Result<Vec<(String, std::path::PathBuf)>> {
+    let entries = match std::fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(e.into()),
+    };
+    let mut records = Vec::new();
+    for entry in entries {
+        let entry = entry?;
+        let path = entry.path();
+        if path.extension().and_then(|s| s.to_str()) != Some(extension) {
+            continue;
+        }
+        let id = path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .context("non UTF-8 box record")?;
+        if !id.starts_with('.') {
+            records.push((id.into(), path));
+        }
+    }
+    records.sort();
+    Ok(records)
 }
 
-/// Parses one box-local `herdr <list> --json` reply into its list. A reply
-/// carrying `error` is a refusal; a missing list is an empty one.
-fn parse_box_list<T: serde::de::DeserializeOwned>(json: &str, field: &str) -> Result<Vec<T>> {
-    let value: serde_json::Value =
-        serde_json::from_str(json).context("the box herdr list is not JSON")?;
-    if let Some(error) = value.get("error") {
-        bail!(
-            "box herdr {field} failed: {}",
-            error.get("message").and_then(|m| m.as_str()).unwrap_or("")
-        );
-    }
-    let list = value
-        .get("result")
-        .and_then(|result| result.get(field))
-        .cloned()
-        .unwrap_or(serde_json::Value::Array(Vec::new()));
-    serde_json::from_value(list)
-        .map_err(|error| anyhow::anyhow!("the box herdr {field} reply changed: {error}"))
+fn basename(path: &str) -> &str {
+    path.rsplit('/').next().unwrap_or(path)
 }
 
 #[derive(Debug)]
@@ -1289,43 +1254,29 @@ fn courier_inner(ctx: &Ctx, projects: &[&Project], machine: &str) -> Result<Cour
 
     // The taken cursor, per project: the helper answers after it.
     let mut states = BTreeMap::new();
-    let mut cursor = String::new();
+    let mut cursor = Vec::new();
     for project in projects {
         let state = events::remote_state(project, &profile.id);
         for id in state.taken.keys() {
-            cursor.push_str(&project.slug);
-            cursor.push('\t');
-            cursor.push_str(id);
-            cursor.push('\n');
+            cursor.push((project.slug.clone(), id.clone()));
         }
         states.insert(project.slug.clone(), state);
     }
 
     let machine_paths = crate::remote::machine_declaration(&ctx.config_dir, &profile.label)
         .map_err(|error| MachineLookupError(format!("machine declaration failed: {error:#}")))?;
-    let script = courier_helper(&machine_paths, &profile.session);
-    let out = crate::remote::ssh_courier(
+    let manifest: CourierManifest = crate::box_helper::call(
         ctx.runner,
         &target,
-        &control,
-        &script,
-        &cursor,
+        &machine_paths,
+        crate::box_helper::Request::Courier {
+            session: profile.session.clone(),
+            taken: cursor,
+        },
         COURIER_TIMEOUT,
+        Some(&control),
     )?;
-    if !out.success() {
-        bail!("courier helper on {target}: {}", out.error_text());
-    }
-    let manifest = parse_courier_manifest(&out.stdout)
-        .with_context(|| format!("courier helper on {target}"))?;
 
-    let agents = match &manifest.agents {
-        Some(json) => Some(parse_box_list::<Agent>(json, "agents")?),
-        None => None,
-    };
-    let panes = match &manifest.panes {
-        Some(json) => Some(parse_box_list::<Pane>(json, "panes")?),
-        None => None,
-    };
     let receipts: BTreeMap<(String, String), &CompletionReceipt> = manifest
         .receipts
         .iter()
@@ -1425,9 +1376,9 @@ fn courier_inner(ctx: &Ctx, projects: &[&Project], machine: &str) -> Result<Cour
     Ok(CourierOutcome {
         machine_id: profile.id,
         boot_id: manifest.boot_id,
-        agents,
-        panes,
-        progress: manifest.progress,
+        agents: manifest.agents,
+        panes: manifest.panes,
+        progress: manifest.progress.into_iter().collect(),
     })
 }
 
@@ -1540,7 +1491,6 @@ pub(crate) fn announce_inbox(project: &Project, state: &mut State, herdr: &Herdr
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::runner::Runner as _;
     use crate::scenarios::{World, agent_json};
     use crate::ticker::{ObservationView, observation_pass};
 
@@ -1565,15 +1515,6 @@ mod tests {
 
     fn at(text: &str) -> jiff::Timestamp {
         text.parse().unwrap()
-    }
-
-    fn test_machine(root: &str) -> crate::remote::MachineDeclaration {
-        crate::remote::MachineDeclaration {
-            root: root.into(),
-            path: "/bin:/usr/bin".into(),
-            ade_bin: "/bin/true".into(),
-            ..Default::default()
-        }
     }
 
     /// A project with a mid-turn coordinator (notices queue without a wake),
@@ -2785,100 +2726,87 @@ mod tests {
     }
 
     #[test]
-    fn courier_manifest_parses_records_and_refuses_junk() {
-        let text = "boot\tboot-1\nagents\t{\"result\":{\"agents\":[]}}\npanes\t-\n\
-                    receipt\tdemo\tt-0001-1-1\tabc\tdef\n\
-                    bootstrap\tdemo\tt-0001\tabcd\tw1:p2\n\
-                    progress\tdemo\tt-0001\tw1:p2\tscreenhash\theadsha\n\
-                    event\tdemo\tt-0001-1-1\t/r/demo/.state/events/t-0001-1-1.toml\tabc\t/r/demo/.state/artifacts/def\tdef\n\
-                    event\tdemo\tt-0002-1-1\t/r/demo/.state/events/t-0002-1-1.toml\tabc\t-\t-\n";
-        let manifest = parse_courier_manifest(text).unwrap();
-        assert_eq!(manifest.boot_id, "boot-1");
-        assert!(manifest.agents.is_some());
-        assert!(manifest.panes.is_none());
-        assert_eq!(manifest.receipts.len(), 1);
-        assert_eq!(manifest.receipts[0].artifact_hash, "def");
-        assert_eq!(manifest.bootstraps.len(), 1);
-        assert_eq!(manifest.bootstraps[0].pane, "w1:p2");
+    fn courier_manifest_roundtrips_typed_progress_and_refuses_junk() {
+        let mut manifest = CourierManifest::default();
+        manifest.progress.push((
+            ("demo".into(), "t-0001".into()),
+            LaneProgress {
+                pane: "w:p".into(),
+                screen: "hash".into(),
+                head: "sha".into(),
+            },
+        ));
+        let text = serde_json::to_string(&manifest).unwrap();
         assert_eq!(
-            manifest.progress[&("demo".into(), "t-0001".into())].head,
-            "headsha"
+            serde_json::from_str::<CourierManifest>(&text).unwrap(),
+            manifest
         );
-        assert_eq!(manifest.envelopes.len(), 2);
-        assert_eq!(manifest.envelopes[0].artifact_hash, "def");
-        assert!(manifest.envelopes[1].artifact_path.is_empty());
-        assert!(parse_courier_manifest("nonsense\n").is_err());
+        assert!(serde_json::from_str::<CourierManifest>("nonsense").is_err());
     }
 
     #[test]
     fn courier_helper_surfaces_box_recovery_failure() {
-        let home = tempfile::tempdir().unwrap();
-        let mut machine = test_machine(&home.path().display().to_string());
-        machine.ade_bin = "/bin/false".into();
-        let script = courier_helper(&machine, "default");
-        let out = crate::runner::RealRunner
-            .run(
-                &crate::runner::Cmd::new("sh", Duration::from_secs(120))
-                    .args(["-c", &script])
-                    .stdin(String::new()),
-            )
-            .unwrap();
-        assert!(!out.success());
-        assert!(out.error_text().contains("box recovery failed: /bin/false"));
-        assert!(!out.stdout.contains("event\t"));
+        let world = World::new();
+        let project = world.project("demo", "a.sock");
+        let dir = project.record_dir_for_write("ops").unwrap();
+        std::fs::write(
+            dir.join("t-0001-1-1.toml"),
+            r#"
+op = "t-0001-1-1"
+revision = 1
+thread = "t-0001"
+attempt = 1
+kind = "waiting"
+helper_pid = 0
+event = "t-0001-1-1"
+state = "staged"
+created = "2026-10-03T00:00:00Z"
+[recipient]
+pane = "w:p"
+coordinator_attempt = 1
+[requested]
+text = "waiting"
+"#,
+        )
+        .unwrap();
+        // Missing staged evidence cannot be mistaken for a completed pass.
+        let error = box_manifest(&world.ctx(), "default", &[]).unwrap_err();
+        assert!(format!("{error:#}").contains("box recovery failed"));
     }
 
     #[test]
     fn courier_helper_survives_a_hostile_box_root() {
-        let script = courier_helper(&test_machine("/home/it's a $(box)"), "default");
-        let command = format!("sh -c {}", crate::remote::quote(&script));
-        // An isolated HOME; recovery is a successful no-op in this fixture.
-        let home = tempfile::tempdir().unwrap();
-        let out = crate::runner::RealRunner
-            .run(
-                &crate::runner::Cmd::new("sh", Duration::from_secs(120))
-                    .args(["-c", &command])
-                    .env("HOME", home.path().display().to_string()),
-            )
-            .unwrap();
-        assert!(out.success(), "{}", out.error_text());
-        assert!(out.stdout.contains("boot\t"), "{}", out.stdout);
-        assert!(out.stdout.contains("agents\t-\n"), "{}", out.stdout);
-        assert!(out.stdout.contains("panes\t-\n"), "{}", out.stdout);
+        let world = World::new();
+        let root = world.home.path().join("it's a $(box)");
+        project::create(&root, "demo", "", vec![]).unwrap();
+        let ctx = Ctx {
+            root,
+            ..world.ctx()
+        };
+        let manifest = box_manifest(&ctx, "default", &[]).unwrap();
+        assert!(manifest.envelopes.is_empty());
+        assert_eq!(world.runner.count("ssh"), 0);
     }
 
     #[test]
     fn courier_helper_answers_only_after_the_taken_cursor() {
-        let home = tempfile::tempdir().unwrap();
-        let root = home.path().join("ade");
-        let dir = root.join("demo/.state/events");
-        std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(dir.join("t-0001-1-1.toml"), "id = \"t-0001-1-1\"\n").unwrap();
-        let script = courier_helper(&test_machine(&root.to_string_lossy()), "default");
-        let command = format!("sh -c {}", crate::remote::quote(&script));
-        let run = |stdin: &str| {
-            crate::runner::RealRunner
-                .run(
-                    &crate::runner::Cmd::new("sh", Duration::from_secs(120))
-                        .args(["-c", &command])
-                        .env("HOME", home.path().display().to_string())
-                        .stdin(stdin.to_string()),
-                )
-                .unwrap()
-        };
-        let skipped = run("demo\tt-0001-1-1\n");
-        assert!(skipped.success(), "{}", skipped.error_text());
-        assert!(
-            !skipped.stdout.contains("event\tdemo"),
-            "{}",
-            skipped.stdout
-        );
-        let fresh = run("");
-        assert!(
-            fresh.stdout.contains("event\tdemo\tt-0001-1-1"),
-            "{}",
-            fresh.stdout
-        );
+        let world = World::new();
+        let project = world.project("demo", "a.sock");
+        let dir = project.record_dir_for_write("events").unwrap();
+        std::fs::write(
+            dir.join("t-0001-1-1.toml"),
+            box_event_bytes("t-0001-1-1", ""),
+        )
+        .unwrap();
+        let skipped = box_manifest(
+            &world.ctx(),
+            "default",
+            &[("demo".into(), "t-0001-1-1".into())],
+        )
+        .unwrap();
+        assert!(skipped.envelopes.is_empty());
+        let fresh = box_manifest(&world.ctx(), "default", &[]).unwrap();
+        assert_eq!(fresh.envelopes[0].event, "t-0001-1-1");
     }
 
     #[test]
@@ -2888,7 +2816,8 @@ mod tests {
         let root = home.path().join("ade");
         let bin = home.path().join("bin");
         let repo = home.path().join("repo");
-        std::fs::create_dir_all(root.join("demo/.state/lanes")).unwrap();
+        let project = project::create(&root, "demo", "", vec![]).unwrap();
+        project.record_dir_for_write("lanes").unwrap();
         std::fs::create_dir_all(&bin).unwrap();
         let git = std::process::Command::new("git")
             .args(["init", "-q"])
@@ -2939,21 +2868,20 @@ mod tests {
         )
         .unwrap();
         let fake = bin.join("herdr");
-        std::fs::write(&fake, "#!/bin/sh\ncase \"$*\" in\n  *'agent list'*) echo '{\"result\":{\"agents\":[{\"pane_id\":\"w:p\"}]}}';;\n  *'pane list'*) echo '{\"result\":{\"panes\":[{\"pane_id\":\"w:p\"}]}}';;\n  *'pane read'*) printf 'working';;\nesac\n").unwrap();
+        std::fs::write(&fake, "#!/bin/sh\ncase \"$*\" in\n  *'agent list'*) echo '{\"result\":{\"agents\":[]}}';;\n  *'pane list'*) echo '{\"result\":{\"panes\":[{\"workspace_id\":\"w\",\"tab_id\":\"w:t\",\"pane_id\":\"w:p\",\"cwd\":\"/repo\"}]}}';;\n  *'pane read'*) printf 'working';;\nesac\n").unwrap();
         std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
-        let mut machine = test_machine(&root.to_string_lossy());
-        machine.path = format!("{}:/bin:/usr/bin", bin.display());
-        let script = courier_helper(&machine, "default");
-        let out = crate::runner::RealRunner
-            .run(
-                &crate::runner::Cmd::new("sh", Duration::from_secs(120))
-                    .args(["-c", &script])
-                    .stdin(String::new()),
-            )
-            .unwrap();
-        assert!(out.success(), "{}", out.error_text());
-        let manifest = parse_courier_manifest(&out.stdout).unwrap();
-        let progress = &manifest.progress[&("demo".into(), "t-1".into())];
+        let env =
+            crate::paths::Env::for_test(home.path(), &[("HERDR_BIN_PATH", fake.to_str().unwrap())]);
+        let ctx = Ctx {
+            env: &env,
+            root,
+            config_dir: home.path().join("cfg"),
+            runner: &crate::runner::RealRunner,
+            detached_ticker: false,
+        };
+        let manifest = box_manifest(&ctx, "default", &[]).unwrap();
+        let progress = &manifest.progress[0].1;
+        assert_eq!(manifest.progress[0].0, ("demo".into(), "t-1".into()));
         assert_eq!(progress.head, sha);
         assert_eq!(progress.screen, thread::sha256_hex(b"working"));
     }
@@ -3438,14 +3366,35 @@ pi_bin = "/home/agent/.local/bin/herdr-pi"
                 r#"[{"id":"1","label":"box","target":"me@box","session":"default","enabled":true}]"#,
             ),
         );
-        let manifest = format!(
-            "boot\tboot-1\nagents\t{{\"result\":{{\"agents\":[]}}}}\npanes\t{{\"result\":{{\"panes\":[]}}}}\n\
-             event\talpha\tt-0001-1-1\t/box/alpha/.state/events/t-0001-1-1.toml\t{event_hash}\t/box/alpha/.state/artifacts/{artifact_hash}\t{artifact_hash}\n\
-             receipt\talpha\tt-0001-1-1\t{event_hash}\t{artifact_hash}\n\
-             bootstrap\talpha\tt-0001\t\tw2:p1\n\
-             event\tbeta\tt-0001-1-1\t/box/beta/.state/events/t-0001-1-1.toml\t{event_hash}\t/box/beta/.state/artifacts/{artifact_hash}\t{artifact_hash}\n\
-             receipt\tbeta\tt-0001-1-1\t{event_hash}\t{artifact_hash}\n"
-        );
+        let mut manifest = CourierManifest {
+            boot_id: "boot-1".into(),
+            agents: Some(Vec::new()),
+            panes: Some(Vec::new()),
+            ..Default::default()
+        };
+        for slug in ["alpha", "beta"] {
+            manifest.envelopes.push(BoxEnvelope {
+                slug: slug.into(),
+                event: "t-0001-1-1".into(),
+                event_path: format!("/box/{slug}/.state/events/t-0001-1-1.toml"),
+                event_hash: event_hash.clone(),
+                artifact_path: format!("/box/{slug}/.state/artifacts/{artifact_hash}"),
+                artifact_hash: artifact_hash.clone(),
+            });
+            manifest.receipts.push(CompletionReceipt {
+                slug: slug.into(),
+                event: "t-0001-1-1".into(),
+                event_hash: event_hash.clone(),
+                artifact_hash: artifact_hash.clone(),
+            });
+        }
+        manifest.bootstraps.push(BootstrapReceipt {
+            slug: "alpha".into(),
+            thread: "t-0001".into(),
+            brief_hash: String::new(),
+            pane: "w2:p1".into(),
+        });
+        let manifest = crate::box_helper::tests::ready(manifest);
         let manifest_for_ssh = manifest.clone();
         runner.on_fn(
             |cmd| cmd.program == "ssh",
@@ -3526,11 +3475,24 @@ pi_bin = "/home/agent/.local/bin/herdr-pi"
                 r#"[{"id":"1","label":"box","target":"me@box","session":"default","enabled":true}]"#,
             ),
         );
-        let manifest = format!(
-            "boot\tboot-1\nagents\t-\npanes\t-\n\
-             event\talpha\tt-0001-1-1\t/box/alpha/.state/events/t-0001-1-1.toml\t{event_hash}\t/box/alpha/.state/artifacts/{artifact_hash}\t{artifact_hash}\n\
-             receipt\talpha\tt-0001-1-1\tdeadbeef\t{artifact_hash}\n"
-        );
+        let manifest = crate::box_helper::tests::ready(CourierManifest {
+            boot_id: "boot-1".into(),
+            envelopes: vec![BoxEnvelope {
+                slug: "alpha".into(),
+                event: "t-0001-1-1".into(),
+                event_path: "/box/alpha/.state/events/t-0001-1-1.toml".into(),
+                event_hash,
+                artifact_path: format!("/box/alpha/.state/artifacts/{artifact_hash}"),
+                artifact_hash: artifact_hash.clone(),
+            }],
+            receipts: vec![CompletionReceipt {
+                slug: "alpha".into(),
+                event: "t-0001-1-1".into(),
+                event_hash: "deadbeef".into(),
+                artifact_hash: artifact_hash.clone(),
+            }],
+            ..Default::default()
+        });
         let manifest_for_ssh = manifest.clone();
         runner.on_fn(
             |cmd| cmd.program == "ssh",

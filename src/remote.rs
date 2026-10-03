@@ -435,6 +435,55 @@ fn ssh_command(
     checked_transport(runner.run(&cmd))
 }
 
+/// Typed box replies may carry an 8 MiB batch. Retain diagnostics as usual,
+/// but decode a complete bounded log, never a truncated JSON prefix.
+pub(crate) struct BoxRunner<'a>(pub(crate) &'a dyn Runner);
+impl Runner for BoxRunner<'_> {
+    fn run(&self, cmd: &Cmd) -> Result<Output> {
+        if !self.0.is_real() {
+            return self.0.run(cmd);
+        }
+        use std::io::Read;
+        use std::os::unix::fs::DirBuilderExt;
+        const CAP: u64 = 40 * 1024 * 1024;
+        let dir = std::env::temp_dir().join(format!(
+            "ade-box-{}-{}",
+            std::process::id(),
+            jiff::Timestamp::now().as_nanosecond()
+        ));
+        std::fs::DirBuilder::new().mode(0o700).create(&dir)?;
+        struct Cleanup(std::path::PathBuf);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let _cleanup = Cleanup(dir.clone());
+        let logs = crate::runner::OutputLogs {
+            stdout: dir.join("out"),
+            stderr: dir.join("err"),
+        };
+        let capture = self.0.capture(cmd, Some(&logs))?;
+        let complete = capture.complete();
+        if !complete && !capture.output.timed_out {
+            bail!("incomplete typed box output");
+        }
+        let mut out = capture.output;
+        if capture.stdout.omitted() > 0 && complete {
+            let mut bytes = Vec::new();
+            std::fs::File::open(logs.stdout)?
+                .take(CAP + 1)
+                .read_to_end(&mut bytes)?;
+            anyhow::ensure!(
+                bytes.len() as u64 <= CAP && bytes.len() as u64 == capture.stdout.seen,
+                "typed box output exceeds cap or is incomplete"
+            );
+            out.stdout = String::from_utf8(bytes)?;
+        }
+        Ok(out)
+    }
+}
+
 /// Connection failures are infrastructure evidence, never provider evidence.
 pub(crate) fn is_unreachable(detail: &str) -> bool {
     let detail = detail.to_ascii_lowercase();

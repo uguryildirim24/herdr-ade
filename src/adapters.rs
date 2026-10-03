@@ -493,6 +493,8 @@ pub(crate) fn dependency_ready(
         let detail = format!("{error:#}");
         [
             "disk_low:",
+            "version_skew:",
+            "protocol_unavailable:",
             "box_repo_",
             "machine_held:",
             "adapter_",
