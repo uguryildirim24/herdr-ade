@@ -467,6 +467,16 @@ impl Project {
         Ok(file)
     }
 
+    /// Serializes coordinator lifecycle operations, separately from short record
+    /// writes. Lock order: coordinator, prompt writer, project record.
+    pub(crate) fn coordinator_lock(&self) -> Result<File> {
+        let file = lock_file(&self.state_dir().join("coordinator.lock"))?;
+        if !self.project_md().is_file() {
+            bail!("project `{}` is gone", self.slug);
+        }
+        Ok(file)
+    }
+
     pub(crate) fn read_project_md(&self) -> Result<(Settings, String)> {
         let text = std::fs::read_to_string(self.project_md())
             .with_context(|| format!("could not read {}", self.project_md().display()))?;
