@@ -294,9 +294,452 @@ pub(crate) fn settings_path(project_dir: &Path, adapter: &Adapter) -> Option<Pat
         .then(|| project_dir.join(&adapter.hook.path))
 }
 
+/// Evidence emitted by an adapter probe. A reset is an observation, never a
+/// polling deadline. Custom adapters can emit this JSON as `ade_dependency`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub(crate) struct DependencyEvidence {
+    pub(crate) kind: String,
+    pub(crate) reset_at: Option<i64>,
+}
+
+impl DependencyEvidence {
+    fn from_detail(detail: &str) -> Self {
+        if let Some(evidence) = detail.lines().find_map(|line| {
+            let start = line.find("{\"ade_dependency\":")?;
+            serde_json::from_str::<serde_json::Value>(&line[start..])
+                .ok()
+                .and_then(|value| value.get("ade_dependency").cloned())
+                .and_then(|value| serde_json::from_value::<Self>(value).ok())
+        }) && ["auth", "quota", "connectivity", "unknown"].contains(&evidence.kind.as_str())
+        {
+            return Self {
+                reset_at: evidence.reset_at.filter(|at| {
+                    evidence.kind == "quota" && jiff::Timestamp::from_second(*at).is_ok()
+                }),
+                kind: evidence.kind,
+            };
+        }
+        let lower = detail.to_ascii_lowercase();
+        let kind = if crate::pi::doctor::positive_sign_in_evidence(detail) {
+            "auth"
+        } else if lower.contains("you've hit your limit")
+            || lower.contains("you have hit your limit")
+            || lower.contains("usage limit reached")
+            || lower.contains("quota exceeded")
+            || lower.contains("rate limit exceeded")
+        {
+            "quota"
+        } else if crate::remote::is_unreachable(detail)
+            || lower.contains("connection error")
+            || lower.contains("service unavailable")
+        {
+            "connectivity"
+        } else {
+            "unknown"
+        };
+        let reset_at = (kind == "quota")
+            .then(|| {
+                let reset = lower.find("reset")?;
+                detail[reset..].split_whitespace().find_map(|token| {
+                    token
+                        .trim_matches(|c: char| matches!(c, ')' | ',' | '.'))
+                        .parse::<jiff::Timestamp>()
+                        .ok()
+                        .map(|at| at.as_second())
+                })
+            })
+            .flatten();
+        Self {
+            kind: kind.into(),
+            reset_at,
+        }
+    }
+}
+
+/// Only a terminal error, not quoted tool output or old scrollback, can park a
+/// live conversational process. Unknown prose is not provider evidence.
+pub(crate) fn terminal_dependency(screen: &str) -> Option<(String, DependencyEvidence)> {
+    let lines: Vec<_> = screen
+        .lines()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .collect();
+    let last = *lines.last()?;
+    let line = if last.starts_with(['❯', '›', '>']) && lines.len() > 1 {
+        lines[lines.len() - 2]
+    } else {
+        last
+    };
+    let lower = line.to_ascii_lowercase();
+    if !(lower.starts_with("you've hit your limit")
+        || lower.starts_with("you have hit your limit")
+        || lower.starts_with("usage limit reached")
+        || lower.starts_with("quota exceeded")
+        || lower.starts_with("rate limit exceeded")
+        || lower.starts_with("authentication failed")
+        || lower.starts_with("api error:")
+        || lower.starts_with("api error (")
+        || lower.starts_with("{\"ade_dependency\":"))
+    {
+        return None;
+    }
+    Some((line.into(), DependencyEvidence::from_detail(line)))
+}
+
+#[derive(Default, Serialize, Deserialize)]
+#[serde(default)]
+struct DependencyWait {
+    evidence: DependencyEvidence,
+    detail: String,
+    checked_at: i64,
+    ready: bool,
+    auth_notified: bool,
+}
+
+/// Models and recipes using the same provider on the same machine share a
+/// wait. Native CLIs that hide the provider share their runtime dependency.
+pub(crate) fn dependency_key(machine: &str, launch: &crate::contracts::Launch) -> (String, String) {
+    let provider = crate::pi::launch::flag_value(&launch.args, "--provider")
+        .unwrap_or_else(|| launch.kind.clone());
+    (machine.into(), format!("{}:{provider}", launch.kind))
+}
+
+fn dependency_path(root: &Path, machine: &str, launch: &crate::contracts::Launch) -> PathBuf {
+    let key = dependency_key(machine, launch);
+    let hash = crate::thread::sha256_hex(format!("{}\0{}", key.0, key.1).as_bytes());
+    root.join(".readiness")
+        .join(format!("dependency-{hash}.json"))
+}
+
+fn dependency_lock(path: &Path) -> Result<std::fs::File> {
+    std::fs::create_dir_all(path.parent().expect("dependency directory"))?;
+    crate::project::lock_file(&path.with_extension("lock"))
+}
+
+fn load_dependency(path: &Path) -> Result<DependencyWait> {
+    match std::fs::read(path) {
+        Ok(bytes) => serde_json::from_slice(&bytes)
+            .with_context(|| format!("invalid dependency wait {}", path.display())),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(DependencyWait::default()),
+        Err(error) => Err(error.into()),
+    }
+}
+
+pub(crate) fn dependency_waiting(
+    root: &Path,
+    machine: &str,
+    launch: &crate::contracts::Launch,
+) -> bool {
+    load_dependency(&dependency_path(root, machine, launch))
+        .map(|wait| !wait.ready && !wait.detail.is_empty())
+        .unwrap_or(true)
+}
+
+pub(crate) fn dependency_failure_class(
+    root: &Path,
+    machine: &str,
+    launch: &crate::contracts::Launch,
+) -> crate::contracts::FailureClass {
+    match load_dependency(&dependency_path(root, machine, launch))
+        .ok()
+        .map(|wait| wait.evidence.kind)
+        .as_deref()
+    {
+        Some("auth" | "quota") => crate::contracts::FailureClass::Provider,
+        Some("connectivity") => crate::contracts::FailureClass::LostConnection,
+        _ => crate::contracts::FailureClass::Unknown,
+    }
+}
+
+pub(crate) fn reset_pending(root: &Path, machine: &str, launch: &crate::contracts::Launch) -> bool {
+    crate::project::read_json::<DependencyWait>(&dependency_path(root, machine, launch))
+        .and_then(|wait| wait.evidence.reset_at)
+        .is_some_and(|at| at > jiff::Timestamp::now().as_second())
+}
+
+/// Serialize recovery probes across lanes, projects and ticker incarnations.
+/// The minute is a recheck interval, NOT a claimed provider reset. Success is
+/// shared too; no lane needs to rediscover the outage or acquire a new budget.
+pub(crate) fn dependency_ready(
+    root: &Path,
+    machine: &str,
+    launch: &crate::contracts::Launch,
+    probe: impl FnOnce() -> Result<()>,
+) -> Result<()> {
+    let path = dependency_path(root, machine, launch);
+    let _lock = dependency_lock(&path)?;
+    let now = jiff::Timestamp::now().as_second();
+    let mut wait = load_dependency(&path)?;
+    if wait.checked_at != 0
+        && (now.saturating_sub(wait.checked_at) < 60
+            || wait.evidence.reset_at.is_some_and(|at| at > now))
+    {
+        if wait.ready {
+            return Ok(());
+        }
+        bail!("{}", wait.detail);
+    }
+    let result = probe();
+    if result.as_ref().err().is_some_and(|error| {
+        let detail = format!("{error:#}");
+        [
+            "disk_low:",
+            "box_repo_",
+            "machine_held:",
+            "adapter_",
+            "pi_args_forbidden:",
+        ]
+        .iter()
+        .any(|local| detail.contains(local))
+    }) {
+        return result;
+    }
+    wait.checked_at = jiff::Timestamp::now().as_second();
+    wait.ready = result.is_ok();
+    match &result {
+        Ok(()) => {
+            wait.evidence = DependencyEvidence::default();
+            wait.detail.clear();
+            wait.auth_notified = false;
+        }
+        Err(error) => {
+            wait.detail = format!("{error:#}");
+            let mut evidence = DependencyEvidence::from_detail(&wait.detail);
+            if evidence.kind == wait.evidence.kind && evidence.reset_at.is_none() {
+                evidence.reset_at = wait.evidence.reset_at;
+            }
+            // A later opaque probe cannot erase a recorded reset or auth fact.
+            if evidence.kind != "unknown" || wait.evidence.kind.is_empty() {
+                wait.evidence = evidence;
+            }
+        }
+    }
+    crate::project::write_json(&path, &wait)?;
+    result
+}
+
+pub(crate) fn observe_dependency(
+    root: &Path,
+    machine: &str,
+    launch: &crate::contracts::Launch,
+    detail: &str,
+    evidence: &DependencyEvidence,
+) -> Result<()> {
+    let path = dependency_path(root, machine, launch);
+    let _lock = dependency_lock(&path)?;
+    let mut wait = load_dependency(&path)?;
+    // Repeated screen observations must not push the recheck into the future.
+    if wait.detail.is_empty() || wait.ready {
+        wait.checked_at = jiff::Timestamp::now().as_second();
+        wait.auth_notified = false;
+    }
+    wait.ready = false;
+    wait.detail = detail.into();
+    if evidence.kind != "unknown" || wait.evidence.kind.is_empty() {
+        let reset = wait.evidence.reset_at;
+        let same_kind = wait.evidence.kind == evidence.kind;
+        wait.evidence = evidence.clone();
+        if same_kind && wait.evidence.reset_at.is_none() {
+            wait.evidence.reset_at = reset;
+        }
+    }
+    crate::project::write_json(&path, &wait)
+}
+
+/// A courier receipt proves this machine's link recovered, not its provider.
+/// Release only cached machine-unreachable evidence, retaining quota/auth facts.
+pub(crate) fn machine_reconnected(
+    root: &Path,
+    machine: &str,
+    launch: &crate::contracts::Launch,
+) -> Result<()> {
+    let path = dependency_path(root, machine, launch);
+    if !path.exists() {
+        return Ok(());
+    }
+    let _lock = dependency_lock(&path)?;
+    let mut wait = load_dependency(&path)?;
+    if wait.evidence.kind == "connectivity" && crate::remote::is_unreachable(&wait.detail) {
+        wait.checked_at = 0;
+        crate::project::write_json(&path, &wait)?;
+    }
+    Ok(())
+}
+
+pub(crate) fn notify_auth(
+    root: &Path,
+    project: &crate::project::Project,
+    machine: &str,
+    launch: &crate::contracts::Launch,
+) -> Result<()> {
+    let path = dependency_path(root, machine, launch);
+    let _lock = dependency_lock(&path)?;
+    let mut wait = load_dependency(&path)?;
+    if wait.evidence.kind == "auth" && !wait.auth_notified {
+        crate::inbox::write(
+            project,
+            "dependency-auth",
+            &dependency_key(machine, launch).1,
+            &format!(
+                "Sign in to {} on machine `{machine}`; authentication requires Rolf. {}",
+                launch.kind, wait.detail
+            ),
+            "",
+        )?;
+        wait.auth_notified = true;
+        crate::project::write_json(&path, &wait)?;
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+pub(crate) fn expire_dependency_probe(
+    root: &Path,
+    machine: &str,
+    launch: &crate::contracts::Launch,
+) {
+    let path = dependency_path(root, machine, launch);
+    let mut wait = load_dependency(&path).unwrap();
+    wait.checked_at = jiff::Timestamp::now().as_second() - 61;
+    crate::project::write_json(&path, &wait).unwrap();
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn dependency_probes_are_shared_across_recipes_passes_and_concurrent_recovery() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let root = tempfile::tempdir().unwrap();
+        let launch = crate::contracts::Launch {
+            kind: "pi".into(),
+            args: vec!["--provider".into(), "same".into()],
+            recipe_id: "first-model".into(),
+            work_retries: 2,
+            same_recipe_retries: 3,
+            ..Default::default()
+        };
+        let probes = AtomicUsize::new(0);
+        for recipe in ["first-model", "second-model"] {
+            let mut other = launch.clone();
+            other.recipe_id = recipe.into();
+            assert!(
+                dependency_ready(root.path(), "oci", &other, || {
+                    probes.fetch_add(1, Ordering::SeqCst);
+                    bail!("opaque provider response")
+                })
+                .is_err()
+            );
+        }
+        assert_eq!(probes.load(Ordering::SeqCst), 1);
+        let wait = load_dependency(&dependency_path(root.path(), "oci", &launch)).unwrap();
+        assert_eq!(wait.evidence.kind, "unknown");
+        assert_eq!(wait.evidence.reset_at, None);
+        expire_dependency_probe(root.path(), "oci", &launch);
+        std::thread::scope(|scope| {
+            for _ in 0..8 {
+                scope.spawn(|| {
+                    dependency_ready(root.path(), "oci", &launch, || {
+                        probes.fetch_add(1, Ordering::SeqCst);
+                        Ok(())
+                    })
+                    .unwrap()
+                });
+            }
+        });
+        assert_eq!(probes.load(Ordering::SeqCst), 2);
+        assert_eq!((launch.work_retries, launch.same_recipe_retries), (2, 3));
+    }
+
+    #[test]
+    fn quota_reset_is_evidence_not_a_guessed_polling_deadline() {
+        let root = tempfile::tempdir().unwrap();
+        let launch = crate::contracts::Launch {
+            kind: "custom".into(),
+            ..Default::default()
+        };
+        let detail = r#"probe failed: {"ade_dependency":{"kind":"quota","reset_at":4070908800}}"#;
+        assert!(dependency_ready(root.path(), "oci", &launch, || bail!("{detail}")).is_err());
+        expire_dependency_probe(root.path(), "oci", &launch);
+        assert!(reset_pending(root.path(), "oci", &launch));
+        assert!(
+            dependency_ready(root.path(), "oci", &launch, || panic!(
+                "future reset must park"
+            ))
+            .is_err()
+        );
+        observe_dependency(
+            root.path(),
+            "oci",
+            &launch,
+            "Usage limit reached",
+            &DependencyEvidence {
+                kind: "quota".into(),
+                reset_at: None,
+            },
+        )
+        .unwrap();
+        assert!(reset_pending(root.path(), "oci", &launch));
+        let mut wait = load_dependency(&dependency_path(root.path(), "oci", &launch)).unwrap();
+        wait.evidence.reset_at = Some(0);
+        crate::project::write_json(&dependency_path(root.path(), "oci", &launch), &wait).unwrap();
+        dependency_ready(root.path(), "oci", &launch, || Ok(())).unwrap();
+        assert_eq!(
+            terminal_dependency("Usage limit reached\n❯")
+                .unwrap()
+                .1
+                .reset_at,
+            None
+        );
+        assert_eq!(
+            terminal_dependency("Usage limit reached for account 2099-01-01T00:00:00Z")
+                .unwrap()
+                .1
+                .reset_at,
+            None
+        );
+    }
+
+    #[test]
+    fn auth_is_shown_once_for_the_exact_machine_without_inventing_a_reset() {
+        let world = crate::scenarios::World::new();
+        let first = world.project("first", "a.sock");
+        let second = world.project("second", "b.sock");
+        let launch = crate::contracts::Launch {
+            kind: "pi".into(),
+            ..Default::default()
+        };
+        assert!(
+            dependency_ready(&world.root, "oci", &launch, || bail!(
+                "authentication failed"
+            ))
+            .is_err()
+        );
+        for project in [&first, &first, &second] {
+            notify_auth(&world.root, project, "oci", &launch).unwrap();
+        }
+        let notices: Vec<_> = crate::inbox::unhandled(&first)
+            .into_iter()
+            .chain(crate::inbox::unhandled(&second))
+            .filter(|notice| notice.kind == "dependency-auth")
+            .collect();
+        assert_eq!(notices.len(), 1);
+        assert!(notices[0].summary.contains("machine `oci`"));
+        assert!(
+            load_dependency(&dependency_path(&world.root, "oci", &launch))
+                .unwrap()
+                .evidence
+                .reset_at
+                .is_none()
+        );
+        // A connection receipt is not proof of provider authentication.
+        machine_reconnected(&world.root, "oci", &launch).unwrap();
+        assert!(
+            dependency_ready(&world.root, "oci", &launch, || panic!("auth remains held")).is_err()
+        );
+    }
 
     #[test]
     fn every_shipped_claude_recipe_disallows_agent() {

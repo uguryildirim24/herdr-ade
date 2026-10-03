@@ -163,6 +163,68 @@ fn idle_reviewer_warns_once_and_a_new_verdict_lands() {
 }
 
 #[test]
+fn offline_box_does_not_hold_local_task_or_local_pile_in_the_same_project() {
+    let fx = configured();
+    lane(&fx, 1);
+    let review = prepared(&fx);
+    let candidate = git(&fx.repo, &["rev-parse", &review.candidate_branch]);
+    seal_verdict(
+        &fx,
+        &review,
+        &candidate,
+        "MERGE",
+        BTreeMap::new(),
+        vec![],
+        1,
+    );
+    let remote = thread::allocate(&fx.project, |t| {
+        t.status = Status::Open;
+        t.machine = "box".into();
+        t.repo = "/unrelated-box-repo".into();
+    })
+    .unwrap();
+    let local = thread::allocate(&fx.project, |t| {
+        t.status = Status::Open;
+        t.launch.kind = "claude".into();
+        t.provider_wait_started = project::now();
+    })
+    .unwrap();
+    fx.world.runner.on(
+        "machine list --json",
+        crate::runner::fake::ok(
+            r#"[{"id":"box","label":"box","target":"box","session":"default","enabled":true}]"#,
+        ),
+    );
+    fx.world.runner.on_fn(
+        |cmd| cmd.program == "ssh",
+        |_| {
+            Ok(crate::runner::fake::fail(
+                255,
+                "ssh: connect to host box: Operation timed out",
+            ))
+        },
+    );
+    let before =
+        std::fs::read(thread::threads_dir(&fx.project).join(format!("{}.toml", remote.id)))
+            .unwrap();
+    let ctx = fx.world.ctx();
+    crate::ticker::tick_for_test(&ctx, &mut crate::steps::Memory::new(&ctx));
+    assert!(
+        thread::load(&fx.project, &local.id)
+            .unwrap()
+            .provider_wait_started
+            .is_empty()
+    );
+    assert_eq!(
+        std::fs::read(thread::threads_dir(&fx.project).join(format!("{}.toml", remote.id)))
+            .unwrap(),
+        before
+    );
+    assert!(load(&fx.project, &review.id).unwrap().fast_forward);
+    assert_eq!(git(&fx.repo, &["rev-parse", "main"]), candidate);
+}
+
+#[test]
 fn sleep_does_not_age_the_stuck_review_notice() {
     let fx = configured();
     lane(&fx, 1);

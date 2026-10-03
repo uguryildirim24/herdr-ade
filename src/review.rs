@@ -1899,14 +1899,26 @@ fn working_hold(lane: &Thread, events: &[crate::contracts::Event]) -> Option<&'s
     }
 }
 
-pub(crate) fn tick(ctx: &Ctx, project: &Project) -> Result<()> {
+#[cfg(test)]
+fn tick(ctx: &Ctx, project: &Project) -> Result<()> {
+    tick_observed(ctx, project, |_| true)
+}
+
+pub(crate) fn tick_observed(
+    ctx: &Ctx,
+    project: &Project,
+    can_advance: impl Fn(&Review) -> bool,
+) -> Result<()> {
     let enabled = project.state_dir().join("reviews-enabled").exists();
     let mut first = None;
     if enabled && let Err(error) = classify_old_seals(ctx, project, false) {
         // An unrelated historical seal must not prevent a fresh pile starting.
         first = Some(error);
     }
-    for old in list(project)?.into_iter().filter(|r| !r.phase.closed()) {
+    for old in list(project)?
+        .into_iter()
+        .filter(|r| !r.phase.closed() && can_advance(r))
+    {
         let Some(_lock) = try_operation_lock(ctx, &old.repo)? else {
             continue;
         };
