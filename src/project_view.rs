@@ -173,7 +173,11 @@ fn action_row(
             row.note = format!(
                 "waiting seal retained: {}; {}; when input is ready, {}",
                 one_line(&wait.text),
-                if absent { "process absent" } else { &row.note },
+                if absent {
+                    "agent gone, waiting seal kept (process absent)"
+                } else {
+                    &row.note
+                },
                 if absent {
                     format!(
                         "retry with a continuation reason: ha thread retry {} {} --reason \"input is ready; continue preserved work\"",

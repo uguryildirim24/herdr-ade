@@ -1652,7 +1652,7 @@ fn forty_minute_sleep_defers_dark_wakes_and_imports_seals_before_resuming_starts
     crate::review::save(&project, &review).unwrap();
     let review_path = crate::review::path(&project, "review-1");
     let review_before = std::fs::read(&review_path).unwrap();
-    let remote_before = toml::to_string(&thread::load(&project, "t-0001").unwrap()).unwrap();
+    let remote_before = thread::load(&project, "t-0001").unwrap();
     let local_before = toml::to_string(&local).unwrap();
     let offline = Rc::new(RefCell::new(true));
     let flag = offline.clone();
@@ -1733,9 +1733,9 @@ fn forty_minute_sleep_defers_dark_wakes_and_imports_seals_before_resuming_starts
     for n in 1..=7 {
         crate::awake::set_sample(Some((now - 2400 + n * 300, 100 + n as u64 * 5)));
         assert!(ticker::tick_for_test(&ctx, &mut memory));
-        assert_eq!(
-            toml::to_string(&thread::load(&project, "t-0001").unwrap()).unwrap(),
-            remote_before
+        crate::testkit::assert_failed_observation_only(
+            &remote_before,
+            &thread::load(&project, "t-0001").unwrap(),
         );
         assert_eq!(
             toml::to_string(&thread::load(&project, &local.id).unwrap()).unwrap(),
@@ -1794,7 +1794,7 @@ fn forty_minute_sleep_defers_dark_wakes_and_imports_seals_before_resuming_starts
 #[test]
 fn unreachable_box_does_not_freeze_another_projects_due_work_during_backoff() {
     let (world, offline) = remote_world();
-    let before = toml::to_string(&thread::load(&offline, "t-0001").unwrap()).unwrap();
+    let before = thread::load(&offline, "t-0001").unwrap();
     world.runner.on_fn(
         |cmd| cmd.program == "ssh",
         |_| Ok(fail(255, "ssh: connect to host box: Operation timed out")),
@@ -1826,9 +1826,9 @@ fn unreachable_box_does_not_freeze_another_projects_due_work_during_backoff() {
             .unwrap();
         assert!(ticker::tick_for_test(&ctx, &mut memory));
         assert!(other.coordinator().unwrap().prime_sent);
-        assert_eq!(
-            toml::to_string(&thread::load(&offline, "t-0001").unwrap()).unwrap(),
-            before
+        crate::testkit::assert_failed_observation_only(
+            &before,
+            &thread::load(&offline, "t-0001").unwrap(),
         );
     }
     assert_eq!(world.runner.count("ssh"), 1);

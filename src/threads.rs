@@ -5204,12 +5204,26 @@ fn row(t: &Thread, view: Option<&SessionView>, now: jiff::Timestamp) -> Row {
         report_hash: thread::local_report_hash(t).unwrap_or_else(|| t.report_hash.clone()),
         ..t.clone()
     };
-    let group = thread::group(&fresh, &live, now);
+    // Liveness is independent of restart eligibility: a waiting seal keeps
+    // its attempt even when the bound agent has left an identity-matched shell.
+    let agent_gone = live.pane_exists
+        && live.agent_state.is_none()
+        && !view.agents.iter().any(|agent| agent.pane_id == t.pane_id)
+        && thread::can_check_process_gone(t, now)
+        && view
+            .herdr
+            .pane_process_info(&t.pane_id)
+            .is_ok_and(|info| info.agent_gone(&t.pane_id));
+    let group = if agent_gone {
+        Group::WaitingOnYou
+    } else {
+        thread::group(&fresh, &live, now)
+    };
     let note = if t.status == Status::Failed {
         format!("{}: {}", t.failure_class.plain(), t.error)
     } else if !t.startup_wait_started.is_empty() {
         "starting (checking agent readiness)".to_string()
-    } else if !live.pane_exists {
+    } else if agent_gone || !live.pane_exists {
         "process gone: pane or agent is absent".to_string()
     } else {
         live.agent_state
@@ -8180,6 +8194,137 @@ mod tests {
             assert_eq!(started.machine, "buildbox");
             assert_eq!(started.machine_id, "buildbox-id");
         }
+    }
+
+    #[test]
+    fn killed_waiting_agent_has_retry_advice_without_restarting_or_losing_seal() {
+        use crate::runner::fake::{fail, ok};
+        let fx = crate::testkit::fixture();
+        let lane = fx
+            .world
+            .thread(&fx.project, &fx.world.home.path().join("lane"), |t| {
+                t.attempt = 1;
+                t.launch_attempts = 1;
+                t.bootstrap = "acknowledged".into();
+                t.identity.workspace_id = t.workspace_id.clone();
+                t.identity.tab_id = t.tab_id.clone();
+                t.identity.pane_id = t.pane_id.clone();
+                t.identity.process = Some(crate::contracts::ProcessIdentity {
+                    pid: 42,
+                    argv0: "claude".into(),
+                });
+            });
+        thread::update(&fx.project, &lane.id, |t| {
+            t.bootstrap = "acknowledged".into()
+        })
+        .unwrap();
+        let seal = fx.seal_waiting(&lane.id, 1, 1, "Input needed");
+        let seal_path = fx
+            .project
+            .state_dir()
+            .join("events")
+            .join(format!("{seal}.toml"));
+        let seal_bytes = std::fs::read(&seal_path).unwrap();
+        *fx.world.panes.borrow_mut() = format!(
+            "[{}]",
+            crate::scenarios::pane_json(&lane.workspace_id, &lane.tab_id, &lane.pane_id, &lane.cwd,)
+        );
+        let ctx = fx.world.ctx();
+        let probe = std::rc::Rc::new(std::cell::RefCell::new(ok("")));
+        let answer = probe.clone();
+        fx.world.runner.on_fn(
+            |cmd| cmd.display().contains("pane process-info"),
+            move |_| Ok(answer.borrow().clone()),
+        );
+        for (output, bound, gone) in [
+            (
+                ok(
+                    r#"{"result":{"process_info":{"pane_id":"w2:p1","foreground_processes":[{"pid":7,"name":"bash"}]}}}"#,
+                ),
+                true,
+                true,
+            ),
+            (
+                ok(r#"{"result":{"process_info":{"pane_id":"w2:p1","foreground_processes":[]}}}"#),
+                true,
+                true,
+            ),
+            (fail(1, "process probe unavailable"), true, false),
+            (
+                ok(
+                    r#"{"result":{"process_info":{"pane_id":"w2:p1","foreground_processes":[{"pid":8,"name":"opaque-tool"}]}}}"#,
+                ),
+                true,
+                false,
+            ),
+            (
+                ok(r#"{"result":{"process_info":{"pane_id":"other","foreground_processes":[]}}}"#),
+                true,
+                false,
+            ),
+            (
+                ok(r#"{"result":{"process_info":{"pane_id":"w2:p1","foreground_processes":[]}}}"#),
+                false,
+                false,
+            ),
+        ] {
+            *probe.borrow_mut() = output;
+            let current = thread::update(&fx.project, &lane.id, |t| {
+                t.identity.pane_id = if bound {
+                    lane.pane_id.clone()
+                } else {
+                    "other".into()
+                };
+            })
+            .unwrap();
+            let rows = rows(&ctx, &fx.project);
+            let view = crate::project_view::View::capture(
+                &fx.project,
+                &project::Settings::default(),
+                Some(rows),
+                None,
+            );
+            let text = view.render(&["Current work"]);
+            assert!(text.contains("waiting seal retained"), "{text}");
+            if gone {
+                assert!(text.contains("agent gone, waiting seal kept"), "{text}");
+                assert!(
+                    text.contains("ha thread retry demo t-0001 --reason"),
+                    "{text}"
+                );
+                assert!(!text.contains("process unknown"), "{text}");
+            } else {
+                assert!(text.contains("process unknown"), "{text}");
+                assert!(!text.contains("ha thread retry"), "{text}");
+            }
+            let session = session_view(&ctx, &fx.project).unwrap();
+            assert!(
+                crate::ticker::observation_pass(
+                    &ctx,
+                    &fx.project,
+                    crate::ticker::ObservationView {
+                        machine_id: "",
+                        threads: &[current],
+                        agents: &session.agents,
+                        panes: &session.panes,
+                        boot_id: "",
+                        now: jiff::Timestamp::now(),
+                    }
+                )
+                .is_empty()
+            );
+            let held = thread::load(&fx.project, &lane.id).unwrap();
+            assert_eq!(held.status, Status::Open);
+            assert_eq!(held.attempt, 1);
+            assert!(!held.recovery_pending);
+            assert_eq!(held.bootstrap, "acknowledged");
+            assert_eq!(std::fs::read(&seal_path).unwrap(), seal_bytes);
+            assert!(attempt_sealed(&fx.project, &held));
+        }
+        assert_eq!(fx.world.runner.count("agent start"), 0);
+        assert_eq!(fx.world.runner.count("tab close"), 0);
+        assert_eq!(fx.world.runner.count("workspace close"), 0);
+        assert_eq!(crate::plan::counts(&fx.project).unwrap(), (0, 0));
     }
 
     #[test]
