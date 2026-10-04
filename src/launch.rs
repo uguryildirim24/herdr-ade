@@ -449,13 +449,17 @@ fn resolve(ctx: &Ctx, project: &Project, input: &ResolveInput) -> Result<Launch>
                 .collect();
             // Pin new lane launches only. Recovery preserves the stored env;
             // installing this build does not retrofit a running process.
-            if input.workflow != "coordinator"
-                && config.adapters[&recipe.kind].execution == EXECUTION_BACKEND
-            {
-                env.push(format!("HERDR_ADE_EXECUTION={EXECUTION_BACKEND}"));
+            if input.workflow != "coordinator" {
+                let backend =
+                    crate::adapters::recipe_execution(&config.adapters[&recipe.kind], recipe);
+                if backend == EXECUTION_BACKEND || recipe.execution == "advisory" {
+                    env.push(format!("HERDR_ADE_EXECUTION={backend}"));
+                }
             }
             env
         },
+        execution: recipe.execution.clone(),
+        network: recipe.network.clone(),
         ready_timeout_ms: if recipe.ready_timeout_ms == 0 {
             config.adapters[&recipe.kind].ready_timeout_ms
         } else {
@@ -487,11 +491,95 @@ pub(crate) fn execution_requested(launch: &Launch) -> bool {
         .any(|value| value == &format!("HERDR_ADE_EXECUTION={EXECUTION_BACKEND}"))
 }
 
-pub(crate) fn execution_description(backend: &str, os: &str) -> String {
-    if backend == EXECUTION_BACKEND && os == "linux" {
-        "Linux bubblewrap tool boundary (availability probed separately): worktree/private Git/build writable; tool network denied; provider and authorized seal/publication outside. Trusted Pi and installed extensions are not contained.".into()
+pub(crate) fn execution_network(launch: &Launch) -> &str {
+    if launch.network == "allowed" {
+        "allowed"
     } else {
-        "advisory: no ADE filesystem/network/credential boundary; permission bypass, hooks and worktrees do not protect the host".into()
+        "denied"
+    }
+}
+
+pub(crate) fn execution_description(backend: &str, os: &str, network: &str) -> String {
+    if backend == EXECUTION_BACKEND && os == "linux" {
+        format!(
+            "Linux bubblewrap tool boundary (availability probed separately): worktree/private Git/build/cache writable; tool network {network}; provider and authorized seal/publication outside. Trusted Pi and installed extensions are not contained."
+        )
+    } else {
+        format!(
+            "advisory: no ADE filesystem/network/credential boundary; permission bypass, hooks and worktrees do not protect the host{}",
+            if network == "denied" {
+                "; requested network denial cannot be enforced here"
+            } else {
+                ""
+            }
+        )
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum ExecutionNotice {
+    None,
+    Machine,
+    Lane,
+}
+
+#[derive(Debug)]
+pub(crate) struct ExecutionBinding {
+    pub(crate) args: Vec<String>,
+    pub(crate) advisory: Option<String>,
+    pub(crate) notice: ExecutionNotice,
+}
+
+/// Apply inside the thread update's project lock. Existing durable lane notices
+/// are the outbox: retain one warning per project/machine, even after receipt
+/// or across concurrent first launches, rather than flooding every new lane.
+pub(crate) fn apply_execution(
+    project: &Project,
+    lane: &mut crate::thread::Thread,
+    binding: &ExecutionBinding,
+) {
+    lane.launch.args = binding.args.clone();
+    if let Some(reason) = &binding.advisory {
+        lane.launch
+            .env
+            .retain(|value| !value.starts_with("HERDR_ADE_EXECUTION="));
+        lane.launch.env.push("HERDR_ADE_EXECUTION=advisory".into());
+        let annotation = format!("; execution advisory: {reason}");
+        if !lane.placement_reason.ends_with(&annotation) {
+            lane.placement_reason.push_str(&annotation);
+        }
+        if binding.notice == ExecutionNotice::None {
+            return;
+        }
+        let key = if lane.machine_route().is_empty() {
+            "local"
+        } else {
+            lane.machine_route()
+        };
+        let prefix = if binding.notice == ExecutionNotice::Lane {
+            format!("EXECUTION {}/{} advisory:", lane.id, lane.attempt.max(1))
+        } else {
+            format!("EXECUTION {key} advisory:")
+        };
+        let heard = crate::thread::list(project).iter().any(|other| {
+            other
+                .start_notices
+                .iter()
+                .any(|notice| notice.line.starts_with(&prefix))
+        });
+        if !heard {
+            lane.start_notices.push(crate::steps::Notice {
+                line: format!(
+                    "{prefix} {}: {reason}",
+                    if lane.machine.is_empty() {
+                        "local"
+                    } else {
+                        &lane.machine
+                    }
+                ),
+                submitted: false,
+            });
+        }
     }
 }
 
@@ -502,37 +590,54 @@ pub(crate) fn bind_execution(
     ctx: &Ctx,
     record: &crate::thread::Thread,
     machine: Option<&crate::remote::MachineDeclaration>,
-) -> Result<Vec<String>> {
-    if !execution_requested(&record.launch) {
-        return Ok(record.launch.args.clone());
-    }
-    let linux = if let Some(machine) = machine {
-        let output = crate::remote::ssh(
-            ctx.runner,
-            &machine.target,
-            &crate::remote::with_path(&machine.path, "uname -s"),
-            None,
-            HELP_TIMEOUT,
-        )?;
+) -> Result<ExecutionBinding> {
+    if record.launch.execution == "advisory" {
         anyhow::ensure!(
-            output.success(),
-            "execution_boundary_unavailable: execution OS is unknown: {}",
-            output.error_text()
+            !record
+                .launch
+                .args
+                .iter()
+                .any(|arg| arg == "--no-extensions")
+                || !execution_requested(&record.launch),
+            "execution_boundary_unavailable: a stored bounded launch cannot downgrade to advisory"
         );
-        output.stdout.trim() == "Linux"
-    } else {
-        cfg!(target_os = "linux")
-    };
-    if !linux {
+        return Ok(ExecutionBinding {
+            args: record.launch.args.clone(),
+            advisory: Some(format!(
+                "recipe {} explicitly requests host execution; no filesystem/network/credential boundary",
+                record.launch.recipe_id
+            )),
+            notice: ExecutionNotice::Lane,
+        });
+    }
+    if !execution_requested(&record.launch) {
+        return Ok(ExecutionBinding {
+            args: record.launch.args.clone(),
+            advisory: None,
+            notice: ExecutionNotice::None,
+        });
+    }
+    let observation =
+        crate::doctor::lane_execution(ctx, machine, execution_network(&record.launch))?;
+    if observation.level != crate::pi::doctor::Level::Ok {
         anyhow::ensure!(
             !record
                 .launch
                 .args
                 .iter()
                 .any(|arg| arg == "--no-extensions"),
-            "execution_boundary_unavailable: a stored bounded launch cannot downgrade to an advisory host"
+            "execution_boundary_unavailable: a stored bounded launch cannot downgrade to an advisory host: {}",
+            observation.detail
         );
-        return Ok(record.launch.args.clone());
+        return Ok(ExecutionBinding {
+            args: record.launch.args.clone(),
+            advisory: Some(observation.detail),
+            notice: if observation.level == crate::pi::doctor::Level::Fail {
+                ExecutionNotice::Machine
+            } else {
+                ExecutionNotice::None
+            },
+        });
     }
     let root = machine.map_or_else(
         || std::path::absolute(&ctx.root).map(|root| root.display().to_string()),
@@ -557,7 +662,7 @@ pub(crate) fn bind_execution(
         !Path::new(&state).starts_with(&record.worktree_path),
         "execution_root_exposed: runtime state must be outside the writable worktree"
     );
-    let policy = json!({"root": root, "ade": ade, "cwd": record.worktree_path, "branch": record.branch, "role": record.role, "state": state});
+    let policy = json!({"root": root, "ade": ade, "cwd": record.worktree_path, "branch": record.branch, "role": record.role, "state": state, "network": execution_network(&record.launch)});
     let source = include_str!("../assets/pi-execution-boundary.mjs")
         .replace("__ADE_EXECUTION_POLICY__", &serde_json::to_string(&policy)?);
     let hash = crate::thread::sha256_hex(source.as_bytes());
@@ -597,7 +702,11 @@ pub(crate) fn bind_execution(
             format!("{root}/pi/agent/extensions/{extension}"),
         ]);
     }
-    Ok(args)
+    Ok(ExecutionBinding {
+        args,
+        advisory: None,
+        notice: ExecutionNotice::None,
+    })
 }
 
 /// Append-only dispatch journal. No network call is made while holding its lock.
@@ -706,6 +815,96 @@ mod tests {
     use crate::contracts::FailureClass;
     use crate::scenarios::World;
 
+    fn recipe_launch(extra: &str) -> (World, Project, Launch) {
+        let world = World::new();
+        let project = world.project("demo", "a.sock");
+        std::fs::write(world.ctx().config_dir.join("config.toml"), format!(
+            "[routing]\ndefault = 'pi_test'\nretries = 1\n[recipes.pi_test]\nkind = 'pi'\nprovider = 'p'\nargs = ['--provider', 'p', '--model', 'm', '--thinking', 'high', '--no-skills']\n{extra}\n")).unwrap();
+        let launch = resolve(
+            &world.ctx(),
+            &project,
+            &ResolveInput {
+                task: "Build the requested artifact.",
+                workflow: "lane",
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        (world, project, launch)
+    }
+
+    #[test]
+    fn recipe_network_defaults_allowed_denied_is_frozen_and_legacy_boundaries_stay_denied() {
+        let (_, _, online) = recipe_launch("");
+        assert_eq!(online.network, "allowed");
+        assert_eq!(execution_network(&online), "allowed");
+        let (world, project, denied) = recipe_launch("network = 'denied'");
+        assert!(execution_requested(&denied));
+        assert_eq!(execution_network(&denied), "denied");
+        let path = world.ctx().config_dir.join("config.toml");
+        let changed = std::fs::read_to_string(&path)
+            .unwrap()
+            .replace("network = 'denied'", "network = 'allowed'");
+        std::fs::write(path, changed).unwrap();
+        let resumed = resolve_failure(
+            &world.ctx(),
+            &project,
+            &ResolveInput {
+                previous: Some(&denied),
+                failure: Some("lost connection"),
+                workflow: "lane",
+                ..Default::default()
+            },
+            FailureClass::LostConnection,
+        )
+        .unwrap();
+        assert_eq!(resumed.network, "denied");
+        let legacy: Launch = serde_json::from_str("{}").unwrap();
+        assert_eq!(execution_network(&legacy), "denied");
+    }
+
+    #[test]
+    fn recipe_advisory_overrides_adapter_and_has_one_start_notice_without_a_probe() {
+        let (world, project, launch) = recipe_launch("execution = 'advisory'");
+        assert!(!execution_requested(&launch));
+        assert!(launch.env.contains(&"HERDR_ADE_EXECUTION=advisory".into()));
+        let record =
+            crate::thread::allocate(&project, |lane| lane.launch = launch.clone()).unwrap();
+        for _ in 0..2 {
+            let binding = bind_execution(&world.ctx(), &record, None).unwrap();
+            assert_eq!(binding.args, launch.args);
+            crate::thread::update(&project, &record.id, |lane| {
+                apply_execution(&project, lane, &binding)
+            })
+            .unwrap();
+        }
+        let saved = crate::thread::load(&project, &record.id).unwrap();
+        assert_eq!(saved.start_notices.len(), 1);
+        assert!(
+            saved.start_notices[0]
+                .line
+                .contains("explicitly requests host execution")
+        );
+        assert_eq!(world.runner.count("/usr/bin/bwrap"), 0);
+        let (_, _, mut bounded) = recipe_launch("");
+        bounded.args.push("--no-extensions".into());
+        // A newly configured opt-out cannot rewrite a stored bounded retry.
+        let resumed = resolve_failure(
+            &world.ctx(),
+            &project,
+            &ResolveInput {
+                previous: Some(&bounded),
+                failure: Some("lost connection"),
+                workflow: "lane",
+                ..Default::default()
+            },
+            FailureClass::LostConnection,
+        )
+        .unwrap();
+        assert!(execution_requested(&resumed));
+        assert_eq!(resumed.execution, "");
+    }
+
     #[test]
     fn boundary_launch_is_pinned_outside_work_and_old_launches_stay_unchanged() {
         let world = World::new();
@@ -724,7 +923,7 @@ mod tests {
         };
         let before = record.launch.clone();
         assert_eq!(
-            bind_execution(&world.ctx(), &record, None).unwrap(),
+            bind_execution(&world.ctx(), &record, None).unwrap().args,
             before.args
         );
         assert_eq!(record.launch, before);
@@ -733,7 +932,10 @@ mod tests {
             .env
             .push(format!("HERDR_ADE_EXECUTION={EXECUTION_BACKEND}"));
         if cfg!(target_os = "linux") {
-            let args = bind_execution(&world.ctx(), &record, None).unwrap();
+            world
+                .runner
+                .on("/usr/bin/bwrap", crate::runner::fake::ok(""));
+            let args = bind_execution(&world.ctx(), &record, None).unwrap().args;
             assert!(args.contains(&"--no-tools".into()));
             assert!(!args.contains(&"--tools".into()));
             assert!(args.contains(&"--no-extensions".into()));
@@ -745,9 +947,12 @@ mod tests {
             assert!(!source.contains("__ADE_EXECUTION_POLICY__"));
             assert!(source.contains("\"role\":\"reviewer\""));
             record.launch.args = args.clone();
-            assert_eq!(bind_execution(&world.ctx(), &record, None).unwrap(), args);
+            assert_eq!(
+                bind_execution(&world.ctx(), &record, None).unwrap().args,
+                args
+            );
             record.attempt += 1;
-            let retry = bind_execution(&world.ctx(), &record, None).unwrap();
+            let retry = bind_execution(&world.ctx(), &record, None).unwrap().args;
             assert_ne!(retry[index + 1], args[index + 1]);
             assert_eq!(
                 retry.iter().filter(|arg| *arg == "--no-extensions").count(),
@@ -755,16 +960,23 @@ mod tests {
             );
             assert_eq!(std::fs::read_to_string(path).unwrap(), source);
         }
-        assert!(execution_description(EXECUTION_BACKEND, "macos").starts_with("advisory:"));
-        assert!(execution_description("", "linux").starts_with("advisory:"));
+        assert!(
+            execution_description(EXECUTION_BACKEND, "macos", "allowed").starts_with("advisory:")
+        );
+        assert!(execution_description("", "linux", "allowed").starts_with("advisory:"));
     }
 
     #[test]
     fn unsupported_remote_is_advisory_but_a_stored_boundary_cannot_downgrade() {
         let world = World::new();
-        world
-            .runner
-            .on("uname -s", crate::runner::fake::ok("Darwin\n"));
+        world.runner.on(
+            "HERDR_ADE_BOX_INPUT",
+            crate::runner::fake::ok(&crate::box_helper::tests::ready(
+                serde_json::json!({"rows": [
+                crate::pi::doctor::Row::warn("recipe lane execution", "advisory: unsupported OS")
+            ], "snapshot": {}}),
+            )),
+        );
         let machine = crate::remote::MachineDeclaration {
             target: "scratch-mac".into(),
             path: "/usr/bin:/bin".into(),
@@ -779,7 +991,9 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(
-            bind_execution(&world.ctx(), &record, Some(&machine)).unwrap(),
+            bind_execution(&world.ctx(), &record, Some(&machine))
+                .unwrap()
+                .args,
             record.launch.args
         );
         record.launch.args.push("--no-extensions".into());
@@ -792,11 +1006,125 @@ mod tests {
         assert_eq!(world.runner.count("python3"), 0);
     }
 
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn failed_probe_keeps_new_lanes_advisory_with_one_durable_machine_notice() {
+        let world = World::new();
+        let project = world.project("demo", "a.sock");
+        world.runner.on(
+            "/usr/bin/bwrap",
+            crate::runner::fake::fail(1, "user namespaces restricted"),
+        );
+        let original = vec!["--provider".into(), "same".into(), "--no-approve".into()];
+        for n in 0..2 {
+            let record = crate::thread::allocate(&project, |lane| {
+                lane.launch = Launch {
+                    args: original.clone(),
+                    env: vec![format!("HERDR_ADE_EXECUTION={EXECUTION_BACKEND}")],
+                    ..Default::default()
+                };
+            })
+            .unwrap();
+            let binding = bind_execution(&world.ctx(), &record, None).unwrap();
+            assert_eq!(binding.args, original);
+            assert!(
+                binding
+                    .advisory
+                    .as_ref()
+                    .unwrap()
+                    .contains("user namespaces restricted")
+            );
+            let saved = crate::thread::update(&project, &record.id, |lane| {
+                apply_execution(&project, lane, &binding)
+            })
+            .unwrap();
+            assert!(
+                saved
+                    .launch
+                    .env
+                    .contains(&"HERDR_ADE_EXECUTION=advisory".into())
+            );
+            assert!(
+                saved
+                    .placement_reason
+                    .contains("user namespaces restricted")
+            );
+            // Receipt must not cause a new warning, nor may a same-attempt bind
+            // silently promote a running advisory launch after OS recovery.
+            if n == 0 {
+                crate::thread::update(&project, &record.id, |lane| {
+                    lane.start_notices[0].submitted = true
+                })
+                .unwrap();
+            }
+            let repeat = bind_execution(&world.ctx(), &saved, None).unwrap();
+            crate::thread::update(&project, &record.id, |lane| {
+                apply_execution(&project, lane, &repeat)
+            })
+            .unwrap();
+        }
+        assert_eq!(
+            crate::thread::list(&project)
+                .iter()
+                .map(|lane| lane.start_notices.len())
+                .sum::<usize>(),
+            1
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn passed_probe_binds_but_a_started_boundary_cannot_downgrade() {
+        let world = World::new();
+        let denied = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let signal = denied.clone();
+        world.runner.on_fn(
+            |cmd| cmd.program == "/usr/bin/bwrap",
+            move |_| {
+                Ok(if signal.load(std::sync::atomic::Ordering::Relaxed) {
+                    crate::runner::fake::fail(1, "namespace denied")
+                } else {
+                    crate::runner::fake::ok("")
+                })
+            },
+        );
+        let mut record = crate::thread::Thread {
+            id: "t-0001".into(),
+            worktree_path: world.home.path().join("work").display().to_string(),
+            launch: Launch {
+                args: vec!["--no-approve".into()],
+                env: vec![format!("HERDR_ADE_EXECUTION={EXECUTION_BACKEND}")],
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let binding = bind_execution(&world.ctx(), &record, None).unwrap();
+        assert!(binding.advisory.is_none());
+        assert_eq!(binding.notice, ExecutionNotice::None);
+        assert!(binding.args.contains(&"--no-extensions".into()));
+        record.launch.args = binding.args;
+        record.launch_attempts = 1;
+        denied.store(true, std::sync::atomic::Ordering::Relaxed);
+        assert!(
+            bind_execution(&world.ctx(), &record, None)
+                .unwrap_err()
+                .to_string()
+                .contains("cannot downgrade")
+        );
+        assert!(record.launch.args.contains(&"--no-extensions".into()));
+        assert!(execution_requested(&record.launch));
+    }
+
     // These run without root when Linux permits unprivileged namespaces. The
     // doctor failure regression covers machines that cannot run this backend;
     // the authorized oci transcript supplies the positive enforcement witness.
     #[cfg(target_os = "linux")]
     fn isolated_trial(code: &str) {
+        isolated_trial_network(code, "denied");
+    }
+
+    #[cfg(target_os = "linux")]
+    fn isolated_trial_network(code: &str, network: &str) {
         use std::process::Command;
         let probe = Command::new("/usr/bin/bwrap")
             .args(["--unshare-all", "--ro-bind", "/", "/", "/usr/bin/true"])
@@ -842,7 +1170,7 @@ mod tests {
         .unwrap();
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(&ade, std::fs::Permissions::from_mode(0o700)).unwrap();
-        let policy = json!({"root": root, "ade": ade, "cwd": work, "branch": "lane/trial", "state": root.join("backend")});
+        let policy = json!({"root": root, "ade": ade, "cwd": work, "branch": "lane/trial", "state": root.join("backend"), "network": network});
         let source = include_str!("../assets/pi-execution-boundary.mjs")
             .replace("__ADE_EXECUTION_POLICY__", &policy.to_string())
             .replace("import { Type } from '@sinclair/typebox';", "");
@@ -865,6 +1193,27 @@ mod tests {
         assert_eq!(
             std::fs::read_to_string(root.join("records")).unwrap(),
             "protected"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn namespace_allows_network_and_writable_private_cache_without_host_access() {
+        isolated_trial_network(
+            r#"
+import net from 'node:net';
+const server = net.createServer(socket => socket.end('loopback-ok'));
+await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
+try {
+  assert.equal(await run('cat < /dev/tcp/127.0.0.1/' + server.address().port), 'loopback-ok');
+  await run('echo cache-ok > "$CARGO_HOME/registry/private-proof"');
+  assert.equal(await run('cat "$CARGO_HOME/registry/private-proof"'), 'cache-ok\n');
+  await assert.rejects(run('cat "' + process.env.ADE_TRIAL_ROOT + '/credential"'));
+  await assert.rejects(run('echo hostile > "' + policy.root + '/records"'));
+  await assert.rejects(run('git push "' + process.env.ADE_TRIAL_ROOT + '/repo" HEAD:refs/heads/unauthorized'));
+} finally { await new Promise(resolve => server.close(resolve)); }
+"#,
+            "allowed",
         );
     }
 

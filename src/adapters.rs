@@ -274,7 +274,21 @@ pub(crate) fn launch_args(adapter: &Adapter, recipe: &Recipe) -> Vec<String> {
     args
 }
 
+pub(crate) fn recipe_execution<'a>(adapter: &'a Adapter, recipe: &'a Recipe) -> &'a str {
+    if recipe.execution.is_empty() {
+        &adapter.execution
+    } else {
+        &recipe.execution
+    }
+}
+
 pub(crate) fn validate_recipe(adapter: &Adapter, id: &str, recipe: &Recipe) -> Result<()> {
+    if !matches!(recipe.execution.as_str(), "" | "advisory") {
+        bail!("recipe_execution_invalid: `{id}` must inherit its adapter or request advisory");
+    }
+    if !matches!(recipe.network.as_str(), "allowed" | "denied") {
+        bail!("recipe_network_invalid: `{id}` must use allowed or denied");
+    }
     for flag in &adapter.required_flags {
         if !recipe.args.contains(flag) && !adapter.launch_flags.contains(flag) {
             bail!("recipe_permission_missing: `{id}` has no permission flag `{flag}`");

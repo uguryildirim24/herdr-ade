@@ -10,6 +10,10 @@ pub(crate) struct Recipe {
     pub(crate) kind: String,
     pub(crate) args: Vec<String>,
     pub(crate) env: Vec<String>,
+    /// Empty inherits the adapter; `advisory` explicitly requests host work.
+    pub(crate) execution: String,
+    /// Ordinary lanes may fetch dependencies/research; untrusted work can deny.
+    pub(crate) network: String,
     pub(crate) ready_timeout_ms: u64,
     pub(crate) provider: String,
     /// Runtime features this recipe can satisfy (for example `pictures`).
@@ -24,6 +28,8 @@ impl Default for Recipe {
             kind: String::new(),
             args: Vec::new(),
             env: Vec::new(),
+            execution: String::new(),
+            network: "allowed".into(),
             ready_timeout_ms: 0,
             provider: String::new(),
             capabilities: Vec::new(),
@@ -98,6 +104,10 @@ pub(crate) struct Launch {
     pub(crate) kind: String,
     pub(crate) args: Vec<String>,
     pub(crate) env: Vec<String>,
+    /// Frozen recipe overrides, not re-read on retry. Empty historical network
+    /// retains deny-all for previously bounded launches.
+    pub(crate) execution: String,
+    pub(crate) network: String,
     pub(crate) ready_timeout_ms: u64,
     pub(crate) policy_hash: String,
     pub(crate) attempt: u32,

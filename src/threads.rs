@@ -1055,16 +1055,14 @@ fn bind_terminal(ctx: &Ctx, project: &Project, view: &SessionView, record: &Thre
         None
     };
     let herdr = view.herdr.on_machine(record.machine_route());
-    let execution_args = crate::launch::bind_execution(ctx, record, machine.as_ref())?;
+    let execution = crate::launch::bind_execution(ctx, record, machine.as_ref())?;
     let mut spec = crate::contracts::RoleSpec {
         kind: record.launch.kind.clone(),
-        args: execution_args.clone(),
+        args: execution.args.clone(),
         env: record.launch.env.clone(),
         ready_timeout_ms: record.launch.ready_timeout_ms,
     };
-    if crate::launch::execution_requested(&record.launch)
-        && !execution_args.iter().any(|arg| arg == "--no-extensions")
-    {
+    if execution.advisory.is_some() {
         spec.env
             .retain(|value| !value.starts_with("HERDR_ADE_EXECUTION="));
         spec.env.push("HERDR_ADE_EXECUTION=advisory".into());
@@ -1128,8 +1126,7 @@ fn bind_terminal(ctx: &Ctx, project: &Project, view: &SessionView, record: &Thre
     // can now close this exact workspace instead of leaking an unrecorded one.
     thread::update(project, &record.id, |t| {
         t.cwd = cwd.clone();
-        t.launch.args = execution_args.clone();
-        t.launch.env = spec.env.clone();
+        crate::launch::apply_execution(project, t, &execution);
         t.workspace_id = created.workspace_id.clone();
         t.tab_id = created.tab_id.clone();
         t.pane_id = created.pane_id.clone();

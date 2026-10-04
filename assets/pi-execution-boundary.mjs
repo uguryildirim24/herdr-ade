@@ -22,7 +22,7 @@ function setup() {
   fs.mkdirSync(policy.state, { recursive: true, mode: 0o700 });
   const relative = path.relative(fs.realpathSync(policy.cwd), fs.realpathSync(policy.state));
   if (!relative.startsWith('..' + path.sep) && relative !== '..' && !path.isAbsolute(relative)) throw new Error('execution_policy_invalid: backend state is exposed inside the worktree');
-  for (const dir of ['build', 'home', 'empty']) fs.mkdirSync(path.join(policy.state, dir), { recursive: true });
+  for (const dir of ['build', 'home', 'empty', 'home/.cargo/registry']) fs.mkdirSync(path.join(policy.state, dir), { recursive: true });
   const git = path.join(policy.state, 'git');
   const objects = fs.realpathSync(hostGit(['rev-parse', '--path-format=absolute', '--git-path', 'objects']));
   if (!fs.existsSync(git)) {
@@ -38,15 +38,24 @@ function setup() {
   fs.writeFileSync(path.join(policy.state, 'alternates'), '/base-objects\n');
   let toolchain;
   try { toolchain = execFileSync('rustc', ['--print', 'sysroot'], { cwd: policy.state, encoding: 'utf8' }).trim(); } catch { /* Rust is optional. */ }
-  initialized = { git, objects, toolchain, directoryGit: fs.lstatSync(path.join(policy.cwd, '.git')).isDirectory() };
+  // Expose executable/package files, never the account's bin/home/config tree.
+  const node = fs.realpathSync(process.execPath);
+  const npm = [path.resolve(path.dirname(node), '../lib/node_modules/npm'), '/usr/share/nodejs/npm'].find((dir) => fs.existsSync(path.join(dir, 'bin/npm-cli.js')));
+  const uv = (process.env.PATH || '').split(path.delimiter).map((dir) => path.join(dir, 'uv')).find((file) => { try { return fs.statSync(file).isFile() && (fs.statSync(file).mode & 0o111); } catch { return false; } });
+  fs.writeFileSync(path.join(policy.state, 'npm-launcher'), '#!/bin/sh\nexec /tool-bin/node /npm/bin/npm-cli.js "$@"\n', { mode: 0o755 });
+  initialized = { git, objects, toolchain, node, npm, uv: uv && fs.realpathSync(uv), directoryGit: fs.lstatSync(path.join(policy.cwd, '.git')).isDirectory() };
 }
 
 export function sandboxArgs() {
   setup();
   const args = ['--unshare-all', '--die-with-parent', '--new-session', '--cap-drop', 'ALL', '--clearenv'];
+  if (policy.network === 'allowed') args.splice(1, 0, '--share-net');
   for (const dir of ['/usr', '/bin', '/lib', '/lib64']) if (fs.existsSync(dir)) args.push('--ro-bind', dir, dir);
-  for (const file of ['/etc/ld.so.cache', '/etc/alternatives']) if (fs.existsSync(file)) args.push('--ro-bind', file, file);
-  args.push('--proc', '/proc', '--dev', '/dev', '--tmpfs', '/tmp', '--tmpfs', '/cargo', '--ro-bind', path.join(policy.state, 'empty'), '/empty',
+  for (const file of ['/etc/ld.so.cache', '/etc/alternatives', '/etc/resolv.conf', '/etc/hosts', '/etc/nsswitch.conf', '/etc/ssl/certs', '/etc/pki/ca-trust/extracted', '/etc/pki/tls/certs']) if (fs.existsSync(file)) args.push('--ro-bind', file, file);
+  args.push('--ro-bind', initialized.node, '/tool-bin/node');
+  if (initialized.npm) args.push('--ro-bind', initialized.npm, '/npm', '--ro-bind', path.join(policy.state, 'npm-launcher'), '/tool-bin/npm');
+  if (initialized.uv) args.push('--ro-bind', initialized.uv, '/tool-bin/uv');
+  args.push('--proc', '/proc', '--dev', '/dev', '--tmpfs', '/tmp', '--ro-bind', path.join(policy.state, 'empty'), '/empty',
     '--bind', policy.cwd, policy.cwd, '--bind', path.join(policy.state, 'build'), '/build',
     '--bind', path.join(policy.state, 'home'), '/home/lane', '--ro-bind', initialized.objects, '/base-objects');
   const viewGit = initialized.directoryGit ? path.join(policy.cwd, '.git') : '/lane-git';
@@ -57,10 +66,10 @@ export function sandboxArgs() {
   if (!initialized.directoryGit) args.push('--ro-bind', path.join(policy.state, 'git-pointer'), path.join(policy.cwd, '.git'));
   if (initialized.toolchain) args.push('--ro-bind', initialized.toolchain, '/toolchain');
   const registry = path.join(process.env.HOME || '', '.cargo/registry');
-  if (fs.existsSync(registry)) args.push('--ro-bind', registry, '/cargo/registry');
-  args.push('--setenv', 'PATH', '/toolchain/bin:/usr/bin:/bin', '--setenv', 'HOME', '/home/lane',
-    '--setenv', 'CARGO_HOME', '/cargo', '--setenv', 'CARGO_TARGET_DIR', '/build', '--setenv', 'GIT_CONFIG_NOSYSTEM', '1',
-    '--setenv', 'GIT_CONFIG_GLOBAL', '/dev/null', '--setenv', 'GIT_EDITOR', 'true', '--chdir', policy.cwd, '--remount-ro', '/');
+  if (fs.existsSync(registry)) args.push('--ro-bind', registry, '/cargo-base/registry');
+  args.push('--setenv', 'PATH', '/home/lane/.cargo/bin:/tool-bin:/toolchain/bin:/usr/bin:/bin', '--setenv', 'HOME', '/home/lane',
+    '--setenv', 'CARGO_HOME', '/home/lane/.cargo', '--setenv', 'CARGO_TARGET_DIR', '/build', '--setenv', 'GIT_CONFIG_NOSYSTEM', '1',
+    '--setenv', 'GIT_CONFIG_GLOBAL', '/dev/null', '--setenv', 'GIT_TERMINAL_PROMPT', '0', '--setenv', 'GIT_EDITOR', 'true', '--chdir', policy.cwd, '--remount-ro', '/');
   return args;
 }
 
@@ -111,12 +120,12 @@ export default function (pi) {
   // Only the successfully loaded backend activates tools; no builtin fallback.
   pi.on('session_start', () => { pi.setActiveTools(['bash', 'ade']); });
   pi.on('tool_call', (event) => !['bash', 'ade'].includes(event.toolName) ? { block: true, reason: 'tool has no isolated backend' } : undefined);
-  pi.registerTool({ name: 'bash', label: 'bash (isolated)', description: 'Run shell/file/build commands in the lane filesystem and network namespace. No host credentials or network. Use ade for skill/sealing, not ha in bash.',
+  pi.registerTool({ name: 'bash', label: 'bash (isolated)', description: `Run shell/file/build commands in the lane filesystem boundary. No host credentials. Tool network ${policy.network === 'allowed' ? 'allowed' : 'denied'}. Use ade for skill/sealing, not ha in bash.`,
     parameters: Type.Object({ command: Type.String(), timeout: Type.Optional(Type.Number()) }),
     async execute(_id, params, signal) { return text(await runSandbox(['/bin/bash', '--noprofile', '--norc', '-c', params.command], signal, params.timeout)); } });
   pi.registerTool({ name: 'ade', label: 'ADE authorized seal', description: 'Bound lane skill or ha done/waiting/failed. done transfers the private lane commit, then runs the existing authorized seal/publish path. No other control or publication operation.',
     parameters: Type.Object({ action: Type.Union(['skill', 'done', 'waiting', 'failed'].map((action) => Type.Literal(action))), reason: Type.Optional(Type.String()) }),
     async execute(_id, params, signal) { return text(await seal(params.action, params.reason, signal)); } });
   pi.on('user_bash', async (event) => ({ result: { output: await runSandbox(['/bin/bash', '--noprofile', '--norc', '-c', event.command]), exitCode: 0, cancelled: false, truncated: false } }));
-  pi.on('before_agent_start', (event) => ({ systemPrompt: event.systemPrompt + '\nADE execution: Linux bubblewrap tool boundary. Only bash and ade are available. Use bash for reading/editing/building and ade(action=skill) for the lane skill; ade(action=done) is ha done. Provider/auth and trusted runtime stay outside; no worktree extensions or MCP load. Network is unavailable in tools. Build/artifact state persists in /build and the worktree.' }));
+  pi.on('before_agent_start', (event) => ({ systemPrompt: event.systemPrompt + '\nADE execution: Linux bubblewrap tool boundary. Only bash and ade are available. Use bash for reading/editing/building and ade(action=skill) for the lane skill; ade(action=done) is ha done. Provider/auth and trusted runtime stay outside; no worktree extensions or MCP load. ' + (policy.network === 'allowed' ? 'Tool network is allowed for dependency acquisition and research. ' : 'Tool network is denied by the frozen recipe. ') + 'Cargo/npm/uv use the writable lane-private home/cache. Build/artifact state persists in /build and the worktree.' }));
 }
