@@ -1,0 +1,3 @@
+#!/bin/sh
+# LOOP-01: goal-only waits vanish immediately. Exits nonzero while present.
+exec "$(dirname "$0")/run-scenario" goal-wait "$@"
