@@ -1450,6 +1450,19 @@ fn install_for(ctx: &Ctx, current: Option<(&str, &str)>) -> Result<InstallOutcom
     if boxes.iter().any(BoxInstall::pending) {
         checks.result.push_str("; boxes pending");
     }
+    checks
+        .result
+        .push_str("; ticker first full pass pending; journey pending");
+    if let Err(error) = crate::journey::after_install(ctx, current) {
+        checks
+            .result
+            .push_str(&format!("; post-install checks FAIL: {error:#}"));
+        if let Err(delivery) = crate::journey::launch_failed(ctx, current, &error) {
+            checks
+                .result
+                .push_str(&format!("; journey notice pending: {delivery:#}"));
+        }
+    }
     checks.record(&ctx.config_dir)?;
     Ok(InstallOutcome {
         repositories: installed,

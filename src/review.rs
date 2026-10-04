@@ -287,6 +287,28 @@ fn reviewer_ids(project: &Project) -> Result<std::collections::BTreeSet<String>>
     }
     Ok(ids)
 }
+/// Observation failures are verification facts, never a rollback or a lost install.
+pub(crate) fn post_install_result(
+    ctx: &Ctx,
+    slug: &str,
+    id: &str,
+    observation: &str,
+) -> Result<()> {
+    let project = Project::load(&ctx.root, slug)?;
+    let record = load(&project, id)?;
+    let _operation = try_operation_lock(ctx, &record.repo)?
+        .context("review operation busy; post-install result remains in journey notice")?;
+    let mut record = load(&project, id)?;
+    if record.install_result.contains(observation) {
+        return Ok(());
+    }
+    record.install_result = record
+        .install_result
+        .replace("; ticker first full pass pending; journey pending", "");
+    record.install_result.push_str(&format!("; {observation}"));
+    save(&project, &record)
+}
+
 fn queue_notice(review: &mut Review, line: String) {
     if !review.notices.iter().any(|n| n.line == line) {
         review.notices.push(crate::steps::Notice {
@@ -964,7 +986,7 @@ fn prepare(ctx: &Ctx, project: &Project, review: &mut Review) -> Result<()> {
                     }),
                     task: task(project, review),
                     workflow: Some("reviewer".into()),
-                    recipe: None,
+                    recipe: crate::journey::reviewer_recipe(project),
                     task_id: String::new(),
                     review_id: review.id.clone(),
                     attach: Vec::new(),
