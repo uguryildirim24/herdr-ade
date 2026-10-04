@@ -94,6 +94,29 @@ mod tests {
     use crate::scenarios::World;
 
     #[test]
+    fn overview_does_not_invent_null_subtasks() {
+        let world = World::new();
+        let project = world.project("demo", "a.sock");
+        std::fs::write(
+            crate::plan::plan_path(&project),
+            "schema = 1\nrevision = 1\n[[steps]]\nid = 's-1'\ntext = 'Standalone'\n[[steps]]\nid = 's-2'\ntext = 'Parent'\n[[steps.subtasks]]\nid = 's-3'\ntext = 'Child'\n",
+        ).unwrap();
+        let json = crate::project_view::View::load(&world.ctx(), &project, None)
+            .unwrap()
+            .rundown();
+        let steps = json["plan"]["steps"].as_array().unwrap();
+        assert!(!steps[0].as_object().unwrap().contains_key("subtasks"));
+        assert!(
+            !steps[1]["subtasks"][0]
+                .as_object()
+                .unwrap()
+                .contains_key("subtasks")
+        );
+        assert!(!json.to_string().contains("\"subtasks\":null"));
+        assert_eq!(crate::plan::counts(&project).unwrap(), (0, 3));
+    }
+
+    #[test]
     fn unreadable_lane_records_survive_the_shared_overview_handoff_and_rundown_view() {
         for damaged in [
             "not valid TOML at all!",
