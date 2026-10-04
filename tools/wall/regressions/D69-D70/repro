@@ -33,7 +33,8 @@ try:
        f'(wt/"scripted-{thread}.txt").write_text("Follow-up before scripted correction\\n"); '
        'subprocess.run(["git","-C",str(wt),"add","."],check=True); '
        'subprocess.run(["git","-C",str(wt),"commit","-m","D69 follow-up"],check=True)')
-    enter(f'ha thread prompt wall {thread} "Finish the rebased correction and seal it"')
+    enter("printf '%s\\n' 'Finish the rebased correction and seal it' > /tmp/d69-prompt.md && "
+          f'ha thread prompt --text-file /tmp/d69-prompt.md wall {thread}')
     seals = until(lambda: [e for e in records(kind='events') if e['thread'] == thread
                   and e['payload'].get('done') and e['payload']['done']['sha'] != old], 'rebased seal')
     new = seals[-1]['payload']['done']['sha']
