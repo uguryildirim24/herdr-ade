@@ -1,0 +1,89 @@
+#!/usr/bin/env python3
+"""D69/D70: rebased Mac member publication and executable box-review recovery."""
+import json
+from pathlib import Path
+import sys
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from support import (control, enter, evidence, phase, py, quiet_py, record, records,
+                     repro_args, reset, snapshot, start, until)
+
+args = repro_args(__doc__)
+print('EXPECTED: archive the old member tip, lease the rebased publication; refuse unknown work with both SHAs; FAILED reviewer advice runs review retry.', flush=True)
+passed = False
+observed = {}
+reset({'hold': []})
+try:
+    # A local producer, then a box reviewer: the actual incident's journey.
+    lane = start()
+    thread = lane['id']
+    assert not lane.get('machine'), 'fixture producer must be local'
+    phase(thread, 'seal-end')
+    until(lambda: record(thread).get('parked'), 'producer parked after first seal')
+    lane = record(thread)
+    old = next(e['payload']['done']['sha'] for e in records(kind='events')
+               if e['thread'] == thread and e['payload'].get('done'))
+    py('import os,subprocess; from pathlib import Path; '
+       f'wt=Path({lane["worktree_path"]!r}); '
+       f'subprocess.run(["git","-C",str(wt),"push",str(Path.home()/"remote.git"),'
+       f'{old!r}+":refs/heads/"+{lane["branch"]!r}],check=True); '
+       'base=subprocess.check_output(["git","-C",str(wt),"rev-parse","main"],text=True).strip(); '
+       'newbase=subprocess.check_output(["git","-C",str(wt),"commit-tree",base+"^{tree}","-p",base,"-m","D69 integration advances"],text=True).strip(); '
+       'subprocess.run(["git","-C",str(wt),"rebase","--onto",newbase,base],check=True); '
+       f'(wt/"scripted-{thread}.txt").write_text("Follow-up before scripted correction\\n"); '
+       'subprocess.run(["git","-C",str(wt),"add","."],check=True); '
+       'subprocess.run(["git","-C",str(wt),"commit","-m","D69 follow-up"],check=True)')
+    enter(f'ha thread prompt wall {thread} "Finish the rebased correction and seal it"')
+    seals = until(lambda: [e for e in records(kind='events') if e['thread'] == thread
+                  and e['payload'].get('done') and e['payload']['done']['sha'] != old], 'rebased seal')
+    new = seals[-1]['payload']['done']['sha']
+    lane = record(thread)
+    until(lambda: record(thread).get('parked'), 'rebased producer parked')
+    # Hold the scripted reviewer before its verdict; no model is started here.
+    control({'hold': ['mid-review']}, box=True)
+    py('import os; from pathlib import Path; '
+       'cfg=Path.home()/".config/herdr-ade/config.toml"; '
+       'cfg.write_text(cfg.read_text()+"\\n[dispatch]\\nmachine = "+'
+       f'{json.dumps("wall-box-"+str(args.instance))!r}'+ '+"\\n")')
+    enter('ha review wall')
+    review = until(lambda: next((r for r in records(kind='reviews') if r.get('reviewer')), None), 'reviewer bound')
+    reviewer = review['reviewer']
+    phase(reviewer, 'mid-review', box=True)
+    observed['rebased_refs'] = quiet_py('import subprocess,json; '
+        f'refs={ [lane["branch"], "seals/"+lane["branch"]+"/"+old]!r}; '
+        'print(json.dumps([subprocess.check_output(["git","--git-dir",str(__import__("pathlib").Path.home()/"remote.git"),"rev-parse","refs/heads/"+r],text=True).strip() for r in refs]))')
+    assert observed['rebased_refs'] == [new, old], observed
+    enter('ha review cancel wall')
+    until(lambda: all(r['phase'] in ('cancelled', 'complete', 'rejected') for r in records(kind='reviews')), 'review cancelled')
+    rogue = quiet_py('import subprocess,json; from pathlib import Path; '
+        'repo=str(Path.home()/"repo"); '
+        'sha=subprocess.check_output(["git","-C",repo,"commit-tree","main^{tree}","-m","D69 unknown work"],text=True).strip(); '
+        f'subprocess.run(["git","-C",repo,"push","--force",str(Path.home()/"remote.git"),sha+":refs/heads/"+{lane["branch"]!r}],check=True,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL); '
+        'print(json.dumps(sha))')
+    enter('ha review wall')
+    failed = until(lambda: next((t for t in records() if t.get('role') == 'reviewer'
+                   and t['id'] != reviewer and t['status'] == 'failed'
+                   and not t.get('recovery_pending') and t.get('start_notices')), None), 'bounded reviewer startup failure')
+    observed['refusal'] = failed['error']
+    assert rogue in failed['error'] and new in failed['error'], observed
+    observed['unknown_tip'] = quiet_py('import subprocess,json; from pathlib import Path; '
+        f'print(json.dumps(subprocess.check_output(["git","--git-dir",str(Path.home()/"remote.git"),"rev-parse","refs/heads/{lane["branch"]}"],text=True).strip()))')
+    assert observed['unknown_tip'] == rogue, observed
+    next_command = failed['start_notices'][-1]['line'].rsplit(' — next: ', 1)[1]
+    observed['next'] = next_command
+    assert next_command.startswith('ha review retry wall --repo '), observed
+    # Repair only the injected unknown tip, then execute the printed advice.
+    py('import subprocess; from pathlib import Path; '
+       f'subprocess.run(["git","-C",str(Path.home()/"repo"),'
+       f'"--no-pager","push", "--force-with-lease=refs/heads/{lane["branch"]}:{rogue}",'
+       f'str(Path.home()/"remote.git"), "{new}:refs/heads/{lane["branch"]}"],check=True)')
+    enter(next_command)
+    phase(failed['id'], 'mid-review', box=True)
+    observed['replacement_attempt'] = record(failed['id'])['attempt']
+    passed = observed['replacement_attempt'] > failed['attempt']
+    snapshot()
+finally:
+    print('ACTUAL:', json.dumps(observed), flush=True)
+    print('D69/D70 PASS' if passed else 'D69/D70 NOT ESTABLISHED', flush=True)
+    evidence(args.evidence)
+sys.exit(0 if passed else 1)

@@ -856,7 +856,6 @@ fn stage_box_review(
     let settings = project.read_project_md()?.0;
     let (box_repo, url) = box_repo_row(&ctx.config_dir, &settings, &profile.label, &record.repo)?;
     let machine = remote::machine_declaration(&ctx.config_dir, &profile.label)?;
-    let git = crate::repo::Git::new(ctx.runner, &record.repo);
     let mut fetch = format!(
         "git -C {} fetch {}",
         remote::quote(&box_repo),
@@ -874,7 +873,12 @@ fn stage_box_review(
             thread::update(project, &member.thread, |t| {
                 t.review_sources.insert(url.clone(), member.sha.clone());
             })?;
-            git.run(&["push", &url, &format!("{}:{reference}", member.sha)])?;
+            let lane = Thread {
+                repo: record.repo.clone(),
+                branch: member.branch.clone(),
+                ..thread::load(project, &member.thread)?
+            };
+            crate::branches::publish_lane(ctx.runner, project, &lane, &url, &member.sha)?;
         }
         fetch.push(' ');
         fetch.push_str(&remote::quote(&reference));
@@ -1005,7 +1009,7 @@ fn prepare_checkout(ctx: &Ctx, project: &Project, record: &Thread) -> Result<()>
             crate::git::exclude_plugin_paths_locked(ctx.runner, &record.repo)?;
             ensure_branch(ctx.runner, &record.repo, &record.branch, &record.base)?;
         }
-        push_branch(ctx.runner, &record.repo, &url, &record.branch, &record.base)?;
+        crate::branches::publish_lane(ctx.runner, project, record, &url, &record.base)?;
         remote::provision(
             ctx.runner,
             &profile.target,
@@ -1270,18 +1274,6 @@ fn ensure_branch(runner: &dyn Runner, repo: &str, branch: &str, sha: &str) -> Re
     crate::repo::Git::new(runner, repo)
         .with_timeout(GIT_TIMEOUT)
         .run(&["branch", branch, sha])?;
-    Ok(())
-}
-
-/// Pushes the lane branch by URL, never by remote name and never with force
-/// (SPEC-remote §4.2 step 2).
-fn push_branch(runner: &dyn Runner, repo: &str, url: &str, branch: &str, sha: &str) -> Result<()> {
-    crate::repo::Git::new(runner, repo).run(&[
-        "push",
-        "--quiet",
-        url,
-        &format!("{sha}:refs/heads/{branch}"),
-    ])?;
     Ok(())
 }
 
@@ -2271,10 +2263,7 @@ pub(crate) fn send_lane_input(
             Status::Failed => {
                 return Err(crate::refusal::error(
                     format!("{id} is gone"),
-                    format!(
-                        "ha thread retry {} {id} --reason \"<why replace attempt>\"",
-                        project.slug
-                    ),
+                    executable_retry_command(project, &record)?,
                 ));
             }
             Status::Starting | Status::Open => {}
@@ -3250,6 +3239,15 @@ pub(crate) fn retry_command(slug: &str, id: &str) -> String {
     )
 }
 
+pub(crate) fn executable_retry_command(project: &Project, lane: &Thread) -> Result<String> {
+    Ok(crate::review::thread_retry_command(
+        project,
+        lane,
+        &crate::review::list(project)?,
+        "retry failed startup",
+    ))
+}
+
 /// Marks a start failed, removes its Working metadata, and closes everything
 /// the attempt opened. The failed state is durable even when cleanup itself
 /// reports an error, so no view can keep presenting the attempt as Working.
@@ -3305,6 +3303,7 @@ pub(crate) fn fail_start_checked(
             Err(error) => (None, Some(format!("WAITING: {error:#}"))),
         }
     };
+    let retry = executable_retry_command(project, &record)?;
     let mut matched = false;
     let failed = thread::update_checked(project, id, |t| {
         if expected.is_some_and(|old| {
@@ -3330,7 +3329,7 @@ pub(crate) fn fail_start_checked(
                 t.attempt.max(1).saturating_add(1)
             )
         } else {
-            retry_command(&project.slug, id)
+            retry.clone()
         };
         let gone = class == crate::contracts::FailureClass::ProcessGone
             && !t.parked

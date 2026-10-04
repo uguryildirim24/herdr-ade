@@ -1676,6 +1676,7 @@ struct Pass {
 fn startup_failure(input: &LaunchPass<'_>, thread: &thread::Thread, detail: &str) -> Result<()> {
     let screen = threads::startup_screen(input.herdr, &thread.pane_id);
     let reason = format!("agent_not_ready: screen: {screen}; herdr: {detail}");
+    let retry = threads::executable_retry_command(input.project, thread)?;
     thread::update(input.project, &thread.id, |t| {
         t.status = thread::Status::Failed;
         t.prompt_pending = false;
@@ -1684,11 +1685,7 @@ fn startup_failure(input: &LaunchPass<'_>, thread: &thread::Thread, detail: &str
         t.failure_class = crate::contracts::FailureClass::Unknown;
         t.last_group = thread::Group::WaitingOnYou.token().into();
         t.start_notices.push(steps::Notice {
-            line: format!(
-                "FAILED {}: {reason} — next: {}",
-                thread.id,
-                threads::retry_command(&input.project.slug, &thread.id)
-            ),
+            line: format!("FAILED {}: {reason} — next: {}", thread.id, retry),
             submitted: false,
         });
     })?;

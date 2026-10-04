@@ -585,6 +585,20 @@ fn scoped_wait_survives_independent_work_and_replacement_then_answer_rechecks_on
     assert_eq!(load(&f.project).waits[0].0, wait);
     crate::prompt::record_test_request(&f.project, "q-answer", "Choose the reversible route")
         .unwrap();
+    // Request records use second-resolution timestamps. Make the outside
+    // answer strictly newer than q-1 without depending on wall-clock speed.
+    let answer_path = f.project.record_dir("requests").join("q-answer.json");
+    let mut answer: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&answer_path).unwrap()).unwrap();
+    let first: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(f.project.record_dir("requests").join("q-1.json")).unwrap(),
+    )
+    .unwrap();
+    let first_at: jiff::Timestamp = first["at"].as_str().unwrap().parse().unwrap();
+    answer["at"] = (first_at + std::time::Duration::from_secs(1))
+        .to_string()
+        .into();
+    project::write_atomic(&answer_path, &serde_json::to_vec(&answer).unwrap()).unwrap();
     reconcile(&f.project, Some(&replacement), 50).unwrap();
     let answer_check = load(&f.project);
     assert!(answer_check.disposition.is_none());

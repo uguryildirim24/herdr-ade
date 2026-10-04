@@ -1283,6 +1283,57 @@ fn exclusion_requires_candidate_without_that_lane_and_new_seal_for_next_pile() {
 }
 
 #[test]
+fn failed_reviewer_start_notice_and_next_action_use_review_retry() {
+    let fx = configured();
+    let (member, _) = lane(&fx, 1);
+    let review = prepared(&fx);
+    let reviewer = review.reviewer.as_deref().unwrap();
+    let failed = crate::threads::fail_start(
+        &fx.world.ctx(),
+        &fx.project,
+        reviewer,
+        "placement exhausted",
+        crate::contracts::FailureClass::Unknown,
+        false,
+    )
+    .unwrap();
+    let next = review.command(&fx.project, "retry");
+    assert!(
+        failed
+            .start_notices
+            .last()
+            .unwrap()
+            .line
+            .ends_with(&format!("next: {next}"))
+    );
+    assert_eq!(
+        crate::threads::executable_retry_command(&fx.project, &failed).unwrap(),
+        next
+    );
+    let prompt_refusal =
+        crate::threads::prompt(&fx.world.ctx(), "demo", reviewer, "continue").unwrap_err();
+    assert_eq!(crate::refusal::next(&prompt_refusal), Some(next.as_str()));
+    // The old printed command refuses in exactly this state.
+    assert!(
+        crate::threads::retry(&fx.world.ctx(), "demo", reviewer, "retry failed startup")
+            .unwrap_err()
+            .to_string()
+            .contains("cancel the review first")
+    );
+    let retried = retry(&fx.world.ctx(), "demo", Some(&review.repo))
+        .unwrap()
+        .unwrap();
+    assert_eq!(retried.reviewer.as_deref(), Some(reviewer));
+    assert_eq!(retried.retry_generation, 1);
+    // A failed member's direct retry is also refused while its pile is active.
+    let member = thread::load(&fx.project, &member).unwrap();
+    assert_eq!(
+        crate::threads::executable_retry_command(&fx.project, &member).unwrap(),
+        review.command(&fx.project, "cancel")
+    );
+}
+
+#[test]
 fn dead_reviewer_needs_coordinator_once_after_retries_end() {
     let fx = configured();
     lane(&fx, 1);
