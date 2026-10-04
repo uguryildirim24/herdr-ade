@@ -2201,7 +2201,11 @@ pub(crate) fn record_follow_up_delivery(
 pub(crate) fn prompt_refused_before_submission(error: &crate::herdr::HerdrError) -> bool {
     matches!(
         error.code.as_str(),
-        "agent_not_ready" | "agent_blocked" | "agent_not_found" | "empty_agent_prompt"
+        "agent_not_ready"
+            | "agent_blocked"
+            | "agent_not_found"
+            | "empty_agent_prompt"
+            | "exec_failed"
     )
 }
 
@@ -6427,6 +6431,7 @@ mod tests {
             .unwrap();
             *world.agents.borrow_mut() = serde_json::to_string(&agents).unwrap();
             world.runner.on("agent prompt", ok(r#"{"result":{}}"#));
+            world.runner.on("machine list --json", ok(r#"[{"id":"box","label":"box","target":"box","session":"default","enabled":true}]"#));
             let herdr = Herdr::new(world.env.herdr_bin(), "a.sock", &world.runner);
             let outcome = if machine.is_empty() {
                 prompt(&world.ctx(), "demo", &lane.id, "steer at next boundary").unwrap()
@@ -6454,8 +6459,10 @@ mod tests {
                 .iter()
                 .find(|c| c.display().contains("agent prompt"))
                 .unwrap();
-            assert!(!call.args.iter().any(|a| a == "--wait" || a == "--steer"));
-            assert_eq!(call.args.iter().any(|a| a == "--machine"), machine == "box");
+            let request: serde_json::Value =
+                serde_json::from_str(call.stdin.as_deref().unwrap()).unwrap();
+            assert!(request["params"].get("wait").is_none());
+            assert_eq!(call.program == "ssh", machine == "box");
             assert!(!calls.iter().any(|c| c.display().contains("pane send-text")));
         }
     }
@@ -7290,7 +7297,13 @@ mod tests {
         let prompts: Vec<String> = calls
             .iter()
             .filter(|c| c.display().contains("agent prompt") && c.display().contains("w1:p2"))
-            .map(|c| c.args.get(3).cloned().unwrap_or_default())
+            .map(|c| {
+                serde_json::from_str::<serde_json::Value>(c.stdin.as_deref().unwrap()).unwrap()
+                        ["params"]["text"]
+                        .as_str()
+                        .unwrap()
+                        .to_string()
+            })
             .collect();
         assert_eq!(prompts.len(), 1, "{prompts:?}");
         assert!(prompts[0].contains(&format!(".herdr-project/demo-{}/brief.md", started.id)));

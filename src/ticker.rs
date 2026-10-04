@@ -4106,6 +4106,9 @@ mod tests {
                         cmd, 99_999_999, None,
                     ));
                 }
+                if cmd.display().contains("remote-api-bridge") {
+                    return Ok(ok(r#"{"result":{}}"#));
+                }
                 Ok(ok("Linux\n"))
             },
         );
@@ -5213,12 +5216,9 @@ mod tests {
                 .find(|cmd| cmd.display().contains("agent prompt"))
                 .unwrap();
             let cap = crate::herdr::AGENT_START_TIMEOUT.as_millis() as u64;
-            assert!(
-                prompt
-                    .args
-                    .windows(2)
-                    .any(|pair| pair == ["--timeout", &cap.to_string()])
-            );
+            let request: serde_json::Value =
+                serde_json::from_str(prompt.stdin.as_deref().unwrap()).unwrap();
+            assert_eq!(request["params"]["wait"]["timeout_ms"], cap);
             assert_eq!(
                 prompt.timeout,
                 crate::herdr::AGENT_START_TIMEOUT + Duration::from_secs(5)
@@ -5281,7 +5281,7 @@ mod tests {
                     record.machine = "box".into();
                 }
             });
-            world.runner.on("machine list --json", ok("[]"));
+            world.runner.on("machine list --json", ok(r#"[{"id":"box","label":"box","target":"box","session":"default","enabled":true}]"#));
             // The command timed out without a server submission, as t-0607's
             // box log shows. Staging must not become an infinite delivery latch.
             world.runner.on(
@@ -8562,10 +8562,10 @@ mod tests {
                 ),
             )
             .unwrap();
-            world.runner.on("machine list --json", ok("[]"));
+            world.runner.on("machine list --json", ok(r#"[{"id":"abc","label":"buildbox","target":"box","session":"default","enabled":true}]"#));
             let reply = session_reply.clone();
             world.runner.on_fn(
-                |cmd| cmd.program == "ssh",
+                |cmd| cmd.program == "ssh" && !cmd.display().contains("remote-api-bridge"),
                 move |cmd| {
                     Ok(if crate::box_helper::tests::is_doctor(cmd) {
                         crate::testkit::diagnostic_output(cmd, 99_999_999, None)
@@ -8695,7 +8695,8 @@ mod tests {
             move |cmd| {
                 // A PTY submission alone is not proof that a new process has
                 // consumed its first instruction. Require the activity gate.
-                assert!(cmd.args.iter().any(|arg| arg == "--wait"));
+                let request: serde_json::Value = serde_json::from_str(cmd.stdin.as_deref().unwrap()).unwrap();
+                assert!(request["params"].get("wait").is_some());
                 let saved = thread::load(&delivery_project, &delivery_id).unwrap();
                 if recovery == Some("gone-timeout") && cmd.display().contains("skill lane") {
                     assert!(saved.follow_ups.iter().all(|f| f.state == thread::FollowUpState::Uncertain));
@@ -8708,7 +8709,7 @@ mod tests {
                         .find(|f| f.state == thread::FollowUpState::Uncertain)
                         .unwrap();
                     assert!(pending.delivered_at.is_empty());
-                    assert!(cmd.args.iter().any(|arg| arg == &pending.text));
+                    assert_eq!(request["params"]["text"], pending.text);
                     if refuse_first.replace(false) {
                         return Ok(fail(1, r#"{"error":{"code":"agent_not_ready","message":"new process is not ready yet"}}"#));
                     }

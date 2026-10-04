@@ -207,6 +207,15 @@ fn saved_machines(runner: &dyn Runner, herdr_bin: &str) -> Result<Vec<SavedMachi
         .context("machine_list_invalid: herdr returned invalid JSON")
 }
 
+pub(crate) fn saved_herdr_profile(
+    runner: &dyn Runner,
+    herdr_bin: &str,
+    machine: &str,
+) -> Result<MachineProfile> {
+    saved_profile(&saved_machines(runner, herdr_bin)?, machine)?
+        .with_context(|| format!("unknown_machine: `{machine}` is not a saved profile"))
+}
+
 fn saved_profile(saved: &[SavedMachine], machine: &str) -> Result<Option<MachineProfile>> {
     let Some(found) = saved
         .iter()
@@ -424,6 +433,15 @@ fn ssh_command(
     stdin: Option<&str>,
     timeout: Duration,
 ) -> Result<Output> {
+    checked_transport(runner.run(&ssh_cmd(target, script, stdin, timeout)?))
+}
+
+pub(crate) fn ssh_cmd(
+    target: &str,
+    script: &str,
+    stdin: Option<&str>,
+    timeout: Duration,
+) -> Result<Cmd> {
     check_target(target)?;
     let mut cmd = Cmd::new("ssh", timeout)
         .own_group()
@@ -432,7 +450,7 @@ fn ssh_command(
     if let Some(text) = stdin {
         cmd = cmd.stdin(text);
     }
-    checked_transport(runner.run(&cmd))
+    Ok(cmd)
 }
 
 /// Typed box replies may carry an 8 MiB batch. Retain diagnostics as usual,

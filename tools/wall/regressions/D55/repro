@@ -1,0 +1,2 @@
+#!/bin/sh
+exec "$(dirname "$0")/../herdr-input-repro" D55 "$@"
