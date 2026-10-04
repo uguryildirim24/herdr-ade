@@ -1,0 +1,57 @@
+#!/usr/bin/env python3
+"""D65: completed progress survives; empty existing plans are unreadable."""
+import json
+from pathlib import Path
+import sys
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]/'D64'))
+from support import Sandbox
+
+box = Sandbox()
+box.reset()
+box.guest(r'''
+import json, sys, tomllib
+sys.path.insert(0, str(home/'tools'))
+import guest
+config = home/'.config/herdr-ade/config.toml'
+config.write_text(config.read_text().replace('[adapters.pi]',
+    '[[routing.rules]]\nworkflow = "reviewer"\nrecipe = "wall_lane"\n\n[adapters.pi]'))
+(home/'control.json').write_text(json.dumps({'hold':['before-seal'],'gate_review':True}))
+guest.run('ha','ticker','start')
+lane = guest.lane()
+guest.run('ha','plan','set','wall','--does','Durable progress')
+guest.run('ha','plan','step','add','wall','Keep progress','--task','job-0001')
+guest.wait(lane['id'],'before-seal')
+(home/'release/before-seal').touch()
+guest.poll('sealed event',lambda: list((state/'events').glob('*.toml')))
+guest.run('ha','review','wall')
+def landed():
+    rows = [tomllib.loads(p.read_text()) for p in (state/'reviews').glob('*.toml')]
+    for row in rows:
+        if row.get('attention'):
+            raise RuntimeError(row['attention'])
+    return any(r['phase']=='complete' and r['push'] and r['fast_forward'] for r in rows)
+guest.poll('fixture reviewed and published',landed,seconds=240)
+guest.run('ha','ticker','stop')
+''')
+before = json.loads(box.ha('plan','show','wall','--json').stdout)['data']['result']
+assert len(before['steps']) == 1 and before['steps'][0]['state'] == 'done', before
+print('EXPECTED: healthy historical plan retains completed progress 1/1')
+print('ACTUAL: healthy plan done/total 1/1')
+box.apply_condition('plan.toml', 'empty')
+checks = []
+for args in [('plan','show','wall','--json'), ('overview','wall'),
+             ('overview','wall','--json'), ('context','wall','--peek')]:
+    result = box.ha(*args, check=False)
+    output = result.stdout
+    passed = 'unreadable record' in output and 'plan.toml' in output
+    if args[0] == 'plan':
+        passed = passed and result.returncode != 0
+    print('EXPECTED:', ' '.join(args), 'reports unreadable record with path, not 0/0')
+    print('ACTUAL: exit', result.returncode, 'unreadable path visible:', passed)
+    checks.append(passed)
+rundown = box.run('enter', 'herdr-rundown --print', check=False)
+checks.append(rundown.returncode != 0 and 'unreadable record' in rundown.stdout
+              and 'plan.toml' in rundown.stdout and '0 of 0' not in rundown.stdout)
+print('EXPECTED: Rundown reports unreadable plan, nonzero --print, never 0 of 0')
+print('ACTUAL: Rundown exit', rundown.returncode, 'PASS:', checks[-1])
+sys.exit(0 if all(checks) else 1)

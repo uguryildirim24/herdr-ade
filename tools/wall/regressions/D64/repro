@@ -1,0 +1,34 @@
+#!/usr/bin/env python3
+"""D64: storage full must fail cancel before any cancelled receipt."""
+import sys
+from support import Sandbox
+
+box = Sandbox()
+box.reset()
+result = box.guest(r'''
+import subprocess, sys, tomllib
+sys.path.insert(0, str(home/'tools'))
+import guest
+(home/'control.json').write_text('{"hold":["working"]}')
+guest.run('ha','ticker','start')
+lane = guest.lane()
+guest.wait(lane['id'],'working')
+guest.run('ha','ticker','stop')
+path = state/'threads'/f"{lane['id']}.toml"
+before = path.read_bytes()
+try:
+    guest.fault('fill',[])
+    p = subprocess.run(['ha','thread','cancel','wall',lane['id'],'--reason','storage full check'],
+                       text=True,stdout=subprocess.PIPE,stderr=subprocess.STDOUT,timeout=45)
+    after = path.read_bytes()
+    current = tomllib.loads(after.decode())
+    passed = (p.returncode != 0 and 'No space left on device' in p.stdout
+              and 'cancelled;' not in p.stdout and before == after
+              and current['status'] == 'open' and not current['cancellation_reason'])
+    print('EXPECTED: storage full causes nonzero cancel with its real cause; lane remains open, not reported cancelled')
+    print('ACTUAL: exit', p.returncode, p.stdout, 'record unchanged:', before == after, flush=True)
+finally:
+    (home/'disk-full').unlink(missing_ok=True)
+sys.exit(0 if passed else 1)
+''', check=False)
+sys.exit(result.returncode)

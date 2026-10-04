@@ -284,6 +284,7 @@ pub(crate) struct View {
     harness: Value,
     reviews: Vec<crate::review::Review>,
     unreadable_lanes: usize,
+    read_errors: Vec<String>,
 }
 
 impl View {
@@ -364,6 +365,21 @@ impl View {
         };
         let lane_errors = crate::thread::read_errors(project);
         let unreadable_lanes = lane_errors.len();
+        let mut read_errors: Vec<String> = lane_errors
+            .iter()
+            .map(|error| {
+                format!("Some work records could not be read; unreadable record: {error:#}")
+            })
+            .collect();
+        let seal_errors: Vec<String> = if evidence.readable() {
+            Vec::new()
+        } else {
+            crate::events::read_errors(project)
+                .into_iter()
+                .map(|error| format!("unreadable record (seal): {error:#}"))
+                .collect()
+        };
+        read_errors.extend(seal_errors.iter().cloned());
         let mut lanes = observed.unwrap_or_else(|| {
             crate::thread::list(project)
                 .into_iter()
@@ -658,6 +674,16 @@ impl View {
                 ),
             )
         }));
+        if let Some(error) = plan["error"].as_str() {
+            read_errors.push(error.into());
+            work.push(entry("plan-error", error));
+        }
+        work.extend(
+            seal_errors
+                .iter()
+                .enumerate()
+                .map(|(i, error)| entry(format!("seal-error:{i}"), error)),
+        );
         sections.push(Section::new("Current work", work));
         sections.push(Section::new(
             "Seals",
@@ -717,6 +743,11 @@ impl View {
                 )
             })
             .collect();
+        read_errors.extend(
+            errors
+                .iter()
+                .map(|error| format!("unreadable record (task): {error:#}")),
+        );
         task_rows.extend(errors.into_iter().enumerate().map(|(i, error)| {
             entry(
                 format!("task-error:{i}"),
@@ -885,6 +916,7 @@ impl View {
             harness,
             reviews,
             unreadable_lanes,
+            read_errors,
         }
     }
 
@@ -955,7 +987,7 @@ impl View {
 
     pub(crate) fn rundown(&self) -> Value {
         json!({"title":self.title, "plan":self.plan, "work":self.work_summary(), "needs_you":self.needs_you.join("; "),
-            "read_error":if self.unreadable_lanes > 0 { "Some work records could not be read" } else { "" },
+            "read_error":self.read_errors.join("; "),
             "needs_you_items":self.needs_you_items, "activity":self.activity, "harness":self.harness,
             "actions":self.sections.iter().filter(|s| matches!(s.name.as_str(), "Current work" | "Pile reviews" | "Open tasks")).flat_map(|s| &s.rows).map(|r| format!("{}: {}", r.id, r.text.lines().next().unwrap_or(""))).collect::<Vec<_>>()})
     }

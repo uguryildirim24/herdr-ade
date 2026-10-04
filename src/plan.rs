@@ -58,14 +58,20 @@ fn read_plan<T: serde::de::DeserializeOwned>(project: &Project) -> Result<Option
     let path = plan_path(project);
     match std::fs::read_to_string(&path) {
         Ok(text) => {
-            toml::from_str::<PlanHistory>(&text)
-                .with_context(|| format!("{} has unreadable binding history", path.display()))?;
-            Ok(Some(toml::from_str(&text).with_context(|| {
-                format!("{} does not parse", path.display())
+            let read = || -> Result<T> {
+                let plan: Plan = toml::from_str(&text)?;
+                if plan.schema != 1 {
+                    bail!("expected plan schema 1, got {}", plan.schema);
+                }
+                toml::from_str::<PlanHistory>(&text)?;
+                Ok(toml::from_str(&text)?)
+            };
+            Ok(Some(read().with_context(|| {
+                format!("unreadable record: {}", path.display())
             })?))
         }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(e) => Err(e.into()),
+        Err(e) => Err(e).with_context(|| format!("unreadable record: {}", path.display())),
     }
 }
 
@@ -1099,6 +1105,31 @@ mod tests {
 
     fn add(fx: &Fx, text: &str, expect: u64) -> Plan {
         step_add(&fx.world.ctx(), "demo", text, vec![], vec![], expect).unwrap()
+    }
+
+    #[test]
+    fn empty_existing_plan_is_unreadable_on_all_count_surfaces() {
+        let fx = fixture();
+        let ctx = fx.world.ctx();
+        assert!(load(&fx.project).unwrap().is_none());
+        for text in ["", "revision = 1\n", "schema = 1\n", "goal = 'Goal'\n"] {
+            std::fs::write(plan_path(&fx.project), text).unwrap();
+            let error = format!("{:#}", load(&fx.project).unwrap_err());
+            assert!(error.contains("unreadable record") && error.contains("plan.toml"));
+            assert!(counts(&fx.project).is_err());
+            assert!(show(&ctx, "demo").is_err());
+            assert!(binding_changes(&fx.project).is_err());
+            let view = crate::project_view::View::load(&ctx, &fx.project, None).unwrap();
+            let overview = view.rundown();
+            assert!(
+                overview["read_error"]
+                    .as_str()
+                    .unwrap()
+                    .contains("unreadable record")
+            );
+            assert!(view.render(&[]).contains("unreadable record"));
+            assert!(view.render(&["Current work"]).contains("unreadable record"));
+        }
     }
 
     #[test]

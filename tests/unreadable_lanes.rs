@@ -37,7 +37,7 @@ fn corrupt_truncated_and_empty_lanes_remain_visible_in_overview_handoff_and_rund
     )
     .unwrap();
     std::fs::write(state.join("tasks/job-0001.toml"), "id = 'job-0001'\ntitle = 'Historical finished task'\nauthority = ['request:historical']\nacceptance = ['done']\n[[installed]]\nat = 'then'\ncommand = 'historical install'\n").unwrap();
-    let plan = "schema = 1\nrevision = 1\n[[steps]]\nid = 's-1'\ntasks = ['job-0001']\n[[steps.subtasks]]\nid = 's-2'\ntasks = ['job-0001']\n[[steps]]\nid = 's-3'\n";
+    let plan = "schema = 1\ngoal = 'Historical goal'\nrevision = 1\n[[steps]]\nid = 's-1'\ntasks = ['job-0001']\n[[steps.subtasks]]\nid = 's-2'\ntasks = ['job-0001']\n[[steps]]\nid = 's-3'\n";
     std::fs::write(state.join("plan.toml"), plan).unwrap();
     let before: serde_json::Value = serde_json::from_str(&run(&["install-check"])).unwrap();
     assert_eq!(before[0]["done"], 2);

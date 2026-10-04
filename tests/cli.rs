@@ -166,7 +166,7 @@ fn internal_install_check_reports_only_counts_and_readability_without_writes() {
     .unwrap();
     std::fs::write(state.join("project.json"), r#"{"status":"archived"}"#).unwrap();
     std::fs::write(state.join("tasks/job-0001.toml"), "id = 'job-0001'\ntitle = 'private task title'\nauthority = ['request:historical']\nacceptance = ['done']\n[[installed]]\nat = 'then'\ncommand = 'historical install'\n").unwrap();
-    let plan = "schema = 1\n[[steps]]\nid = 's-1'\ntext = 'private step text'\ntasks = ['job-0001']\n[[steps.subtasks]]\nid = 's-2'\ntasks = ['job-0001']\n[[steps]]\nid = 's-3'\n";
+    let plan = "schema = 1\ngoal = 'Historical goal'\n[[steps]]\nid = 's-1'\ntext = 'private step text'\ntasks = ['job-0001']\n[[steps.subtasks]]\nid = 's-2'\ntasks = ['job-0001']\n[[steps]]\nid = 's-3'\n";
     std::fs::write(state.join("plan.toml"), plan).unwrap();
     let check = || {
         let output = hp(

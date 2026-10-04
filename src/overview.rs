@@ -94,12 +94,58 @@ mod tests {
     use crate::scenarios::World;
 
     #[test]
+    fn rundown_read_error_names_unreadable_task_and_seal_paths() {
+        let fx = crate::testkit::fixture();
+        let lane = fx.thread("Evidence lane");
+        let seal = fx.seal_waiting(&lane, 1, 1, "waiting evidence");
+        let task = crate::task::Task {
+            id: "job-0001".into(),
+            title: "Healthy historical task".into(),
+            authority: vec!["request:historical".into()],
+            acceptance: vec!["Keep evidence readable".into()],
+            ..Default::default()
+        };
+        let task_path = fx
+            .project
+            .record_dir_for_write("tasks")
+            .unwrap()
+            .join("job-0001.toml");
+        std::fs::write(&task_path, toml::to_string(&task).unwrap()).unwrap();
+        let seal_path = fx.project.record_dir("events").join(format!("{seal}.toml"));
+        let intact_seal = std::fs::read(&seal_path).unwrap();
+        let healthy = crate::project_view::View::load(&fx.world.ctx(), &fx.project, None).unwrap();
+        assert_eq!(healthy.rundown()["read_error"], "");
+        for cached in [false, true] {
+            crate::events::set_cache(cached);
+            for path in [&task_path, &seal_path] {
+                crate::project::write_atomic(path, b"{invalid record").unwrap();
+                let view =
+                    crate::project_view::View::load(&fx.world.ctx(), &fx.project, None).unwrap();
+                let json = view.rundown();
+                let error = json["read_error"].as_str().unwrap();
+                assert!(
+                    error.contains("unreadable record")
+                        && error.contains(&path.display().to_string()),
+                    "{error}"
+                );
+                crate::project::write_atomic(
+                    &task_path,
+                    toml::to_string(&task).unwrap().as_bytes(),
+                )
+                .unwrap();
+                crate::project::write_atomic(&seal_path, &intact_seal).unwrap();
+            }
+            crate::events::set_cache(false);
+        }
+    }
+
+    #[test]
     fn overview_does_not_invent_null_subtasks() {
         let world = World::new();
         let project = world.project("demo", "a.sock");
         std::fs::write(
             crate::plan::plan_path(&project),
-            "schema = 1\nrevision = 1\n[[steps]]\nid = 's-1'\ntext = 'Standalone'\n[[steps]]\nid = 's-2'\ntext = 'Parent'\n[[steps.subtasks]]\nid = 's-3'\ntext = 'Child'\n",
+            "schema = 1\ngoal = 'Goal'\nrevision = 1\n[[steps]]\nid = 's-1'\ntext = 'Standalone'\n[[steps]]\nid = 's-2'\ntext = 'Parent'\n[[steps.subtasks]]\nid = 's-3'\ntext = 'Child'\n",
         ).unwrap();
         let json = crate::project_view::View::load(&world.ctx(), &project, None)
             .unwrap()

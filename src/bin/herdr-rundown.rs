@@ -118,12 +118,6 @@ impl Source {
             bail!("{cause}");
         }
         let reply: serde_json::Value = serde_json::from_str(&out.stdout)?;
-        if let Some(error) = reply
-            .pointer("/data/result/plan/error")
-            .and_then(|v| v.as_str())
-        {
-            bail!("plan read failed: {error}");
-        }
         let title = if title.is_empty() {
             reply
                 .pointer("/data/result/title")
@@ -212,8 +206,16 @@ fn run() -> Result<()> {
         for line in draw(&panels, 80, 0) {
             println!("{}", view::visible(&line));
         }
-        if panels.iter().any(|panel| !panel.note.is_empty()) {
-            bail!("one or more project overviews unavailable");
+        let errors = panels
+            .iter()
+            .filter(|panel| !panel.note.is_empty())
+            .map(|panel| panel.note.as_str())
+            .collect::<Vec<_>>();
+        if !errors.is_empty() {
+            bail!(
+                "one or more project overviews unavailable: {}",
+                errors.join("; ")
+            );
         }
         return Ok(());
     }
@@ -247,6 +249,7 @@ fn empty_card(title: String) -> view::Card {
         about: String::new(),
         steps: vec![],
         read_error: String::new(),
+        plan_unreadable: true,
         activity: Default::default(),
         needs_you_items: vec![],
         harness: Default::default(),

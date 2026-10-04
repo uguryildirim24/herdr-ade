@@ -1,0 +1,67 @@
+#!/usr/bin/env python3
+"""D66: unreadable real inbox notices stay visible beside historical notices."""
+import json
+from pathlib import Path
+import sys
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]/'D64'))
+from support import Sandbox
+
+box = Sandbox()
+box.reset()
+# R02's actual coordinator-draft notice journey, not a fabricated unreadable row.
+box.guest(r'''
+import json, sys
+sys.path.insert(0, str(home/'tools'))
+import guest
+config = home/'.config/herdr-ade/config.toml'
+config.write_text(config.read_text().replace('[adapters.pi]',
+    '[[routing.rules]]\nworkflow = "reviewer"\nrecipe = "wall_lane"\n\n[adapters.pi]'))
+(home/'control.json').write_text(json.dumps({'hold':['before-seal', 'mid-review']}))
+guest.run('ha','ticker','start')
+lane = guest.lane()
+guest.wait(lane['id'],'before-seal')
+(home/'release/before-seal').touch()
+guest.poll('sealed event', lambda: list((state/'events').glob('*.toml')))
+guest.run('ha','review','wall')
+guest.poll('reviewer', lambda: len(guest.records()) == 2)
+reviewer = guest.records()[-1]
+guest.poll('reviewer brief', lambda: guest.target(reviewer['id']).get('brief_submitted'), seconds=120)
+guest.wait(reviewer['id'],'mid-review')
+guest.run('ha','note','add','wall','Keep measured results','--kind','memory',
+          '--request',(home/'request').read_text())
+guest.run('ha','plan','set','wall','--does','Durable progress')
+guest.run('ha','plan','step','add','wall','Keep progress','--task','job-0001')
+guest.poll('input hold', lambda: (state/'coordinator-input-hold.json').exists())
+p = state/'coordinator-input-hold.json'
+v = json.loads(p.read_text()); v['since'] -= 1900; v['notified'] = False
+p.write_text(json.dumps(v))
+guest.poll('draft notice', lambda: list((state/'inbox').glob('*.md')), seconds=60)
+guest.run('ha','ticker','stop')
+''')
+items = json.loads(box.ha('inbox','list','wall','--json').stdout)['data']['items']
+assert len(items) == 1 and items[0]['kind'] == 'coordinator-draft', items
+notice_id = items[0]['id']
+path = 'inbox/' + notice_id + '.md'
+original = json.loads(box.guest('import json\nprint(json.dumps((state/'+repr(path)+').read_text()))').stdout)
+# Historical notice format without new optional fields must still load.
+box.guest(r'''
+(state/'inbox/healthy.md').write_text(
+    '+++\nid = "healthy"\nkind = "coordinator-draft"\nsubject = "wall"\n'
+    'created = "2026-09-17T00:00:00Z"\nsummary = "Historical notice"\n+++\n')
+''')
+checks = []
+for condition in ['unreadable', 'truncated', 'empty']:
+    box.guest('(state/'+repr(path)+').write_text('+repr(original)+')')
+    box.apply_condition(path, condition)
+    result = box.ha('inbox','list','wall','--json',check=False)
+    items = json.loads(result.stdout)['data']['items'] if result.returncode == 0 else []
+    broken = next((item for item in items if item['id'] == notice_id), {})
+    passed = (len(items) == 2 and broken.get('kind') == 'unreadable-record'
+              and path in broken.get('unreadable', '')
+              and any(item['id'] == 'healthy' and item['kind'] == 'coordinator-draft' for item in items))
+    print('EXPECTED:', condition, 'notice listed as unreadable with its path; healthy notice remains')
+    print('ACTUAL:', json.dumps(items), 'PASS:', passed)
+    checks.append(passed)
+    plain = box.ha('inbox','list','wall',check=False)
+    checks.append('unreadable record' in plain.stdout and path in plain.stdout)
+sys.exit(0 if all(checks) else 1)

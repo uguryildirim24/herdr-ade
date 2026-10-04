@@ -2426,6 +2426,7 @@ mod tests {
             let tasks = project.record_dir_for_write("tasks").unwrap();
             std::fs::write(tasks.join("job-0001.toml"), toml::to_string(&task).unwrap()).unwrap();
             let plan = crate::contracts::Plan {
+                schema: 1,
                 steps: vec![crate::contracts::PlanStep {
                     id: "s-1".into(),
                     tasks: vec![task.id],

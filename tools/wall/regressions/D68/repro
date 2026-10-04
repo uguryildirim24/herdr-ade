@@ -1,0 +1,48 @@
+#!/usr/bin/env python3
+"""D68 / S01: unreadable task and real seal evidence must reach Rundown."""
+import json
+from pathlib import Path
+import sys
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]/'D64'))
+from support import Sandbox
+
+box = Sandbox()
+checks = []
+for kind in ['task', 'seal']:
+    box.reset()
+    box.guest(r'''
+import sys
+sys.path.insert(0, str(home/'tools'))
+import guest
+(home/'control.json').write_text('{"hold":["before-seal"]}')
+guest.run('ha','ticker','start')
+lane = guest.lane()
+guest.wait(lane['id'], 'before-seal')
+guest.run('ha','plan','set','wall','--does','Deliver the scratch fixture')
+guest.run('ha','plan','step','add','wall','Land fixture','--task','job-0001')
+''')
+    if kind == 'seal':
+        box.guest(r'''
+import sys
+sys.path.insert(0, str(home/'tools'))
+import guest
+(home/'release/before-seal').touch()
+guest.poll('real done seal', lambda: list((state/'events').glob('*.toml')))
+guest.run('ha','ticker','stop')
+''')
+        name = json.loads(box.guest('import json\nprint(json.dumps(next((state/"events").glob("*.toml")).name))').stdout)
+        target = '.state/events/' + name
+    else:
+        box.ha('ticker', 'stop')
+        target = '.state/tasks/job-0001.toml'
+    intact = json.loads(box.ha('--json','overview','wall').stdout)['data']['result']
+    assert intact['read_error'] == '', intact['read_error']
+    box.run('fault', 'corrupt', target, 'garbage')
+    view = json.loads(box.ha('--json','overview','wall').stdout)['data']['result']
+    rundown = box.run('enter', 'herdr-rundown --print', check=False)
+    passed = ('unreadable record' in view['read_error'] and target.removeprefix('.state/') in view['read_error']
+              and rundown.returncode != 0 and 'unreadable record' in rundown.stdout)
+    print('EXPECTED:', kind, 'known unreadable record and path in overview read_error; Rundown unavailable, nonzero --print')
+    print('ACTUAL:', kind, 'read_error=', repr(view['read_error']), 'Rundown exit=', rundown.returncode, 'PASS=', passed)
+    checks.append(passed)
+sys.exit(0 if all(checks) else 1)

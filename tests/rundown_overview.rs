@@ -56,7 +56,7 @@ fn real_overview_renders_standalone_nested_held_and_unreadable_work() {
         "id = 'job-0001'\ntitle = 'Historical finished work'\nauthority = ['request:historical']\nacceptance = ['done']\n[[installed]]\nat = 'then'\ncommand = 'historical install'\n",
     )
     .unwrap();
-    let plan = "schema = 1\nrevision = 1\n[[steps]]\nid = 's-1'\ntext = 'Finished standalone'\ntasks = ['job-0001']\n[[steps]]\nid = 's-2'\ntext = 'Parent work'\n[[steps.subtasks]]\nid = 's-3'\ntext = 'Nested work'\n[[steps]]\nid = 's-4'\ntext = 'Held check'\nthreads = ['t-0001']\n";
+    let plan = "schema = 1\ngoal = 'Historical goal'\nrevision = 1\n[[steps]]\nid = 's-1'\ntext = 'Finished standalone'\ntasks = ['job-0001']\n[[steps]]\nid = 's-2'\ntext = 'Parent work'\n[[steps.subtasks]]\nid = 's-3'\ntext = 'Nested work'\n[[steps]]\nid = 's-4'\ntext = 'Held check'\nthreads = ['t-0001']\n";
     std::fs::write(state.join("plan.toml"), plan).unwrap();
     let before: serde_json::Value = serde_json::from_str(&run(&["install-check"])).unwrap();
     // These exact bytes cross the producer/consumer boundary.
