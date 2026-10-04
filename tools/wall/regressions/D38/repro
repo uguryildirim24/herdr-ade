@@ -29,7 +29,7 @@ try:
                         'print(p.read_text())')
 
     until(lambda: [e for e in health()['failures'] if 'unreachable' in e],
-          'courier proved connection failure', seconds=65)
+          'courier proved connection failure', seconds=65, wake=False)
     failed = record()
     enter('ha overview wall; ha ticker status')
     time.sleep(20)  # One 15-second tick, still inside the 95-second outage.

@@ -64,7 +64,15 @@ def quiet_py(code, box=False):
     return json.loads(result.stdout)
 
 
-def until(check, label, seconds=150):
+def wake_ticker(box=False):
+    # This is the ticker's existing wake signal, not a state-record edit or a
+    # clock override. Normal passes still own placement, launch and backoff.
+    quiet_py('import pathlib,os,json; '
+             '(pathlib.Path(os.environ["HOME"])/".herdr-ade/.ticker.wake").touch(); '
+             'print(json.dumps(None))', box)
+
+
+def until(check, label, seconds=150, wake=True):
     deadline = time.monotonic() + seconds
     last = None
     while time.monotonic() < deadline:
@@ -72,6 +80,9 @@ def until(check, label, seconds=150):
         if last:
             print('OBSERVED', label, json.dumps(last), flush=True)
             return last
+        if wake:
+            wake_ticker()
+            wake_ticker(box=True)
         time.sleep(1)
     raise RuntimeError(f'timeout waiting for {label}: {last!r}')
 
@@ -117,6 +128,12 @@ def phase(thread, name, box=False):
     if box:
         until(lambda: any(r['thread'] == thread and r['pane_id'] == record(thread)['pane_id']
                           for r in records(True, 'lanes')), 'box lane card provisioned')
+    pane = record(thread)['pane_id']
+    until(lambda: quiet_py('import pathlib,os,json; '
+          'rows=[json.loads(line) for f in (pathlib.Path(os.environ["HOME"])/"runs").glob("*.jsonl") '
+          'for line in f.read_text().splitlines()]; '
+          f'print(json.dumps([r for r in rows if r["pane"] == {pane!r} '
+          f'and r["phase"] == {name!r}]))', box), name)
     enter('python3 "$HOME/tools/guest.py" wait ' + shlex.join([thread, name]), box)
 
 

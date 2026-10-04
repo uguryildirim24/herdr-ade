@@ -26,6 +26,12 @@ sudo tools/wall/wall --instance 3 reset
 ```
 
 The gate discovers these alongside D27 and D30 in its locked instance 5.
+The shared helper wakes the existing tickers while awaiting setup/recovery,
+using their normal `.ticker.wake` signal; it never edits lifecycle records or
+changes the clock/backoff algorithm. D38 leaves the ticker's normal cadence
+alone during the outage/backoff assertion, then wakes it after restoration.
+D39 still observes 35 seconds without an automatic restart. D37 retains its
+40-second broken-build window but stops early on positive working evidence.
 The rest of this document is the original historical wall-1 campaign: its
 build, default-instance commands, evidence names and unfixed observations are
 not instructions to run the permanent regressions on the default instance.
