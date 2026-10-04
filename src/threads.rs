@@ -1385,6 +1385,12 @@ fn finish_placement(project: &Project, view: &SessionView, id: &str) -> Result<T
         t.prompt_pending = true;
         t.brief_submitted = false;
         t.brief_submitted_at.clear();
+        // While retry still names the old pane, the courier can import its
+        // receipt again. Placement starts unacknowledged; only an explicit
+        // same-attempt parked-session resume retains its conversation.
+        if t.bootstrap != "resuming" {
+            t.bootstrap.clear();
+        }
         t.launch_attempts = 0;
         t.startup_wait_started = project::now();
         t.recovery_pending = false;
@@ -7854,6 +7860,53 @@ mod tests {
         assert_eq!(default_machine("research", "buildbox", Some("/r")), None);
         assert_eq!(default_machine("lane", "", Some("/r")), None);
         assert_eq!(default_machine("lane", "buildbox", None), None);
+    }
+
+    #[test]
+    fn remote_retry_discards_old_bootstrap_and_submission_before_and_after_placement() {
+        let (fx, _) = box_fixture();
+        write_config(&fx, &lane_config());
+        stub_box(&fx);
+        let ctx = fx.world.ctx();
+        let started = start(
+            &ctx,
+            "demo",
+            start_args(Some(fx.repo.to_string_lossy().into_owned()), None),
+        )
+        .unwrap();
+        let started = place_started(&ctx, &fx.project, &started);
+        thread::update(&fx.project, &started.id, |t| {
+            t.status = Status::Failed;
+            t.bootstrap = "acknowledged".into();
+            t.brief_submitted = true;
+            t.brief_submitted_at = project::now();
+            t.launch_attempts = 1;
+            t.startup_wait_started.clear();
+            t.failure_class = crate::contracts::FailureClass::ProcessGone;
+        })
+        .unwrap();
+        retry(&ctx, "demo", &started.id, "remote agent killed").unwrap();
+        let queued = thread::load(&fx.project, &started.id).unwrap();
+        assert_eq!(queued.attempt, started.attempt + 1);
+        assert!(queued.bootstrap.is_empty());
+        assert!(!queued.brief_submitted);
+        assert!(queued.brief_submitted_at.is_empty());
+
+        // The old pane remains bound until placement. A courier pass in this
+        // interval can import its old receipt again; that is not new work.
+        thread::update(&fx.project, &started.id, |t| {
+            t.bootstrap = "acknowledged".into();
+        })
+        .unwrap();
+        let placed = place_started(&ctx, &fx.project, &queued);
+        assert_eq!(placed.attempt, queued.attempt);
+        assert_eq!(placed.worktree_path, started.worktree_path);
+        assert_eq!(placed.launch.brief_hash, started.launch.brief_hash);
+        assert!(placed.bootstrap.is_empty());
+        assert!(!placed.brief_submitted);
+        assert!(placed.brief_submitted_at.is_empty());
+        assert!(placed.prompt_pending);
+        assert_eq!(placed.launch_attempts, 0);
     }
 
     #[test]
