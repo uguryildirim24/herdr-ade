@@ -187,6 +187,21 @@ class WallBoundaryTests(unittest.TestCase):
         # An absolute foreign record path cannot substitute for a local ID.
         with self.assertRaises(StopIteration):
             guest.fault('kill-pane', [str(self.outside)])
+        runs = self.home / 'runs'
+        runs.mkdir()
+        (runs / 'ready.jsonl').write_text('{"pane":"local-pane","phase":"ready","pid":1}\n')
+        original_stat = guest.Path.stat
+
+        def foreign_stat(path, *args, **kwargs):
+            if path == Path('/proc/1'):
+                return SimpleNamespace(st_uid=os.getuid() + 1)
+            return original_stat(path, *args, **kwargs)
+
+        with mock.patch.object(guest, 'HOME', self.home), \
+                mock.patch.object(guest.Path, 'stat', autospec=True, side_effect=foreign_stat), \
+                mock.patch.object(guest.os, 'kill') as kill, self.assertRaises(ValueError):
+            guest.fault('kill-process', ['t-0001'])
+        kill.assert_not_called()
 
     def test_reset_never_removes_shared_auth_and_evidence_excludes_it(self):
         auth = self.home / 'shared-auth/auth.json'
