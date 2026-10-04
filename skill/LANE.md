@@ -8,6 +8,7 @@ You are one lane of a herdr ADE project. A coordinator gave you the task at the 
 - Keep technical detail in reports. Messages meant for Rolf should be short and clear.
 - Do not add a refusal, flag, config key or check the brief didn't ask for. If you think one is needed, say so in the report instead.
 - Do not edit project memory. Put durable lessons in your report for the coordinator to decide.
+- When fixing a defect found live, add `tools/wall/regressions/<defect>/repro` if the sandbox can express it. Accept `--instance N`, start from that instance's reset, print EXPECTED and ACTUAL, and exit non-zero while the bug exists.
 - Never add a throwaway tab or pane to your lane workspace or to the watched session. Run visual checks and probes in the isolated session `herdr --session scratch-<lane id> ...` on your lane's machine. When done, run `herdr session stop scratch-<lane id>` and `herdr session delete scratch-<lane id>`; resolve also removes a leftover session.
 
 ## If this attempt fails

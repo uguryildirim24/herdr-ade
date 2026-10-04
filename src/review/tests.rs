@@ -4,6 +4,7 @@ use crate::testkit::{Fx, commit_file, fixture, git};
 mod attachments;
 mod holds;
 mod starts;
+mod wall_gate;
 mod withdrawals;
 use std::path::Path;
 
@@ -2483,10 +2484,17 @@ fn incomplete_capture_with_exit_zero_is_not_a_passing_receipt() {
     ctx.runner = &Incomplete;
     let git = Git::new(ctx.runner, &review.repo);
     assert!(
-        observed_gates(&ctx, &fx.project, &review, &candidate, &git)
-            .unwrap_err()
-            .to_string()
-            .contains("not established")
+        observed_gates(
+            &ctx,
+            &fx.project,
+            &review,
+            &candidate,
+            &git,
+            &mut String::new()
+        )
+        .unwrap_err()
+        .to_string()
+        .contains("not established")
     );
     let receipt = receipts(&fx.project, &review).pop().unwrap();
     assert_eq!(receipt.exit, Some(0));
@@ -2508,7 +2516,15 @@ fn passing_receipt_records_environment_candidate_and_full_logs_and_invalidates_o
     let mut ctx = fx.world.ctx();
     ctx.runner = &crate::runner::RealRunner;
     let git = Git::new(ctx.runner, &review.repo);
-    let runs = observed_gates(&ctx, &fx.project, &review, &candidate, &git).unwrap();
+    let runs = observed_gates(
+        &ctx,
+        &fx.project,
+        &review,
+        &candidate,
+        &git,
+        &mut String::new(),
+    )
+    .unwrap();
     assert_eq!(
         runs,
         vec![GateRun {
@@ -2536,12 +2552,27 @@ fn passing_receipt_records_environment_candidate_and_full_logs_and_invalidates_o
     );
     assert!(!receipt.matches(&fx.project, &review, &changed, &cmd, "local"));
     assert!(
-        observed_gates(&ctx, &fx.project, &review, &candidate, &git)
-            .unwrap_err()
-            .to_string()
-            .contains("not established")
+        observed_gates(
+            &ctx,
+            &fx.project,
+            &review,
+            &candidate,
+            &git,
+            &mut String::new()
+        )
+        .unwrap_err()
+        .to_string()
+        .contains("not established")
     );
-    observed_gates(&ctx, &fx.project, &review, &changed, &git).unwrap();
+    observed_gates(
+        &ctx,
+        &fx.project,
+        &review,
+        &changed,
+        &git,
+        &mut String::new(),
+    )
+    .unwrap();
     assert!(
         receipts(&fx.project, &review)
             .iter()
@@ -2564,9 +2595,16 @@ fn gate_free_and_allowlist_exclusions_are_visible_not_silently_broadened() {
         ..Default::default()
     }];
     assert!(
-        observed_gates(&fx.world.ctx(), &fx.project, &review, &candidate, &git)
-            .unwrap()
-            .is_empty()
+        observed_gates(
+            &fx.world.ctx(),
+            &fx.project,
+            &review,
+            &candidate,
+            &git,
+            &mut String::new()
+        )
+        .unwrap()
+        .is_empty()
     );
     let selection_path = dir(&fx.project)
         .join(&review.id)
@@ -2581,7 +2619,15 @@ fn gate_free_and_allowlist_exclusions_are_visible_not_silently_broadened() {
     assert_eq!(selection["changed_paths"][0].as_str(), Some("src/lane1.rs"));
     review.gates.clear();
     review.gates_note = "no gates declared".into();
-    observed_gates(&fx.world.ctx(), &fx.project, &review, &candidate, &git).unwrap();
+    observed_gates(
+        &fx.world.ctx(),
+        &fx.project,
+        &review,
+        &candidate,
+        &git,
+        &mut String::new(),
+    )
+    .unwrap();
     assert!(
         std::fs::read_to_string(selection_path)
             .unwrap()
@@ -2675,8 +2721,15 @@ fn checker_timeout_and_spawn_errors_are_unknown_not_pass_or_work_failure() {
     }];
     let candidate = candidate(&fx, &review);
     let git = Git::new(&fx.world.runner, &review.repo);
-    let failure =
-        observed_gates(&fx.world.ctx(), &fx.project, &review, &candidate, &git).unwrap_err();
+    let failure = observed_gates(
+        &fx.world.ctx(),
+        &fx.project,
+        &review,
+        &candidate,
+        &git,
+        &mut String::new(),
+    )
+    .unwrap_err();
     assert!(failure.to_string().contains("not established"));
     assert!(
         receipts(&fx.project, &review)[0]
@@ -2687,7 +2740,17 @@ fn checker_timeout_and_spawn_errors_are_unknown_not_pass_or_work_failure() {
         |cmd| cmd.program == "sh",
         |_| Ok(crate::runner::fake::timeout()),
     );
-    assert!(observed_gates(&fx.world.ctx(), &fx.project, &review, &candidate, &git).is_err());
+    assert!(
+        observed_gates(
+            &fx.world.ctx(),
+            &fx.project,
+            &review,
+            &candidate,
+            &git,
+            &mut String::new()
+        )
+        .is_err()
+    );
     assert!(
         receipts(&fx.project, &review)
             .iter()
@@ -2709,7 +2772,15 @@ fn receipt_capture_keeps_full_large_logs_instead_of_treating_clipping_as_pass() 
     let mut ctx = fx.world.ctx();
     ctx.runner = &crate::runner::RealRunner;
     let git = Git::new(ctx.runner, &review.repo);
-    observed_gates(&ctx, &fx.project, &review, &candidate, &git).unwrap();
+    observed_gates(
+        &ctx,
+        &fx.project,
+        &review,
+        &candidate,
+        &git,
+        &mut String::new(),
+    )
+    .unwrap();
     let receipt = receipts(&fx.project, &review).pop().unwrap();
     assert!(receipt.complete);
     assert_eq!(

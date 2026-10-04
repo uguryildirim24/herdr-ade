@@ -1,0 +1,207 @@
+#!/usr/bin/python3
+"""Trusted host gate for oci. Never invoke this inside a lane boundary.
+
+Exit 75 means contention: retry the same sealed candidate, not a code failure.
+All transcripts/captures are outside the candidate and the disposable instance.
+"""
+import argparse
+import fcntl
+import hashlib
+import json
+import os
+from pathlib import Path
+import shlex
+import signal
+import subprocess
+import sys
+import tempfile
+import time
+
+TOOLS = Path(__file__).resolve().parent
+FAULTS = 'kill-pane kill-process ticker disconnect reboot fill corrupt clock install'
+BUDGET = 900
+CLEANUP = 90
+
+
+class Incomplete(Exception):
+    pass
+
+
+def findings(path, clock=False):
+    for line in path.read_text(errors='replace').splitlines():
+        if line.startswith('FINDING') and not (clock and line.startswith('FINDING: no injectable harness clock.')):
+            raise RuntimeError(f'{line}; see {path}')
+
+
+class Gate:
+    def __init__(self, evidence, candidate, alternate):
+        self.evidence = evidence
+        self.candidate = candidate
+        self.alternate = alternate
+        self.started = time.monotonic()
+        self.deadline = self.started + BUDGET - CLEANUP
+        self.round = 'build'
+        self.wall = ['sudo', '-n', str(TOOLS / 'wall'), '--instance', '5']
+
+    def command(self, args, name, env=None, timeout=None):
+        remaining = self.deadline - time.monotonic()
+        if timeout is not None:
+            remaining = min(remaining, timeout)
+        if remaining <= 0:
+            raise TimeoutError(f'timed out at {self.round}')
+        with (self.evidence / 'commands.log').open('a') as log:
+            log.write(f'{time.monotonic() - self.started:.3f}s {self.round}: {shlex.join(map(str, args))}\n')
+        with (self.evidence / f'{name}.log').open('ab') as output:
+            process = subprocess.Popen(list(map(str, args)), cwd=self.candidate, env=env,
+                                       stdout=output, stderr=subprocess.STDOUT, start_new_session=True)
+            try:
+                code = process.wait(timeout=remaining)
+            except BaseException:
+                # sudo-owned controllers must also die before capture/reset.
+                subprocess.run(['sudo', '-n', '/bin/kill', '-KILL', '--', f'-{process.pid}'],
+                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=5)
+                process.wait(timeout=5)
+                raise
+        if code:
+            raise RuntimeError(f'exit {code}; see {name}.log')
+        # Historical guest helpers explicitly disclose assisted-open/provider
+        # workarounds. They are evidence for exploration, not a passing gate.
+        findings(self.evidence / f'{name}.log')
+
+    def snapshot(self, name):
+        self.command(['sh', '-c', 'date -u; id ubuntu; '
+                      'ls -ld /home/ubuntu/.herdr-ade /home/ubuntu/.config/herdr '
+                      '/home/ubuntu/.config/herdr/herdr.sock; '
+                      'ps -u ubuntu -o pid,lstart,comm'], name)
+
+    def run(self):
+        self.snapshot('ubuntu-before')
+        self.command(['git', 'rev-parse', 'HEAD'], 'candidate')
+        self.command(['git', 'status', '--porcelain'], 'candidate-status')
+        tools = [TOOLS / name for name in ['gate', 'wall', 'guest.py', 'prove', 'scripted-agent.js']]
+        tools += sorted((TOOLS / 'regressions').glob('*/repro'))
+        (self.evidence / 'tools.json').write_text(json.dumps(
+            {str(p): hashlib.sha256(p.read_bytes()).hexdigest() for p in tools}, indent=2) + '\n')
+        self.command(['cargo', 'build', '--bins'], 'build')
+        # cargo metadata honors this worktree's config and CARGO_TARGET_DIR.
+        self.command(['cargo', 'metadata', '--no-deps', '--format-version', '1'], 'metadata')
+        metadata = json.loads((self.evidence / 'metadata.log').read_text())
+        build = Path(metadata['target_directory']) / 'debug'
+        if not (self.alternate / 'herdr-ade').is_file():
+            raise Incomplete('prove install: alternate herdr-ade build missing')
+        with (build / 'herdr-ade').open('rb') as candidate, (self.alternate / 'herdr-ade').open('rb') as alternate:
+            if hashlib.file_digest(candidate, 'sha256').digest() == hashlib.file_digest(alternate, 'sha256').digest():
+                raise Incomplete('prove install: alternate build is identical to candidate')
+        self.round = 'install'
+        self.command([*self.wall, 'install', '--build', build], 'install')
+        self.command([*self.wall, 'enter', 'set -e; ha --version; id; '
+                      'sha256sum "$HOME/bin/herdr-ade" "$HOME/bin/herdr-pi" "$HOME/bin/herdr-rundown"'],
+                     'installed-build')
+        # Repros run first so a known defect is named rather than masked by a
+        # later general journey failure. Each repro owns its initial reset.
+        repros = sorted((TOOLS / 'regressions').glob('*/repro'))
+        if not repros:
+            raise Incomplete('no live regression repros found')
+        for repro in repros:
+            self.round = f'regression {repro.parent.name}'
+            self.command([repro, '--instance', '5'], f'regression-{repro.parent.name}')
+            self.command([*self.wall, 'evidence', self.evidence / f'{repro.parent.name}-capture'],
+                         f'{repro.parent.name}-evidence')
+        self.round = 'prove'
+        # Ignore inherited selection overrides: a gate always runs every round.
+        env = dict(os.environ)
+        env.pop('WALL_PROVE_FAULTS', None)
+        self.command([*self.wall, 'prove', self.evidence / 'prove', self.alternate], 'prove', env)
+        for fault in FAULTS.split():
+            self.round = f'prove/{fault}'
+            if not all((self.evidence / 'prove' / fault / 'capture' / name).is_file()
+                       for name in ['local.tar', 'box.tar']):
+                raise Incomplete(f'prove {fault}: capture missing')
+            findings(self.evidence / 'prove' / fault / 'commands.log', clock=(fault == 'clock'))
+        # Staging strips the candidate, while install faults stream the alternate
+        # unchanged. Compare the actual sandbox images, not debug-file sizes.
+        install_log = (self.evidence / 'prove/install/commands.log').read_text()
+        hashes = {parts[0] for line in install_log.splitlines()
+                  if len(parts := line.split()) == 2 and len(parts[0]) == 64
+                  and parts[1].endswith('/bin/herdr-ade')}
+        if len(hashes) < 2:
+            raise Incomplete('prove install: sandbox image did not change')
+        self.round = 'loop'
+        self.command([*self.wall, 'reset'], 'loop-reset')
+        self.command([*self.wall, 'enter', 'python3 "$HOME/tools/guest.py" gate-loop'], 'loop')
+        self.command([*self.wall, 'evidence', self.evidence / 'loop-capture'], 'loop-evidence')
+
+    def active_round(self):
+        if self.round == 'prove':
+            rounds = [p for p in (self.evidence / 'prove').glob('*') if p.is_dir()]
+            if rounds:
+                return 'prove/' + max(rounds, key=lambda p: p.stat().st_mtime).name
+        return self.round
+
+    def finish(self):
+        # Reserve cleanup time inside the total 15-minute budget, not after it.
+        self.deadline = self.started + BUDGET - 15
+        errors = []
+        for verb, args in [('evidence', [self.evidence / 'final-capture']), ('reset', [])]:
+            try:
+                self.command([*self.wall, verb, *args], f'final-{verb}',
+                             timeout=25 if verb == 'evidence' else 55)
+            except (TimeoutError, subprocess.TimeoutExpired):
+                errors.append(f'timed out at cleanup/{verb}')
+            except Exception as error:
+                errors.append(f'{verb}: {error}')
+        try:
+            self.snapshot('ubuntu-after')
+        except Exception as error:
+            errors.append(f'ubuntu-after: {error}')
+        return errors
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--candidate', type=Path, default=Path.cwd(), help='review worktree (default: cwd)')
+    parser.add_argument('--alternate-build', type=Path, default=Path('/home/ubuntu/.local/bin'),
+                        help='existing alternate ADE build for the mixed-build fault')
+    args = parser.parse_args()
+    lock_dir = Path('/home/ubuntu/.cache/herdr-wall-gate')
+    lock_dir.mkdir(parents=True, exist_ok=True)
+    with (lock_dir / 'instance-5.lock').open('a') as lock:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            print('WALL GATE INCOMPLETE: gate instance busy (retryable; exit 75)')
+            return 75
+        evidence = Path(tempfile.mkdtemp(prefix='wall-gate-', dir=lock_dir))
+        gate = Gate(evidence, args.candidate.resolve(), args.alternate_build.resolve())
+        result, code = 'WALL GATE PASS', 0
+
+        def interrupted(signum, _frame):
+            raise RuntimeError(f'interrupted by signal {signum}')
+
+        signal.signal(signal.SIGTERM, interrupted)
+        signal.signal(signal.SIGINT, interrupted)
+        try:
+            gate.run()
+        except Incomplete as error:
+            result, code = f'WALL GATE INCOMPLETE: {error}', 1
+        except (TimeoutError, subprocess.TimeoutExpired):
+            result, code = f'WALL GATE FAIL: {gate.active_round()}: timed out at {gate.active_round()}', 1
+        except Exception as error:
+            result, code = f'WALL GATE FAIL: {gate.active_round()}: {error}', 1
+        finally:
+            # A second signal must not interrupt the bounded cleanup.
+            signal.signal(signal.SIGTERM, signal.SIG_IGN)
+            signal.signal(signal.SIGINT, signal.SIG_IGN)
+            errors = gate.finish()
+            if errors:
+                result, code = f'WALL GATE FAIL: cleanup: {"; ".join(errors)}; prior result: {result}', 1
+        elapsed = time.monotonic() - gate.started
+        (evidence / 'result.txt').write_text(f'{result}\nElapsed: {elapsed:.3f}s\n')
+        print(f'Evidence: {evidence}; elapsed {elapsed:.3f}s')
+        print('Allowed skips: prove clock (no injectable clock); Claude trust probe (Mac only).')
+        print(result)
+        return code
+
+
+if __name__ == '__main__':
+    sys.exit(main())
