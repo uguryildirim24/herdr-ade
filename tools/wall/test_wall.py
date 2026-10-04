@@ -108,6 +108,10 @@ class WallBoundaryTests(unittest.TestCase):
             self.assertEqual(list((home / 'bin').glob('herdr-ade.*')),
                              [home / 'bin/herdr-ade.next'])
 
+    def test_scripted_reviewer_uses_reviewer_skill_before_mid_review(self):
+        subprocess.run(['node', str(Path(__file__).with_name('test_scripted_agent.js'))],
+                       check=True)
+
     def test_reset_refuses_an_existing_shared_filesystem(self):
         base = self.home / 'base'
         (base / 'tools').mkdir(parents=True)

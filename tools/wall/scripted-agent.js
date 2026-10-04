@@ -55,7 +55,7 @@ async function work() {
   const controlPath = path.join(home,'control.json');
   const control = fs.existsSync(controlPath) ? JSON.parse(fs.readFileSync(controlPath)) : {};
   report('working');
-  const skill = cp.spawnSync('ha',['skill','lane'],{encoding:'utf8'});
+  const skill = cp.spawnSync('ha',['skill',record.role === 'reviewer' ? 'reviewer' : 'lane'],{encoding:'utf8'});
   if (skill.status !== 0) throw Error(skill.stderr);
   const brief = path.join(record.thread_dir,'brief.md');
   event('brief',{path:brief,sha256:crypto.createHash('sha256').update(fs.readFileSync(brief)).digest('hex')});
