@@ -81,6 +81,41 @@ class GateTests(unittest.TestCase):
             self.assertNotIn('WALL_PROVE_FAULTS', prove)
             self.assertFalse(any(name == 'loop' for _, name, _ in calls))
 
+    def test_loop_restores_candidate_after_mixed_build_fault(self):
+        with tempfile.TemporaryDirectory() as home:
+            home = Path(home)
+            alternate = home / 'alternate'
+            alternate.mkdir()
+            (alternate / 'herdr-ade').write_text('alternate')
+            (home / 'debug').mkdir()
+            (home / 'debug/herdr-ade').write_text('candidate')
+            subject = gate.Gate(home, home, alternate)
+            calls = []
+
+            def command(args, name, env=None):
+                calls.append((args, name))
+                if name == 'metadata':
+                    (home / 'metadata.log').write_text(json.dumps({'target_directory': str(home)}))
+                if name == 'prove':
+                    for fault in gate.FAULTS.split():
+                        capture = home / 'prove' / fault / 'capture'
+                        capture.mkdir(parents=True)
+                        for archive in ['local.tar', 'box.tar']:
+                            (capture / archive).touch()
+                        (capture.parent / 'commands.log').write_text('')
+                    (home / 'prove/install/commands.log').write_text(
+                        'a' * 64 + ' /home/wall-5/bin/herdr-ade\n' +
+                        'b' * 64 + ' /home/wall-5/bin/herdr-ade\n')
+
+            with mock.patch.object(subject, 'command', command):
+                subject.run()
+            names = [name for _, name in calls]
+            restored, = [args for args, name in calls if name == 'loop-install']
+            self.assertEqual(restored, [*subject.wall, 'install', '--build', home / 'debug'])
+            self.assertLess(names.index('prove'), names.index('loop-install'))
+            self.assertLess(names.index('loop-install'), names.index('loop-build'))
+            self.assertLess(names.index('loop-build'), names.index('loop'))
+
     def test_only_the_clock_finding_is_allowed_not_assisted_open_or_provider_workarounds(self):
         with tempfile.TemporaryDirectory() as home:
             log = Path(home) / 'commands.log'

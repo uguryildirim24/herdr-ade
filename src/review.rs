@@ -1191,10 +1191,7 @@ fn verdict(
     // reviewer; mechanical proof comes only from the existing execution path.
     let mut execution = review.clone();
     execution.verdict_event = event.id.clone();
-<<<<<<< HEAD
     execution.verdict = Some(verdict.clone());
-    verdict.gates = observed_gates(ctx, project, &execution, &verdict.candidate, git)?;
-=======
     verdict.gates = observed_gates(
         ctx,
         project,
@@ -1203,7 +1200,6 @@ fn verdict(
         git,
         &mut verdict.gates_note,
     )?;
->>>>>>> de2fa1d4d76199837704127f913571d7eaaa61b9
     Ok(verdict)
 }
 /// ADE-owned execution evidence, separate from the reviewer-authored report.

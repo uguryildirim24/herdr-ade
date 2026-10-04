@@ -16,7 +16,8 @@ Run `tools/wall/gate` in the review worktree. This is a **trusted host gate**, l
 `cargo test`, not a lane command or a new lane boundary exception. It builds the
 candidate with its existing Cargo target directory; installs only instance 5;
 runs all repros, every prove fault and a Linux scripted fixture journey; captures
-evidence and resets. Use the canonical gate command `tools/wall/gate` (or
+evidence and resets. It reinstalls the candidate after prove's mixed-build fault,
+so the final journey runs the candidate, not the alternate fault image. Use the canonical gate command `tools/wall/gate` (or
 `./tools/wall/gate`) when declaring it. Do not declare it until it is on main.
 The review path selector always retains a declared wall gate for changes under
 `src/`, `assets/`, `mods/`, or `tools/wall/`, regardless of its paths allowlist.

@@ -127,7 +127,11 @@ class Gate:
         if len(hashes) < 2:
             raise Incomplete('prove install: sandbox image did not change')
         self.round = 'loop'
-        self.command([*self.wall, 'reset'], 'loop-reset')
+        # The mixed-build install fault leaves the alternate executable in the
+        # sandbox. Install restores the candidate AND resets both accounts.
+        self.command([*self.wall, 'install', '--build', build], 'loop-install')
+        self.command([*self.wall, 'enter', 'set -e; ha --version; '
+                      'sha256sum "$HOME/bin/herdr-ade"'], 'loop-build')
         self.command([*self.wall, 'enter', 'python3 "$HOME/tools/guest.py" gate-loop'], 'loop')
         self.command([*self.wall, 'evidence', self.evidence / 'loop-capture'], 'loop-evidence')
 
