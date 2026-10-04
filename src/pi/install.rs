@@ -146,9 +146,10 @@ pub(crate) struct SetupReport {
 
 /// Write the DeepSeek `contextWindow` overrides into `models.json`. Runs on
 /// every setup; the merge keeps every other key.
-fn write_deepseek(env: &super::Env, layout: &Layout) -> Result<()> {
+fn write_deepseek(env: &super::Env, layout: &Layout) -> Result<usize> {
     let models = super::doctor::configured_deepseek_models(&env.config_dir())?;
-    deepseek::write_overrides(&layout.models(), &models)
+    deepseek::write_overrides(&layout.models(), &models)?;
+    Ok(models.len())
 }
 
 /// Setup: pinned install, shared folder, guard, the running herdr's state
@@ -162,7 +163,7 @@ pub(crate) fn setup(
     let folder = super::folder::ensure(layout)?;
     let wrapper = super::launch::write_wrapper(layout)?;
     let guard = write_guard(layout)?;
-    write_deepseek(env, layout)?;
+    let deepseek_models = write_deepseek(env, layout)?;
 
     let integration = runner.run(
         &sh::Cmd::new(env.herdr_bin(), Duration::from_secs(120))
@@ -194,11 +195,18 @@ pub(crate) fn setup(
             "installed the herdr state hook into {}",
             layout.extensions().display()
         ),
-        format!(
-            "wrote the DeepSeek compaction override (contextWindow {}) into {}",
-            deepseek::DEEPSEEK_CONTEXT_WINDOW,
-            layout.models().display()
-        ),
+        if deepseek_models == 0 {
+            format!(
+                "no DeepSeek recipes; removed any setup-owned empty provider from {}",
+                layout.models().display()
+            )
+        } else {
+            format!(
+                "wrote the DeepSeek compaction override (contextWindow {}) into {}",
+                deepseek::DEEPSEEK_CONTEXT_WINDOW,
+                layout.models().display()
+            )
+        },
     ];
     let _ = folder;
     Ok(SetupReport {
@@ -212,6 +220,69 @@ pub(crate) fn setup(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn setup_without_deepseek_never_declares_an_empty_provider() {
+        use crate::runner::fake::ok;
+
+        struct SetupRunner(Layout);
+        impl sh::Runner for SetupRunner {
+            fn run(&self, cmd: &sh::Cmd) -> Result<sh::Output> {
+                if cmd.program == "npm" {
+                    std::fs::create_dir_all(self.0.cli_js().parent().unwrap())?;
+                    std::fs::write(
+                        self.0.package_json(),
+                        format!(r#"{{"version":"{PI_VERSION}"}}"#),
+                    )?;
+                    std::fs::write(self.0.cli_js(), "// fake installed pi")?;
+                } else {
+                    assert_eq!(cmd.program, "herdr");
+                    assert_eq!(cmd.args, ["integration", "install", "pi"]);
+                }
+                Ok(ok("installed"))
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let env = super::super::Env::for_test(dir.path(), &[]);
+        let layout = Layout::for_test(dir.path().join("pi"));
+        std::fs::create_dir_all(env.config_dir()).unwrap();
+        // Replace the shipped DeepSeek recipe with a Codex recipe: this box
+        // has no DeepSeek model in its canonical catalog.
+        std::fs::write(
+            env.config_dir().join("config.toml"),
+            r#"
+[recipes.pi_opencode_deepseek]
+kind = "pi"
+provider = "openai-codex"
+args = ["--provider", "openai-codex", "--model", "gpt-6.1-sol", "--thinking", "high", "--no-skills"]
+"#,
+        )
+        .unwrap();
+        assert!(
+            super::super::doctor::configured_deepseek_models(&env.config_dir())
+                .unwrap()
+                .is_empty()
+        );
+        let runner = SetupRunner(layout.clone());
+        setup(&runner, &env, &layout).unwrap();
+        let value: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(layout.models()).unwrap()).unwrap();
+        assert_eq!(value, serde_json::json!({"providers": {}}));
+        std::fs::write(
+            layout.models(),
+            r#"{"providers":{"opencode-go":{"modelOverrides":{}}}}"#,
+        )
+        .unwrap();
+        setup(&runner, &env, &layout).unwrap();
+        let value: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(layout.models()).unwrap()).unwrap();
+        assert!(value["providers"].get("opencode-go").is_none());
+        let nonempty = r#"{ "providers" : { "opencode-go" : {"baseUrl":"keep", "modelOverrides":{}}, "custom": {"apiKey":"keep"} } }"#;
+        std::fs::write(layout.models(), nonempty).unwrap();
+        setup(&runner, &env, &layout).unwrap();
+        assert_eq!(std::fs::read_to_string(layout.models()).unwrap(), nonempty);
+    }
 
     #[test]
     fn npm_argv_is_pinned_and_never_global() {

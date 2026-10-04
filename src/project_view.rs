@@ -89,6 +89,15 @@ fn installation_pending(thread: &crate::thread::Thread, reviews: &[crate::review
 }
 
 fn process_unknown(row: &Row) -> bool {
+    // A first readiness check has no process observation yet by design.
+    // Actual connection errors still remain unknown.
+    if row.group == Group::Working
+        && (row.thread.status == Status::Starting || !row.thread.startup_wait_started.is_empty())
+        && row.thread.observation_error.is_empty()
+        && !row.note.contains("session unreachable")
+    {
+        return false;
+    }
     !row.thread.recovery_pending
         && (row.group == Group::Unknown
             || row.note.contains("agent state unknown")
@@ -263,6 +272,7 @@ pub(crate) struct View {
     pub(crate) plan: Value,
     pub(crate) needs_you: Vec<String>,
     reviews: Vec<crate::review::Review>,
+    unreadable_lanes: usize,
 }
 
 impl View {
@@ -316,6 +326,8 @@ impl View {
             Ok(rows) => (rows, None),
             Err(error) => (vec![], Some(format!("review read error: {error:#}"))),
         };
+        let lane_errors = crate::thread::read_errors(project);
+        let unreadable_lanes = lane_errors.len();
         let mut lanes = observed.unwrap_or_else(|| {
             crate::thread::list(project)
                 .into_iter()
@@ -564,6 +576,15 @@ impl View {
                 });
             }
         }
+        work.extend(lane_errors.into_iter().enumerate().map(|(i, error)| {
+            entry(
+                format!("lane-error:{i}"),
+                format!(
+                    "[Unknown] Unreadable lane: {}",
+                    one_line(&format!("{error:#}"))
+                ),
+            )
+        }));
         sections.push(Section::new("Current work", work));
         sections.push(Section::new(
             "Seals",
@@ -782,6 +803,7 @@ impl View {
             plan,
             needs_you,
             reviews,
+            unreadable_lanes,
         }
     }
 
@@ -841,6 +863,7 @@ impl View {
             (review, "awaiting review"),
             (install, "awaiting installation"),
             (unknown, "unknown"),
+            (self.unreadable_lanes, "unreadable"),
         ] {
             if count > 0 {
                 work.push(format!("{count} {label}"));
