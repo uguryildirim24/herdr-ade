@@ -1,0 +1,55 @@
+#!/usr/bin/env python3
+"""B01: a deferred box start must honor a subsequently held machine."""
+import argparse
+import json
+import time
+from pathlib import Path
+from support import Sandbox
+
+parser = argparse.ArgumentParser(description=__doc__)
+parser.add_argument('--instance', type=int, required=True, choices=range(1, 9))
+parser.add_argument('--alternate-build', type=Path, required=True,
+                    help='a real different-commit ADE build, used only on the box')
+parser.add_argument('--evidence', type=Path, required=True)
+args = parser.parse_args()
+s = Sandbox(args.instance)
+s.wall('reset')
+s.enter('ha --version; sha256sum "$HOME/bin/herdr-ade"')
+s.open()
+s.control({'hold': ['working']})
+s.wall('fault', 'install', args.alternate_build.resolve(), '--box')
+s.enter('ha --version; sha256sum "$HOME/bin/herdr-ade"', box=True)
+s.start(wait=False)
+before = s.record()
+assert before.get('provider_wait_started'), 'did not defer placement'
+assert 'version_skew:' in before.get('error', ''), 'did not establish genuine build skew'
+assert not before.get('pane_id') and not before.get('worktree_path'), 'already placed'
+s.enter('ha machine hold ' + s.machine)
+# Reset's root-owned stage is the exact candidate; no extra build or copied image.
+s.wall('fault', 'install', f'/var/lib/herdr-wall-{args.instance}/bin', '--box')
+deadline = time.monotonic() + 70
+while time.monotonic() < deadline:
+    after = s.record()
+    if after.get('brief_submitted'):
+        break
+    time.sleep(3)
+held = json.loads(s.py('from pathlib import Path; import json; '
+    'print(json.dumps([p.name for p in (Path.home()/".herdr-ade/.machines").glob("*.hold")]))'))
+assert before['machine_id'] + '.hold' in held, 'saved machine hold was not retained'
+launched = bool(after.get('brief_submitted'))
+if launched:
+    s.phase('working')
+s.enter('ha overview wall')
+print('EXPECTED: no new checkout/pane/agent while the saved machine remains held')
+print('ACTUAL:', json.dumps({'hold_files': held, 'pane': after.get('pane_id'),
+                            'checkout': after.get('worktree_path'),
+                            'brief_submitted': after.get('brief_submitted'),
+                            'attempt': after.get('attempt')}), flush=True)
+s.evidence(args.evidence)
+if not launched:
+    assert not after.get('pane_id'), 'partially placed despite the hold'
+    s.enter('ha machine release ' + s.machine)
+    s.wait(lambda: s.record().get('brief_submitted'), seconds=120)
+    s.phase('working')
+print('B01 REPRODUCED' if launched else 'B01 absent; release resumes placement', flush=True)
+raise SystemExit(1 if launched else 0)

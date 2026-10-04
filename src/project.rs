@@ -263,6 +263,9 @@ pub(crate) struct Repo {
     /// reviews require a declaration here or on the reviewing project's row.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) gates: Option<Vec<Gate>>,
+    /// Explicit pile-review placement, independent of the repository's filesystem.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) review_machine: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) machine: Option<String>,
     /// The box clone path for this repository (SPEC-remote §4.1). When
@@ -1140,6 +1143,24 @@ mod tests {
         );
         assert_eq!(project.status(), Status::Active);
         assert!(create(&root, "demo", "", vec![]).is_err());
+    }
+
+    #[test]
+    fn review_machine_is_optional_and_distinct_from_repo_filesystem() {
+        let old = "+++\nname = 'Demo'\n[[repos]]\npath = '/srv/app'\nmachine = 'storage'\ngates = []\n+++\nHistorical body\n";
+        let (settings, body) = parse_project_md(old).unwrap();
+        assert_eq!(settings.repos[0].review_machine, None);
+        assert_eq!(settings.repos[0].machine.as_deref(), Some("storage"));
+        assert_eq!(body, "Historical body\n");
+        assert!(
+            !toml::to_string(&settings)
+                .unwrap()
+                .contains("review_machine")
+        );
+        let new = old.replace("gates = []", "gates = []\nreview_machine = 'local'");
+        let (settings, _) = parse_project_md(&new).unwrap();
+        assert_eq!(settings.repos[0].review_machine.as_deref(), Some("local"));
+        assert_eq!(settings.repos[0].machine.as_deref(), Some("storage"));
     }
 
     #[test]

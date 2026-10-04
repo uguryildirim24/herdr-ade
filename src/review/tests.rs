@@ -3,6 +3,7 @@ use crate::testkit::{Fx, commit_file, fixture, git};
 
 mod attachments;
 mod holds;
+mod placement;
 mod starts;
 mod wall_gate;
 mod withdrawals;

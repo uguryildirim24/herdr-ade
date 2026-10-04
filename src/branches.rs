@@ -1045,6 +1045,7 @@ mod tests {
                     gates_note: String::new(),
                     selected_gates: vec![],
                     reviewer: reviewer.then(|| record.id.clone()),
+                    review_machine: None,
                     phase: crate::review::Phase::Complete,
                     verdict: reviewer.then(|| crate::review::Verdict {
                         verdict: "approve".into(),

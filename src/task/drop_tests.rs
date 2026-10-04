@@ -45,6 +45,7 @@ fn reject(fx: &Fx, lane: &thread::Thread, sha: &str, event: &str) {
         gates_note: String::new(),
         selected_gates: vec![],
         reviewer: None,
+        review_machine: None,
         phase: crate::review::Phase::Rejected,
         verdict: None,
         verdict_event: String::new(),
