@@ -2,6 +2,7 @@
 """Unprivileged tools. All paths/identities are resolved inside this sandbox."""
 import json
 import os
+import pwd
 from pathlib import Path
 import subprocess
 import sys
@@ -9,6 +10,9 @@ import tarfile
 import time
 import tomllib
 
+from instance import AUTH, Instance
+
+INSTANCE = Instance(int(os.environ.get('WALL_INSTANCE', '0')))
 HOME = Path(os.environ['HOME'])
 ROOT = HOME / '.herdr-ade'
 PROJECT = ROOT / 'wall'
@@ -117,7 +121,7 @@ plain = "the real wall lane"
     run('git', 'config', '--global', 'user.name', 'Wall scripted lane')
     run('git', 'config', '--global', 'user.email', 'wall@localhost')
     run('git', 'config', '--global', 'init.defaultBranch', 'main')
-    run('git', 'config', '--global', '--add', 'safe.directory', '/home/wall/remote.git')
+    run('git', 'config', '--global', '--add', 'safe.directory', INSTANCE.home / 'remote.git')
     run('git', 'init', '--bare', HOME / 'remote.git')
     run('git', 'clone', HOME / 'remote.git', HOME / 'repo')
     repo = HOME / 'repo'
@@ -129,6 +133,11 @@ plain = "the real wall lane"
     run('git', '-C', repo, 'push', '-u', 'origin', 'main')
     boot()
     run('herdr-pi','setup', env=dict(os.environ, NPM_CONFIG_OFFLINE='true'))
+    # Only credentials are shared; hooks, models, sessions and config stay private.
+    auth = ROOT / 'pi/agent/auth.json'
+    if auth.exists():
+        raise ValueError('setup unexpectedly created credentials')
+    auth.symlink_to(AUTH / 'auth.json')
     models = ROOT / 'pi/agent/models.json'
     value = json.loads(models.read_text())
     if remove_empty_provider(value):
@@ -151,14 +160,17 @@ plain = "the real wall lane"
 def open_project():
     opened = subprocess.run(['ha', 'open', 'wall'], check=False)
     coordinator = json.loads((PROJECT / '.state/coordinator.json').read_text())
-    agents = subprocess.check_output(['herdr','agent','list'], text=True)
-    if coordinator['agent_name'] not in agents:
-        print('FINDING D27: explicit sandbox bootstrap after ha open timeout; not a harness fix', flush=True)
-        run('herdr','agent','start',coordinator['agent_name'],'--kind','pi',
-            '--pane',coordinator['pane_id'],'--timeout','30000','--','--wall-coordinator')
-        run('ha','open','wall')
-    elif opened.returncode:
-        opened.check_returncode()
+    # A successful modern ha open may return before the asynchronous hook
+    # publishes the agent name. Never double-start that occupied pane.
+    if opened.returncode:
+        agents = subprocess.check_output(['herdr','agent','list'], text=True)
+        if coordinator['agent_name'] not in agents:
+            print('FINDING D27: explicit sandbox bootstrap after ha open timeout; not a harness fix', flush=True)
+            run('herdr','agent','start',coordinator['agent_name'],'--kind','pi',
+                '--pane',coordinator['pane_id'],'--timeout','30000','--','--wall-coordinator')
+            run('ha','open','wall')
+        else:
+            opened.check_returncode()
     binding = json.loads((PROJECT / '.state/coordinator-hook.json').read_text())
     env = dict(os.environ, HERDR_PANE_ID=binding['pane'])
     reply = subprocess.check_output(['ha','hook','--kind','pi','--project','wall',
@@ -171,42 +183,42 @@ def open_project():
 
 
 def connect():
-    if HOME != Path('/home/wall'):
-        raise ValueError('connect runs on local wall only')
-    (HOME / '.ssh/config').write_text('''Host wall-box
+    if HOME != INSTANCE.home:
+        raise ValueError('connect runs on the local account only')
+    machine = INSTANCE.machine
+    box = HOME / 'box'
+    (HOME / '.ssh/config').write_text(f'''Host {machine}
   HostName 127.0.0.1
-  Port 22286
-  User wallbox
-  IdentityFile /home/wall/.ssh/box_key
+  Port {INSTANCE.box_port}
+  User {INSTANCE.box_user}
+  IdentityFile {HOME}/.ssh/box_key
   IdentitiesOnly yes
   StrictHostKeyChecking yes
-  UserKnownHostsFile /home/wall/.ssh/known_hosts
+  UserKnownHostsFile {HOME}/.ssh/known_hosts
 ''')
-    run('herdr','machine','add','wall-box','--label','wall-box')
+    run('herdr','machine','add',machine,'--label',machine)
     config = HOME / '.config/herdr-ade/config.toml'
     with config.open('a') as out:
-        out.write('''
-[machines.wall-box]
-label = "wall-box"
-target = "wall-box"
+        out.write(f'''
+[machines.{machine}]
+label = "{machine}"
+target = "{machine}"
 session = "default"
-home = "/home/wall/box"
-root = "/home/wall/box/.herdr-ade"
-worktrees = "/home/wall/box/worktrees"
-build = "/home/wall/box/build"
-path = "/home/wall/box/.local/bin:/home/wall/box/bin:/usr/local/bin:/usr/bin:/bin"
-ade_bin = "/home/wall/box/bin/herdr-ade"
-pi_bin = "/home/wall/box/bin/herdr-pi"
+home = "{box}"
+root = "{box}/.herdr-ade"
+worktrees = "{box}/worktrees"
+build = "{box}/build"
+path = "{box}/.local/bin:{box}/bin:/usr/local/bin:/usr/bin:/bin"
+ade_bin = "{box}/bin/herdr-ade"
+pi_bin = "{box}/bin/herdr-pi"
 kinds = ["pi"]
-[[machines.wall-box.repos]]
-path = "/home/wall/repo"
-box_path = "/home/wall/box/repo"
-publish_url = "/home/wall/remote.git"
+[[machines.{machine}.repos]]
+path = "{HOME}/repo"
+box_path = "{box}/repo"
+publish_url = "{HOME}/remote.git"
 ''')
-    # Local bare remote shared only inside the confined sandbox. All scratch
-    # branch publication still uses a real git receive-pack, never GitHub.
     run('chmod','-R','a+rwX',HOME / 'remote.git')
-    run('ssh','wall-box','git -C "$HOME/repo" remote set-url origin /home/wall/remote.git; '
+    run('ssh',machine,f'git -C "$HOME/repo" remote set-url origin {HOME}/remote.git; '
         'git -C "$HOME/repo" fetch origin; git -C "$HOME/repo" reset --hard origin/main')
 
 
@@ -219,7 +231,7 @@ def lane(remote=False):
         '--repo',HOME / 'repo','--recipe','wall_lane','--request',(HOME / 'request').read_text(),
         '--acceptance','Scripted fault plumbing observed']
     if remote:
-        command += ['--machine','wall-box']
+        command += ['--machine', INSTANCE.machine]
     run(*command)
     record = records()[-1]
     for _ in range(600):
@@ -317,8 +329,10 @@ def evidence():
 
 
 if __name__ == '__main__':
-    if HOME not in [Path('/home/wall'),Path('/home/wall/box')] or os.geteuid() == 0:
-        sys.exit('guest commands require the unprivileged sandbox account')
+    expected_user = INSTANCE.user if HOME == INSTANCE.home else INSTANCE.box_user
+    if (HOME not in [INSTANCE.home, INSTANCE.home / 'box'] or os.geteuid() == 0
+            or pwd.getpwuid(os.getuid()).pw_name != expected_user):
+        sys.exit('guest commands require the selected unprivileged sandbox account')
     command = sys.argv[1]
     if command == 'fault':
         fault(sys.argv[2],sys.argv[3:])

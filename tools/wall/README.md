@@ -3,6 +3,38 @@
 A disposable live ADE harness, not a unit-test fake. No production Rust behavior
 is changed. The host controller needs oci's existing `sudo`; agents do not get it.
 
+## Instances
+
+The omitted flag preserves the original default: `wall`/`wallbox`, `/home/wall`,
+ports 22285/22286, units `herdr-wall-PORT`, and saved machine `wall-box`.
+**Do not reset/install/fault the default while another lane uses it.**
+
+Every command accepts `--instance N` before its verb, N = 1..8. Instance N uses
+`wallN`/`wallboxN`, `/home/wall-N` (box beneath it), ports `22285+2*N` and
+`22286+2*N`, units `herdr-wall-N-PORT`, and saved machine `wall-box-N`. Each has
+its own root/socket, remote, mounts, private tmp, cgroups, controls and releases.
+The limits below are unchanged per instance. Homes are hidden across instances;
+UIDs prevent cross-instance signals. Thread IDs are resolved **only** in the
+selected account's records, even if another instance has the same short ID.
+
+```bash
+cargo build --bins
+sudo tools/wall/wall --instance 1 install --build "${CARGO_TARGET_DIR:-target}/debug"
+sudo tools/wall/wall --instance 1 reset
+sudo tools/wall/wall --instance 1 enter
+sudo tools/wall/wall list
+sudo tools/wall/wall --instance 1 prove /tmp/new-proof-1 /absolute/alternate-build
+```
+
+Install stages the explicitly selected branch build once, keyed by binary
+hashes, in root-owned `/var/lib/herdr-wall-builds`. Instances share this
+read-only stage, with private writable executable copies for fault injection.
+No old v1 stage is reused. Install another instance with the same `--build` to
+reuse the stage; a later `install --build NEW` refreshes only its selected
+instance. `list` inventories all nine slots, build version/commit, processes,
+tmpfs use and last reset. An untouched v1 default has no reset/build metadata;
+its existing version is read without installing or stopping it.
+
 ## Install, reset, enter
 
 From the checked-out harness on oci:
@@ -23,7 +55,7 @@ a fresh pinned pi download and these tools. It never imports ubuntu's npm
 configuration, provider credentials or SSH identity. It generates new sandbox
 SSH identities. `reset` is offline, stops only wall-owned processes/cgroups,
 wipes/remounts the scratch disk, and rebuilds both accounts. The baseline git
-commit is deterministic. **Reset also removes sandbox provider logins.**
+commit is deterministic. **Reset retains the one shared sandbox login.**
 
 Inside, `HOME=/home/wall`, root is `$HOME/.herdr-ade`, socket is
 `$HOME/.config/herdr/herdr.sock`; `ha`, `herdr`, `pi`, node and npm are sandbox
@@ -33,11 +65,15 @@ on 127.0.0.1:22286. Local entry uses port 22285. Neither port is publicly bound.
 
 The two SSH services have separate cgroups and mount namespaces. Host homes
 (including ubuntu and root) and host `/run` sockets are hidden; host filesystems
-are read-only. Only `/home/wall` is exposed writable: a **2 GiB tmpfs**, containing
+are read-only. The selected home is exposed writable: a **2 GiB tmpfs**, containing
 both roots, logs, repositories, bare remotes and worktrees. `/tmp`, `/var/tmp`,
 `/dev/shm` and `/run` have separately bounded private tmpfs mounts. Each cgroup
-has a 2 GiB memory limit and 512-task limit. Accounts have only their private
-group, no sudo, and cannot signal ubuntu processes. System tools/libraries and
+has a 2 GiB memory limit and 512-task limit. Numbered instances also put both
+services under a dedicated `herdrwallN.slice` with **aggregate** 2 GiB memory
+and 512 tasks, so the two accounts cannot double the instance budget. The
+untouched default keeps its original cgroups. Accounts have their private
+group and `wall-auth`, no sudo, and cannot signal ubuntu or other instance
+processes. System tools/libraries and
 DNS configuration are read-only; outbound networking remains available for pi.
 This is filesystem/UID/resource isolation, not a VM or network-denial firewall.
 Never give a wall lane the host controller's sudo access **inside** the sandbox.
@@ -57,7 +93,7 @@ not invented panes. The remote variant exercises provisioning, lane cards,
 branch publication and courier over real SSH against the shared **local bare
 remote** `/home/wall/remote.git`, never GitHub. All repos are scratch fixtures.
 
-On builds with D27, `ha open` records an invalid-timeout failure. The helper
+On older builds with D27, `ha open` records an invalid-timeout failure. The helper
 prints `FINDING D27` and explicitly starts that recorded coordinator with Herdr's
 valid 30000 ms timeout, then reopens it. This sandbox-only bootstrap preserves
 the failure evidence; it is not a production fix or claim that open succeeded
@@ -93,11 +129,23 @@ Do not use it to claim a real-model review or successful landing.
 
 Rolf enters the local sandbox, runs `pi`, types `/login openai-codex`, and selects
 **ChatGPT Plus/Pro (Codex)**, completing its browser/device flow. That single
-provider login **as `wall`** enables local `wall_real` lanes (configured Astra/max;
-confirm the model ID in the installed catalog after login). Credentials remain
-in wall's own pi agent folder. Nothing is copied from ubuntu or another machine.
-Real remote model lanes additionally need the same provider login **as
-`wallbox`**; scripted remote lanes need no login. Reset wipes both logins.
+provider login in any installed instance enables local and box `wall_real` lanes
+(configured Astra/max; confirm the model ID in the installed catalog after login).
+Credentials live in `/var/lib/herdr-wall-auth/auth.json`, outside every home
+and reset path. Its directory is root:`wall-auth` 2770; the file is 0660. Only
+sandbox users belong to that group, never ubuntu. Nothing is copied from
+ubuntu or another machine. All freshly installed local and box accounts link
+their private pi `auth.json` to this one file, so login and token refresh are
+shared. The pinned sandbox pi package resolves auth locks to the shared file
+(two `realpath` options), preventing different account symlinks from bypassing
+each other's refresh locks. Settings, hooks, models and sessions remain private.
+
+Use any numbered instance for the one `/login openai-codex`. Reset preserves it;
+`sudo tools/wall/wall logout` clears it **for all instances**. The already-running
+v1 default is deliberately not migrated or restarted: its active mount namespace
+and private login stay as they are until its lane finishes and a later explicit
+install refreshes it. Its accounts are included in `wall-auth` without stopping
+any process. Scripted lanes need no provider login.
 
 Use a new task file and ordinary `ha thread start wall --recipe wall_real` with
 an existing request (`$HOME/request` from the helper), exact acceptance and the
@@ -160,23 +208,35 @@ scripted checkpoint claims.
   pi guard and helper binaries, as D24 needs. Pick a genuinely different build;
   log versions and hashes before/after. It never calls production `ha harness`.
 
+Additional faults are executable files in `tools/wall/faults/<name>`. The
+controller dispatches them with `--instance` and optional `--box` after applying
+standard timing options. See [faults/README.md](faults/README.md) for the contract.
+
 ## Evidence and findings
 
 ```bash
 sudo tools/wall/wall evidence /absolute/new/evidence-directory
-sudo tools/wall/prove /absolute/new/proof-directory /absolute/alternate-build-directory
+sudo tools/wall/wall --instance 1 prove /absolute/new/proof-directory /absolute/alternate-build-directory
 python3 -m unittest discover -s tools/wall -p 'test_*.py' -v
+sudo tools/wall/prove-isolation --instance 3 --peer 4 /absolute/new/isolation-proof
 ```
+
+`prove-isolation` resets only its two **explicitly numbered** slots. It tests
+cross-reset/reboot/disconnect, foreign thread refusal, hidden homes and UID
+signal denial, plus real pi auth-backend writes across accounts and reset.
+It briefly adds a clearly synthetic auth fixture (not a provider credential),
+checks evidence exclusion and removes it without removing any existing login.
+Both slots finish clean; do not run it on slots occupied by wall lanes.
 
 `evidence` exports `local.tar`/`box.tar`: project records/artifacts, `.ticker.*`,
 Herdr/server logs, scripted runs and control. It deliberately excludes provider
 auth, SSH keys, npm caches, pi sessions and the fill file. Capture **before
 reset**, to a host path outside the full filesystem. Inspect evidence before
-sharing; any log may contain an agent's text. The fresh pi state has no credentials.
+sharing; any log may contain an agent's text. Fresh installs create an empty shared auth file only if none exists.
 For a stuck/disconnected server, restore transport first; host service logs are
 `sudo journalctl -u herdr-wall-22285 -u herdr-wall-22286`.
 
-`prove` runs each command from its own clean reset, records exact commands/effects
+`prove` accepts the same instance flag and runs each command from that instance's own clean reset, records exact commands/effects
 and read-only before/after listings of ubuntu's root/socket/processes. It finishes
 with a clean reset. `WALL_PROVE_FAULTS='...'` can resume selected rounds. Normal
 ubuntu scheduler activity and concurrent installations can change ticker times
