@@ -4,11 +4,24 @@
 import { spawn, execFileSync } from 'node:child_process';
 import fs from 'node:fs';
 import path from 'node:path';
+import { createHash } from 'node:crypto';
 import { Type } from '@sinclair/typebox';
 
 export const policy = Object.freeze(__ADE_EXECUTION_POLICY__);
 const text = (s) => ({ content: [{ type: 'text', text: s }], details: undefined });
 const cleanEnv = { PATH: '/usr/bin:/bin', HOME: '/nonexistent', GIT_CONFIG_NOSYSTEM: '1', GIT_CONFIG_GLOBAL: '/dev/null' };
+// Only the fixed bridge uses the trusted runtime environment. Never pass this
+// environment to bwrap or expose it through a tool.
+const trustedEnv = Object.freeze({ ...process.env });
+const authorizedHost = (program, args) => execFileSync(program, args, {
+  cwd: policy.cwd, encoding: 'utf8', timeout: 120000, env: trustedEnv, maxBuffer: 1024 * 1024,
+});
+export function publicationProbe() {
+  validatePolicy();
+  if (!policy.publication) throw new Error('authorized publication target missing');
+  return authorizedHost('/usr/bin/git', ['-c', 'core.hooksPath=/dev/null', '-C', policy.cwd,
+    'push', '--dry-run', policy.publication, 'HEAD:refs/heads/seals/ade-publication-probe']);
+}
 const hostGit = (args) => execFileSync('/usr/bin/git', ['-c', 'core.hooksPath=/dev/null', '-C', policy.cwd, ...args], { env: cleanEnv, encoding: 'utf8' }).trim();
 let initialized;
 
@@ -56,7 +69,15 @@ function setup() {
   const npm = [path.resolve(path.dirname(node), '../lib/node_modules/npm'), '/usr/share/nodejs/npm'].find((dir) => fs.existsSync(path.join(dir, 'bin/npm-cli.js')));
   const uv = (process.env.PATH || '').split(path.delimiter).map((dir) => path.join(dir, 'uv')).find((file) => { try { return fs.statSync(file).isFile() && (fs.statSync(file).mode & 0o111); } catch { return false; } });
   fs.writeFileSync(path.join(policy.state, 'npm-launcher'), '#!/bin/sh\nexec /tool-bin/node /npm/bin/npm-cli.js "$@"\n', { mode: 0o755 });
-  initialized = { git, objects, toolchain, node, npm, uv: uv && fs.realpathSync(uv), directoryGit: fs.lstatSync(path.join(policy.cwd, '.git')).isDirectory() };
+  const evidence = (policy.evidence || []).map(({ path: destination, hash }) => {
+    const bytes = fs.readFileSync(destination);
+    if (createHash('sha256').update(bytes).digest('hex') !== hash) throw new Error('execution_evidence_mismatch: ' + destination);
+    const source = path.join(policy.state, 'evidence', hash);
+    fs.mkdirSync(path.dirname(source), { recursive: true, mode: 0o700 });
+    fs.writeFileSync(source, bytes, { mode: 0o600 });
+    return { source, destination };
+  });
+  initialized = { git, objects, toolchain, node, npm, evidence, uv: uv && fs.realpathSync(uv), directoryGit: fs.lstatSync(path.join(policy.cwd, '.git')).isDirectory() };
 }
 
 export function sandboxArgs() {
@@ -68,7 +89,7 @@ export function sandboxArgs() {
   args.push('--ro-bind', initialized.node, '/tool-bin/node');
   if (initialized.npm) args.push('--ro-bind', initialized.npm, '/npm', '--ro-bind', path.join(policy.state, 'npm-launcher'), '/tool-bin/npm');
   if (initialized.uv) args.push('--ro-bind', initialized.uv, '/tool-bin/uv');
-  args.push('--proc', '/proc', '--dev', '/dev', '--tmpfs', '/tmp', '--ro-bind', path.join(policy.state, 'empty'), '/empty',
+  args.push('--proc', '/proc', '--dev', '/dev', '--tmpfs', '/tmp', '--tmpfs', policy.root, '--ro-bind', path.join(policy.state, 'empty'), '/empty',
     '--bind', policy.cwd, policy.cwd, '--bind', path.join(policy.state, 'build'), '/build',
     '--bind', path.join(policy.state, 'home'), '/home/lane', '--ro-bind', initialized.objects, '/base-objects');
   const viewGit = initialized.directoryGit ? path.join(policy.cwd, '.git') : '/lane-git';
@@ -77,12 +98,13 @@ export function sandboxArgs() {
     '--ro-bind', path.join(policy.state, 'empty'), viewGit + '/hooks',
     '--ro-bind', path.join(policy.state, 'alternates'), viewGit + '/objects/info/alternates');
   if (!initialized.directoryGit) args.push('--ro-bind', path.join(policy.state, 'git-pointer'), path.join(policy.cwd, '.git'));
+  for (const { source, destination } of initialized.evidence) args.push('--ro-bind', source, destination);
   if (initialized.toolchain) args.push('--ro-bind', initialized.toolchain, '/toolchain');
   const registry = path.join(process.env.HOME || '', '.cargo/registry');
   if (fs.existsSync(registry)) args.push('--ro-bind', registry, '/cargo-base/registry');
   args.push('--setenv', 'PATH', '/home/lane/.cargo/bin:/tool-bin:/toolchain/bin:/usr/bin:/bin', '--setenv', 'HOME', '/home/lane',
     '--setenv', 'CARGO_HOME', '/home/lane/.cargo', '--setenv', 'CARGO_TARGET_DIR', '/build', '--setenv', 'GIT_CONFIG_NOSYSTEM', '1',
-    '--setenv', 'GIT_CONFIG_GLOBAL', '/dev/null', '--setenv', 'GIT_TERMINAL_PROMPT', '0', '--setenv', 'GIT_EDITOR', 'true', '--chdir', policy.cwd, '--remount-ro', '/');
+    '--setenv', 'GIT_CONFIG_GLOBAL', '/dev/null', '--setenv', 'GIT_TERMINAL_PROMPT', '0', '--setenv', 'GIT_EDITOR', 'true', '--chdir', policy.cwd, '--remount-ro', policy.root, '--remount-ro', '/');
   return args;
 }
 
@@ -123,8 +145,7 @@ export async function seal(action, reason, signal) {
     if (typeof reason !== 'string' || reason.length === 0 || reason.length > 16000) throw new Error('a bounded reason is required');
     args.push('--', reason);
   }
-  return execFileSync(policy.ade, args, { cwd: policy.cwd, encoding: 'utf8', timeout: 120000,
-    env: { ...process.env, GIT_CONFIG_NOSYSTEM: '1', GIT_CONFIG_GLOBAL: '/dev/null' }, maxBuffer: 1024 * 1024 });
+  return authorizedHost(policy.ade, args);
 }
 
 export default function (pi) {
@@ -133,6 +154,7 @@ export default function (pi) {
   // --no-tools would prevent activating extension tools too (Pi 0.99.1).
   const names = ['bash', 'read', 'write', 'edit', 'ade'];
   pi.registerFlag('ade-execution-probe', { description: 'Report bounded CLI tool provenance without a model request', type: 'boolean', default: false });
+  pi.registerFlag('ade-publication-probe', { description: 'Dry-run authorized publication without a model request', type: 'boolean', default: false });
   pi.on('session_start', (_event, ctx) => {
     pi.setActiveTools(names);
     if (pi.getFlag('ade-execution-probe')) {
@@ -142,6 +164,10 @@ export default function (pi) {
         const active = pi.getActiveTools();
         const tools = pi.getAllTools().filter(tool => active.includes(tool.name));
         console.error('ADE_BOUNDARY_TOOLS=' + JSON.stringify(tools.map(tool => ({ name: tool.name, source: tool.sourceInfo }))));
+        if (pi.getFlag('ade-publication-probe')) {
+          try { publicationProbe(); console.error('ADE_AUTHORIZED_PUBLICATION=passed'); }
+          catch (error) { console.error('ADE_AUTHORIZED_PUBLICATION=failed: ' + error.message); }
+        }
         ctx.shutdown();
       });
     }

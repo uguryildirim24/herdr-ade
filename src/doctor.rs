@@ -543,7 +543,7 @@ pub(crate) fn pi_execution_fixture() -> Output {
         serde_json::json!({"name": name, "source": {"path": "/runtime/ade-boundary-probe.mjs"}})
     ).collect();
     crate::runner::fake::ok(&format!(
-        "ADE_BOUNDARY_TOOLS={}\n",
+        "ADE_BOUNDARY_TOOLS={}\nADE_AUTHORIZED_PUBLICATION=passed\n",
         serde_json::to_string(&tools).unwrap()
     ))
 }
@@ -584,9 +584,41 @@ pub(crate) fn lane_execution(
 
 /// Execute the installed Pi CLI, not the SDK: the CLI's allowlist semantics
 /// caused D40. No model/provider request or namespace operation is needed here.
+#[cfg(test)]
 pub(crate) fn pi_execution_probe_command(root: &Path) -> Cmd {
+    pi_probe_command(root, false, None)
+}
+
+/// Uses a trusted host lane card, never a target chosen by lane tools. A
+/// machine without an authorized publication target remains advisory.
+pub(crate) fn pi_authorized_publication_probe_command(root: &Path) -> Cmd {
+    pi_probe_command(root, true, None)
+}
+
+pub(crate) fn pi_publication_probe_for(root: &Path, repo: &str, url: &str) -> Cmd {
+    pi_probe_command(root, true, Some((repo.to_string(), url.to_string())))
+}
+
+fn pi_probe_command(root: &Path, publication: bool, target: Option<(String, String)>) -> Cmd {
+    let target = target.or_else(|| {
+        crate::project::list_slugs(root)
+            .into_iter()
+            .find_map(|slug| {
+                let cards = root.join(slug).join(".state/lanes");
+                std::fs::read_dir(cards)
+                    .ok()?
+                    .filter_map(|entry| entry.ok())
+                    .find_map(|entry| {
+                        let card: crate::contracts::LaneCard =
+                            toml::from_str(&std::fs::read_to_string(entry.path()).ok()?).ok()?;
+                        (Path::new(&card.box_repo).join(".git").exists()
+                            && !card.publish_url.is_empty())
+                        .then_some((card.box_repo, card.publish_url))
+                    })
+            })
+    });
     let root = root.display().to_string();
-    let policy = serde_json::json!({"root": root, "ade": "/usr/bin/true", "cwd": "/tmp", "branch": "probe", "role": "lane", "state": "/tmp", "network": "denied"});
+    let policy = serde_json::json!({"root": root, "ade": "/usr/bin/true", "cwd": target.as_ref().map_or("/tmp", |t| t.0.as_str()), "publication": target.as_ref().map(|t| &t.1), "branch": "probe", "role": "lane", "state": "/tmp", "network": "denied"});
     let source = include_str!("../assets/pi-execution-boundary.mjs")
         .replace("__ADE_EXECUTION_POLICY__", &policy.to_string());
     let args =
@@ -599,7 +631,12 @@ pub(crate) fn pi_execution_probe_command(root: &Path) -> Cmd {
             .collect::<Vec<_>>()
             .join(" ");
     let script = format!(
-        "set -eu\nmkdir -p {runtime}\nstate=$(mktemp -d {template})\ntrap 'rm -rf -- \"$state\"' EXIT\ncat > \"$state/ade-boundary-probe.mjs\"\npi --no-skills {args} --mode rpc --ade-execution-probe </dev/null\n",
+        "set -eu\nmkdir -p {runtime}\nstate=$(mktemp -d {template})\ntrap 'rm -rf -- \"$state\"' EXIT\ncat > \"$state/ade-boundary-probe.mjs\"\npi --no-skills {args} --mode rpc --ade-execution-probe {publication_flag} </dev/null\n",
+        publication_flag = if publication {
+            "--ade-publication-probe"
+        } else {
+            ""
+        },
         runtime = crate::remote::quote(&format!("{root}/.execution")),
         template = crate::remote::quote(&format!("{root}/.execution/probe.XXXXXX")),
     );
@@ -609,6 +646,20 @@ pub(crate) fn pi_execution_probe_command(root: &Path) -> Cmd {
         .stdin(source)
         .cwd("/tmp")
         .own_group()
+}
+
+pub(crate) fn pi_authorized_publication_probe_result(output: &Output) -> Result<()> {
+    pi_execution_probe_result(output)?;
+    anyhow::ensure!(
+        output
+            .stdout
+            .lines()
+            .chain(output.stderr.lines())
+            .any(|line| line == "ADE_AUTHORIZED_PUBLICATION=passed"),
+        "bounded authorized publication dry run failed or missing: {}",
+        output.error_text()
+    );
+    Ok(())
 }
 
 pub(crate) fn pi_execution_probe_result(output: &Output) -> Result<()> {
@@ -663,14 +714,14 @@ fn execution_row(ctx: &Ctx, id: &str, backend: &str, network: &str) -> crate::pi
         Ok(output) if output.success() => {
             let probe = ctx
                 .runner
-                .run(&pi_execution_probe_command(&ctx.root))
-                .and_then(|output| pi_execution_probe_result(&output));
+                .run(&pi_authorized_publication_probe_command(&ctx.root))
+                .and_then(|output| pi_authorized_publication_probe_result(&output));
             match probe {
                 Ok(()) => Row::ok(
                     label,
                     detail.replace(
                         "(availability probed separately)",
-                        "(namespace and bounded Pi CLI tool probes passed)",
+                        "(namespace, bounded Pi CLI tool and authorized publication probes passed)",
                     ),
                 ),
                 Err(error) => Row::fail(
@@ -3746,11 +3797,9 @@ recipe = "claude_fable_xhigh"
                 .on("ade-boundary-probe.mjs", pi_execution_fixture());
             let ready = execution_row(&ready_world.ctx(), "pi", backend, "allowed");
             assert_eq!(ready.level, crate::pi::doctor::Level::Ok);
-            assert!(
-                ready
-                    .detail
-                    .contains("namespace and bounded Pi CLI tool probes passed")
-            );
+            assert!(ready.detail.contains(
+                "namespace, bounded Pi CLI tool and authorized publication probes passed"
+            ));
         }
     }
 
