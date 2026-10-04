@@ -1,0 +1,3 @@
+#!/bin/sh
+# H03: inherited sockets override the courier's requested named session.
+exec "$(dirname "$0")/run-scenario" session-selection "$@"

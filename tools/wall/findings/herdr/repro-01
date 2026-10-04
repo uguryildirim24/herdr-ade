@@ -1,0 +1,3 @@
+#!/bin/sh
+# H01: file-based large notes fail before Herdr starts, but become uncertain.
+exec "$(dirname "$0")/run-scenario" large-prompt "$@"
