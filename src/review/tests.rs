@@ -781,6 +781,110 @@ fn job(fx: &Fx, id: &str) -> crate::task::Task {
 }
 
 #[test]
+fn drop_during_active_review_cancels_membership_and_never_publishes() {
+    let fx = configured();
+    let (id, sha) = lane(&fx, 1);
+    job(&fx, &id);
+    let review = prepared(&fx);
+    let base = review.base.clone();
+    let event = review.members[0].event.clone();
+    let outcome =
+        crate::task::drop_task(&fx.world.ctx(), &fx.project, "job-0001", "not needed").unwrap();
+    assert!(!outcome.task.dropped.is_empty());
+    assert_eq!(
+        load(&fx.project, &review.id).unwrap().phase,
+        Phase::Cancelled
+    );
+    tick(&fx.world.ctx(), &fx.project).unwrap();
+    assert_eq!(git(&fx.repo, &["rev-parse", "main"]), base);
+    assert_eq!(fx.world.runner.count("git push"), 0);
+    assert!(
+        crate::events::load(&fx.project, &event)
+            .unwrap()
+            .payload
+            .done
+            .is_some()
+    );
+    let retired = thread::load(&fx.project, &id).unwrap();
+    assert!(Path::new(&retired.worktree_path).exists());
+    assert_eq!(git(&fx.repo, &["rev-parse", &retired.branch]), sha);
+    assert!(start(&fx.world.ctx(), "demo", None).unwrap().is_none());
+}
+
+#[test]
+fn landing_revalidates_dropped_tasks_before_merge_and_pending_publication() {
+    for recovered_ff in [false, true] {
+        let fx = configured();
+        let (id, _) = lane(&fx, 1);
+        job(&fx, &id);
+        let mut review = prepared(&fx);
+        let candidate = candidate(&fx, &review);
+        landing_verdict(&mut review, &candidate);
+        if recovered_ff {
+            git(&fx.repo, &["merge", "--ff-only", &candidate]);
+            review.fast_forward = true;
+        }
+        // Recovery of an interrupted process with old frozen membership.
+        let mut task = crate::task::load(&fx.project, "job-0001").unwrap();
+        task.dropped.push(crate::task::DropEvidence {
+            at: project::now(),
+            reason: "not needed".into(),
+        });
+        std::fs::write(
+            fx.project.state_dir().join("tasks/job-0001.toml"),
+            toml::to_string(&task).unwrap(),
+        )
+        .unwrap();
+        fx.world.runner.calls.borrow_mut().clear();
+        let error = land_with_install(&fx.world.ctx(), &fx.project, &mut review, || {
+            panic!("dropped work installed")
+        })
+        .unwrap_err();
+        assert!(
+            error.to_string().contains("task dropped during review"),
+            "{error:#}"
+        );
+        assert_eq!(fx.world.runner.count("git push"), 0);
+        assert_eq!(fx.world.runner.count("merge --ff-only"), 0);
+        assert!(!review.push);
+    }
+}
+
+#[test]
+fn cancelled_sealed_task_offers_a_new_attempt_or_explicit_retirement() {
+    let fx = configured();
+    let (id, _) = lane(&fx, 1);
+    let task = job(&fx, &id);
+    let event = crate::events::checked(&fx.project).unwrap()[0].id.clone();
+    thread::update(&fx.project, &id, |lane| {
+        lane.status = Status::Resolved;
+        lane.cancellation_reason = "no longer pursuing this attempt".into();
+    })
+    .unwrap();
+    let view = crate::task::view(&fx.project, task);
+    assert_eq!(view.state, crate::task::State::Open);
+    assert_eq!(view.next, "start a new attempt or drop the task");
+    assert!(start(&fx.world.ctx(), "demo", None).unwrap().is_none());
+    assert!(
+        crate::events::load(&fx.project, &event)
+            .unwrap()
+            .payload
+            .done
+            .is_some()
+    );
+    // Explicit retirement is executable, without losing the old seal.
+    crate::task::drop_task(&fx.world.ctx(), &fx.project, "job-0001", "retired").unwrap();
+    assert_eq!(
+        crate::task::view(
+            &fx.project,
+            crate::task::load(&fx.project, "job-0001").unwrap()
+        )
+        .state,
+        crate::task::State::Dropped
+    );
+}
+
+#[test]
 fn resolved_historical_seals_are_classified_once_without_old_rounds() {
     let fx = configured();
     let (id, sha) = lane(&fx, 1);
