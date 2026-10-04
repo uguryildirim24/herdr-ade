@@ -1713,7 +1713,7 @@ pub(crate) fn restore_unchanged_seal(
     project: &Project,
     lane: &thread::Thread,
 ) -> Result<()> {
-    let events = crate::events::for_thread(project, &lane.id);
+    let events = crate::events::checked_for_thread(project, &lane.id)?;
     let Some(event) = crate::events::latest_done_event(&events, &lane.id, lane.attempt.max(1))
     else {
         return Ok(());
@@ -1784,7 +1784,7 @@ pub(crate) fn restore_unchanged_seal(
                 || current.pane_id != lane.pane_id
                 || current.follow_ups != lane.follow_ups
                 || crate::events::latest_done_event(
-                    &crate::events::for_thread(project, &lane.id),
+                    &crate::events::checked_for_thread(project, &lane.id)?,
                     &lane.id,
                     lane.attempt.max(1),
                 )

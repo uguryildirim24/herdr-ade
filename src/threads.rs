@@ -6598,6 +6598,39 @@ mod tests {
     }
 
     #[test]
+    fn unreadable_newer_seal_cannot_confirm_an_older_answered_seal() {
+        let fx = crate::testkit::fixture();
+        let (id, sha) = fx.lane(1);
+        let old = fx.seal_done(&id, 1, 1, &sha, "MERGE");
+        let lane = thread::update(&fx.project, &id, |t| {
+            t.role = "reviewer".into();
+            t.review_after = old.clone();
+            t.follow_ups.push(FollowUp {
+                attempt: 1,
+                text: "check the verdict".into(),
+                state: FollowUpState::Delivered,
+                after_seal: old.clone(),
+                delivered_at: "2026-09-18T11:00:00Z".into(),
+                ..Default::default()
+            });
+        })
+        .unwrap();
+        let newer = fx.seal_done(&id, 1, 2, &sha, "REJECT");
+        std::fs::write(
+            crate::events::dir(&fx.project).join(format!("{newer}.toml")),
+            "id = 'truncated",
+        )
+        .unwrap();
+        assert!(
+            crate::ticker::restore_unchanged_seal(&fx.world.ctx(), &fx.project, &lane).is_err()
+        );
+        let saved = thread::load(&fx.project, &id).unwrap();
+        assert_eq!(saved.review_after, old);
+        assert_eq!(saved.follow_ups[0].state, FollowUpState::Delivered);
+        assert!(saved.start_notices.is_empty());
+    }
+
+    #[test]
     fn cli_and_ticker_share_staging_transport_and_receipts() {
         use crate::runner::fake::ok;
         use crate::scenarios::{World, agent_json};
