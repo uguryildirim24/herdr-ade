@@ -1576,6 +1576,13 @@ pub(crate) fn resume_provider_starts(
         if let Err(error) = ready {
             // Installation skew is deferred placement, not provider failure:
             // no auth notice, expiry, or evidence of a dead lane.
+            if error.contains("machine_held:") {
+                if let Err(update) = thread::update(project, &lane.id, |t| t.error = error.clone())
+                {
+                    report(update);
+                }
+                continue;
+            }
             if error.contains("version_skew:") {
                 continue;
             }
@@ -1641,6 +1648,9 @@ pub(crate) fn resume_provider_starts(
                 }
             }
             Err(error) => {
+                if format!("{error:#}").contains("machine_held:") {
+                    continue;
+                }
                 if crate::remote::is_unreachable(&format!("{error:#}")) {
                     reachable = false;
                     report(error);
@@ -3134,6 +3144,17 @@ fn launch_pass(
             if !format!("{error:#}").starts_with("plan_prerequisite:") {
                 errors.push(error.context(format!("{}: plan gate", t.id)));
             }
+            continue;
+        }
+        // A hold can arrive after terminal placement, before agent submission.
+        if let Err(error) = threads::check_placement_hold(pass.ctx, t) {
+            errors.extend(
+                thread::update(pass.project, &t.id, |record| {
+                    record.error = format!("{error:#}");
+                    record.startup_wait_started.clear();
+                })
+                .err(),
+            );
             continue;
         }
         // Disk can fill after placement. Keep the attempt queued until it recovers.

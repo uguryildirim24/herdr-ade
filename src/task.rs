@@ -1222,7 +1222,8 @@ pub(crate) fn view_with_evidence(
         return view;
     }
     view.state = State::Working;
-    view.next = "finish the current attempt".into();
+    view.next = crate::threads::pending_start_note(lane)
+        .unwrap_or_else(|| "finish the current attempt".into());
     if !lane.review_reason.is_empty() {
         view.next = format!("follow up: {}", lane.review_reason);
     }
