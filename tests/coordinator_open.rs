@@ -17,6 +17,7 @@ fn fresh_open_starts_and_primes_or_reports_a_hard_failure_with_a_retry() {
         "missing-command",
     ] {
         let home = tempfile::tempdir().unwrap();
+        let physical_home = std::fs::canonicalize(home.path()).unwrap();
         let root = home.path().join("root");
         std::fs::create_dir(&root).unwrap();
         let config = home.path().join(".config/herdr-ade");
@@ -74,7 +75,7 @@ esac
         let run = |args: &[&str]| {
             Command::new(BIN)
                 .env_clear()
-                .env("HOME", home.path())
+                .env("HOME", &physical_home)
                 .env("PATH", "/usr/bin:/bin")
                 .env("HERDR_BIN_PATH", &herdr)
                 .env("HERDR_SOCKET_PATH", home.path().join("fixture.sock"))
@@ -99,6 +100,21 @@ esac
                 "agent start hp-demo-coordinator --kind claude --pane w1:p1 --timeout 3001"
             ),
             "{calls}\nstdout: {stdout}\nstderr: {stderr}"
+        );
+        let claim = calls.find("pane report-metadata w1:p1 --source herdr-ade --token project=demo --token thread=coordinator").unwrap();
+        let start = calls
+            .find("agent start hp-demo-coordinator --kind")
+            .unwrap();
+        assert!(
+            claim < start,
+            "ownership must precede startup in mode {mode}: {calls}"
+        );
+        assert!(
+            !calls
+                .lines()
+                .find(|line| line.starts_with("pane report-metadata"))
+                .unwrap()
+                .contains("--ttl-ms")
         );
         assert_eq!(
             calls
