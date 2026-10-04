@@ -40,7 +40,7 @@ Content folders in this tree are created on their first write; a new project has
 
 ## Safety and cleanup
 
-ADE is not a sandbox. The first-result guide's Pi recipes execute tools without per-command approval. Claude and agy require `--dangerously-skip-permissions`, and Cursor requires `--force`; removing a required flag makes a recipe invalid, not safely interactive. Agents have the launching account's filesystem, network and credential access. Git worktrees isolate changes, not privileges. Trust repositories, briefs and selected providers before dispatch; do not copy provider credentials between machines. Missing process or publication evidence is not success. Seal, merge, push, install and delivery remain separate facts.
+New Pi **lanes on Linux** use a bubblewrap tool boundary, described below. Pi on the Mac, Claude, agy, Cursor and undeclared/custom backends are **advisory**: they retain the launching account's filesystem, network and credential access. Their permission-bypass flags permit unattended actions; they do not protect the host. Neither hooks, worktrees, allowed-path diffs nor review prose are a sandbox. Do not copy provider credentials between machines. Missing process or publication evidence is not success. Seal, merge, push, install and delivery remain separate facts.
 
 Deletion verifies owned-resource scope and requires a platform trash tool on every affected machine before effects. Shared repositories stay; GitHub deletion requires explicit `--github`. Use `delete --preview` to inspect scope or `archive` for a reversible lifecycle change. Lane cleanup follows the checks below, not an agent permission dialog.
 
@@ -171,6 +171,52 @@ recipe = "claude_fable_xhigh"
 A rule may override global `retries = N`. `herdr-ade failed "<failure and evidence>"` seals failed work; automatic recovery retries the same recipe up to that bound, preserving the checkout. Provider, connection and process-loss failures never authorize a model switch. A lost connection needs reachable process evidence before replacement; unknown evidence waits for the coordinator. Exhaustion remains failed, but a coordinator can issue a reasoned `thread retry` beyond the automatic budget.
 
 Each launch record and dispatch journal row says `pin`, `default`, `explicit` or `rule[n]`, so the reason for selection stays inspectable. Coordinator rows also carry `recipe_basis` and `recipe_request`; lane rows leave them empty. Historical launch and dispatch records without those fields still load.
+
+## Unattended lane execution
+
+| Runtime | Actual new-lane boundary |
+| --- | --- |
+| Pi on a Linux box (including `oci` and `a2`) | **Bounded when the namespace probe passes**: Pi's supported tool-replacement backend runs commands and all descendants under bubblewrap filesystem, PID and user namespaces, with capabilities dropped and a cleared environment. Tool network is allowed by default; `network = "denied"` adds network isolation. **Advisory when unavailable**, with a FAIL diagnostic and coordinator notice. |
+| Pi on the Mac | **Advisory**. No ADE-enforced Seatbelt/VM boundary. |
+| Claude | **Advisory**. ADE does not declare Claude's optional Bash sandbox a complete filesystem/credential boundary for all tools. Permission bypass remains an unattended-action setting, not security. |
+| Other/custom adapters | **Advisory** unless a supported backend is explicitly declared. |
+
+The Pi adapter declares `execution = "linux-bwrap-tools-v1"`. An empty declaration or `"advisory"` makes no isolation claim. Doctor reports each enabled recipe's lane capability on the machine that executes it and probes namespace creation, not just the presence of `bwrap`. A Linux probe failure remains **FAIL**, with its reason and the advisory first-launch policy. New lanes there retain today's unattended host execution, explicitly recorded as `HERDR_ADE_EXECUTION=advisory` with the probe reason in `placement_reason`. One durable coordinator notice per project/machine is queued through existing lane notices, without repeating for subsequent lanes or acknowledged warnings. This is continuity, not security: those lanes have the same host/credential exposure as today's advisory runtimes. A pinned bounded launch never downgrades, and a failing bounded tool never retries on the host. Mac mode is advisory, not a successful sandbox probe. Coordinators retain their existing authorized control access.
+
+For bounded Pi lanes, provider authentication, the trusted Pi process and the explicitly installed Herdr/provider-state extensions remain on the host. Credentials are **not copied** into tool execution. The process starts with `--no-tools --no-extensions`; only the successfully loaded, frozen ADE backend activates `bash` and `ade`. Project trust is declined, project MCP/packages/extensions are disabled, and session storage is pinned outside the worktree. A missing/broken backend cannot activate the host Bash tool. This is **tool isolation**, not whole-process containment: trusted Pi, installed extensions and the OS/kernel are part of the trusted computing base.
+
+Tools see the writable lane checkout, private Git metadata, persistent `/build` and a lane-only home. Cargo uses a persistent writable private `CARGO_HOME=/home/lane/.cargo`; npm and uv also cache in the private home. The host Cargo registry is available read-only at `/cargo-base/registry` (it can be copied into the private cache for offline work), not used as an unwritable active registry. System tools, selected Rust and Node/npm toolchains and the installed uv executable are read-only; account bin/home/config directories are never copied or mounted. `/tmp` is private/ephemeral. Shared repository refs/config/hooks, ADE control records, other checkouts, SSH/provider/publication credentials, host processes and pathname sockets are absent. Symlinks and child processes resolve inside the same filesystem namespace. Files already supplied inside the worktree are deliberately accessible; do not put credentials there.
+
+Tool networking is **allowed by default**, including host loopback: public dependency downloads and research happen inside the filesystem boundary without approval clicks or a nonexistent pre-dispatch acquisition service. DNS configuration and public TLS trust roots are read-only; no host proxy/auth environment is inherited. `network = "denied"` in a recipe gives untrusted-content work deny-all networking, including localhost and direct-IP connections. Network policy is frozen on the launch and backend. Publication credentials remain outside: tools have neither the host remote/config nor SSH/provider tokens. Allowed networking is not an anti-exfiltration/SSRF or anonymous-upload guarantee. Authenticated host operations can use an explicitly advisory recipe; no credential broker or arbitrary host-command escape is added.
+
+A recipe's `execution = "advisory"` overrides its adapter default for host work (for example wall lanes needing setuid sudo and loopback SSH). It keeps today's host access and unattended permission flags, labels the lane record and doctor's recipe row **advisory**, and queues one start notice per lane attempt. It makes no isolation claim. Both recipe fields are validated; omitted execution inherits the adapter, omitted network is allowed. Unsupported/advisory runtimes cannot enforce network denial. Retries use the frozen launch, not a newly edited recipe: a stored bounded launch never downgrades, and historical bounded launches without a network field retain deny-all.
+
+```toml
+# Add to the existing recipe whose kind/provider/model/effort you selected:
+network = "denied"       # bounded untrusted-content work
+# Or, for a different recipe needing the real host:
+execution = "advisory"   # no filesystem/network/credential boundary
+```
+
+Use `bash` for shell and file work. The `ade` tool offers only the bound lane's `skill`, `done`, `waiting` and `failed`; `ade(action="done")` executes **ha done** with no caller-selected root, report, SHA, branch or remote. It checks cleanliness inside the boundary, exports Git bundle data, imports only the recorded lane branch and updates its index without executing worktree scripts. The existing validated lane card, non-force publication/ref verification, report capture, sealed event, independent review and request-bound consequential decisions remain authoritative. No new merge/push/install tool is exposed. Authorized review gates, merge/install and delivery remain separate trusted operations, **not** an assertion that every factory process is contained.
+
+The launch pins its backend mode, network policy and arguments. Already-running lanes, historical launches and same-recipe recovery keep their original launch; an install does not retrofit a live process. New bound attempts get attempt-private Git/build state and an immutable content-hashed backend outside writable work. Recipe/model/effort selection is unchanged.
+
+### Linux prerequisite
+
+`ha harness install` provisions prerequisites on **each declared Linux machine** through the coordinator's authorized `sudo -n` path, before box builds. It installs the distribution's `bubblewrap` package when missing (apt-get/dnf), ensures `/etc/apparmor.d/ade-bwrap` matches the executable-specific profile below, and loads/reloads it when AppArmor is active. If necessary, it installs the AppArmor loader package. Matching package/profile state is retained on repeated installs. No keys or credentials are read or copied, and the global user-namespace restriction is never relaxed.
+
+```text
+abi <abi/4.0>,
+include <tunables/global>
+profile ade_bwrap /usr/bin/bwrap flags=(unconfined) {
+  userns,
+}
+```
+
+The install then runs doctor's exact namespace-probe argv, even if provisioning failed. Each machine's provisioning/probe outcome appears in the install result and coordinator install notice. A failed probe does not make the box install pending or stop ready new lanes; doctor remains FAIL and those lanes are labelled advisory. Provider, disk, build, settings and process failures retain their existing readiness/install behavior. Transport/protocol failures are not invented successful namespace observations.
+
+On `oci`, the next install keeps its existing bubblewrap and restores this profile persistently. On `a2`, it first installs bubblewrap, then installs/loads the same profile. Both keep `kernel.apparmor_restrict_unprivileged_userns=1`; bounded mode is selected only after the actual probe succeeds. No production installation or fleet restart was performed by the trial. ADE never exposes sudo/install through the lane's bounded tool bridge. This is an OS prerequisite, not a purchased sandbox service.
 
 ## Inbox notifications
 

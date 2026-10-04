@@ -36,6 +36,9 @@ pub(crate) struct DoctorAdapter {
 #[serde(default, deny_unknown_fields)]
 pub(crate) struct Adapter {
     pub(crate) binary: String,
+    /// `advisory` (default) or the Pi Linux namespace tool backend.
+    /// Permission flags, hooks and worktrees are not an execution boundary.
+    pub(crate) execution: String,
     /// Flags appended to every launch of this kind.
     pub(crate) launch_flags: Vec<String>,
     pub(crate) ready_timeout_ms: u64,
@@ -75,6 +78,14 @@ pub(crate) fn declaration(config_dir: &Path, kind: &str) -> Result<Adapter> {
 fn validate(kind: &str, row: &Adapter) -> Result<()> {
     if kind.trim().is_empty() || row.binary.trim().is_empty() {
         bail!("adapter_invalid: `{kind}` needs a binary");
+    }
+    if !matches!(
+        row.execution.as_str(),
+        "" | "advisory" | "linux-bwrap-tools-v1"
+    ) || (row.execution == "linux-bwrap-tools-v1"
+        && (kind != "pi" || row.doctor.readiness != "pi"))
+    {
+        bail!("adapter_invalid: `{kind}` has an unsupported execution backend");
     }
     if row.coordinator
         && (row.hook.prompt_event.is_empty() || !row.hook.events.contains(&row.hook.prompt_event))
@@ -216,6 +227,7 @@ fn builtin() -> BTreeMap<String, Adapter> {
         "pi".into(),
         Adapter {
             binary: "pi".into(),
+            execution: "linux-bwrap-tools-v1".into(),
             ready_timeout_ms: 30_000,
             coordinator: true,
             blocked_error_resumable: true,
@@ -262,7 +274,21 @@ pub(crate) fn launch_args(adapter: &Adapter, recipe: &Recipe) -> Vec<String> {
     args
 }
 
+pub(crate) fn recipe_execution<'a>(adapter: &'a Adapter, recipe: &'a Recipe) -> &'a str {
+    if recipe.execution.is_empty() {
+        &adapter.execution
+    } else {
+        &recipe.execution
+    }
+}
+
 pub(crate) fn validate_recipe(adapter: &Adapter, id: &str, recipe: &Recipe) -> Result<()> {
+    if !matches!(recipe.execution.as_str(), "" | "advisory") {
+        bail!("recipe_execution_invalid: `{id}` must inherit its adapter or request advisory");
+    }
+    if !matches!(recipe.network.as_str(), "allowed" | "denied") {
+        bail!("recipe_network_invalid: `{id}` must use allowed or denied");
+    }
     for flag in &adapter.required_flags {
         if !recipe.args.contains(flag) && !adapter.launch_flags.contains(flag) {
             bail!("recipe_permission_missing: `{id}` has no permission flag `{flag}`");
@@ -499,6 +525,7 @@ pub(crate) fn dependency_ready(
             "box_repo_",
             "machine_held:",
             "adapter_",
+            "execution_boundary_unavailable:",
             "pi_args_forbidden:",
         ]
         .iter()
@@ -827,6 +854,14 @@ mod tests {
             }
         }
         assert_eq!(claude_rows, 2);
+    }
+
+    #[test]
+    fn a_provider_probe_cannot_mislabel_a_non_pi_runtime_as_bounded() {
+        let row = builtin().remove("pi").unwrap();
+        assert!(validate("pi", &row).is_ok());
+        assert!(validate("claude", &row).is_err());
+        assert!(validate("custom", &row).is_err());
     }
 
     #[test]

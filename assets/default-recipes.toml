@@ -1,4 +1,8 @@
 # Shipped recipe data. Model and provider choices live here, not in the engine.
+# New Pi lanes inherit Linux bubblewrap tool isolation and allowed network.
+# Add network = "denied" for untrusted-content work, or execution = "advisory"
+# for host work. Mac Pi and native Claude/agy remain advisory. Permission
+# bypass below is not a host/credential/network boundary. Doctor reports mode.
 [recipes.agy_gemini_flash]
 kind = "agy"
 provider = "agy"
