@@ -13,6 +13,7 @@ use crate::runner::{Cmd, Output, Runner};
 const CLAUDE_PROBE_RECIPE: &str = "claude_journey_probe";
 const COMMAND: Duration = Duration::from_secs(60);
 const OBSERVE: Duration = Duration::from_secs(180);
+const LAUNCH: Duration = Duration::from_secs(300);
 const WHOLE_RUN: Duration = Duration::from_secs(720);
 const SHUTDOWN: Duration = Duration::from_secs(120);
 
@@ -745,6 +746,29 @@ fn seal(project: &Project, id: &str) -> Result<(Option<String>, String)> {
     ))
 }
 
+// Placement sets startup_wait_started too. Only a nonzero launch_attempts
+// makes it the ticker's agent-start claim rather than time spent in the queue.
+fn launch_claim(project: &Project, id: &str) -> Result<(Option<(Instant, i64)>, String)> {
+    let (_, state) = seal(project, id)?;
+    let lane = crate::thread::load(project, id)?;
+    if lane.launch_attempts == 0 || lane.startup_wait_started.is_empty() {
+        return Ok((None, format!("{state}; launch claim not observed")));
+    }
+    let claimed = lane.startup_wait_started.parse::<jiff::Timestamp>()?;
+    let queued = claimed
+        .duration_since(lane.created.parse::<jiff::Timestamp>()?)
+        .as_secs()
+        .max(0);
+    let elapsed = Duration::from_secs(
+        jiff::Timestamp::now()
+            .duration_since(claimed)
+            .as_secs()
+            .max(0) as u64,
+    );
+    let seal_deadline = Instant::now() + OBSERVE.saturating_sub(elapsed);
+    Ok((Some((seal_deadline, queued)), state))
+}
+
 fn sealed_sha(project: &Project, id: &str) -> Result<String> {
     let lane = crate::thread::load(project, id)?;
     let events = crate::events::checked_for_thread(project, id)?;
@@ -1053,8 +1077,9 @@ fn run_steps(
         crate::review::try_operation_lock(ctx, &repo.to_string_lossy())?
             .context("journey review start lock busy")?,
     );
-    let mac_ready = report.optional_step(
-        "Mac lane seals",
+    let mut mac_launch = None;
+    let mac_launched = report.optional_step(
+        "Mac lane launched",
         (|| {
             let small = available(&small)?;
             if !opened {
@@ -1064,7 +1089,27 @@ fn run_steps(
         })(),
         |small| {
             mac = start_lane(ctx, &slug, &repo, small, "local", &mac_brief, &request)?;
-            mac_seal = bounded_poll(deadline, "Mac seal", OBSERVE, || seal(&project, &mac))?;
+            let claim = bounded_poll(deadline, "Mac launch claim", LAUNCH, || {
+                launch_claim(&project, &mac)
+            })?;
+            mac_launch = Some(claim);
+            Ok(format!("Mac lane launched after {} s: {mac}", claim.1))
+        },
+    )?;
+    let mac_ready = report.optional_step(
+        "Mac lane seals",
+        mac_launch
+            .filter(|_| mac_launched)
+            .context("Mac launch probe was skipped"),
+        |(seal_deadline, queued)| {
+            mac_seal = bounded_poll(deadline.min(seal_deadline), "Mac seal", OBSERVE, || {
+                seal(&project, &mac)
+            })
+            .with_context(|| {
+                format!(
+                    "Mac lane launched after {queued} s; seal window is 180 s from launch claim"
+                )
+            })?;
             let sha = sealed_sha(&project, &mac)?;
             git(ctx, &repo, &["cat-file", "-e", &format!("{sha}:mac.txt")])?;
             Ok(format!(
