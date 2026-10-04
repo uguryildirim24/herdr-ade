@@ -12,6 +12,9 @@ use crate::project::{Project, Settings};
 use crate::thread::{Group, Status};
 use crate::threads::Row;
 
+#[path = "rundown/activity.rs"]
+mod activity;
+
 #[derive(Clone)]
 pub(crate) struct Entry {
     pub(crate) id: String,
@@ -274,7 +277,11 @@ pub(crate) struct View {
     pub(crate) messages: BTreeMap<String, String>,
     pub(crate) events: BTreeMap<String, String>,
     pub(crate) plan: Value,
+    title: String,
     pub(crate) needs_you: Vec<String>,
+    needs_you_items: Vec<String>,
+    activity: Value,
+    harness: Value,
     reviews: Vec<crate::review::Review>,
     unreadable_lanes: usize,
 }
@@ -282,11 +289,12 @@ pub(crate) struct View {
 impl View {
     pub(crate) fn load(ctx: &Ctx, project: &Project, history: Option<usize>) -> Result<Self> {
         let (settings, _) = project.read_project_md()?;
-        let mut view = Self::capture(
+        let mut view = Self::capture_with_runner(
             project,
             &settings,
             Some(crate::threads::rows(ctx, project)),
             history,
+            Some(ctx.runner),
         );
         if !settings.repos.is_empty() {
             view.sections.push(Section::new(
@@ -324,6 +332,18 @@ impl View {
         observed: Option<Vec<Row>>,
         history: Option<usize>,
     ) -> Self {
+        Self::capture_with_runner(project, settings, observed, history, None)
+    }
+
+    // Record-only page generation needs no subprocesses. Interactive reads can
+    // also recover historical landing dates from the repository's reflog.
+    fn capture_with_runner(
+        project: &Project,
+        settings: &Settings,
+        observed: Option<Vec<Row>>,
+        history: Option<usize>,
+        runner: Option<&dyn crate::runner::Runner>,
+    ) -> Self {
         let evidence = crate::task::EvidenceSnapshot::load(project);
         let events = evidence.events();
         let (reviews, review_error) = match crate::review::list(project) {
@@ -357,9 +377,11 @@ impl View {
             action_row(project, row, events, &reviews, &evidence.tasks);
         }
         lanes.sort_by_key(|row| Group::DISPLAY_ORDER.iter().position(|g| *g == row.group));
+        let mut activity = json!({});
         let mut plan = match crate::plan::load(project) {
             Ok(Some(mut plan)) => {
                 let holds = crate::plan::failed_check_holds(project, &mut plan, &evidence);
+                activity = activity::activity(&plan, &evidence, &reviews, &lanes, runner);
                 let mut value = serde_json::to_value(&plan).expect("serializable plan");
                 for step in value
                     .get_mut("steps")
@@ -433,10 +455,26 @@ impl View {
         }
         let mut seal_rows = BTreeMap::new();
         let mut needs_you = Vec::new();
+        let mut needs_you_items = Vec::new();
         if let Some(line) = crate::steps::goal_check::attention(project) {
             needs_you.push(line);
         }
-        let explicit_parties: BTreeMap<_, _> = crate::steps::goal_check::load(project)
+        let goal_check = crate::steps::goal_check::load(project);
+        if goal_check.disposition == Some(crate::steps::goal_check::Disposition::NeedsRolf)
+            && !goal_check.evidence.is_empty()
+        {
+            needs_you_items.push(goal_check.evidence.clone());
+        }
+        for (wait, _) in &goal_check.waits {
+            if let crate::steps::goal_check::Disposition::Wait {
+                party, condition, ..
+            } = wait
+                && party.eq_ignore_ascii_case("Rolf")
+            {
+                needs_you_items.push(condition.clone());
+            }
+        }
+        let explicit_parties: BTreeMap<_, _> = goal_check
             .waits
             .into_iter()
             .flat_map(|(wait, _)| match wait {
@@ -471,6 +509,7 @@ impl View {
                 || row.group == Group::WaitingOnYou)
                 && personal_wait(&t.error)
             {
+                needs_you_items.push(one_line(&t.error));
                 needs_you.push(format!("{}: {}", t.id, one_line(&t.error)));
             }
             let mut detail = format!(
@@ -524,6 +563,7 @@ impl View {
                     .filter(|_| event.id != t.answered_waiting_event)
                 {
                     if personal_wait(&wait.text) {
+                        needs_you_items.push(one_line(&wait.text));
                         needs_you.push(format!("{}: {}", t.id, one_line(&wait.text)));
                     }
                     Some(format!(
@@ -538,6 +578,7 @@ impl View {
                 } else {
                     event.payload.failed.as_ref().map(|failed| {
                         if personal_wait(&failed.text) {
+                            needs_you_items.push(one_line(&failed.text));
                             needs_you.push(format!("{}: {}", t.id, one_line(&failed.text)));
                         }
                         format!(
@@ -755,6 +796,7 @@ impl View {
                             || i.kind.contains("approval")
                             || i.kind.contains("login"))
                     {
+                        needs_you_items.push(one_line(&i.summary));
                         needs_you.push(format!("{}: {}", i.subject, one_line(&i.summary)));
                     }
                     entry(
@@ -806,6 +848,9 @@ impl View {
         }
         needs_you.sort();
         needs_you.dedup();
+        needs_you_items.sort();
+        needs_you_items.dedup();
+        let harness = activity::harness(project);
         let messages = crate::prompt::recent_requests(project, usize::MAX)
             .into_iter()
             .collect();
@@ -815,7 +860,11 @@ impl View {
             messages,
             events: seal_rows,
             plan,
+            title: settings.name.clone(),
             needs_you,
+            needs_you_items,
+            activity,
+            harness,
             reviews,
             unreadable_lanes,
         }
@@ -887,7 +936,9 @@ impl View {
     }
 
     pub(crate) fn rundown(&self) -> Value {
-        json!({"plan":self.plan, "work":self.work_summary(), "needs_you":self.needs_you.join("; "),
+        json!({"title":self.title, "plan":self.plan, "work":self.work_summary(), "needs_you":self.needs_you.join("; "),
+            "read_error":if self.unreadable_lanes > 0 { "Some work records could not be read" } else { "" },
+            "needs_you_items":self.needs_you_items, "activity":self.activity, "harness":self.harness,
             "actions":self.sections.iter().filter(|s| matches!(s.name.as_str(), "Current work" | "Pile reviews" | "Open tasks")).flat_map(|s| &s.rows).map(|r| format!("{}: {}", r.id, r.text.lines().next().unwrap_or(""))).collect::<Vec<_>>()})
     }
 }

@@ -7,11 +7,17 @@ use std::process::Command;
 
 fn screen(reply: &serde_json::Value) -> (view::Card, String) {
     let card = view::Card::from_view("Demo", reply).unwrap();
-    let text = view::render(&card, 160, 0, "")
-        .iter()
-        .map(|line| view::visible(line))
-        .collect::<Vec<_>>()
-        .join("\n");
+    let text = std::iter::once(view::harness_line(
+        &card.harness,
+        160,
+        jiff::Timestamp::now(),
+    ))
+    .chain(view::render(&card, 160, 0, ""))
+    .collect::<Vec<_>>()
+    .iter()
+    .map(|line| view::visible(line))
+    .collect::<Vec<_>>()
+    .join("\n");
     (card, text)
 }
 
@@ -70,8 +76,7 @@ fn real_overview_renders_standalone_nested_held_and_unreadable_work() {
         "Finished standalone",
         "Nested work",
         "Held check",
-        "held by failed check",
-        "Unreadable lane",
+        "Some work records could not be read",
     ] {
         assert!(text.contains(expected), "missing {expected}: {text}");
     }

@@ -1097,6 +1097,8 @@ fn whole_pile_lands_pushes_closes_and_prunes_once() {
         .map(|cmd| cmd.args.clone())
         .collect::<Vec<_>>();
     assert_eq!(remote_checks.len(), 2, "{remote_checks:?}");
+    let merged_at = review.merged_at.clone();
+    assert!(merged_at.parse::<jiff::Timestamp>().is_ok());
     assert_eq!(review.phase, Phase::Landing);
     assert!(!review.close);
     review = load(&fx.project, &review.id).unwrap();
@@ -1106,6 +1108,8 @@ fn whole_pile_lands_pushes_closes_and_prunes_once() {
     assert!(review.notices[0].line.contains("merged"));
     assert!(review.notices[0].line.contains("publication verified"));
     assert!(review.notices[0].line.contains("install not required"));
+    assert_eq!(review.merged_at, merged_at);
+    assert!(review.installed_at.is_empty());
     assert!(review.fast_forward && review.push && review.install && review.close && review.prune);
     assert_eq!(git(&fx.repo, &["rev-parse", "main"]), candidate);
     assert_eq!(git(&remote, &["rev-parse", "main"]), candidate);
@@ -1815,10 +1819,17 @@ fn landing_recovers_ref_before_marker_and_install_failure_without_early_task_don
         crate::task::State::Installed
     );
     assert_eq!(git(&fx.repo, &["rev-parse", "main"]), candidate);
+    let installed_at = restored.installed_at.clone();
+    assert!(installed_at.parse::<jiff::Timestamp>().is_ok());
     land_with_install(&fx.world.ctx(), &fx.project, &mut restored, || {
         panic!("install replayed")
     })
     .unwrap();
+    assert_eq!(restored.installed_at, installed_at);
+    assert_eq!(
+        load(&fx.project, &restored.id).unwrap().installed_at,
+        installed_at
+    );
 }
 
 #[test]

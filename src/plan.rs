@@ -857,7 +857,7 @@ fn is_unlinked(changes: &[BindingChange], step: &str, id: &str) -> bool {
 }
 
 /// Normalize in memory; the original records and reasoned binding history stay.
-fn bindings(step: &PlanStep, evidence: &EvidenceSnapshot) -> (Vec<String>, Vec<String>) {
+pub(crate) fn bindings(step: &PlanStep, evidence: &EvidenceSnapshot) -> (Vec<String>, Vec<String>) {
     let allowed = |id: &String| !is_unlinked(&evidence.binding_changes, &step.id, id);
     let mut tasks: BTreeSet<_> = step.tasks.iter().cloned().collect();
     tasks.extend(

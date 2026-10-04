@@ -2653,6 +2653,8 @@ mod tests {
             push_remote: None,
             install_required: false,
             fast_forward: true,
+            merged_at: String::new(),
+            installed_at: String::new(),
             push: true,
             install: true,
             install_result: String::new(),

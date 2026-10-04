@@ -1400,23 +1400,12 @@ fn reopened_rundown_check(ctx: &Ctx) -> Result<Option<String>> {
     loop {
         let text = herdr.pane_read_text(&pane, "visible")?;
         let view = crate::project_view::View::load(ctx, &project, None)?.rundown();
-        let expected = if let Some(needs) = view["needs_you"].as_str().filter(|s| !s.is_empty()) {
-            format!("Needs you: {needs}")
-        } else {
-            view["work"].as_str().unwrap_or_default().to_string()
-        };
         let steps = view["plan"]["steps"]
             .as_array()
             .context("overview has no steps")?;
         let done = steps.iter().filter(|step| step["state"] == "done").count();
         let count = format!("{done} of {}", steps.len());
-        match rundown_screen_error(
-            &text,
-            &title,
-            &expected,
-            view["work"].as_str().unwrap_or_default(),
-            &count,
-        ) {
+        match rundown_screen_error(&text, &title, &count) {
             None => return Ok(Some("Rundown renders: OK".into())),
             Some(error) if Instant::now() >= deadline => bail!("{error}"),
             Some(_) => std::thread::sleep(Duration::from_millis(100)),
@@ -1424,13 +1413,7 @@ fn reopened_rundown_check(ctx: &Ctx) -> Result<Option<String>> {
     }
 }
 
-fn rundown_screen_error(
-    text: &str,
-    title: &str,
-    expected: &str,
-    work: &str,
-    count: &str,
-) -> Option<String> {
+fn rundown_screen_error(text: &str, title: &str, count: &str) -> Option<String> {
     let lines: Vec<_> = text
         .lines()
         .map(|line| line.trim().trim_matches('│').trim())
@@ -1450,27 +1433,15 @@ fn rundown_screen_error(
     let Some(first) = lines.get(at + 1).filter(|line| !line.is_empty()) else {
         return Some("reopened Rundown has no content".into());
     };
-    // The normal first row is current work (or Needs you). Any extra row here
-    // is the renderer's error slot, including serde and command-read failures.
-    if expected.is_empty() || !matches(first, expected) {
-        return Some((*first).to_string());
-    }
-    let progress_at = if expected != work {
-        let next = lines.get(at + 2).copied().unwrap_or_default();
-        if next.is_empty() || !matches(next, work) {
-            return Some(next.to_string());
-        }
-        at + 3
+    // Progress now follows the title; activity sections follow it. The error
+    // slot still precedes progress, so a partial render must not prove success.
+    if first.ends_with(count) {
+        None
+    } else if first.starts_with('█') || first.split_once(" of ").is_some() {
+        Some(format!("step count not rendered: expected {count}"))
     } else {
-        at + 2
-    };
-    if !lines
-        .get(progress_at)
-        .is_some_and(|line| line.ends_with(count))
-    {
-        return Some(format!("step count not rendered: expected {count}"));
+        Some((*first).to_string())
     }
-    None
 }
 
 fn install_for(ctx: &Ctx, current: Option<(&str, &str)>) -> Result<InstallOutcome> {
@@ -1736,7 +1707,7 @@ mod tests {
     #[test]
     fn install_reads_the_proven_reopened_harness_pane_and_restores_focus() {
         let world = crate::scenarios::World::new();
-        let project = world.project("adeherdr", "scratch.sock");
+        world.project("adeherdr", "scratch.sock");
         crate::project::write_json(
             &world.root.join(".rundown-reopen.json"),
             &serde_json::json!([{"project":"adeherdr", "outcome":"reopened"}]),
@@ -1758,13 +1729,10 @@ mod tests {
         );
         world.runner.on("plugin pane focus w1:p2", ok(r#"{"result":{"plugin_pane":{"plugin_id":"herdr-ade","entrypoint":"rundown","pane":{"pane_id":"w1:p2","tab_id":"w1:t2","workspace_id":"w1"}}}}"#));
         world.runner.on("tab focus w1:t1", ok(r#"{"result":{}}"#));
-        let view = crate::project_view::View::load(&world.ctx(), &project, None)
-            .unwrap()
-            .rundown();
-        let text = format!("Adeherdr\n{}\n████ 0 of 0", view["work"].as_str().unwrap());
+        let text = "Harness update time unknown · not run yet\nAdeherdr\n████ 0 of 0";
         world
             .runner
-            .on("pane read w1:p2 --source visible --format text", ok(&text));
+            .on("pane read w1:p2 --source visible --format text", ok(text));
         assert_eq!(
             reopened_rundown_check(&world.ctx()).unwrap().as_deref(),
             Some("Rundown renders: OK")
@@ -1784,45 +1752,27 @@ mod tests {
 
     #[test]
     fn reopened_rundown_screen_accepts_clipped_rows() {
-        let work = "2 running · 0 waiting · 1 awaiting review · 1 awaiting installation";
-        assert_eq!(
-            rundown_screen_error(
-                "Adeherdr\n2 running · 0 waiting · 1 awaiting…\n████ 1 of 3",
+        for (text, title) in [
+            (
+                "Adeherdr\n████ 1 of 3\nWorking on now\nMake the screen…",
                 "Adeherdr",
-                work,
-                work,
-                "1 of 3",
             ),
-            None
-        );
-        assert_eq!(
-            rundown_screen_error(
-                "Adeherdr\nNeeds you: finish the browser…\n2 running · 0 waiting · 1 awaiting…\n████ 1 of 3",
+            (
+                "Adeherdr\n████ 1 of 3\nNeeds you\nFinish the browser…",
                 "Adeherdr",
-                "Needs you: finish the browser login before continuing",
-                work,
-                "1 of 3",
             ),
-            None
-        );
-        assert_eq!(
-            rundown_screen_error(
-                "A long project…\n2 running\n████ 1 of 3",
-                "A long project title",
-                "2  running",
-                "2  running",
-                "1 of 3",
-            ),
-            None
-        );
+            ("A long project…\n████ 1 of 3", "A long project title"),
+        ] {
+            assert_eq!(rundown_screen_error(text, title, "1 of 3"), None);
+        }
     }
 
     #[test]
     fn reopened_rundown_screen_reports_the_first_error_not_an_empty_plan() {
         for (text, error) in [
-            ("Adeherdr\n2 running\n████ 1 of 3\nReadable step", None),
+            ("Adeherdr\n████ 1 of 3\nReadable step", None),
             (
-                " │ Adeherdr │\n │ Needs you: login │\n │ 2 running │\n │ ████ 1 of 3 │",
+                " │ Adeherdr │\n │ ████ 1 of 3 │\n │ Needs you │\n │ Sign in │",
                 None,
             ),
             (
@@ -1834,23 +1784,18 @@ mod tests {
                 Some("Rundown read failed: missing field `text`"),
             ),
             (
-                "Adeherdr\nNeeds you: login\nRundown read failed: missing field `text`\n████ 1 of 3",
-                Some("Rundown read failed: missing field `text`"),
+                "Adeherdr\nSome work records could not be read\n████ 1 of 3",
+                Some("Some work records could not be read"),
             ),
             (
-                "Adeherdr\n2 running\n████ 0 of 0",
+                "Adeherdr\n████ 0 of 0",
                 Some("step count not rendered: expected 1 of 3"),
             ),
             ("", Some("project title not rendered")),
             ("Adeherdr\n", Some("reopened Rundown has no content")),
         ] {
-            let expected = if text.contains("Needs you") {
-                "Needs you: login"
-            } else {
-                "2 running"
-            };
             assert_eq!(
-                rundown_screen_error(text, "Adeherdr", expected, "2 running", "1 of 3").as_deref(),
+                rundown_screen_error(text, "Adeherdr", "1 of 3").as_deref(),
                 error
             );
         }
