@@ -7,7 +7,7 @@ sudo -n "$wall" --instance "$2" reset
 sudo -n "$wall" --instance "$2" enter "$(/usr/bin/python3 - <<'HOST'
 import shlex
 script = r'''
-import json, os, pathlib, shutil, subprocess, sys
+import hashlib, json, os, pathlib, shlex, shutil, subprocess, sys
 home = pathlib.Path.home()
 repo = home / 'd67-repo'
 repo.mkdir()
@@ -43,6 +43,46 @@ if passed:
     print('EXPECTED large ignored status: Ready, no kept data; status bytes', len(raw))
     print('ACTUAL', json.dumps(result))
     passed = result.get('status') == 'Ready' and result['result'] == {'dirty': [], 'ignored_data': []}
+# A resolved, uninspectable box checkout must not pin either kind of cache.
+sys.path.insert(0, str(home/'tools'))
+from instance import Instance
+instance = Instance(int(os.environ.get('WALL_INSTANCE', '0')))
+box = home/'box'
+thread = 't-0999'
+box_checkout = box/'repo/.worktrees'/thread
+branch = 'hp/wall/'+thread
+private = box/'.herdr-ade/.execution'/hashlib.sha256(f'{box}/.herdr-ade\0{thread}\01\0{box_checkout}'.encode()).hexdigest()
+cache = box/'build'/('wall-'+thread)
+setup = f"""import pathlib, subprocess, shutil
+repo=pathlib.Path.home()/'repo'; checkout=pathlib.Path({str(box_checkout)!r})
+subprocess.run(['git','-C',str(repo),'worktree','add','-qb',{branch!r},str(checkout)],check=True)
+admin=pathlib.Path((checkout/'.git').read_text().strip().removeprefix('gitdir: ')); shutil.rmtree(admin)
+for path in [{str(cache)!r}, {str(private/'build')!r}]:
+ p=pathlib.Path(path); p.mkdir(parents=True); (p/'rebuildable').write_text('cache')
+(pathlib.Path({str(private)!r})/'retained-runtime').write_text('not a build cache')
+"""
+subprocess.run(['ssh',instance.machine,'python3 -c '+shlex.quote(setup)],check=True)
+records = home/'.herdr-ade/wall/.state/threads'; records.mkdir(exist_ok=True)
+record = f"""id = "{thread}"
+kind = "worktree"
+status = "resolved"
+repo = "{home}/repo"
+branch = "{branch}"
+machine = "{instance.machine}"
+worktree_path = "{box_checkout}"
+cwd = "{box_checkout}"
+merged_sha = "fixture-landed"
+cleanup_pending = true
+[retirement]
+skip_copy = true
+"""
+(records/(thread+'.toml')).write_text(record)
+resolved = subprocess.run(['ha','--json','thread','resolve','wall',thread,'--skip-copy'],capture_output=True,text=True)
+probe = f'test -e {shlex.quote(str(box_checkout))} && test ! -e {shlex.quote(str(cache))} && test ! -e {shlex.quote(str(private/"build"))} && test -f {shlex.quote(str(private/"retained-runtime"))}'
+cleaned = subprocess.run(['ssh',instance.machine,probe],capture_output=True,text=True).returncode == 0
+print('EXPECTED refused resolved checkout: kept; lane and private caches removed; other runtime retained')
+print('ACTUAL', 'cache obligation completed' if cleaned else 'cache pinned', 'resolve:', resolved.stdout.strip() or resolved.stderr.strip())
+passed = passed and cleaned
 sys.exit(0 if passed else 1)
 '''
 print('python3 -c ' + shlex.quote(script))

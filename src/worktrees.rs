@@ -286,8 +286,26 @@ pub(crate) fn inspect_local(
     disposable: &[String],
     report_artifact_stored: bool,
 ) -> Result<Inspection> {
+    inspect_local_removal(
+        runner,
+        repo,
+        path,
+        disposable,
+        report_artifact_stored,
+        false,
+    )
+}
+
+pub(crate) fn inspect_local_removal(
+    runner: &dyn Runner,
+    repo: &str,
+    path: &str,
+    disposable: &[String],
+    report_artifact_stored: bool,
+    recovered: bool,
+) -> Result<Inspection> {
     crate::git::with_worktree_status(runner, repo, path, |stream| {
-        inspect_status_stream(stream, path, disposable, report_artifact_stored)
+        inspect_status_stream(stream, path, disposable, report_artifact_stored, recovered)
     })
 }
 
@@ -296,6 +314,7 @@ fn inspect_status_stream(
     path: &str,
     disposable: &[String],
     report_artifact_stored: bool,
+    recovered: bool,
 ) -> Result<Inspection> {
     let mut dirty = Vec::new();
     let mut kept = BTreeSet::new();
@@ -324,7 +343,10 @@ fn inspect_status_stream(
                 disposable,
                 report_artifact_stored,
             ));
-        } else if dirty.len() < 32 {
+        } else if !(recovered && &row[..3] == b" D ") && dirty.len() < 32 {
+            // Missing files in a reconstructed sealed index contain no unique
+            // bytes. The caller already required finished work and retained
+            // evidence. Staged deletions and every other edit still refuse.
             // Only diagnostics are bounded. Any dirty row still refuses removal.
             dirty.push(relative);
         }

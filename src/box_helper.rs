@@ -232,21 +232,24 @@ fn execute(ctx: &Ctx, request: Request) -> Result<String> {
             disposable,
             report_stored,
         } => {
-            if let Some((repo, branch, sealed)) = repair {
+            let recovered = if let Some((repo, branch, sealed)) = repair {
                 crate::git::repair_worktree(
                     ctx.runner,
                     &repo,
                     &path,
                     &branch,
                     if report_stored { &sealed } else { "" },
-                )?;
-            }
-            ready(crate::worktrees::inspect_local(
+                )?
+            } else {
+                false
+            };
+            ready(crate::worktrees::inspect_local_removal(
                 ctx.runner,
                 &path,
                 &path,
                 &disposable,
                 report_stored,
+                recovered,
             )?)
         }
     }

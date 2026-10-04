@@ -4,7 +4,7 @@ use crate::testkit::{fixture, git};
 
 #[test]
 fn d67_missing_admin_cleanup_removes_merged_work_and_keeps_unique_work() {
-    for merged in [false, true] {
+    for (merged, pointer_missing) in [(false, false), (true, false), (false, true), (true, true)] {
         let fx = fixture();
         let (id, sha) = fx.lane(1);
         fx.seal_done(&id, 1, 1, &sha, "sealed report\n");
@@ -13,6 +13,11 @@ fn d67_missing_admin_cleanup_removes_merged_work_and_keeps_unique_work() {
             std::fs::read_to_string(Path::new(&record.worktree_path).join(".git")).unwrap();
         let admin = pointer.trim().strip_prefix("gitdir: ").unwrap();
         std::fs::remove_dir_all(admin).unwrap();
+        // Git can also partially remove tracked files and the Git pointer.
+        std::fs::remove_file(Path::new(&record.worktree_path).join("README.md")).unwrap();
+        if pointer_missing {
+            std::fs::remove_file(Path::new(&record.worktree_path).join(".git")).unwrap();
+        }
         if merged {
             git(&fx.repo, &["merge", "--ff-only", &record.branch]);
         }

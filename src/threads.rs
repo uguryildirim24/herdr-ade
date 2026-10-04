@@ -4598,12 +4598,20 @@ pub(crate) fn inspect_worktree_for_removal(
     }
     let disposable = crate::worktrees::disposable(&ctx.config_dir, project, &record.repo)?;
     if !record.is_remote() {
-        return crate::worktrees::inspect_local(
+        let recovered = crate::git::repair_worktree(
+            ctx.runner,
+            &record.repo,
+            &record.worktree_path,
+            &record.branch,
+            &cleanup_sealed_sha(project, record)?,
+        )?;
+        return crate::worktrees::inspect_local_removal(
             ctx.runner,
             &record.repo,
             &record.worktree_path,
             &disposable,
             report_artifact_stored,
+            recovered,
         );
     }
     let profile = remote::machine_profile(
@@ -4658,6 +4666,7 @@ fn repair_worktree_for_cleanup(ctx: &Ctx, project: &Project, record: &Thread) ->
         &record.branch,
         &cleanup_sealed_sha(project, record)?,
     )
+    .map(|_| ())
 }
 
 /// Whether the recorded checkout still exists. A missing checkout is the

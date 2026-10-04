@@ -14,6 +14,7 @@ use crate::repo::Git;
 use crate::runner::Runner;
 
 const GIT_TIMEOUT: Duration = Duration::from_secs(20);
+const RECOVERED_INDEX: &str = "herdr-ade-recovered-index";
 
 /// Held while worktree add/remove, `info/exclude` edits, and plugin ref writes
 /// run. Keyed by `git rev-parse --git-common-dir`.
@@ -149,6 +150,13 @@ pub(crate) fn worktree_remove(runner: &dyn Runner, repo: &str, path: &str) -> Re
         "worktree backlink mismatch: {path}"
     );
     anyhow::ensure!(!admin.join("locked").exists(), "worktree is locked: {path}");
+    let recovered = recovered_index(admin)?;
+    if let Some(sealed) = &recovered {
+        anyhow::ensure!(
+            rev_parse(runner, path, "HEAD")? == *sealed,
+            "recovered worktree moved beyond its seal"
+        );
+    }
     with_worktree_status(runner, repo, path, |stream| {
         let mut row = Vec::new();
         loop {
@@ -157,7 +165,10 @@ pub(crate) fn worktree_remove(runner: &dyn Runner, repo: &str, path: &str) -> Re
                 break;
             }
             anyhow::ensure!(row.last() == Some(&0), "incomplete Git status record");
-            anyhow::ensure!(row.starts_with(b"!! "), "not a clean worktree: {path}");
+            anyhow::ensure!(
+                row.starts_with(b"!! ") || recovered.is_some() && row.starts_with(b" D "),
+                "not a clean worktree: {path}"
+            );
         }
         Ok(())
     })?;
@@ -224,16 +235,24 @@ pub(crate) fn forget_worktree(runner: &dyn Runner, repo: &str, path: &str) -> Re
 /// Rebuild lost administration from a sealed branch without changing checkout
 /// files. The reconstructed index is only a comparison baseline; dirty files
 /// and unique commits still face the normal removal safety checks.
+fn recovered_index(admin: &Path) -> Result<Option<String>> {
+    match std::fs::read_to_string(admin.join(RECOVERED_INDEX)) {
+        Ok(sha) => Ok(Some(sha.trim_end_matches('\n').into())),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e.into()),
+    }
+}
+
 pub(crate) fn repair_worktree(
     runner: &dyn Runner,
     repo: &str,
     path: &str,
     branch: &str,
     sealed: &str,
-) -> Result<()> {
+) -> Result<bool> {
     let pointer = Path::new(path).join(".git");
     if pointer.is_dir() {
-        return Ok(());
+        return Ok(false);
     }
     let raw = match std::fs::read_to_string(&pointer) {
         Ok(text) => Some(PathBuf::from(
@@ -244,15 +263,24 @@ pub(crate) fn repair_worktree(
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
         Err(e) => return Err(e.into()),
     };
-    if raw.as_ref().is_some_and(|dir| dir.is_dir()) {
-        return Ok(());
+    if let Some(dir) = raw.as_ref().filter(|dir| dir.is_dir()) {
+        if let Some(baseline) = recovered_index(dir)? {
+            anyhow::ensure!(
+                !sealed.is_empty()
+                    && baseline == sealed
+                    && Git::new(runner, repo).branch_head(branch)?.as_deref() == Some(sealed),
+                "worktree_metadata_missing: recovered branch moved beyond retained seal; checkout kept for a decision"
+            );
+            return Ok(true);
+        }
+        return Ok(false);
     }
     if raw.is_none()
         && Path::new(path).parent() != Some(Path::new(repo).join(".worktrees").as_path())
     {
         // Do not infer administration for an arbitrary unregistered folder.
         // Its ordinary status check remains authoritative.
-        return Ok(());
+        return Ok(false);
     }
     anyhow::ensure!(
         !sealed.is_empty() && !branch.is_empty(),
@@ -280,6 +308,7 @@ pub(crate) fn repair_worktree(
     std::fs::write(admin.join("commondir"), "../..\n")?;
     std::fs::write(admin.join("HEAD"), format!("ref: refs/heads/{branch}\n"))?;
     std::fs::write(admin.join("gitdir"), format!("{}\n", pointer.display()))?;
+    std::fs::write(admin.join(RECOVERED_INDEX), format!("{sealed}\n"))?;
     Git::new(runner, repo).run(&[
         &format!("--git-dir={}", admin.display()),
         "read-tree",
@@ -289,7 +318,7 @@ pub(crate) fn repair_worktree(
     if missing_pointer {
         std::fs::write(pointer, format!("gitdir: {}\n", dir.display()))?;
     }
-    Ok(())
+    Ok(true)
 }
 
 /// Full removal status, including ignored files. This is only for worktree
