@@ -83,7 +83,31 @@ impl Cmd {
             line.push(' ');
             line.push_str(arg);
         }
+        if let Ok(Some(call)) = fake_herdr::input_call(self) {
+            line.push_str(" [stdin API: ");
+            line.push_str(&call.display());
+            line.push(']');
+        }
         line
+    }
+}
+
+/// A definite pre-submission failure: no child was started.
+#[derive(Debug)]
+pub(crate) struct SpawnError {
+    program: String,
+    source: std::io::Error,
+}
+
+impl std::fmt::Display for SpawnError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "could not execute `{}`: {}", self.program, self.source)
+    }
+}
+
+impl std::error::Error for SpawnError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.source)
     }
 }
 
@@ -363,9 +387,10 @@ impl Runner for RealRunner {
             command.process_group(0);
         }
 
-        let mut child = command
-            .spawn()
-            .with_context(|| format!("could not run `{}`", cmd.program))?;
+        let mut child = command.spawn().map_err(|source| SpawnError {
+            program: cmd.program.clone(),
+            source,
+        })?;
 
         // Readers and the writer run on their own threads so a full pipe in
         // either direction cannot deadlock against the deadline loop below.

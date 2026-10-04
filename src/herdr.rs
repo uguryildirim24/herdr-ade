@@ -154,6 +154,20 @@ impl std::fmt::Display for HerdrError {
 
 impl std::error::Error for HerdrError {}
 
+fn transport_error(error: anyhow::Error) -> HerdrError {
+    HerdrError {
+        code: if error.downcast_ref::<crate::runner::SpawnError>().is_some() {
+            "exec_failed"
+        } else if crate::remote::is_unreachable(&format!("{error:#}")) {
+            "unreachable"
+        } else {
+            "failed"
+        }
+        .into(),
+        message: format!("herdr transport failed: {error:#}"),
+    }
+}
+
 pub(crate) const AGENT_START_TIMEOUT: Duration = Duration::from_secs(20);
 /// Keep short names readable; long project slugs otherwise exceed the fork's
 /// 32-byte agent-name limit. Preserve the role suffix and distinguish slugs.
@@ -399,10 +413,7 @@ impl<'a> Herdr<'a> {
     ) -> Result<serde_json::Value, HerdrError> {
         self.require_session()?;
         let cmd = self.cmd(timeout).args(args.iter().copied());
-        let out = self.runner.run(&cmd).map_err(|e| HerdrError {
-            code: "unreachable".into(),
-            message: format!("{e:#}"),
-        })?;
+        let out = self.runner.run(&cmd).map_err(transport_error)?;
         decode_call(&args.join(" "), out)
     }
 
@@ -575,10 +586,7 @@ impl<'a> Herdr<'a> {
                     .cmd(CALL_TIMEOUT)
                     .args(["pane", "read", pane, "--source", source, "--format", format]),
             )
-            .map_err(|e| HerdrError {
-                code: "unreachable".into(),
-                message: format!("{e:#}"),
-            })?;
+            .map_err(transport_error)?;
         if !out.success() {
             return Err(HerdrError {
                 code: "failed".into(),
@@ -652,10 +660,7 @@ impl<'a> Herdr<'a> {
             .into_iter()
             .zip(prepared)
             .map(|(output, (args, _))| {
-                let output = output.map_err(|error| HerdrError {
-                    code: "unreachable".into(),
-                    message: format!("{error:#}"),
-                })?;
+                let output = output.map_err(transport_error)?;
                 let result = decode_call(&args.join(" "), output)?;
                 serde_json::from_value(result["agent"].clone()).map_err(|error| HerdrError {
                     code: "failed".into(),
@@ -692,19 +697,69 @@ impl<'a> Herdr<'a> {
         })
     }
 
-    /// Submits a prompt. herdr's parser takes positionals first and options
-    /// after them, and has no `--` separator here; text in the second
-    /// position is accepted even when it starts with a dash (checked on 0.9.1).
+    /// Herdr 0.9.1's remote-api-bridge forwards newline-delimited JSON from
+    /// stdin to its socket. The prompt CLI has no file/stdin option; putting
+    /// arbitrary note text in argv can fail before the client even starts.
+    fn input_request(
+        &self,
+        method: &str,
+        params: serde_json::Value,
+        timeout: Duration,
+    ) -> Result<(), HerdrError> {
+        self.require_session()?;
+        let input = format!(
+            "{}\n",
+            serde_json::json!({
+                "id": "ade:input", "method": method, "params": params,
+            })
+        );
+        let output = if let Some(machine) = &self.machine {
+            let profile = crate::remote::saved_herdr_profile(self.runner, &self.bin, machine)
+                .map_err(|error| HerdrError {
+                    code: "failed".into(),
+                    message: format!("{error:#}"),
+                })?;
+            let cmd = crate::remote::ssh_cmd(
+                &profile.target,
+                &format!(
+                    "exec herdr --session {} remote-api-bridge",
+                    crate::remote::quote(&profile.session)
+                ),
+                Some(&input),
+                timeout,
+            )
+            .map_err(transport_error)?;
+            self.runner.run(&cmd)
+        } else {
+            self.runner.run(
+                &self
+                    .cmd(timeout)
+                    .own_group()
+                    .arg("remote-api-bridge")
+                    .stdin(input),
+            )
+        }
+        .map_err(transport_error)?;
+        decode_call(method, output).map(|_| ())
+    }
+
     pub(crate) fn agent_prompt(&self, target: &str, text: &str) -> Result<(), HerdrError> {
-        self.call(&["agent", "prompt", target, text], CALL_TIMEOUT)
-            .map(|_| ())
+        self.input_request(
+            "agent.prompt",
+            serde_json::json!({"target": target, "text": text}),
+            CALL_TIMEOUT,
+        )
     }
 
     /// Submit through the pane surface when an adapter has identified its own
     /// recoverable error screen. `agent prompt` deliberately refuses every
     /// blocked state, including this adapter-owned one.
     pub(crate) fn pane_submit_text(&self, pane: &str, text: &str) -> Result<(), HerdrError> {
-        self.call(&["pane", "send-text", pane, text], CALL_TIMEOUT)?;
+        self.input_request(
+            "pane.send_text",
+            serde_json::json!({"pane_id": pane, "text": text}),
+            CALL_TIMEOUT,
+        )?;
         self.pane_send_keys(pane, "Enter")
     }
 
@@ -720,24 +775,15 @@ impl<'a> Herdr<'a> {
         text: &str,
         timeout_ms: u64,
     ) -> Result<(), HerdrError> {
-        let (timeout, wait) = agent_timeout(timeout_ms, AgentTimeout::Wait);
-        self.call(
-            &[
-                "agent",
-                "prompt",
-                target,
-                text,
-                "--wait",
-                "--until",
-                "working",
-                "--until",
-                "blocked",
-                "--timeout",
-                &timeout,
-            ],
+        let (_, wait) = agent_timeout(timeout_ms, AgentTimeout::Wait);
+        self.input_request(
+            "agent.prompt",
+            serde_json::json!({
+                "target": target, "text": text,
+                "wait": {"until": ["working", "blocked"], "timeout_ms": timeout_ms},
+            }),
             wait,
         )
-        .map(|_| ())
     }
 
     pub(crate) fn agent_focus(&self, target: &str) -> Result<(), HerdrError> {
@@ -849,6 +895,59 @@ mod tests {
     use super::*;
 
     #[test]
+    fn large_notes_use_stdin_for_local_and_saved_machine_input() {
+        use crate::runner::fake::{FakeRunner, ok};
+        let runner = FakeRunner::new();
+        runner.on("machine list --json", ok(r#"[{"id":"box","label":"box","target":"box","session":"scratch-t-0825","enabled":true}]"#));
+        runner.on("agent prompt", ok(r#"{"result":{}}"#));
+        runner.on("pane send-text", ok(r#"{"result":{}}"#));
+        runner.on("pane send-keys", ok(r#"{"result":{}}"#));
+        let herdr = Herdr::new("herdr", "/test.sock", &runner);
+        let text = "x".repeat(131_072);
+        for bound in [herdr.on_machine(""), herdr.on_machine("box")] {
+            bound.agent_prompt("w1:p1", &text).unwrap();
+            bound
+                .agent_prompt_wait_started("w1:p1", &text, 20_000)
+                .unwrap();
+            bound.pane_submit_text("w1:p1", &text).unwrap();
+        }
+        let calls = runner.calls.borrow();
+        let inputs: Vec<_> = calls
+            .iter()
+            .filter(|cmd| cmd.args.iter().any(|arg| arg.contains("remote-api-bridge")))
+            .collect();
+        assert_eq!(inputs.len(), 6);
+        for cmd in inputs {
+            assert!(cmd.args.iter().all(|arg| arg.len() < 1024));
+            let request: serde_json::Value =
+                serde_json::from_str(cmd.stdin.as_deref().unwrap()).unwrap();
+            assert_eq!(request["params"]["text"], text);
+            if cmd.program == "ssh" {
+                assert!(
+                    cmd.args
+                        .iter()
+                        .any(|arg| arg.contains("--session") && arg.contains("scratch-t-0825"))
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_large_notes_exec_failure_is_definite_not_server_unreachable() {
+        let dir = tempfile::tempdir().unwrap();
+        let bin = dir.path().join("missing-herdr");
+        let runner = crate::runner::RealRunner;
+        let herdr = Herdr::new(bin.to_string_lossy(), "/test.sock", &runner);
+        let error = herdr
+            .agent_prompt("w1:p1", &"x".repeat(131_072))
+            .unwrap_err();
+        assert_eq!(error.code, "exec_failed");
+        assert!(error.message.contains("could not execute"), "{error}");
+        assert!(!error.message.contains("unreachable"), "{error}");
+        assert!(crate::threads::prompt_refused_before_submission(&error));
+    }
+
+    #[test]
     fn project_names_fit_the_fork_for_coordinators_and_lanes() {
         use crate::runner::fake::{FakeRunner, ok};
         let runner = FakeRunner::new();
@@ -951,12 +1050,17 @@ mod tests {
                 .unwrap();
             let calls = runner.calls.borrow();
             for command in calls.iter().rev().take(2) {
-                assert!(
-                    command
-                        .args
-                        .windows(2)
-                        .any(|args| args == ["--timeout", &requested.to_string()])
-                );
+                if let Some(input) = &command.stdin {
+                    let request: serde_json::Value = serde_json::from_str(input).unwrap();
+                    assert_eq!(request["params"]["wait"]["timeout_ms"], requested);
+                } else {
+                    assert!(
+                        command
+                            .args
+                            .windows(2)
+                            .any(|args| args == ["--timeout", &requested.to_string()])
+                    );
+                }
                 assert_eq!(
                     command.timeout,
                     Duration::from_millis(requested) + Duration::from_secs(5)

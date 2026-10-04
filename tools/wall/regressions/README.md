@@ -14,6 +14,11 @@ and returns nonzero while the defect exists. Repros need an installed build.
 The gate discovers every `*/repro`; a missing/non-executable/broken repro cannot
 silently pass. D27 disallows guest.py's historical assisted-open fallback. D30
 corrupts an actual started lane, checking garbage, truncation and empty records.
+D54 checks the installed courier's requested session with an inherited default
+socket; D55 delivers an exact 128 KiB file note to a ready fixture lane; D56
+compares real blank-title rejections with the unignored fake contract test.
+Their shared runner captures both guest evidence and host fake-test output,
+uses only `scratch-t-0825`, then stops/deletes it and resets the selected instance.
 
 ## Gate contract
 

@@ -1160,8 +1160,11 @@ pub(crate) fn box_manifest(
                 }
                 let Ok(screen) = ctx.runner.run(
                     &crate::runner::Cmd::new(&bin, COURIER_TIMEOUT)
-                        .env("HERDR_SESSION", session)
+                        .env_remove("HERDR_SOCKET_PATH")
+                        .env_remove("HERDR_SESSION")
                         .args([
+                            "--session",
+                            session,
                             "pane",
                             "read",
                             &card.pane_id,
@@ -1655,12 +1658,11 @@ mod tests {
             .iter()
             .find(|cmd| cmd.display().contains("agent prompt"))
             .unwrap()
-            .args
-            .clone();
-        assert!(
-            prompt.iter().any(|arg| arg == &lines.join("\n")),
-            "{prompt:?}"
-        );
+            .stdin
+            .clone()
+            .unwrap();
+        let request: serde_json::Value = serde_json::from_str(&prompt).unwrap();
+        assert_eq!(request["params"]["text"], lines.join("\n"));
         prime_unread(&world.ctx(), &project).unwrap();
         assert_eq!(
             typed_lines(&world).len(),
@@ -2915,7 +2917,7 @@ text = "waiting"
         )
         .unwrap();
         let fake = bin.join("herdr");
-        std::fs::write(&fake, "#!/bin/sh\ncase \"$*\" in\n  *'agent list'*) echo '{\"result\":{\"agents\":[]}}';;\n  *'pane list'*) echo '{\"result\":{\"panes\":[{\"workspace_id\":\"w\",\"tab_id\":\"w:t\",\"pane_id\":\"w:p\",\"cwd\":\"/repo\"}]}}';;\n  *'pane read'*) printf 'working';;\nesac\n").unwrap();
+        std::fs::write(&fake, "#!/bin/sh\n[ \"$1\" = --session ] && [ \"$2\" = scratch-t-0825 ] && [ -z \"${HERDR_SOCKET_PATH+x}\" ] && [ -z \"${HERDR_SESSION+x}\" ] || exit 9\ncase \"$*\" in\n  *'agent list'*) echo '{\"result\":{\"agents\":[]}}';;\n  *'pane list'*) echo '{\"result\":{\"panes\":[{\"workspace_id\":\"w\",\"tab_id\":\"w:t\",\"pane_id\":\"w:p\",\"cwd\":\"/repo\"}]}}';;\n  *'pane read'*) printf 'working';;\nesac\n").unwrap();
         std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
         let env =
             crate::paths::Env::for_test(home.path(), &[("HERDR_BIN_PATH", fake.to_str().unwrap())]);
@@ -2926,7 +2928,9 @@ text = "waiting"
             runner: &crate::runner::RealRunner,
             detached_ticker: false,
         };
-        let manifest = box_manifest(&ctx, "default", &[]).unwrap();
+        let manifest = box_manifest(&ctx, "scratch-t-0825", &[]).unwrap();
+        assert!(manifest.agents.is_some());
+        assert_eq!(manifest.panes.as_ref().unwrap().len(), 1);
         let progress = &manifest.progress[0].1;
         assert_eq!(manifest.progress[0].0, ("demo".into(), "t-1".into()));
         assert_eq!(progress.head, sha);

@@ -351,10 +351,47 @@ fn metadata(args: &Args<'_>, pane: bool) -> Check {
     Ok(())
 }
 
+/// Model the bridge's API input separately from its actual process argv.
+/// Scripted answers use the equivalent command description, while recorded
+/// calls retain the real stdin transport for assertions.
+pub(super) fn input_call(cmd: &Cmd) -> Result<Option<Cmd>, String> {
+    if !cmd.args.iter().any(|arg| arg.contains("remote-api-bridge")) {
+        return Ok(None);
+    }
+    let request: serde_json::Value =
+        serde_json::from_str(cmd.stdin.as_deref().ok_or("bridge requires stdin")?)
+            .map_err(|error| format!("invalid bridge request: {error}"))?;
+    let params = &request["params"];
+    let (verb, action, target) = match request["method"].as_str() {
+        Some("agent.prompt") => ("agent", "prompt", "target"),
+        Some("pane.send_text") => ("pane", "send-text", "pane_id"),
+        _ => return Err("unmodelled bridge method".into()),
+    };
+    let mut call = Cmd::new("herdr", cmd.timeout).args([
+        verb,
+        action,
+        params[target].as_str().ok_or("missing bridge target")?,
+        params["text"].as_str().ok_or("missing bridge text")?,
+    ]);
+    if let Some(wait) = params.get("wait") {
+        call = call.arg("--wait");
+        for state in wait["until"].as_array().ok_or("missing wait states")? {
+            call = call.args(["--until", state.as_str().ok_or("invalid wait state")?]);
+        }
+        if let Some(timeout) = wait["timeout_ms"].as_u64() {
+            call = call.args(["--timeout", &timeout.to_string()]);
+        }
+    }
+    Ok(Some(call))
+}
+
 /// Check every herdr invocation before fake answers (including errors) match.
 /// State-dependent checks remain scripted: resource existence, busy panes,
 /// duplicate live names, ancestor cycles and per-resource token capacity.
 pub(super) fn validate(cmd: &Cmd) -> Check {
+    if let Some(call) = input_call(cmd)? {
+        return validate(&call);
+    }
     let is_herdr = cmd.env.iter().any(|(key, _)| key == "HERDR_SOCKET_PATH")
         || std::path::Path::new(&cmd.program)
             .file_name()
@@ -576,6 +613,9 @@ pub(super) fn validate(cmd: &Cmd) -> Check {
         }
     }
     match path.as_str() {
+        "notification show" if parsed.positional[0].trim().is_empty() => {
+            return Err("notification title is empty".into());
+        }
         "pane wait-output" => {
             if parsed.has("match") == parsed.has("regex") {
                 return Err("expected --match OR --regex".into());
@@ -775,7 +815,6 @@ mod tests {
     use std::time::Duration;
 
     #[test]
-    #[ignore = "wall H02: real Herdr rejects blank notification titles; findings/herdr/repro-02"]
     fn wall_h02_empty_notification_title() {
         for title in ["", " ", "\n", "\u{2003}"] {
             let cmd = Cmd::new("herdr", Duration::from_secs(1)).args([

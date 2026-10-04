@@ -457,8 +457,9 @@ pub(crate) fn observe_list<T: serde::de::DeserializeOwned>(
     let out = runner.run(
         &Cmd::new(bin, TOOL_TIMEOUT)
             .own_group()
-            .env("HERDR_SESSION", session)
-            .args([verb, "list"]),
+            .env_remove("HERDR_SOCKET_PATH")
+            .env_remove("HERDR_SESSION")
+            .args(["--session", session, verb, "list"]),
     )?;
     anyhow::ensure!(out.success(), "{}", out.error_text());
     let value: serde_json::Value = serde_json::from_str(&out.stdout)?;

@@ -1,0 +1,51 @@
+#!/usr/bin/env python3
+"""Reset/capture/reset runner for the promoted real-herdr D54-D56 repros."""
+import argparse
+from pathlib import Path
+import re
+import shlex
+import subprocess
+import sys
+import tempfile
+
+HERE = Path(__file__).resolve().parent
+REPO = HERE.parents[2]
+parser = argparse.ArgumentParser()
+parser.add_argument("defect", choices=["D54", "D55", "D56"])
+parser.add_argument("--instance", type=int, required=True, choices=range(1, 9))
+parser.add_argument("--evidence", type=Path)
+args = parser.parse_args()
+evidence = args.evidence or Path(tempfile.mkdtemp(prefix=f"wall-{args.defect}-{args.instance}-")) / "evidence"
+evidence = evidence.resolve()
+evidence.parent.mkdir(parents=True, exist_ok=True)
+wall = ["sudo", str(REPO / "tools/wall/wall"), "--instance", str(args.instance)]
+subprocess.run(wall + ["reset"], check=True)
+code = 2
+try:
+    # wall install stages this readable helper into each instance's tools.
+    command = 'python3 "$HOME/tools/regressions/herdr-input-scenarios.py" ' + shlex.quote(args.defect)
+    command += '; result=$?; printf "\\nWALL_SCENARIO_EXIT=%s\\n" "$result"'
+    result = subprocess.run(wall + ["enter", command], capture_output=True, text=True)
+    print(result.stdout, end="")
+    print(result.stderr, end="", file=sys.stderr)
+    marker = re.search(r"^WALL_SCENARIO_EXIT=(\d+)$", result.stdout, re.MULTILINE)
+    code = int(marker[1]) if marker and result.returncode == 0 else 2
+    if "EXPECTED:" not in result.stdout or "ACTUAL:" not in result.stdout:
+        code = 2
+    subprocess.run(wall + ["evidence", str(evidence)], check=True)
+    evidence.with_suffix(".log").write_text(result.stdout + result.stderr)
+    if args.defect == "D56" and code == 0:
+        result = subprocess.run(["cargo", "test", "-q", "--lib", "wall_h02_empty_notification_title",
+                                 "--", "--nocapture"], cwd=REPO,
+                                capture_output=True, text=True)
+        print(result.stdout, end="")
+        print(result.stderr, end="", file=sys.stderr)
+        evidence.with_name(evidence.name + "-fake.log").write_text(result.stdout + result.stderr)
+        if "running 1 test" not in result.stdout:
+            raise RuntimeError("the named fake contract test was not executed")
+        print(f"ACTUAL: fake contract test exit={result.returncode}")
+        code = result.returncode
+    print(f"Evidence: {evidence}")
+finally:
+    subprocess.run(wall + ["reset"], check=True)
+sys.exit(code)
