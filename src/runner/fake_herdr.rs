@@ -862,6 +862,27 @@ mod tests {
     }
 
     #[test]
+    fn pi_steering_uses_the_real_prompt_contract() {
+        // Real pi takes encoded Enter while streaming as steering. The fork
+        // has no --steer option; the fake must not bless an invented channel.
+        assert!(
+            validate(&Cmd::new("herdr", Duration::from_secs(1)).args([
+                "agent",
+                "prompt",
+                "w1:p1",
+                "mid-turn correction",
+            ]))
+            .is_ok()
+        );
+        for args in [
+            vec!["agent", "prompt", "w1:p1", "mid-turn correction", "--steer"],
+            vec!["agent", "prompt", "w1:p1", ""],
+        ] {
+            assert!(validate(&Cmd::new("herdr", Duration::from_secs(1)).args(args)).is_err());
+        }
+    }
+
+    #[test]
     fn rejects_fork_argument_errors_and_preserves_legal_edge_values() {
         for args in [
             vec!["agent", "start", "UPPER", "--kind", "pi", "--pane", "w1:p1"],

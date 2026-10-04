@@ -673,13 +673,10 @@ fn idle_unchanged_follow_up_restores_reviewer_seal_and_verdict_in_same_pass() {
 }
 
 #[test]
-fn box_follow_up_restores_only_after_box_checkout_and_report_match() {
+fn box_follow_up_restores_only_after_box_checkout_is_unchanged_and_clean() {
     let fx = configured();
     let (id, sha) = lane(&fx, 1);
     let event_id = fx.seal_done(&id, 1, 1, &sha, "report\n");
-    let event = crate::events::latest_done_event(&crate::events::list(&fx.project), &id, 1)
-        .unwrap()
-        .clone();
     thread::update(&fx.project, &id, |lane| {
         lane.machine = "box".into();
         lane.machine_id = "box".into();
@@ -696,13 +693,9 @@ fn box_follow_up_restores_only_after_box_checkout_and_report_match() {
     fx.world
         .runner
         .on("machine list --json", crate::runner::fake::ok("[]"));
-    fx.world.runner.on(
-        "ssh",
-        crate::runner::fake::ok(&format!(
-            "{sha}\n{}  report.md\n",
-            event.payload.done.unwrap().artifact
-        )),
-    );
+    fx.world
+        .runner
+        .on("ssh", crate::runner::fake::ok(&format!("{sha}\n")));
     crate::ticker::restore_unchanged_seal(
         &fx.world.ctx(),
         &fx.project,
@@ -737,6 +730,12 @@ fn committed_follow_up_keeps_old_reviewer_seal_void() {
     let checkout = thread::load(&fx.project, reviewer).unwrap().worktree_path;
     let path = post_seal_follow_up(&fx, reviewer, &sealed_event);
     std::fs::write(&path, "changed report").unwrap();
+    commit_file(
+        Path::new(&checkout),
+        "new.txt",
+        "change",
+        "follow-up changed HEAD",
+    );
     crate::ticker::restore_unchanged_seal(
         &fx.world.ctx(),
         &fx.project,
@@ -746,21 +745,6 @@ fn committed_follow_up_keeps_old_reviewer_seal_void() {
     assert_eq!(
         thread::load(&fx.project, reviewer).unwrap().review_after,
         sealed_event.id
-    );
-    std::fs::write(
-        &path,
-        thread::artifact(
-            &fx.project,
-            &sealed_event.payload.done.as_ref().unwrap().artifact,
-        )
-        .unwrap(),
-    )
-    .unwrap();
-    commit_file(
-        Path::new(&checkout),
-        "new.txt",
-        "change",
-        "follow-up changed HEAD",
     );
     crate::ticker::restore_unchanged_seal(
         &fx.world.ctx(),
