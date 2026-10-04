@@ -9720,11 +9720,14 @@ mod tests {
         );
         let held = thread::load(&fx.project, &waiting.id).unwrap();
         assert!(
+            held.worktree_path.is_empty(),
+            "held box received a checkout"
+        );
+        assert!(
             row(&held, None, jiff::Timestamp::now())
                 .note
                 .contains("start pending: box held")
         );
-        assert!(held.worktree_path.is_empty());
         assert_eq!(held.launch_attempts, 0);
         let mut recovering = held.clone();
         recovering.provider_wait_started.clear();

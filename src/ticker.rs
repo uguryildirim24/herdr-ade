@@ -4975,6 +4975,60 @@ mod tests {
     }
 
     #[test]
+    fn held_box_does_not_submit_an_agent_to_an_already_placed_terminal() {
+        use crate::scenarios::{World, pane_json};
+        let world = World::new();
+        let project = world.project("demo", "a.sock");
+        let cwd = world.home.path().join("lane");
+        let lane = world.thread(&project, &cwd, |record| {
+            record.machine = "box".into();
+            record.machine_id = "box-id".into();
+            record.prompt_pending = true;
+            record.error = "provider ready".into();
+            record.launch.kind = "claude".into();
+            record.startup_wait_started = "2020-01-01T00:00:00Z".into();
+        });
+        world.runner.on("machine list --json", ok(r#"[{"id":"box-id","label":"box","target":"box","session":"default","enabled":true}]"#));
+        world.runner.on(
+            "agent start",
+            ok(r#"{"result":{"agent":{"pane_id":"w2:p1","tab_id":"w2:t1","workspace_id":"w2"}}}"#),
+        );
+        let ctx = world.ctx();
+        project::machine_hold(&ctx.root, "box-id").unwrap();
+        let herdr = Herdr::new(
+            ctx.env.herdr_bin(),
+            &project.coordinator().unwrap().socket,
+            &world.runner,
+        )
+        .on_machine("box-id");
+        let panes = serde_json::from_str::<Vec<Pane>>(&format!(
+            "[{}]",
+            pane_json("w2", "w2:t1", "w2:p1", &cwd.to_string_lossy())
+        ))
+        .unwrap();
+        let mut errors = Vec::new();
+        launch_pass(
+            &LaunchPass {
+                ctx: &ctx,
+                project: &project,
+                herdr: &herdr,
+                threads: std::slice::from_ref(&lane),
+                agents: &[],
+                panes: &panes,
+            },
+            &mut true,
+            false,
+            &mut errors,
+        );
+        assert!(errors.is_empty(), "{errors:?}");
+        assert_eq!(world.runner.count("agent start"), 0);
+        let held = thread::load(&project, &lane.id).unwrap();
+        assert_eq!(held.launch_attempts, 0);
+        assert!(held.startup_wait_started.is_empty());
+        assert!(held.error.contains("machine_held:"));
+    }
+
+    #[test]
     fn deferred_launch_waits_for_disk_without_expiring_then_submits() {
         use crate::scenarios::{World, pane_json};
         let world = World::new();
