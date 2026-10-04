@@ -357,9 +357,19 @@ impl View {
             Ok(Some(mut plan)) => {
                 let holds = crate::plan::failed_check_holds(project, &mut plan, &evidence);
                 let mut value = serde_json::to_value(&plan).expect("serializable plan");
-                for step in value["steps"].as_array_mut().into_iter().flatten() {
+                for step in value
+                    .get_mut("steps")
+                    .and_then(serde_json::Value::as_array_mut)
+                    .into_iter()
+                    .flatten()
+                {
                     crate::plan::add_hold_json(step, &holds);
-                    for sub in step["subtasks"].as_array_mut().into_iter().flatten() {
+                    for sub in step
+                        .get_mut("subtasks")
+                        .and_then(serde_json::Value::as_array_mut)
+                        .into_iter()
+                        .flatten()
+                    {
                         crate::plan::add_hold_json(sub, &holds);
                     }
                 }

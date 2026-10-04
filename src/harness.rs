@@ -1318,6 +1318,127 @@ fn defer_to_earlier_reviews(ctx: &Ctx, current: Option<(&str, &str)>) -> Result<
     Ok(())
 }
 
+/// Check the screen actually produced by the replacement, not another JSON
+/// fixture. Read only the harness project's pane, never another project's prose.
+fn reopened_rundown_check(ctx: &Ctx) -> Result<Option<String>> {
+    let observations: serde_json::Value =
+        crate::project::read_json(&ctx.root.join(".rundown-reopen.json"))
+            .context("Rundown reopen observations missing")?;
+    if !observations
+        .as_array()
+        .into_iter()
+        .flatten()
+        .any(|row| row["project"] == "adeherdr" && row["outcome"] == "reopened")
+    {
+        return Ok(None);
+    }
+    let project = crate::project::Project::load(&ctx.root, "adeherdr")?;
+    let coordinator = project
+        .coordinator()
+        .context("no coordinator for reopened Rundown")?;
+    let herdr = crate::herdr::Herdr::new(ctx.env.herdr_bin(), &coordinator.socket, ctx.runner);
+    let title = herdr.workspace_label(&coordinator.workspace_id)?;
+    let tabs = herdr.tab_list()?;
+    let panes = herdr.pane_list()?;
+    let snapshot = herdr.call(&["api", "snapshot"], crate::herdr::CALL_TIMEOUT)?;
+    let focused = snapshot["snapshot"]["focused_tab_id"].as_str();
+    let pane = (|| -> Result<String> {
+        for pane in &panes {
+            if pane.workspace_id != coordinator.workspace_id
+                || !tabs
+                    .iter()
+                    .any(|tab| tab.tab_id == pane.tab_id && tab.label == crate::rundown::LABEL)
+            {
+                continue;
+            }
+            let reply = herdr.call(
+                &["plugin", "pane", "focus", &pane.pane_id],
+                crate::herdr::CALL_TIMEOUT,
+            )?;
+            let proof = &reply["plugin_pane"];
+            if proof["plugin_id"] == "herdr-ade"
+                && proof["entrypoint"] == "rundown"
+                && proof["pane"]["pane_id"] == pane.pane_id
+                && proof["pane"]["tab_id"] == pane.tab_id
+                && proof["pane"]["workspace_id"] == coordinator.workspace_id
+            {
+                return Ok(pane.pane_id.clone());
+            }
+        }
+        bail!("no proven reopened Rundown pane")
+    })();
+    if let Some(focused) = focused {
+        herdr.call(&["tab", "focus", focused], crate::herdr::CALL_TIMEOUT)?;
+    }
+    let pane = pane?;
+    let deadline = Instant::now() + PROCESS_WAIT;
+    loop {
+        let text = herdr.pane_read_text(&pane, "visible")?;
+        let view = crate::project_view::View::load(ctx, &project, None)?.rundown();
+        let expected = if let Some(needs) = view["needs_you"].as_str().filter(|s| !s.is_empty()) {
+            format!("Needs you: {needs}")
+        } else {
+            view["work"].as_str().unwrap_or_default().to_string()
+        };
+        let steps = view["plan"]["steps"]
+            .as_array()
+            .context("overview has no steps")?;
+        let done = steps.iter().filter(|step| step["state"] == "done").count();
+        let count = format!("{done} of {}", steps.len());
+        match rundown_screen_error(
+            &text,
+            &title,
+            &expected,
+            view["work"].as_str().unwrap_or_default(),
+            &count,
+        ) {
+            None => return Ok(Some("Rundown renders: OK".into())),
+            Some(error) if Instant::now() >= deadline => bail!("{error}"),
+            Some(_) => std::thread::sleep(Duration::from_millis(100)),
+        }
+    }
+}
+
+fn rundown_screen_error(
+    text: &str,
+    title: &str,
+    expected: &str,
+    work: &str,
+    count: &str,
+) -> Option<String> {
+    let lines: Vec<_> = text
+        .lines()
+        .map(|line| line.trim().trim_matches('│').trim())
+        .collect();
+    let Some(at) = lines.iter().position(|line| *line == title) else {
+        return Some("project title not rendered".into());
+    };
+    let Some(first) = lines.get(at + 1).filter(|line| !line.is_empty()) else {
+        return Some("reopened Rundown has no content".into());
+    };
+    // The normal first row is current work (or Needs you). Any extra row here
+    // is the renderer's error slot, including serde and command-read failures.
+    if expected.is_empty() || !(expected.starts_with(first) || first.starts_with(expected)) {
+        return Some((*first).to_string());
+    }
+    let progress_at = if expected != work {
+        let next = lines.get(at + 2).copied().unwrap_or_default();
+        if next.is_empty() || !(work.starts_with(next) || next.starts_with(work)) {
+            return Some(next.to_string());
+        }
+        at + 3
+    } else {
+        at + 2
+    };
+    if !lines
+        .get(progress_at)
+        .is_some_and(|line| line.ends_with(count))
+    {
+        return Some(format!("step count not rendered: expected {count}"));
+    }
+    None
+}
+
 fn install_for(ctx: &Ctx, current: Option<(&str, &str)>) -> Result<InstallOutcome> {
     let repos = repos(&ctx.config_dir)?;
     if repos.is_empty() {
@@ -1395,7 +1516,6 @@ fn install_for(ctx: &Ctx, current: Option<(&str, &str)>) -> Result<InstallOutcom
         return rollback(ctx, previous, &mut checks, &reason);
     }
     let rundown_changed = previous.changed(&ctx.env.home, "herdr-rundown")?;
-    previous.discard()?;
     checks.result = format!("installed on mac; {}", checks.summary());
     checks.record(&ctx.config_dir)?;
     #[cfg(target_os = "macos")]
@@ -1404,9 +1524,28 @@ fn install_for(ctx: &Ctx, current: Option<(&str, &str)>) -> Result<InstallOutcom
             install_coordinator_handoff(&ctx.env.home, Path::new(&repo.path))?;
         }
     }
-    if rundown_changed {
-        crate::rundown::reopen_existing(ctx)?;
-    }
+    let rundown_result = if rundown_changed {
+        let result =
+            crate::rundown::reopen_existing(ctx).and_then(|()| reopened_rundown_check(ctx));
+        match result {
+            Ok(result) => result.unwrap_or_else(|| {
+                "Rundown renders: not checked (no reopened adeherdr pane)".into()
+            }),
+            Err(error) => {
+                let reason = format!(
+                    "REGRESSION: Rundown renders: FAIL {}",
+                    crate::project_view::one_line(&format!("{error:#}"))
+                );
+                let result = rollback(ctx, previous, &mut checks, &reason);
+                // The failed replacement must not remain on screen after restoring binaries.
+                let _ = crate::rundown::reopen_existing(ctx);
+                return result;
+            }
+        }
+    } else {
+        "Rundown unchanged".into()
+    };
+    previous.discard()?;
     if kinds.contains(&Kind::Plugin) {
         refresh_local_guard(ctx)?;
         if cfg!(target_os = "macos") && ctx.detached_ticker {
@@ -1510,7 +1649,11 @@ fn install_for(ctx: &Ctx, current: Option<(&str, &str)>) -> Result<InstallOutcom
             .filter(|result| !result.pending())
             .map(|result| result.machine.clone()),
     );
-    checks.result = format!("installed on {}; {}", machines.join(", "), checks.summary());
+    checks.result = format!(
+        "installed on {}; {}; {rundown_result}",
+        machines.join(", "),
+        checks.summary()
+    );
     if boxes.iter().any(BoxInstall::pending) {
         checks.result.push_str("; boxes pending");
     }
@@ -1551,6 +1694,94 @@ mod tests {
     use crate::runner::fake::{FakeRunner, fail, ok};
     use crate::runner::{RealRunner, Runner};
     use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+    #[test]
+    fn install_reads_the_proven_reopened_harness_pane_and_restores_focus() {
+        let world = crate::scenarios::World::new();
+        let project = world.project("adeherdr", "scratch.sock");
+        crate::project::write_json(
+            &world.root.join(".rundown-reopen.json"),
+            &serde_json::json!([{"project":"adeherdr", "outcome":"reopened"}]),
+        )
+        .unwrap();
+        world.runner.on(
+            "workspace get w1",
+            ok(r#"{"result":{"workspace":{"label":"Adeherdr"}}}"#),
+        );
+        world.runner.on(
+            "tab list",
+            ok(r#"{"result":{"tabs":[{"tab_id":"w1:t2","workspace_id":"w1","label":"Rundown"}]}}"#),
+        );
+        *world.panes.borrow_mut() =
+            r#"[{"pane_id":"w1:p2","tab_id":"w1:t2","workspace_id":"w1"}]"#.into();
+        world.runner.on(
+            "api snapshot",
+            ok(r#"{"result":{"snapshot":{"focused_tab_id":"w1:t1"}}}"#),
+        );
+        world.runner.on("plugin pane focus w1:p2", ok(r#"{"result":{"plugin_pane":{"plugin_id":"herdr-ade","entrypoint":"rundown","pane":{"pane_id":"w1:p2","tab_id":"w1:t2","workspace_id":"w1"}}}}"#));
+        world.runner.on("tab focus w1:t1", ok(r#"{"result":{}}"#));
+        let view = crate::project_view::View::load(&world.ctx(), &project, None)
+            .unwrap()
+            .rundown();
+        let text = format!("Adeherdr\n{}\n████ 0 of 0", view["work"].as_str().unwrap());
+        world
+            .runner
+            .on("pane read w1:p2 --source visible --format text", ok(&text));
+        assert_eq!(
+            reopened_rundown_check(&world.ctx()).unwrap().as_deref(),
+            Some("Rundown renders: OK")
+        );
+        assert_eq!(world.runner.count("pane read"), 1);
+        assert_eq!(world.runner.count("tab focus w1:t1"), 1);
+        // A different project's reopened pane is not evidence for the harness,
+        // and must never be read by this check.
+        crate::project::write_json(
+            &world.root.join(".rundown-reopen.json"),
+            &serde_json::json!([{"project":"another", "outcome":"reopened"}]),
+        )
+        .unwrap();
+        assert_eq!(reopened_rundown_check(&world.ctx()).unwrap(), None);
+        assert_eq!(world.runner.count("pane read"), 1);
+    }
+
+    #[test]
+    fn reopened_rundown_screen_reports_the_first_error_not_an_empty_plan() {
+        for (text, error) in [
+            ("Adeherdr\n2 running\n████ 1 of 3\nReadable step", None),
+            (
+                " │ Adeherdr │\n │ Needs you: login │\n │ 2 running │\n │ ████ 1 of 3 │",
+                None,
+            ),
+            (
+                "Adeherdr\ninvalid type: null, expected a sequence\n████ 0 of 0",
+                Some("invalid type: null, expected a sequence"),
+            ),
+            (
+                "Adeherdr\nRundown read failed: missing field `text`\n████ 1 of 3\nReadable step",
+                Some("Rundown read failed: missing field `text`"),
+            ),
+            (
+                "Adeherdr\nNeeds you: login\nRundown read failed: missing field `text`\n████ 1 of 3",
+                Some("Rundown read failed: missing field `text`"),
+            ),
+            (
+                "Adeherdr\n2 running\n████ 0 of 0",
+                Some("step count not rendered: expected 1 of 3"),
+            ),
+            ("", Some("project title not rendered")),
+            ("Adeherdr\n", Some("reopened Rundown has no content")),
+        ] {
+            let expected = if text.contains("Needs you") {
+                "Needs you: login"
+            } else {
+                "2 running"
+            };
+            assert_eq!(
+                rundown_screen_error(text, "Adeherdr", expected, "2 running", "1 of 3").as_deref(),
+                error
+            );
+        }
+    }
 
     #[cfg(target_os = "macos")]
     #[test]

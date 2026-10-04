@@ -24,10 +24,36 @@ pub(crate) struct Step {
     pub(crate) mark: Mark,
     pub(crate) text: String,
     /// One level only: a subtask's own list is always empty.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_subtasks")]
     pub(crate) subtasks: Vec<Step>,
     #[serde(default)]
     failed_check_hold: Option<Hold>,
+}
+
+fn null_subtasks<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<Vec<Step>, D::Error> {
+    Ok(Option::<Vec<Step>>::deserialize(deserializer)?.unwrap_or_default())
+}
+
+/// Keep readable rows when one field in an overview card is damaged.
+fn readable_steps(value: &Value) -> Vec<Step> {
+    value
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|row| {
+            let mut row = row.clone();
+            let subtasks = readable_steps(&row["subtasks"]);
+            row.as_object_mut()?
+                .insert("subtasks".into(), Value::Array(vec![]));
+            // A damaged diagnostic must not erase the step's text and state.
+            if serde_json::from_value::<Step>(row.clone()).is_err() {
+                row.as_object_mut()?.remove("failed_check_hold");
+            }
+            let mut step: Step = serde_json::from_value(row).ok()?;
+            step.subtasks = subtasks;
+            Some(step)
+        })
+        .collect()
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -73,8 +99,34 @@ struct ProjectView {
 impl Card {
     /// Builds the card from the existing overview command's typed result.
     pub(crate) fn from_view(title: &str, reply: &Value) -> serde_json::Result<Card> {
-        let view: ProjectView =
-            serde_json::from_value(reply.pointer("/data/result").unwrap_or(reply).clone())?;
+        let reply = reply.pointer("/data/result").unwrap_or(reply);
+        let view: ProjectView = match serde_json::from_value(reply.clone()) {
+            Ok(view) => view,
+            Err(error) => {
+                // Unknown envelopes remain errors. A recognizable project card
+                // keeps its title and readable rows instead of looking empty.
+                let Some(plan) = reply.get("plan").filter(|plan| plan.is_object()) else {
+                    return Err(error);
+                };
+                let text = |key: &str| plan[key].as_str().unwrap_or_default().to_string();
+                return Ok(Card {
+                    title: title.trim().to_string(),
+                    about: [text("does"), text("goal"), text("what_you_get")]
+                        .into_iter()
+                        .find(|text| !text.is_empty())
+                        .unwrap_or_default(),
+                    steps: readable_steps(&plan["steps"]),
+                    work: format!("Rundown read failed: {error}"),
+                    needs_you: reply["needs_you"].as_str().unwrap_or_default().into(),
+                    actions: reply["actions"]
+                        .as_array()
+                        .into_iter()
+                        .flatten()
+                        .filter_map(|value| value.as_str().map(str::to_string))
+                        .collect(),
+                });
+            }
+        };
         let plan = view.plan;
         let about = [plan.does, plan.goal, plan.what_you_get]
             .into_iter()
