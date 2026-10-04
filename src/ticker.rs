@@ -6823,7 +6823,7 @@ mod tests {
     fn successful_child_exit_without_a_ticker_is_a_startup_failure() {
         let root = tempfile::tempdir().unwrap();
         let error = spawn_and_confirm(
-            spawn_command(Path::new("/bin/true"), root.path()),
+            spawn_command(Path::new("/usr/bin/true"), root.path()),
             root.path(),
         )
         .unwrap_err();

@@ -166,8 +166,11 @@ enum Command {
         #[arg(long)]
         github: bool,
         /// Show the exact owned-resource scope without changing anything
-        #[arg(long)]
+        #[arg(long, conflicts_with = "cancel")]
         preview: bool,
+        /// Drop a deletion plan only if no steps have completed
+        #[arg(long, conflicts_with = "github")]
+        cancel: bool,
     },
     /// Continue the current workspace's agent pane as a new project
     AdoptWorkspace {
@@ -1863,7 +1866,14 @@ fn dispatch_with_start(
             slug,
             github,
             preview,
-        } => lifecycle::delete(&ctx, &slug, github, preview),
+            cancel,
+        } => {
+            if cancel {
+                lifecycle::cancel_delete(&ctx, &slug)
+            } else {
+                lifecycle::delete(&ctx, &slug, github, preview)
+            }
+        }
         Command::AdoptWorkspace {
             name,
             goal,
