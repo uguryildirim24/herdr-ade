@@ -1,6 +1,7 @@
 #!/usr/bin/python3
 """Host controller. Privileged operations have fixed sandbox-only targets."""
 import argparse
+from contextlib import contextmanager
 import datetime
 import fcntl
 import grp
@@ -13,6 +14,7 @@ import shlex
 import shutil
 import signal
 import socket
+import stat
 import subprocess
 import sys
 import time
@@ -63,6 +65,25 @@ def require_root():
         sys.exit('Use sudo tools/wall/wall for the host controller; agents enter over SSH.')
 
 
+@contextmanager
+def auth_file():
+    # The refresh directory is sandbox-writable. Never follow its entries or
+    # reopen a pathname after validation while running as the host controller.
+    directory = os.open(AUTH, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    try:
+        file = os.open('auth.json', os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_NONBLOCK,
+                       0o660, dir_fd=directory)
+        try:
+            info = os.fstat(file)
+            if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
+                raise ValueError('shared auth must be a single-link regular file')
+            yield directory, file
+        finally:
+            os.close(file)
+    finally:
+        os.close(directory)
+
+
 def shared_auth():
     try:
         group = grp.getgrnam('wall-auth')
@@ -79,13 +100,13 @@ def shared_auth():
             continue
         run('usermod', '-aG', 'wall-auth', name)
     AUTH.mkdir(mode=0o2770, exist_ok=True)
-    os.chown(AUTH, 0, group.gr_gid)
-    AUTH.chmod(0o2770)
-    file = AUTH / 'auth.json'
-    if not file.exists():
-        file.write_text('{}\n')
-    os.chown(file, 0, group.gr_gid)
-    file.chmod(0o660)
+    with auth_file() as (directory, file):
+        os.fchown(directory, 0, group.gr_gid)
+        os.fchmod(directory, 0o2770)
+        os.fchown(file, 0, group.gr_gid)
+        os.fchmod(file, 0o660)
+        if os.fstat(file).st_size == 0:
+            os.write(file, b'{}\n')
 
 
 def stage(args):
@@ -401,7 +422,9 @@ def main():
         list_instances()
     elif args.command == 'logout':
         shared_auth()
-        (AUTH / 'auth.json').write_text('{}\n')
+        with auth_file() as (_, file):
+            os.ftruncate(file, 0)
+            os.write(file, b'{}\n')
         print('Shared sandbox login removed (all instances).')
     elif args.command == 'prove':
         run(Path(__file__).with_name('prove'), '--instance', str(INSTANCE.number),

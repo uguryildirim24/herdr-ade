@@ -222,6 +222,67 @@ class WallBoundaryTests(unittest.TestCase):
         self.assertNotIn('AUTH', host.reset.__code__.co_names)
         self.assertEqual(auth.read_text(), '{"test":"sandbox-token"}')
 
+    def test_privileged_auth_never_follows_sandbox_entries(self):
+        auth = self.home / 'shared-auth'
+        auth.mkdir()
+        file = auth / 'auth.json'
+        outside_mode = self.outside.stat().st_mode
+        with mock.patch.object(host, 'AUTH', auth):
+            file.symlink_to(self.outside)
+            with self.assertRaises(OSError):
+                with host.auth_file():
+                    self.fail('followed auth symlink')
+            file.unlink()
+            os.link(self.outside, file)
+            with self.assertRaises(ValueError):
+                with host.auth_file():
+                    self.fail('accepted hardlinked auth')
+            file.unlink()
+            os.mkfifo(file)
+            with self.assertRaises(ValueError):
+                with host.auth_file():
+                    self.fail('accepted non-regular auth')
+            file.unlink()
+            file.write_text('synthetic login')
+            with host.auth_file() as (_, descriptor):
+                # A sandbox refresh/replacement after opening cannot retarget
+                # the privileged write or metadata operations.
+                file.unlink()
+                file.symlink_to(self.outside)
+                os.ftruncate(descriptor, 0)
+                os.write(descriptor, b'{}\n')
+        self.assertEqual(self.outside.read_text(), 'untouched')
+        self.assertEqual(self.outside.stat().st_mode, outside_mode)
+
+    def test_auth_setup_and_logout_preserve_then_clear_only_the_regular_file(self):
+        auth = self.home / 'shared-auth'
+        auth.mkdir()
+        file = auth / 'auth.json'
+        allowed = [user for n in range(9) for user in
+                   (host.Instance(n).user, host.Instance(n).box_user)]
+        group = SimpleNamespace(gr_gid=os.getgid(), gr_mem=allowed)
+        with mock.patch.object(host, 'AUTH', auth), \
+                mock.patch.object(host.grp, 'getgrnam', return_value=group), \
+                mock.patch.object(host.os, 'fchown'), \
+                mock.patch.object(host, 'require_root'), \
+                mock.patch.object(host.sys, 'argv', ['wall', 'logout']):
+            host.shared_auth()
+            self.assertEqual(file.read_text(), '{}\n')
+            self.assertEqual(auth.stat().st_mode & 0o7777, 0o2770)
+            self.assertEqual(file.stat().st_mode & 0o777, 0o660)
+            file.write_text('synthetic login')
+            host.shared_auth()
+            self.assertEqual(file.read_text(), 'synthetic login')
+            host.main()
+            self.assertEqual(file.read_text(), '{}\n')
+            file.unlink()
+            file.symlink_to(self.outside)
+            with self.assertRaises(OSError):
+                host.shared_auth()
+            with self.assertRaises(OSError):
+                host.main()
+        self.assertEqual(self.outside.read_text(), 'untouched')
+
     def test_additional_fault_dispatches_with_instance_and_rejects_traversal(self):
         self.addCleanup(host.select, 0)
         host.select(3)
@@ -241,6 +302,8 @@ class WallBoundaryTests(unittest.TestCase):
 
     def test_every_command_accepts_numbered_instance(self):
         self.addCleanup(host.select, 0)
+        auth = self.home / 'flag-auth'
+        auth.mkdir()
         commands = [['install', '--build', '/new/build'], ['reset'], ['enter', 'true'],
                     ['fault', 'clock', '0'], ['evidence', str(self.home / 'evidence')],
                     ['prove', str(self.home / 'proof'), '/alternate'], ['list'], ['logout']]
@@ -250,7 +313,7 @@ class WallBoundaryTests(unittest.TestCase):
                     mock.patch.object(host, 'reset'), mock.patch.object(host, 'ssh'), \
                     mock.patch.object(host, 'fault'), mock.patch.object(host, 'run'), \
                     mock.patch.object(host, 'list_instances'), mock.patch.object(host, 'shared_auth'), \
-                    mock.patch.object(host.Path, 'write_text'):
+                    mock.patch.object(host, 'AUTH', auth), mock.patch.object(host.Path, 'write_text'):
                 host.main()
                 self.assertEqual(host.INSTANCE.number, 8)
 

@@ -136,7 +136,11 @@ and reset path. Its directory is root:`wall-auth` 2770; the file is 0660. Only
 sandbox users belong to that group, never ubuntu. Nothing is copied from
 ubuntu or another machine. All freshly installed local and box accounts link
 their private pi `auth.json` to this one file, so login and token refresh are
-shared. The pinned sandbox pi package resolves auth locks to the shared file
+shared. The privileged controller opens the shared directory/file without
+following symlinks and holds descriptors for metadata changes and logout;
+non-regular or multiply linked auth entries are refused, not followed into the
+host. Normal token refresh can still replace the regular file. The pinned
+sandbox pi package resolves auth locks to the shared file
 (two `realpath` options), preventing different account symlinks from bypassing
 each other's refresh locks. Settings, hooks, models and sessions remain private.
 

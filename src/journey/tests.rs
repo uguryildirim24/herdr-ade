@@ -37,7 +37,9 @@ fn generated_repository_passes_the_actual_box_start_preflight_with_real_git() {
     world
         .runner
         .on_fn(crate::box_helper::tests::is_doctor, |cmd| {
-            Ok(crate::testkit::diagnostic_output(cmd, 99_999_999, None))
+            Ok(crate::doctor::boundary_diagnostic_output(
+                cmd, 99_999_999, None,
+            ))
         });
     let scratch = world.home.path().join("scratch");
     std::fs::create_dir(&scratch).unwrap();
