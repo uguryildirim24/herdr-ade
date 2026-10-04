@@ -6,6 +6,8 @@
 //! `HERDR_ADE_ROOT` (the projects root). It reads the card through
 //! `herdr-ade --json overview` and never writes a record. It never reads
 //! `HERDR_PLUGIN_STATE_DIR`; it keeps no state at all.
+//! `--print` emits the same picture without terminal controls and exits.
+//! `--all` (or an unset project) reads every project, isolating card failures.
 //!
 //! Updating stays cheap: once a second it compares the modification times of
 //! the few records a plan's steps are derived from, asks for the card again
@@ -57,7 +59,7 @@ struct Source {
 
 impl Source {
     fn from_env() -> Result<Source> {
-        let slug = var("HERDR_RUNDOWN_PROJECT").context("HERDR_RUNDOWN_PROJECT is not set")?;
+        let slug = var("HERDR_RUNDOWN_PROJECT").unwrap_or_default();
         let root = var("HERDR_ADE_ROOT")
             .map(PathBuf::from)
             .context("HERDR_ADE_ROOT is not set")?;
@@ -80,6 +82,8 @@ impl Source {
             state.join("pile-holds.json"),
             state.join("coordinator-recovery.json"),
             state.join("inbox"),
+            state.join("goal-check.json"),
+            self.root.join("adeherdr/.state/reviews"),
         ]
         .iter()
         .map(|path| modified(path))
@@ -119,6 +123,15 @@ impl Source {
         {
             bail!("plan read failed: {error}");
         }
+        let title = if title.is_empty() {
+            reply
+                .pointer("/data/result/title")
+                .and_then(|value| value.as_str())
+                .filter(|name| !name.is_empty())
+                .unwrap_or(&self.slug)
+        } else {
+            title
+        };
         Ok(view::Card::from_view(title, &reply)?)
     }
 }
@@ -152,7 +165,57 @@ fn stty(args: &[&str]) {
 
 fn run() -> Result<()> {
     let source = Source::from_env()?;
-    let title = var("HERDR_RUNDOWN_TITLE").unwrap_or_else(|| source.slug.clone());
+    let sources = if source.slug.is_empty() || std::env::args().any(|arg| arg == "--all") {
+        let mut sources = Vec::new();
+        for entry in std::fs::read_dir(&source.root)? {
+            let entry = entry?;
+            if entry.path().join("PROJECT.md").exists() {
+                sources.push(Source {
+                    slug: entry.file_name().to_string_lossy().into_owned(),
+                    root: source.root.clone(),
+                    ade: source.ade.clone(),
+                });
+            }
+        }
+        sources.sort_by(|a, b| a.slug.cmp(&b.slug));
+        sources
+    } else {
+        vec![source]
+    };
+    let mut panels: Vec<_> = sources
+        .into_iter()
+        .map(|source| {
+            let title = if var("HERDR_RUNDOWN_PROJECT").as_deref() == Some(&source.slug) {
+                var("HERDR_RUNDOWN_TITLE").unwrap_or_default()
+            } else {
+                String::new()
+            };
+            Panel {
+                card: empty_card(if title.is_empty() {
+                    source.slug.clone()
+                } else {
+                    title.clone()
+                }),
+                source,
+                title,
+                note: String::new(),
+                seen: None,
+                fetched: None,
+            }
+        })
+        .collect();
+    if std::env::args().any(|arg| arg == "--print") {
+        for panel in &mut panels {
+            panel.refresh();
+        }
+        for line in draw(&panels, 80, 0) {
+            println!("{}", view::visible(&line));
+        }
+        if panels.iter().any(|panel| !panel.note.is_empty()) {
+            bail!("one or more project overviews unavailable");
+        }
+        return Ok(());
+    }
 
     // A picture, not a prompt: typed keys are not echoed, the cursor hides,
     // and the alternate screen keeps the pane's scrollback clean.
@@ -161,44 +224,86 @@ fn run() -> Result<()> {
     write!(out, "\x1b[?1049h\x1b[?25l")?;
     out.flush()?;
 
-    let mut card = view::Card {
-        title: title.clone(),
-        about: String::new(),
-        steps: vec![],
-        work: String::new(),
-        needs_you: String::new(),
-        actions: vec![],
-    };
-    let mut note = String::new();
-    let mut seen = None;
-    let mut fetched = None::<Instant>;
-    let mut drawn = None::<(view::Card, String, (usize, usize))>;
+    let mut drawn = Vec::new();
     loop {
-        let print = source.fingerprint();
-        if seen.as_ref() != Some(&print) || fetched.is_none_or(|at| at.elapsed() >= FULL_REFRESH) {
-            match source.card(&title) {
-                Ok(fresh) => {
-                    card = fresh;
-                    note.clear();
-                }
-                Err(error) => note = format!("{error:#}"),
-            }
-            // A failed read must retry on the next tick even if no record
-            // changed; the minute-long refresh is for healthy cards only.
-            if note.is_empty() {
-                seen = Some(print);
-                fetched = Some(Instant::now());
-            }
+        for panel in &mut panels {
+            panel.refresh();
         }
-        let screen = size();
-        let state = (card.clone(), note.clone(), screen);
-        if drawn.as_ref() != Some(&state) {
-            let (rows, cols) = screen;
-            let lines = view::render(&card, cols, rows, &note);
+        let (rows, cols) = size();
+        let lines = draw(&panels, cols, rows);
+        if drawn != lines {
             write!(out, "\x1b[H\x1b[2J{}", lines.join("\r\n"))?;
             out.flush()?;
-            drawn = Some(state);
+            drawn = lines;
         }
         std::thread::sleep(TICK);
     }
+}
+
+fn empty_card(title: String) -> view::Card {
+    view::Card {
+        title,
+        about: String::new(),
+        steps: vec![],
+        activity: Default::default(),
+        needs_you_items: vec![],
+        harness: Default::default(),
+    }
+}
+
+struct Panel {
+    source: Source,
+    title: String,
+    card: view::Card,
+    note: String,
+    seen: Option<Vec<Option<SystemTime>>>,
+    fetched: Option<Instant>,
+}
+
+impl Panel {
+    fn refresh(&mut self) {
+        let fingerprint = self.source.fingerprint();
+        if self.seen.as_ref() == Some(&fingerprint)
+            && self.fetched.is_some_and(|at| at.elapsed() < FULL_REFRESH)
+        {
+            return;
+        }
+        match self.source.card(&self.title) {
+            Ok(card) => {
+                self.card = card;
+                self.note.clear();
+                self.seen = Some(fingerprint);
+                self.fetched = Some(Instant::now());
+            }
+            Err(error) => {
+                self.note = "Overview unavailable; retrying".into();
+                // Keep technical details out of the card, but available in --print's stderr.
+                if std::env::args().any(|arg| arg == "--print") {
+                    eprintln!("overview {}: {error:#}", self.source.slug);
+                }
+            }
+        }
+    }
+}
+
+fn draw(panels: &[Panel], width: usize, height: usize) -> Vec<String> {
+    let harness = panels
+        .iter()
+        .find(|panel| panel.note.is_empty())
+        .map(|panel| &panel.card.harness)
+        .cloned()
+        .unwrap_or_default();
+    let mut lines = vec![view::harness_line(&harness, width, jiff::Timestamp::now())];
+    for panel in panels {
+        let room = if height == 0 {
+            0
+        } else {
+            (height.saturating_sub(1) / panels.len().max(1)).max(1)
+        };
+        lines.extend(view::render(&panel.card, width, room, &panel.note));
+    }
+    if height > 0 {
+        lines.truncate(height);
+    }
+    lines
 }

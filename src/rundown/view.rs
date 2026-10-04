@@ -83,17 +83,44 @@ pub(crate) struct Card {
     /// Authored outcome, cut only to fit the panel.
     pub(crate) about: String,
     pub(crate) steps: Vec<Step>,
-    pub(crate) work: String,
-    pub(crate) needs_you: String,
-    pub(crate) actions: Vec<String>,
+    pub(crate) activity: Activity,
+    pub(crate) needs_you_items: Vec<String>,
+    pub(crate) harness: Harness,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+pub(crate) struct Activity {
+    #[serde(default)]
+    recent: Vec<TimedStep>,
+    #[serde(default)]
+    running: Vec<TimedStep>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+struct TimedStep {
+    text: String,
+    at: String,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+pub(crate) struct Harness {
+    #[serde(default)]
+    updated_at: String,
+    #[serde(default)]
+    check: String,
 }
 
 #[derive(Deserialize)]
 struct ProjectView {
     plan: PlanView,
-    work: String,
-    needs_you: String,
-    actions: Vec<String>,
+    #[serde(default)]
+    title: String,
+    #[serde(default)]
+    activity: Activity,
+    #[serde(default)]
+    needs_you_items: Vec<String>,
+    #[serde(default)]
+    harness: Harness,
 }
 
 impl Card {
@@ -133,12 +160,16 @@ impl Card {
             .find(|text| !text.is_empty())
             .unwrap_or_default();
         Ok(Card {
-            title: title.trim().to_string(),
+            title: if title.is_empty() {
+                view.title
+            } else {
+                title.trim().to_string()
+            },
             about,
             steps: plan.steps,
-            work: view.work,
-            needs_you: view.needs_you,
-            actions: view.actions,
+            activity: view.activity,
+            needs_you_items: view.needs_you_items,
+            harness: view.harness,
         })
     }
 
@@ -192,6 +223,16 @@ const PAD: usize = 3;
 
 /// Reserve the current-work and error slots before spending space on history.
 pub(crate) fn render(card: &Card, width: usize, height: usize, note: &str) -> Vec<String> {
+    render_at(card, width, height, note, jiff::Timestamp::now())
+}
+
+pub(crate) fn render_at(
+    card: &Card,
+    width: usize,
+    height: usize,
+    note: &str,
+    now: jiff::Timestamp,
+) -> Vec<String> {
     let framed = width >= 28 && (height == 0 || height >= 10);
     let panel = width.saturating_sub(4).min(MAX_PANEL);
     let inner = if framed {
@@ -213,23 +254,12 @@ pub(crate) fn render(card: &Card, width: usize, height: usize, note: &str) -> Ve
     if !note.is_empty() {
         content.push(format!("{}{}{RESET}", AMBER.fg(), cut(note, inner)));
     }
-    if !card.needs_you.is_empty() {
-        content.push(format!(
-            "{}{}{RESET}",
-            AMBER.fg(),
-            cut(&format!("Needs you: {}", card.needs_you), inner)
-        ));
-    }
-    content.push(format!("{}{}{RESET}", TEXT.fg(), cut(&card.work, inner)));
     content.push(progress(card, inner));
     if !card.about.is_empty() && content.len() + 2 < room {
         content.push(format!("{}{}{RESET}", QUIET.fg(), cut(&card.about, inner)));
     }
-    let mut work: Vec<_> = card
-        .actions
-        .iter()
-        .map(|a| format!("{}{}{RESET}", TEXT.fg(), cut(a, inner)))
-        .collect();
+    let mut work = activity_lines(card, inner, now);
+    let activity_count = work.len();
     let mut steps: Vec<_> = card
         .steps
         .iter()
@@ -254,8 +284,8 @@ pub(crate) fn render(card: &Card, width: usize, height: usize, note: &str) -> Ve
     };
     content.extend(work.iter().take(shown).cloned());
     if shown < work.len() && available > 0 {
-        let omitted_steps = step_count.saturating_sub(shown.saturating_sub(card.actions.len()));
-        let omitted_work = card.actions.len().saturating_sub(shown);
+        let omitted_steps = step_count.saturating_sub(shown.saturating_sub(activity_count));
+        let omitted_work = activity_count.saturating_sub(shown);
         let label = if omitted_work == 0 {
             format!("{omitted_steps} more steps")
         } else {
@@ -288,6 +318,102 @@ pub(crate) fn render(card: &Card, width: usize, height: usize, note: &str) -> Ve
     lines
 }
 
+fn age(seconds: i64) -> String {
+    let minutes = seconds.max(0) / 60;
+    if minutes < 1 {
+        "less than a min".into()
+    } else if minutes < 60 {
+        format!("{minutes} min")
+    } else if minutes < 1440 {
+        format!("{} hr {} min", minutes / 60, minutes % 60)
+    } else {
+        format!("{} days", minutes / 1440)
+    }
+}
+
+fn local_time(at: jiff::Timestamp) -> String {
+    at.to_zoned(jiff::tz::TimeZone::system())
+        .strftime("%H:%M")
+        .to_string()
+}
+
+pub(crate) fn harness_line(harness: &Harness, width: usize, now: jiff::Timestamp) -> String {
+    let updated = harness
+        .updated_at
+        .parse::<jiff::Timestamp>()
+        .ok()
+        .map(|at| {
+            format!(
+                "Harness updated {} ({} ago)",
+                local_time(at),
+                age(now.as_second() - at.as_second())
+            )
+        })
+        .unwrap_or_else(|| "Harness update time unknown".into());
+    let check = if harness.check.is_empty() {
+        "not run yet"
+    } else {
+        &harness.check
+    };
+    cut(&format!("{updated} · {check}"), width)
+}
+
+fn activity_lines(card: &Card, width: usize, now: jiff::Timestamp) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut section = |title: &str, lines: Vec<String>| {
+        if !lines.is_empty() {
+            out.push(format!(
+                "{BOLD}{}{title}{RESET}",
+                QUIET.fg(),
+                title = cut(title, width)
+            ));
+            out.extend(
+                lines
+                    .into_iter()
+                    .map(|line| format!("{}{}{RESET}", TEXT.fg(), cut(&line, width))),
+            );
+        }
+    };
+    let mut recent: Vec<_> = card
+        .activity
+        .recent
+        .iter()
+        .filter_map(|step| {
+            let at = step.at.parse::<jiff::Timestamp>().ok()?;
+            let elapsed = now.as_second() - at.as_second();
+            (0..86400).contains(&elapsed).then_some((at, &step.text))
+        })
+        .collect();
+    recent.sort_by_key(|(at, _)| std::cmp::Reverse(*at));
+    let mut lines: Vec<_> = recent
+        .iter()
+        .take(6)
+        .map(|(at, text)| format!("{}  {text}", local_time(*at)))
+        .collect();
+    if recent.len() > 6 {
+        lines.push(format!("and {} more", recent.len() - 6));
+    }
+    section("Since yesterday", lines);
+    section(
+        "Working on now",
+        card.activity
+            .running
+            .iter()
+            .map(|step| {
+                let duration = step
+                    .at
+                    .parse::<jiff::Timestamp>()
+                    .ok()
+                    .map(|at| format!("for {}", age(now.as_second() - at.as_second())))
+                    .unwrap_or_else(|| "start time unknown".into());
+                format!("{} — {duration}", step.text)
+            })
+            .collect(),
+    );
+    section("Needs you", card.needs_you_items.clone());
+    out
+}
+
 /// The project's name in bold, its letters shading from violet to sky.
 fn shine(title: &str) -> String {
     let count = len(title).max(2) - 1;
@@ -311,14 +437,11 @@ const LATER: char = '◌';
 /// step gets a star, the one under way a filled ring, and one still to do
 /// an empty dotted circle.
 fn row(step: &Step, width: usize) -> String {
-    let label = step.failed_check_hold.as_ref().map_or_else(
-        || step.text.clone(),
-        |hold| format!("{} — {}", step.text, hold.message),
-    );
+    let label = &step.text;
     if width < 5 {
-        return cut(&label, width);
+        return cut(label, width);
     }
-    let text = cut(&label, width.saturating_sub(5));
+    let text = cut(label, width.saturating_sub(5));
     match step.mark {
         Mark::Done => format!(
             "{}  {}{text}{RESET}",
@@ -341,14 +464,11 @@ fn row(step: &Step, width: usize) -> String {
 /// One subtask: the same mark without its box, so it reads smaller.
 fn sub_row(sub: &Step, width: usize) -> String {
     let lead = " ".repeat(5);
-    let label = sub.failed_check_hold.as_ref().map_or_else(
-        || sub.text.clone(),
-        |hold| format!("{} — {}", sub.text, hold.message),
-    );
+    let label = &sub.text;
     if width < 8 {
-        return cut(&label, width);
+        return cut(label, width);
     }
-    let text = cut(&label, width.saturating_sub(8));
+    let text = cut(label, width.saturating_sub(8));
     let (mark, color, words) = match sub.mark {
         Mark::Done => (DONE, GREEN, QUIET),
         Mark::Started => (NOW, AMBER, AMBER),
@@ -507,7 +627,7 @@ mod tests {
             {"state":"running", "text":"Unfinished", "failed_check_hold":{"message":"held by failed check: permission denied"}},
         ]});
         let mut card = from_plan("Demo", &plan).unwrap();
-        card.needs_you = "browser login".into();
+        card.needs_you_items = vec!["Sign in through your browser".into()];
         for width in [22, 40, 80] {
             let lines = render(&card, width, 12, "Read failed: permission denied");
             let text = lines
@@ -520,7 +640,7 @@ mod tests {
             for required in [
                 "Unfinished",
                 "1 of 2",
-                "Needs you:",
+                "Needs you",
                 "Read failed",
                 "more steps",
             ] {
@@ -535,16 +655,16 @@ mod tests {
             title: "Demo".into(),
             about: String::new(),
             steps: vec![],
-            work: String::new(),
-            needs_you: String::new(),
-            actions: vec![],
+            activity: Activity::default(),
+            needs_you_items: vec![],
+            harness: Harness::default(),
         };
         let lines = render(&empty, 22, 4, "Read failed: permission denied");
         assert!(lines.len() <= 4);
         assert!(lines.iter().all(|l| len(&visible(l)) <= 22));
         assert!(lines.iter().any(|l| visible(l).contains("Read failed")));
         let text = screen(&card, 80);
-        assert!(text.contains("held by failed check: permission denied"));
+        assert!(!text.contains("held by failed check"));
         assert_eq!(card.count(Mark::Done), 1);
         assert_eq!(card.steps[0].subtasks.len(), 25);
     }

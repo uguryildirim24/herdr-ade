@@ -1,0 +1,28 @@
+  ╭──────────────────────────────────────────────────────────────────────────╮
+  │   Adeherdr                                                               │
+  │   ████████████████████████████████████████████   9 of 10                 │
+  │   See what changed without asking.                                       │
+  │   Since yesterday                                                        │
+  │   11:59 Finished change 1                                                │
+  │   11:00 Finished change 2                                                │
+  │   10:00 Finished change 3                                                │
+  │   09:00 Finished change 4                                                │
+  │   08:00 Finished change 5                                                │
+  │   07:00 Finished change 6                                                │
+  │   and 1 more                                                             │
+  │   Working on now                                                         │
+  │   Make tomorrow’s changes visible — for 40 min                           │
+  │   Needs you                                                              │
+  │   Choose the next direction                                              │
+  │   Sign in through your browser                                           │
+  │   ▐✶▌  Finished change 1                                                 │
+  │   ▐✶▌  Finished change 2                                                 │
+  │   ▐✶▌  Finished change 3                                                 │
+  │   ▐✶▌  Finished change 4                                                 │
+  │   ▐✶▌  Finished change 5                                                 │
+  │   ▐✶▌  Finished change 6                                                 │
+  │   ▐✶▌  Finished change 7                                                 │
+  │   ▐✶▌  Finished change 8                                                 │
+  │   ▐✶▌  Finished change 9                                                 │
+  │   ▐◉▌  Make tomorrow’s changes visible                                   │
+  ╰──────────────────────────────────────────────────────────────────────────╯
