@@ -74,7 +74,12 @@ async function work() {
     git(['add',path.basename(output)]);
     git(['commit','-m','Wall scripted lane '+record.id]);
   }
-  fs.writeFileSync(path.join(record.thread_dir,'report.md'), reportText);
+  if (record.role === 'reviewer' && control.gate_review === true) {
+    // Explicit fixture-only review; guest verifies exact files and criteria.
+    cp.execFileSync('python3',[path.join(home,'tools/guest.py'),'gate-review',record.id],{stdio:'inherit'});
+  } else {
+    fs.writeFileSync(path.join(record.thread_dir,'report.md'), reportText);
+  }
   await checkpoint('before-seal',control);
   // --after faults can also hit the real ha done helper; checkpoints are
   // honest boundaries, not claims that a held lane is inside the seal.
@@ -102,7 +107,10 @@ process.stdin.on('data', async data => {
   if (pasted || !/[\r\n]/.test(pending)) return;
   pending = '';
   if (busy) return;
-  if (args.includes('--wall-coordinator')) { event('coordinator-prompt'); return; }
+  if (args.includes('--wall-coordinator')) {
+    cp.execFileSync('ha',['context','wall'],{stdio:'ignore'});
+    event('coordinator-prompt'); return;
+  }
   busy = true;
   try { await work(); } catch(e) { event('error',{message:e.message}); report('blocked'); }
 });

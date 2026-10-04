@@ -157,8 +157,13 @@ plain = "the real wall lane"
     (HOME / 'control.json').write_text(json.dumps({'hold':['before-seal']}))
 
 
-def open_project():
+def open_project(strict=False):
     opened = subprocess.run(['ha', 'open', 'wall'], check=False)
+    if strict:
+        opened.check_returncode()
+        coordinator = json.loads((PROJECT / '.state/coordinator.json').read_text())
+        poll('unassisted coordinator registration', lambda: coordinator['agent_name'] in
+             subprocess.check_output(['herdr', 'agent', 'list'], text=True))
     coordinator = json.loads((PROJECT / '.state/coordinator.json').read_text())
     # A successful modern ha open may return before the asynchronous hook
     # publishes the agent name. Never double-start that occupied pane.
@@ -222,7 +227,7 @@ publish_url = "{HOME}/remote.git"
         'git -C "$HOME/repo" fetch origin; git -C "$HOME/repo" reset --hard origin/main')
 
 
-def lane(remote=False):
+def lane(remote=False, wait_ready=True):
     if not (HOME / 'request').exists():
         open_project()
     task = HOME / 'task.md'
@@ -234,14 +239,11 @@ def lane(remote=False):
         command += ['--machine', INSTANCE.machine]
     run(*command)
     record = records()[-1]
-    for _ in range(600):
+    if wait_ready:
+        poll('lane brief submission', lambda: target(record['id']).get('brief_submitted'), seconds=60)
         record = target(record['id'])
-        if record.get('brief_submitted'):
-            break
-        time.sleep(0.1)
-    else:
-        raise RuntimeError(f'lane not ready: {record}')
-    print(json.dumps(record, indent=2))
+    print(json.dumps(record, indent=2), flush=True)
+    return record
 
 
 def wait(thread, phase):
@@ -316,6 +318,129 @@ def fault(kind, args):
         raise ValueError(kind)
 
 
+def poll(name, check, seconds=120):
+    deadline = time.monotonic() + seconds
+    while time.monotonic() < deadline:
+        result = check()
+        if result:
+            return result
+        time.sleep(0.5)
+    raise RuntimeError(f'timed out at {name}')
+
+
+def regression_d27():
+    print('EXPECTED: ha open starts and registers its coordinator unassisted', flush=True)
+    try:
+        open_project(strict=True)
+    except Exception as error:
+        print(f'ACTUAL: unassisted open failed: {error}', flush=True)
+        raise
+    print('ACTUAL: ha open succeeded; its recorded agent registered; no bootstrap', flush=True)
+
+
+def regression_d30():
+    lane()
+    row = records()[-1]
+    file = PROJECT / '.state/threads' / (row['id'] + '.toml')
+    # Use a real started lane, not a fixture the harness never produced.
+    for invalid in ['{invalid wall record\n', 'id = "cut', '']:
+        file.write_text(invalid)
+        print(f'EXPECTED: Unreadable lane and {file} in overview (damage={invalid!r})', flush=True)
+        result = subprocess.check_output(['ha', 'overview', 'wall'], text=True)
+        print('ACTUAL:', result, flush=True)
+        if 'Unreadable lane' not in result or str(file) not in result:
+            raise RuntimeError('corrupt lane omitted or not identified as unreadable')
+
+
+def gate_review(thread):
+    """Judge only our tiny fixture contract, not arbitrary software semantics."""
+    record = target(thread)
+    review = tomllib.loads((PROJECT / '.state/reviews' / (record['review_id'] + '.toml')).read_text())
+    rows = []
+    for member in review['members']:
+        run('git', 'merge', '--no-edit', member['sha'])
+        filename = f'scripted-{member["thread"]}.txt'
+        expected = f'Scripted wall lane {member["thread"]}\n'
+        actual = subprocess.check_output(['git', 'show', f'HEAD:{filename}'], text=True)
+        if actual != expected:
+            raise RuntimeError(f'fixture mismatch: {filename}: {actual!r}')
+        tasks = [tomllib.loads(p.read_text()) for p in (PROJECT / '.state/tasks').glob('*.toml')]
+        task = next(t for t in tasks if member['thread'] in t['attempts'])
+        if task['acceptance'] != ['Scripted fault plumbing observed']:
+            raise RuntimeError('scripted reviewer cannot judge a non-fixture criterion')
+        rows.append(f'[[acceptance]]\nthread = {json.dumps(member["thread"])}\n'
+                    f'event = {json.dumps(member["event"])}\ncriterion = 1\n'
+                    f'condition = {json.dumps(task["acceptance"][0])}\nestablished = true\n'
+                    f'evidence = {json.dumps("git show HEAD:" + filename + "; exact fixture contents verified")}\n')
+    head = subprocess.check_output(['git', 'rev-parse', 'HEAD'], text=True).strip()
+    report = (f'+++\nreview = {json.dumps(review["id"])}\nverdict = "MERGE"\n'
+              f'candidate = "{head}"\n' + ''.join(rows) + '+++\n'
+              'Scripted fixture review only; no real-model or arbitrary semantic acceptance claimed.\n')
+    Path(record['thread_dir'], 'report.md').write_text(report)
+
+
+def gate_loop():
+    # Reset's init creates a fresh project and local bare remote using real ha
+    # new. As in journey.rs: verify open, exact seals, publication, then delete.
+    if records():
+        raise RuntimeError('loop must start from clean reset')
+    metadata = PROJECT.stat()
+    identity = (metadata.st_dev, metadata.st_ino)
+    config = HOME / '.config/herdr-ade/config.toml'
+    text = config.read_text().replace('[adapters.pi]',
+        '[[routing.rules]]\nworkflow = "reviewer"\nrecipe = "wall_lane"\n\n[adapters.pi]')
+    config.write_text(text)
+    (HOME / 'control.json').write_text(json.dumps({'hold': ['before-seal'], 'gate_review': True}))
+    print('LOOP new: fresh reset project and local bare remote', flush=True)
+    open_project(strict=True)
+    print('LOOP open: unassisted scripted coordinator', flush=True)
+    local = lane(wait_ready=False)['id']
+    remote = lane(remote=True, wait_ready=False)['id']
+    poll('both lane briefs', lambda: all(target(t).get('brief_submitted') for t in [local, remote]))
+    if target(remote).get('machine') != INSTANCE.machine:
+        raise RuntimeError('box lane fell back to local')
+    # Both lanes exist before enabling the review; neither is allowed to seal
+    # until then, so the proof cannot accidentally omit the remote member.
+    run('ssh', INSTANCE.machine, 'touch "$HOME/release/before-seal"')
+    (HOME / 'release/before-seal').touch()
+    def sealed():
+        events = [tomllib.loads(p.read_text()) for p in (PROJECT / '.state/events').glob('*.toml')]
+        return all(any(e.get('thread') == t and e.get('payload', {}).get('done', {}).get('sha')
+                       for e in events) for t in [local, remote])
+    poll('both lane seals and courier', sealed)
+    print(f'LOOP sealed: {local} local; {remote} {INSTANCE.machine}', flush=True)
+    run('ha', 'review', 'wall')
+    def landed():
+        reviews = [tomllib.loads(p.read_text()) for p in (PROJECT / '.state/reviews').glob('*.toml')]
+        for review in reviews:
+            if review.get('attention'):
+                raise RuntimeError(f'review attention: {review["attention"]}')
+        return all(any(r['phase'] == 'complete' and r['fast_forward'] and r['push']
+                       and any(m['thread'] == t for m in r['members']) for r in reviews)
+                   for t in [local, remote])
+    poll('scripted review and landing', landed, seconds=240)
+    head = subprocess.check_output(['git', '-C', HOME / 'repo', 'rev-parse', 'main'], text=True).strip()
+    pushed = subprocess.check_output(['git', '--git-dir', HOME / 'remote.git',
+                                     'rev-parse', 'main'], text=True).strip()
+    if head != pushed:
+        raise RuntimeError(f'local main {head} != bare main {pushed}')
+    for thread in [local, remote]:
+        run('git', '--git-dir', HOME / 'remote.git', 'cat-file', '-e', f'main:scripted-{thread}.txt')
+    print(f'LOOP landed: both fixture files reviewed and pushed to local bare main {pushed}', flush=True)
+    # Preserve project evidence before real delete removes its records.
+    temporary = HOME / '.gate-loop-capture'
+    with temporary.open('wb') as output:
+        run('python3', HOME / 'tools/guest.py', 'evidence', stdout=output)
+    temporary.rename(HOME / 'gate-loop-before-delete.tar')
+    current = PROJECT.stat()
+    if (current.st_dev, current.st_ino) != identity or PROJECT.is_symlink():
+        raise RuntimeError('project identity changed before delete')
+    run('ha', 'delete', 'wall')
+    if PROJECT.exists():
+        raise RuntimeError('project still present after delete')
+    print('LOOP delete: project absent; SKIP Claude trust probe (Mac only)', flush=True)
+
+
 def evidence():
     with tarfile.open(fileobj=sys.stdout.buffer, mode='w|') as out:
         for directory in [PROJECT, HOME / 'runs', HOME / '.config/herdr']:
@@ -323,7 +448,8 @@ def evidence():
                 for file in directory.rglob('*'):
                     if file.is_file() and not file.is_symlink() and file.name != 'config.toml':
                         out.add(file, arcname=str(file.relative_to(HOME)), recursive=False)
-        for file in list(ROOT.glob('.ticker.*')) + [HOME / 'server-start.log', HOME / 'control.json']:
+        for file in list(ROOT.glob('.ticker.*')) + [HOME / 'server-start.log', HOME / 'control.json',
+                                                HOME / 'gate-loop-before-delete.tar']:
             if file.is_file() and not file.is_symlink():
                 out.add(file, arcname=str(file.relative_to(HOME)), recursive=False)
 
@@ -344,5 +470,13 @@ if __name__ == '__main__':
         wait(sys.argv[2],sys.argv[3])
     elif command == 'remote-lane':
         lane(remote=True)
+    elif command == 'gate-review':
+        gate_review(sys.argv[2])
+    elif command == 'gate-loop':
+        gate_loop()
+    elif command == 'regression-D27':
+        regression_d27()
+    elif command == 'regression-D30':
+        regression_d30()
     else:
         {'init':init,'boot':boot,'open':open_project,'lane':lane,'connect':connect}[command]()

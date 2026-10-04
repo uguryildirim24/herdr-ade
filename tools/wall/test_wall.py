@@ -124,6 +124,16 @@ class WallBoundaryTests(unittest.TestCase):
         run.assert_not_called()
         self.assertEqual((self.home / 'request').read_text(), 'test-request')
 
+    def test_d27_gate_never_uses_the_old_assisted_open_fallback(self):
+        failed = subprocess.CompletedProcess(['ha', 'open', 'wall'], 1)
+        with mock.patch.object(guest.subprocess, 'run', return_value=failed), \
+                mock.patch.object(guest.subprocess, 'check_output') as output, \
+                mock.patch.object(guest, 'run') as run:
+            with self.assertRaises(subprocess.CalledProcessError):
+                guest.open_project(strict=True)
+        output.assert_not_called()
+        run.assert_not_called()
+
     def test_scripted_reviewer_uses_reviewer_skill_before_mid_review(self):
         subprocess.run(['node', str(Path(__file__).with_name('test_scripted_agent.js'))],
                        check=True)

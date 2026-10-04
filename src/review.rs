@@ -152,10 +152,14 @@ impl Review {
     }
 
     pub(crate) fn gates_summary(&self) -> String {
-        if self.gates_note.is_empty() {
+        let note = self
+            .verdict
+            .as_ref()
+            .map_or(self.gates_note.as_str(), |v| v.gates_note.as_str());
+        if note.is_empty() {
             String::new()
         } else {
-            format!(" — {}", self.gates_note)
+            format!(" — {note}")
         }
     }
 }
@@ -638,17 +642,36 @@ fn pending_from(
         .filter(|t| sealed(events, t).is_some_and(|e| changes(t, e) != Some(false)))
         .collect()
 }
+fn wall_gate(gate: &project::Gate) -> bool {
+    matches!(gate.command.trim(), "tools/wall/gate" | "./tools/wall/gate")
+}
+
+#[derive(Debug)]
+struct WallGateBusy;
+impl std::fmt::Display for WallGateBusy {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("WALL GATE INCOMPLETE: gate instance busy (retryable)")
+    }
+}
+impl std::error::Error for WallGateBusy {}
+
 fn selected(gates: &[project::Gate], files: &[String]) -> Vec<project::Gate> {
     gates
         .iter()
         .filter(|gate| {
-            gate.paths.as_ref().is_none_or(|paths| {
-                paths.iter().any(|pattern| {
-                    files
+            (wall_gate(gate)
+                && files.iter().any(|file| {
+                    ["src/", "assets/", "mods/", "tools/wall/"]
                         .iter()
-                        .any(|file| crate::gate_paths::matches(pattern, file))
+                        .any(|prefix| file.starts_with(prefix))
+                }))
+                || gate.paths.as_ref().is_none_or(|paths| {
+                    paths.iter().any(|pattern| {
+                        files
+                            .iter()
+                            .any(|file| crate::gate_paths::matches(pattern, file))
+                    })
                 })
-            })
         })
         .cloned()
         .collect()
@@ -1113,7 +1136,14 @@ fn verdict(
     // reviewer; mechanical proof comes only from the existing execution path.
     let mut execution = review.clone();
     execution.verdict_event = event.id.clone();
-    verdict.gates = observed_gates(ctx, project, &execution, &verdict.candidate, git)?;
+    verdict.gates = observed_gates(
+        ctx,
+        project,
+        &execution,
+        &verdict.candidate,
+        git,
+        &mut verdict.gates_note,
+    )?;
     Ok(verdict)
 }
 /// ADE-owned execution evidence, separate from the reviewer-authored report.
@@ -1228,6 +1258,23 @@ struct GateContext {
     target: Option<String>,
     cwd: String,
     environment: BTreeMap<String, String>,
+    cargo_target: Option<String>,
+}
+
+fn gate_environment(
+    mut environment: BTreeMap<String, String>,
+    cargo_target: Option<&str>,
+    gate: &project::Gate,
+) -> BTreeMap<String, String> {
+    // The host wall gate reuses the reviewer's build, but does not inherit its
+    // lane boundary. Other gates retain their existing environment contract.
+    if wall_gate(gate)
+        && let Some(target) = cargo_target
+    {
+        environment.insert("CARGO_TARGET_DIR".into(), target.into());
+    }
+    environment.extend(gate.env.clone());
+    environment
 }
 
 fn gate_context(ctx: &Ctx, project: &Project, review: &Review) -> Result<GateContext> {
@@ -1236,6 +1283,7 @@ fn gate_context(ctx: &Ctx, project: &Project, review: &Review) -> Result<GateCon
         review.reviewer.as_deref().context("reviewer missing")?,
     )?;
     let mut environment = BTreeMap::new();
+    let mut cargo_target = ctx.env.var("CARGO_TARGET_DIR").map(str::to_owned);
     let (machine, target) = if reviewer.is_remote() {
         let profile = crate::remote::machine_profile(
             ctx.runner,
@@ -1245,6 +1293,10 @@ fn gate_context(ctx: &Ctx, project: &Project, review: &Review) -> Result<GateCon
         )?;
         let declaration = crate::remote::machine_declaration(&ctx.config_dir, &profile.label)?;
         environment.insert("PATH".into(), declaration.path);
+        cargo_target = Some(format!(
+            "{}/{}-{}",
+            declaration.build, project.slug, reviewer.id
+        ));
         (profile.id, Some(profile.target))
     } else {
         if let Some(path) = ctx.env.var("PATH") {
@@ -1260,6 +1312,7 @@ fn gate_context(ctx: &Ctx, project: &Project, review: &Review) -> Result<GateCon
         target,
         cwd: reviewer.worktree_path,
         environment,
+        cargo_target,
     })
 }
 
@@ -1269,6 +1322,7 @@ fn observed_gates(
     review: &Review,
     candidate: &str,
     git: &Git<'_>,
+    note: &mut String,
 ) -> Result<Vec<GateRun>> {
     let changed_paths = files(git, &review.base, candidate)?;
     let gates = selected(&review.gates, &changed_paths);
@@ -1300,11 +1354,11 @@ fn observed_gates(
         target,
         cwd,
         environment,
+        cargo_target,
     } = gate_context(ctx, project, review)?;
     let mut runs = Vec::new();
     for (index, gate) in gates.into_iter().enumerate() {
-        let mut environment = environment.clone();
-        environment.extend(gate.env.clone());
+        let environment = gate_environment(environment.clone(), cargo_target.as_deref(), &gate);
         let started = jiff::Timestamp::now().to_string();
         let run_dir = evidence_dir.join(format!("{candidate}-{index}-{started}"));
         std::fs::create_dir(&run_dir)?;
@@ -1367,6 +1421,28 @@ fn observed_gates(
         receipt.complete &= !receipt.stdout_hash.is_empty() && !receipt.stderr_hash.is_empty();
         let path = run_dir.join("receipt.toml");
         project::write_atomic(&path, toml::to_string(&receipt)?.as_bytes())?;
+        if wall_gate(&receipt.gate) {
+            let output = std::fs::read_to_string(&logs.stdout).unwrap_or_default();
+            if let Some(line) = output
+                .lines()
+                .rev()
+                .find(|line| line.starts_with("WALL GATE "))
+            {
+                if receipt.complete
+                    && receipt.exit == Some(75)
+                    && line.starts_with("WALL GATE INCOMPLETE: gate instance busy")
+                {
+                    return Err(WallGateBusy.into());
+                }
+                if !note.is_empty() {
+                    note.push_str("; ");
+                }
+                note.push_str(line);
+                if !receipt.matches(project, review, candidate, &cmd, &machine) {
+                    bail!("{line}; receipt {}", path.display());
+                }
+            }
+        }
         if !receipt.matches(project, review, candidate, &cmd, &machine) {
             bail!(
                 "gate result not established (checker/transport/output error): {}; exit {:?}, timed_out {}, complete {}, error {}; receipt {}",
@@ -1439,6 +1515,7 @@ fn verify_gate_receipts(
         target,
         cwd,
         environment,
+        cargo_target,
     } = gate_context(ctx, project, review)?;
     let entries = std::fs::read_dir(dir(project).join(&review.id))
         .context("gate result not established: matching ADE execution receipts missing")?;
@@ -1458,8 +1535,7 @@ fn verify_gate_receipts(
         }
     }
     for gate in gates {
-        let mut environment = environment.clone();
-        environment.extend(gate.env.clone());
+        let environment = gate_environment(environment.clone(), cargo_target.as_deref(), &gate);
         let cmd = gate_command(&gate, candidate, &cwd, &environment, target.as_deref());
         let receipt = receipts
             .iter()
@@ -1700,6 +1776,19 @@ fn advance(ctx: &Ctx, project: &Project, review: &mut Review) -> Result<()> {
                     review.verdict = Some(checked);
                     review.attention.clear();
                     save(project, review)?;
+                }
+                Err(error) if error.downcast_ref::<WallGateBusy>().is_some() => {
+                    // Contention is not a verdict or a code failure. Leave this
+                    // exact seal eligible for the next ordinary ticker pass.
+                    review.checked_event.clear();
+                    review.verdict = None;
+                    review.attention.clear();
+                    queue_notice(
+                        review,
+                        format!("REVIEW {}: {error}; retries automatically", review.id),
+                    );
+                    save(project, review)?;
+                    return Ok(());
                 }
                 Err(error) => {
                     review.verdict = None;

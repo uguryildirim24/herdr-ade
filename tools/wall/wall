@@ -128,22 +128,9 @@ def stage(args):
                 shutil.copy2(source, temporary / 'bin' / name)
                 if name != 'node':
                     run('strip', temporary / 'bin' / name)
-            npm = Path(args.npm).resolve().parent.parent
-            shutil.copytree(npm, temporary / 'npm')
-            (temporary / 'empty-npmrc').write_text('')
-            env = {'HOME': str(temporary), 'PATH': f'{temporary}/bin:/usr/bin:/bin',
-                   'NPM_CONFIG_USERCONFIG': '/dev/null',
-                   'NPM_CONFIG_GLOBALCONFIG': str(temporary / 'empty-npmrc')}
-            run(temporary / 'bin/node', temporary / 'npm/bin/npm-cli.js', 'install',
-                '--ignore-scripts', '--no-audit', '--no-fund', '--prefix', temporary / 'pi',
-                '@earendil-works/pi-coding-agent@0.99.1', env=env)
-            # Sandbox-only: locks must resolve the shared auth.json symlink,
-            # rather than independently locking each account's path.
-            backend = temporary / 'pi/node_modules/@earendil-works/pi-coding-agent/dist/core/auth-storage.js'
-            text = backend.read_text()
-            if text.count('realpath: false') != 2:
-                sys.exit('pinned pi auth lock implementation changed')
-            backend.write_text(text.replace('realpath: false', 'realpath: true'))
+            package = package_stage(args, temporary, sources['node'])
+            for name in ['npm', 'pi', '.npm']:
+                (temporary / name).symlink_to(package / name, target_is_directory=True)
             version = subprocess.check_output([sources['herdr-ade'], '--version'], text=True).strip()
             build_id = version.split('+', 1)[1].split('.', 1)[0].removesuffix('-dirty')
             commit = subprocess.check_output(['git', '-C', Path(__file__).resolve().parents[2],
@@ -152,6 +139,47 @@ def stage(args):
                                                                   hashes=hashes), indent=2) + '\n')
             temporary.rename(staged)
         return staged
+
+
+def package_stage(args, temporary, node):
+    # Caller holds STAGES/.lock. Pi is independent of ADE's binary hash, so a
+    # new candidate must not redownload the same pinned, patched package.
+    package = STAGES / 'pi-0.99.1-shared-auth-v1'
+    if package.exists():
+        return package
+    building = STAGES / (package.name + '.building')
+    if building.exists():
+        shutil.rmtree(building)
+    # Reuse t-0793 stages as well; they already contain this exact auth patch.
+    for prior in sorted(STAGES.iterdir()):
+        if prior == temporary or not (prior / 'build.json').is_file():
+            continue
+        manifest = prior / 'pi/node_modules/@earendil-works/pi-coding-agent/package.json'
+        backend = manifest.parent / 'dist/core/auth-storage.js'
+        if (manifest.is_file() and json.loads(manifest.read_text()).get('version') == '0.99.1'
+                and backend.is_file() and backend.read_text().count('realpath: true') == 2
+                and (prior / '.npm/_cacache').is_dir()):
+            building.mkdir()
+            for name in ['npm', 'pi', '.npm']:
+                (building / name).symlink_to((prior / name).resolve(), target_is_directory=True)
+            building.rename(package)
+            return package
+    building.mkdir()
+    shutil.copytree(Path(args.npm).resolve().parent.parent, building / 'npm')
+    (building / 'empty-npmrc').write_text('')
+    env = {'HOME': str(building), 'PATH': f'{temporary}/bin:/usr/bin:/bin',
+           'NPM_CONFIG_USERCONFIG': '/dev/null',
+           'NPM_CONFIG_GLOBALCONFIG': str(building / 'empty-npmrc')}
+    run(node, building / 'npm/bin/npm-cli.js', 'install', '--ignore-scripts',
+        '--no-audit', '--no-fund', '--prefix', building / 'pi',
+        '@earendil-works/pi-coding-agent@0.99.1', env=env)
+    backend = building / 'pi/node_modules/@earendil-works/pi-coding-agent/dist/core/auth-storage.js'
+    text = backend.read_text()
+    if text.count('realpath: false') != 2:
+        sys.exit('pinned pi auth lock implementation changed')
+    backend.write_text(text.replace('realpath: false', 'realpath: true'))
+    building.rename(package)
+    return package
 
 
 def install(args):
