@@ -583,8 +583,17 @@ fn scoped_wait_survives_independent_work_and_replacement_then_answer_rechecks_on
     reconcile(&f.project, Some(&replacement), 40).unwrap();
     assert!(notice(&f.project).is_none());
     assert_eq!(load(&f.project).waits[0].0, wait);
-    crate::prompt::record_test_request(&f.project, "q-answer", "Choose the reversible route")
-        .unwrap();
+    // This answer follows q-1, independent of filesystem enumeration order
+    // when the fixture runs within one second on either platform.
+    crate::project::write_json(
+        &f.project.record_dir("requests").join("q-answer.json"),
+        &crate::prompt::RequestRecord {
+            id: "q-answer".into(),
+            text: "Choose the reversible route".into(),
+            at: "2099-01-01T00:00:00Z".into(),
+        },
+    )
+    .unwrap();
     reconcile(&f.project, Some(&replacement), 50).unwrap();
     let answer_check = load(&f.project);
     assert!(answer_check.disposition.is_none());
