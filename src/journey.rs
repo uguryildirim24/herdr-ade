@@ -13,6 +13,7 @@ use crate::runner::{Cmd, Output, Runner};
 const COMMAND: Duration = Duration::from_secs(60);
 const OBSERVE: Duration = Duration::from_secs(180);
 const WHOLE_RUN: Duration = Duration::from_secs(720);
+const SHUTDOWN: Duration = Duration::from_secs(120);
 
 struct BoundedRunner<'a> {
     inner: &'a dyn Runner,
@@ -306,6 +307,274 @@ fn bounded_poll<T>(
     poll(name, timeout.min(left), check)
 }
 
+#[derive(Clone)]
+struct OwnedSession {
+    name: String,
+    socket: std::path::PathBuf,
+    inode: u64,
+}
+
+#[derive(Default)]
+struct RunResources {
+    server: Option<Child>,
+    session: Option<OwnedSession>,
+}
+
+fn observe_session(ctx: &Ctx, name: &str) -> Result<OwnedSession> {
+    let info = crate::herdr::session_list(&ctx.env.herdr_bin(), ctx.runner)?
+        .into_iter()
+        .find(|s| s.name == name && s.running)
+        .context("owned session not running")?;
+    let inode = crate::ticker::socket_inode(&info.socket_path);
+    if inode == 0 {
+        bail!("owned session socket identity unavailable");
+    }
+    Ok(OwnedSession {
+        name: info.name,
+        socket: info.socket_path,
+        inode,
+    })
+}
+
+fn stop_session(ctx: &Ctx, owned: &OwnedSession) -> Result<()> {
+    let sessions = crate::herdr::session_list(&ctx.env.herdr_bin(), ctx.runner)?;
+    if let Some(current) = sessions.iter().find(|s| s.name == owned.name) {
+        if current.socket_path != owned.socket {
+            bail!("session socket path changed; nothing stopped");
+        }
+        if current.running {
+            if crate::ticker::socket_inode(&current.socket_path) != owned.inode {
+                bail!("session incarnation changed; nothing stopped");
+            }
+            command(
+                ctx,
+                Cmd::new(ctx.env.herdr_bin(), COMMAND).args(["session", "stop", &owned.name]),
+            )?;
+        }
+    }
+    let sessions = crate::herdr::session_list(&ctx.env.herdr_bin(), ctx.runner)?;
+    if sessions.iter().any(|s| s.name == owned.name && s.running) {
+        bail!("owned session is still running");
+    }
+    Ok(())
+}
+
+fn cleanup_effect(errors: &mut Vec<String>, name: &str, action: impl FnOnce() -> Result<()>) {
+    if let Err(error) = action() {
+        errors.push(format!("{name}: {error:#}"));
+    }
+}
+
+fn guard_lane(
+    ctx: &Ctx,
+    project: &Project,
+    lane: &crate::thread::Thread,
+    session: Option<&OwnedSession>,
+) -> Result<()> {
+    if lane.pane_id.is_empty() {
+        return Ok(());
+    }
+    let socket = project.coordinator().map(|c| c.socket).unwrap_or_default();
+    if !lane.is_remote() {
+        let session = session.context("local session ownership unavailable")?;
+        if Path::new(&socket) != session.socket
+            || crate::ticker::socket_inode(&session.socket) != session.inode
+        {
+            bail!("local session incarnation changed; nothing stopped");
+        }
+    }
+    let herdr = crate::herdr::Herdr::new(ctx.env.herdr_bin(), socket, ctx.runner)
+        .on_machine(lane.machine_route());
+    if herdr
+        .agent_list()?
+        .iter()
+        .any(|a| a.pane_id == lane.pane_id && !crate::thread::agent_matches(lane, a))
+    {
+        bail!("{} pane occupant changed; nothing stopped", lane.id);
+    }
+    Ok(())
+}
+
+// Cleanup has its own reserved budget. Use the existing cancellation/retirement
+// drivers; retain checkouts even when they are clean or final copying fails.
+fn shutdown_failed_run(
+    ctx: &Ctx,
+    report: &Report,
+    resources: &mut RunResources,
+    deadline: Instant,
+) -> Result<String> {
+    let bounded = BoundedRunner {
+        inner: ctx.runner,
+        deadline,
+    };
+    let ctx = Ctx {
+        runner: &bounded,
+        root: ctx.root.clone(),
+        config_dir: ctx.config_dir.clone(),
+        env: ctx.env,
+        detached_ticker: false,
+    };
+    let mut errors = Vec::new();
+    let mut lanes = Vec::new();
+    let mut coordinator = None;
+    if report.created && !report.deleted {
+        let project = owned_project(&ctx, &report.project)?;
+        // Pausing prevents new allocations; it is NOT the process shutdown.
+        project.set_status(project::Status::Paused)?;
+        coordinator = project.coordinator();
+        project.update_coordinator(|c| c.closed_by_rolf_at = project::now())?;
+        let (records, gaps) = crate::thread::list_with_errors(&project);
+        lanes = records;
+        errors.extend(gaps.into_iter().map(|e| format!("lane records: {e:#}")));
+        let reviews = match crate::review::list(&project) {
+            Ok(reviews) => reviews,
+            Err(error) => {
+                errors.push(format!("review records: {error:#}"));
+                Vec::new()
+            }
+        };
+        // A cancelled review releases its members before their cancellations.
+        // Never roll back an already-landed review or change publication facts.
+        for review in reviews {
+            cleanup_effect(&mut errors, &review.id, || {
+                if let Some(id) = &review.reviewer
+                    && let Some(lane) = lanes.iter().find(|lane| &lane.id == id)
+                {
+                    guard_lane(&ctx, &project, lane, resources.session.as_ref())?;
+                }
+                crate::review::cancel_for_diagnosis(&ctx, &project, &review.id)
+            });
+        }
+        for lane in &lanes {
+            cleanup_effect(&mut errors, &lane.id, || {
+                guard_lane(&ctx, &project, lane, resources.session.as_ref())?;
+                let cancelled = crate::threads::cancel_preserving_checkout(
+                    &ctx,
+                    &project.slug,
+                    &lane.id,
+                    "journey failed or timed out; retain diagnosis evidence",
+                );
+                // Even pending preservation must not leave the process alive.
+                // close_pane rechecks the recorded workspace/tab/pane identity.
+                let current = crate::thread::load(&project, &lane.id)?;
+                crate::threads::close_pane(&ctx, &project, &current)?;
+                let cancelled = cancelled?;
+                if cancelled.state == "cleanup_pending" {
+                    bail!(
+                        "preservation/retirement pending; {}",
+                        current.cleanup_reason
+                    );
+                }
+                Ok(())
+            });
+        }
+        if let Some(c) = &coordinator {
+            cleanup_effect(&mut errors, "coordinator", || {
+                if c.socket.is_empty() {
+                    return Ok(());
+                }
+                let session = resources
+                    .session
+                    .as_ref()
+                    .context("coordinator session ownership unavailable")?;
+                if Path::new(&c.socket) != session.socket
+                    || crate::ticker::socket_inode(&session.socket) != session.inode
+                {
+                    bail!("coordinator session incarnation changed; nothing stopped");
+                }
+                let herdr = crate::herdr::Herdr::new(ctx.env.herdr_bin(), &c.socket, ctx.runner);
+                let agents = herdr.agent_list()?;
+                if agents
+                    .iter()
+                    .any(|a| a.pane_id == c.pane_id && !crate::coordinator::agent_matches(c, a))
+                {
+                    bail!("coordinator occupant changed; nothing stopped");
+                }
+                if herdr
+                    .pane_list()?
+                    .iter()
+                    .any(|p| crate::coordinator::pane_matches(c, p))
+                {
+                    herdr.tab_close(&c.tab_id)?;
+                }
+                crate::coordinator::close(&ctx, &project.slug)
+            });
+        }
+        // Remote sessions are shared: verify only this run's recorded panes,
+        // and never stop the saved machine's whole session.
+        for lane in lanes
+            .iter()
+            .filter(|lane| lane.is_remote() && !lane.pane_id.is_empty())
+        {
+            cleanup_effect(&mut errors, &format!("{} stopped receipt", lane.id), || {
+                let herdr = crate::herdr::Herdr::new(ctx.env.herdr_bin(), "", ctx.runner)
+                    .on_machine(lane.machine_route());
+                if herdr.pane_list()?.iter().any(|p| p.pane_id == lane.pane_id)
+                    || herdr
+                        .agent_list()?
+                        .iter()
+                        .any(|a| a.pane_id == lane.pane_id)
+                {
+                    bail!("run-owned remote process/pane is still present");
+                }
+                Ok(())
+            });
+        }
+    }
+    // Startup can time out before returning the session receipt. Discovery is
+    // authorized only by this run's still-live server child, never by a name alone.
+    if resources.session.is_none()
+        && let Some(server) = resources.server.as_mut()
+        && server.try_wait()?.is_none()
+    {
+        resources.session = Some(observe_session(
+            &ctx,
+            &format!("scratch-{}", report.project),
+        )?);
+    }
+    if let Some(session) = &resources.session {
+        cleanup_effect(&mut errors, "isolated session", || {
+            let herdr = crate::herdr::Herdr::new(ctx.env.herdr_bin(), &session.socket, ctx.runner);
+            let current = crate::herdr::session_list(&ctx.env.herdr_bin(), ctx.runner)?;
+            if current.iter().any(|s| s.name == session.name && s.running) {
+                if crate::ticker::socket_inode(&session.socket) != session.inode {
+                    bail!("session incarnation changed");
+                }
+                let agents = herdr.agent_list()?;
+                if agents.iter().any(|a| {
+                    !lanes
+                        .iter()
+                        .filter(|l| !l.is_remote())
+                        .any(|l| crate::thread::agent_matches(l, a))
+                        && !coordinator
+                            .as_ref()
+                            .is_some_and(|c| crate::coordinator::agent_matches(c, a))
+                }) {
+                    bail!("unowned agent in isolated session; session not stopped");
+                }
+                // The run-created session also owns its initial shells and
+                // panes allocated just before a command wrapper timed out.
+                // Stop that exact incarnation, not merely the observed agents.
+            }
+            stop_session(&ctx, session)
+        });
+    }
+    if let Some(server) = resources.server.as_mut() {
+        cleanup_effect(&mut errors, "server exit receipt", || {
+            bounded_poll(deadline, "owned server exit", COMMAND, || {
+                Ok((
+                    server.try_wait()?.map(|_| ()),
+                    "owned server still alive".into(),
+                ))
+            })
+        });
+    }
+    if !errors.is_empty() {
+        bail!("shutdown not fully verified: {}", errors.join("; "));
+    }
+    Ok("owned agents/panes stopped; isolated session stopped; project, checkouts, refs and evidence retained".into())
+}
+
 struct Process(Child);
 impl Drop for Process {
     fn drop(&mut self) {
@@ -483,7 +752,54 @@ fn prepare_repo(ctx: &Ctx, path: &Path) -> Result<()> {
     Ok(())
 }
 
-fn run_steps(ctx: &Ctx, scratch: &Path, report: &mut Report, deadline: Instant) -> Result<()> {
+fn prepare_transport_repo(
+    ctx: &Ctx,
+    scratch: &Path,
+    url: &str,
+) -> Result<(std::path::PathBuf, std::path::PathBuf)> {
+    let repo = scratch.join("repo");
+    let bare = scratch.join("remote.git");
+    prepare_repo(ctx, &repo)?;
+    git(
+        ctx,
+        scratch,
+        &["init", "--bare", bare.to_str().context("bare path")?],
+    )?;
+    git(
+        ctx,
+        scratch,
+        &[
+            "--git-dir",
+            bare.to_str().context("bare path")?,
+            "symbolic-ref",
+            "HEAD",
+            "refs/heads/main",
+        ],
+    )?;
+    git(
+        ctx,
+        &repo,
+        &[
+            "remote",
+            "add",
+            "journey",
+            bare.to_str().context("bare path")?,
+        ],
+    )?;
+    // Box preflight requires a URL-matched remote in the Mac clone. Landing
+    // still uses `journey`, the local bare path, not this transport remote.
+    git(ctx, &repo, &["remote", "add", "journey-transport", url])?;
+    git(ctx, &repo, &["push", "journey", "main"])?;
+    Ok((repo, bare))
+}
+
+fn run_steps(
+    ctx: &Ctx,
+    scratch: &Path,
+    report: &mut Report,
+    deadline: Instant,
+    resources: &mut RunResources,
+) -> Result<()> {
     let slug = report.project.clone();
     let repo = scratch.join("repo");
     let bare = scratch.join("remote.git");
@@ -526,12 +842,8 @@ fn run_steps(ctx: &Ctx, scratch: &Path, report: &mut Report, deadline: Instant) 
     let mut created = false;
     let mut box_identity = String::new();
     let new_result = report.step("new", || {
-        prepare_repo(ctx, &repo)?;
+        prepare_transport_repo(ctx, scratch, &url)?;
         let seed = git(ctx, &repo, &["rev-parse", "HEAD"])?;
-        git(ctx, scratch, &["init", "--bare", bare.to_str().context("bare path")?])?;
-        git(ctx, scratch, &["--git-dir", bare.to_str().context("bare path")?, "symbolic-ref", "HEAD", "refs/heads/main"])?;
-        git(ctx, &repo, &["remote", "add", "journey", bare.to_str().context("bare path")?])?;
-        git(ctx, &repo, &["push", "journey", "main"])?;
         let mut cmd = Command::new("git");
         cmd.args(["daemon", "--listen=127.0.0.1", &format!("--port={port}"), &format!("--base-path={}", scratch.display()), "--export-all", "--enable=receive-pack", "--timeout=30", "--init-timeout=10", scratch.to_str().context("scratch path")?]);
         daemon = Some(spawn(cmd)?);
@@ -576,11 +888,13 @@ fn run_steps(ctx: &Ctx, scratch: &Path, report: &mut Report, deadline: Instant) 
         let mut server = Command::new(ctx.env.herdr_bin());
         server.args(["--session", &session, "server"]);
         use std::os::unix::process::CommandExt;
-        server.process_group(0).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null()).spawn()?;
+        if crate::herdr::session_list(&ctx.env.herdr_bin(), ctx.runner)?.iter().any(|s| s.name == session) { bail!("session name already exists; nothing adopted"); }
+        resources.server = Some(server.process_group(0).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null()).spawn()?);
         bounded_poll(deadline, "isolated session", Duration::from_secs(15), || {
             let exists = crate::herdr::session_list(&ctx.env.herdr_bin(), ctx.runner)?.iter().any(|s| s.name == session);
             Ok((exists.then_some(()), format!("session {session} absent")))
         })?;
+        resources.session = Some(observe_session(ctx, &session)?);
         ha(ctx, &["open", &slug, "--session", &session, "--recipe", &small, "--basis", &request])?;
         bounded_poll(deadline, "coordinator bootstrap", Duration::from_secs(90), || {
             let c = project.coordinator().context("coordinator binding absent")?;
@@ -758,10 +1072,21 @@ fn run_steps(ctx: &Ctx, scratch: &Path, report: &mut Report, deadline: Instant) 
         if !out.success() {
             bail!("box scratch cleanup: {}", out.error_text());
         }
-        command(
+        stop_session(
             ctx,
-            Cmd::new(ctx.env.herdr_bin(), COMMAND).args(["session", "stop", &session]),
+            resources
+                .session
+                .as_ref()
+                .context("owned session receipt missing")?,
         )?;
+        if let Some(server) = resources.server.as_mut() {
+            bounded_poll(deadline, "owned server exit", COMMAND, || {
+                Ok((
+                    server.try_wait()?.map(|_| ()),
+                    "owned server still alive".into(),
+                ))
+            })?;
+        }
         command(
             ctx,
             Cmd::new(ctx.env.herdr_bin(), COMMAND).args(["session", "delete", &session]),
@@ -781,9 +1106,10 @@ pub(crate) fn run(ctx: &Ctx, review: Option<(&str, &str)>) -> Result<()> {
         bail!("the real Mac + box journey must run on the Mac; oci cannot drive the Mac's herdr");
     }
     let delivery_ctx = ctx;
+    let run_deadline = Instant::now() + WHOLE_RUN;
     let bounded = BoundedRunner {
         inner: ctx.runner,
-        deadline: Instant::now() + WHOLE_RUN,
+        deadline: run_deadline - SHUTDOWN,
     };
     let bounded_ctx = Ctx {
         runner: &bounded,
@@ -839,7 +1165,8 @@ pub(crate) fn run(ctx: &Ctx, review: Option<(&str, &str)>) -> Result<()> {
         format!("INSTALL: {observation_result}")
     };
     let journey_started = Instant::now();
-    if let Err(error) = run_steps(ctx, &scratch, &mut report, bounded.deadline)
+    let mut resources = RunResources::default();
+    if let Err(error) = run_steps(ctx, &scratch, &mut report, bounded.deadline, &mut resources)
         && !report.steps.iter().any(|s| !s.passed)
     {
         report.steps.push(Step {
@@ -850,6 +1177,23 @@ pub(crate) fn run(ctx: &Ctx, review: Option<(&str, &str)>) -> Result<()> {
         });
     }
     report.deleted = report.created && !ctx.root.join(&report.project).exists();
+    if report.steps.iter().any(|s| !s.passed) {
+        let retained = Report {
+            project: report.project.clone(),
+            created: report.created,
+            deleted: report.deleted,
+            ..Default::default()
+        };
+        // Report teardown even if it fails; never claim pause killed processes.
+        let _ = report.step("failure shutdown", || {
+            shutdown_failed_run(
+                delivery_ctx,
+                &retained,
+                &mut resources,
+                run_deadline.min(Instant::now() + SHUTDOWN),
+            )
+        });
+    }
     report.observation = observation.clone();
     project::write_json(&reports.join(format!("{}.json", report.project)), &report)?;
     project::write_json(&scratch.join("report.json"), &report)?;
@@ -870,12 +1214,6 @@ pub(crate) fn run(ctx: &Ctx, review: Option<(&str, &str)>) -> Result<()> {
     println!("{notice}");
     if report.steps.iter().all(|s| s.passed) {
         std::fs::remove_dir_all(scratch)?;
-    } else if report.created {
-        // Stop autonomous scheduling while preserving the failed run's records.
-        // Only the run-owned project is eligible; never pause a name collision.
-        if owned_project(ctx, &report.project).is_ok() {
-            let _ = ha(delivery_ctx, &["pause", &report.project]);
-        }
     }
     Ok(())
 }
@@ -936,6 +1274,10 @@ pub(crate) fn after_install(ctx: &Ctx, current: Option<(&str, &str)>) -> Result<
     }
     Ok(())
 }
+
+#[cfg(test)]
+#[path = "journey/tests.rs"]
+mod boundary_tests;
 
 #[cfg(test)]
 mod tests {

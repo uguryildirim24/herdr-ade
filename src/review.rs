@@ -1987,6 +1987,16 @@ fn prune_candidate(ctx: &Ctx, review: &Review) -> Result<()> {
     Ok(())
 }
 fn cancel_record(ctx: &Ctx, project: &Project, review: &mut Review, reason: &str) -> Result<()> {
+    cancel_record_with_retention(ctx, project, review, reason, false)
+}
+
+fn cancel_record_with_retention(
+    ctx: &Ctx,
+    project: &Project,
+    review: &mut Review,
+    reason: &str,
+    keep_checkout: bool,
+) -> Result<()> {
     if !review.fast_forward && review.phase == Phase::Landing {
         let git = Git::new(ctx.runner, &review.repo);
         let head = git
@@ -2011,18 +2021,42 @@ fn cancel_record(ctx: &Ctx, project: &Project, review: &mut Review, reason: &str
     review.attention = reason.into();
     save(project, review)?;
     if let Some(id) = &review.reviewer {
-        let outcome = crate::threads::cancel(ctx, &project.slug, id, reason)?;
+        let outcome = if keep_checkout {
+            crate::threads::cancel_preserving_checkout(ctx, &project.slug, id, reason)?
+        } else {
+            crate::threads::cancel(ctx, &project.slug, id, reason)?
+        };
         if outcome.state == "cleanup_pending" {
             bail!("reviewer cancellation cleanup pending: {id}");
         }
     }
     review.close = true;
     save(project, review)?;
-    prune_candidate(ctx, review)?;
-    review.prune = true;
+    if !keep_checkout {
+        prune_candidate(ctx, review)?;
+        review.prune = true;
+    }
     review.phase = Phase::Cancelled;
     save(project, review)
 }
+pub(crate) fn cancel_for_diagnosis(ctx: &Ctx, project: &Project, id: &str) -> Result<()> {
+    let record = load(project, id)?;
+    let _lock = try_operation_lock(ctx, &record.repo)?
+        .context("review operation busy; diagnosis cancellation pending")?;
+    let mut record = load(project, id)?;
+    // A landed review's publication/install remain facts and obligations.
+    if record.phase.closed() || record.fast_forward {
+        return Ok(());
+    }
+    cancel_record_with_retention(
+        ctx,
+        project,
+        &mut record,
+        "journey deadline or failure; retained for diagnosis",
+        true,
+    )
+}
+
 pub(crate) fn cancel(ctx: &Ctx, slug: &str, repo: Option<&str>) -> Result<()> {
     let project = Project::load(&ctx.root, slug)?;
     let row = repository(ctx, &project, repo)?;
