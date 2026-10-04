@@ -1,0 +1,4 @@
+#!/usr/bin/env bash
+# PILE-02: a cancelled sealed lane leaves its task pointing at an empty pile.
+set -euo pipefail
+exec "$(dirname "$0")/run" "$@" cancel-projection

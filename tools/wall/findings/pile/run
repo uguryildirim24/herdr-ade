@@ -1,0 +1,23 @@
+#!/usr/bin/env python3
+"""Run one pile scenario against real sandbox binaries, always from reset."""
+import argparse
+import base64
+from pathlib import Path
+import shlex
+import subprocess
+
+parser = argparse.ArgumentParser()
+parser.add_argument('--instance', type=int, required=True, choices=range(1, 9))
+parser.add_argument('--evidence', type=Path)
+parser.add_argument('scenario')
+args = parser.parse_args()
+here = Path(__file__).resolve().parent
+wall = here.parents[1] / 'wall'
+command = ['sudo', str(wall), '--instance', str(args.instance)]
+subprocess.run(command + ['reset'], check=True)
+source = base64.b64encode((here / 'scenarios.py').read_bytes()).decode()
+guest = f"import base64; exec(compile(base64.b64decode({source!r}), 'pile-scenarios.py', 'exec'))"
+result = subprocess.run(command + ['enter', 'python3 -c ' + shlex.quote(guest) + ' ' + shlex.quote(args.scenario)])
+if args.evidence:
+    subprocess.run(command + ['evidence', str(args.evidence.resolve())], check=True)
+raise SystemExit(result.returncode)
