@@ -1,0 +1,90 @@
+#!/usr/bin/env python3
+"""Sandbox surface observations. Never targets production or another instance."""
+import argparse
+from pathlib import Path
+import shlex
+import subprocess
+import time
+
+parser = argparse.ArgumentParser()
+parser.add_argument('--instance', required=True, type=int, choices=range(1, 9))
+parser.add_argument('--evidence', required=True, type=Path)
+parser.add_argument('scenario', choices=['corrupt-task', 'corrupt-plan', 'corrupt-event',
+                                       'kill-process', 'ticker', 'fill', 'disconnect', 'reboot', 'journey'])
+a = parser.parse_args()
+here = Path(__file__).resolve().parent
+wall = ['sudo', '-n', str(here.parents[1] / 'wall'), '--instance', str(a.instance)]
+a.evidence.mkdir(parents=True, exist_ok=False)
+
+def run(*args, **kw):
+    print('+', shlex.join(map(str, args)), flush=True)
+    return subprocess.run(list(map(str, args)), check=True, **kw)
+
+def enter(command, **kw):
+    return run(*wall, 'enter', command, **kw)
+
+def snapshot(name):
+    with (a.evidence / (name + '.log')).open('w') as out:
+        enter('python3 "$HOME/surfaces.py"', stdout=out, stderr=subprocess.STDOUT)
+
+def upload(source, destination):
+    command = ('python3 -c ' + shlex.quote('import pathlib,sys; '
+               f'pathlib.Path.home().joinpath({destination!r}).write_text(sys.stdin.read())'))
+    with source.open() as stream:
+        enter(command, stdin=stream)
+
+run(*wall, 'reset')
+upload(here / 'snapshot.py', 'surfaces.py')
+if a.scenario == 'journey':
+    upload(here / 'journey.py', 'surface-journey.py')
+    enter('python3 "$HOME/surface-journey.py"')
+else:
+    remote = a.scenario in ['disconnect', 'reboot']
+    enter('python3 "$HOME/tools/guest.py" ' + ('remote-lane' if remote else 'lane'))
+    run(*wall, 'enter', *(['--box'] if remote else []),
+        'python3 "$HOME/tools/guest.py" wait t-0001 before-seal')
+    enter('ha plan set wall --does "Deliver the scratch fixture"; '
+          'ha plan step add wall "Land fixture" --task job-0001')
+    snapshot('before')
+    fault = a.scenario
+    background = None
+    if fault.startswith('corrupt-'):
+        kind = fault.removeprefix('corrupt-')
+        if kind == 'event':
+            enter('touch "$HOME/release/before-seal"')
+            # Wait for the actual production done event, not just process exit.
+            command = ('python3 -c ' + shlex.quote('import pathlib,time; '
+                'p=pathlib.Path.home()/".herdr-ade/wall/.state/events"; '
+                '\nfor _ in range(120):\n'
+                ' if list(p.glob("*.toml")): break\n'
+                ' time.sleep(0.5)\n'
+                'else: raise RuntimeError("seal absent")\n'
+                'print(next(p.glob("*.toml")).name)'))
+            result = enter(command, capture_output=True, text=True)
+            target = '.state/events/' + result.stdout.strip()
+            snapshot('sealed')
+        else:
+            target = '.state/tasks/job-0001.toml' if kind == 'task' else '.state/plan.toml'
+        run(*wall, 'fault', 'corrupt', target, 'garbage')
+    elif fault == 'disconnect':
+        background = subprocess.Popen([*wall, 'fault', 'disconnect', '95'])
+        time.sleep(25)
+    elif fault == 'kill-process':
+        run(*wall, 'fault', fault, 't-0001')
+        time.sleep(30)
+    else:
+        run(*wall, 'fault', fault, *(['2'] if fault == 'reboot' else []))
+        if fault == 'reboot':
+            time.sleep(30)
+    snapshot('during')
+    if background:
+        if background.wait() != 0:
+            raise RuntimeError('disconnect injection failed')
+        time.sleep(25)
+        snapshot('recovered')
+    if fault == 'fill':
+        enter('rm "$HOME/disk-full"')
+        time.sleep(15)
+        snapshot('recovered')
+run(*wall, 'evidence', a.evidence / 'capture')
+print('Captured:', a.evidence, flush=True)
