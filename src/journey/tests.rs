@@ -104,6 +104,8 @@ impl Runner for LocalJourney<'_> {
                     let lane = thread::allocate(&project, |lane| {
                         lane.repo = repo.to_string_lossy().into_owned();
                         lane.status = thread::Status::Resolved;
+                        lane.launch_attempts = 1;
+                        lane.startup_wait_started = project::now();
                     })?;
                     let fx = crate::testkit::Fx {
                         world: World::new(),
@@ -243,10 +245,12 @@ fn local_journey(missing_pi: bool) {
     if missing_pi {
         assert_eq!(lanes, 0);
         assert!(notice.contains("SKIP open and prime coordinator: no enabled small recipe"));
-        assert!(notice.contains("SKIP Mac lane seals: no enabled small recipe"));
+        assert!(notice.contains("SKIP Mac lane launched: no enabled small recipe"));
+        assert!(notice.contains("SKIP Mac lane seals: Mac launch probe was skipped"));
     } else {
         assert_eq!(lanes, 1);
         assert!(notice.contains("PASS open and prime coordinator"));
+        assert!(notice.contains("Mac lane launched after 0 s"));
         assert!(notice.contains("PASS Mac lane seals"));
         assert!(notice.contains("PASS reviewer merges, landing pushes"));
         let repo = scratch.join("repo");
@@ -307,7 +311,10 @@ fn generated_repository_passes_the_actual_box_start_preflight_with_real_git() {
     own(&project);
     let settings = project::Settings {
         repos: vec![project::Repo {
-            path: repo.to_string_lossy().into_owned(),
+            path: std::fs::canonicalize(&repo)
+                .unwrap()
+                .to_string_lossy()
+                .into_owned(),
             branch: Some("main".into()),
             push_remote: Some("journey".into()),
             box_path: Some("/box/journey-preflight/repo".into()),
@@ -425,7 +432,22 @@ impl Runner for Lifecycle<'_> {
                 .filter(|a| a.alive && a.machine == machine && (!agent || a.agent))
                 .map(|a| {
                     if agent {
-                        agent_json(&a.workspace, &a.tab, &a.pane, &a.cwd, &a.name, "working")
+                        let mut entry: serde_json::Value = serde_json::from_str(&agent_json(
+                            &a.workspace,
+                            &a.tab,
+                            &a.pane,
+                            &a.cwd,
+                            &a.name,
+                            "working",
+                        ))
+                        .unwrap();
+                        if a.name.is_empty() {
+                            entry["agent"] = "pi".into();
+                            entry["tokens"] = serde_json::json!({
+                                "project": "journey-deadline", "thread": "coordinator"
+                            });
+                        }
+                        entry.to_string()
                     } else {
                         pane_json(&a.workspace, &a.tab, &a.pane, &a.cwd)
                     }
@@ -436,6 +458,10 @@ impl Runner for Lifecycle<'_> {
                 "{{\"result\":{{\"{}\":[{entries}]}}}}",
                 if agent { "agents" } else { "panes" }
             )));
+        }
+        if line.contains("session delete") {
+            assert!(!self.running.get());
+            return Ok(ok("{}"));
         }
         if line.contains("tab close")
             || line.contains("workspace close")
@@ -495,7 +521,7 @@ fn actor(lane: &thread::Thread) -> Actor {
 }
 
 #[test]
-fn forced_deadline_cancels_active_review_workers_coordinator_and_session_but_retains_evidence() {
+fn failed_open_cancels_workers_unnamed_pi_coordinator_and_session_but_retains_evidence() {
     deadline_shutdown(false);
 }
 
@@ -611,6 +637,9 @@ fn deadline_shutdown(pending: bool) {
         notices: Vec::new(),
     };
     crate::review::save(&project, &review).unwrap();
+    project
+        .update_coordinator(|c| c.launch.kind = "pi".into())
+        .unwrap();
     let c = project.coordinator().unwrap();
     let owned = OwnedSession {
         name: format!("scratch-{}", project.slug),
@@ -625,7 +654,8 @@ fn deadline_shutdown(pending: bool) {
         tab: c.tab_id.clone(),
         pane: c.pane_id.clone(),
         cwd: c.cwd.clone(),
-        name: c.agent_name.clone(),
+        // A failed Pi open can lose its launch name, not its pane identity.
+        name: String::new(),
         agent: true,
         alive: true,
         child: sleeper(),
@@ -785,12 +815,15 @@ fn deadline_shutdown(pending: bool) {
             *sha
         );
     }
-    assert!(
-        !runner
+    assert_eq!(
+        runner
             .calls
             .borrow()
             .iter()
-            .any(|c| c.args.iter().any(|a| a == "delete"))
+            .filter(|c| c.args.iter().any(|a| a == "delete"))
+            .count(),
+        1,
+        "delete only the run-owned stopped session, never retained project evidence"
     );
     assert!(
         runner
@@ -800,6 +833,127 @@ fn deadline_shutdown(pending: bool) {
             .all(|c| c.timeout <= Duration::from_secs(30)),
         "shutdown commands must share the cleanup deadline"
     );
+}
+
+#[test]
+fn mac_seal_window_starts_at_launch_claim_not_placement() {
+    let world = World::new();
+    let project = world.project("journey-launch-window", "owned.sock");
+    let now = jiff::Timestamp::now();
+    let queued = now - jiff::SignedDuration::from_secs(161);
+    let lane = thread::allocate(&project, |lane| {
+        lane.created = queued.to_string();
+        lane.startup_wait_started = queued.to_string();
+        lane.status = thread::Status::Open;
+    })
+    .unwrap();
+    // A placed shell is not an agent start, despite the placement timestamp.
+    assert!(launch_claim(&project, &lane.id).unwrap().0.is_none());
+    thread::update(&project, &lane.id, |lane| {
+        lane.launch_attempts = 1;
+        lane.startup_wait_started = now.to_string();
+    })
+    .unwrap();
+    let (seal_deadline, seconds) = launch_claim(&project, &lane.id).unwrap().0.unwrap();
+    assert_eq!(seconds, 161);
+    assert!(seal_deadline.saturating_duration_since(Instant::now()) > Duration::from_secs(178));
+
+    // Polling late must not grant a fresh 180-second window.
+    thread::update(&project, &lane.id, |lane| {
+        lane.startup_wait_started = (now - jiff::SignedDuration::from_secs(181)).to_string();
+    })
+    .unwrap();
+    let (seal_deadline, _) = launch_claim(&project, &lane.id).unwrap().0.unwrap();
+    assert!(seal_deadline <= Instant::now());
+}
+
+#[test]
+fn queued_mac_lane_hits_launch_deadline_not_seal_deadline() {
+    let world = World::new();
+    let project = world.project("journey-launch-deadline", "owned.sock");
+    let lane = thread::allocate(&project, |lane| {
+        lane.status = thread::Status::Open;
+        lane.startup_wait_started = project::now();
+    })
+    .unwrap();
+    let error = poll("Mac launch claim", Duration::ZERO, || {
+        launch_claim(&project, &lane.id)
+    })
+    .unwrap_err();
+    assert!(error.to_string().contains("Mac launch claim deadline"));
+    assert!(error.to_string().contains("launch claim not observed"));
+    assert_eq!(LAUNCH, Duration::from_secs(300));
+}
+
+#[test]
+fn failed_open_drops_the_wrapped_git_daemon_not_just_its_parent() {
+    let world = World::new();
+    world
+        .runner
+        .on_fn(|cmd| cmd.program == "git", |cmd| RealRunner.run(cmd));
+    let scratch = world.home.path().join("daemon");
+    std::fs::create_dir(&scratch).unwrap();
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    drop(listener);
+    let url = format!("git://127.0.0.1:{port}/remote.git");
+    prepare_transport_repo(&world.ctx(), &scratch, &url).unwrap();
+    {
+        let mut cmd = Command::new("git");
+        cmd.args([
+            "daemon",
+            "--listen=127.0.0.1",
+            &format!("--port={port}"),
+            &format!("--base-path={}", scratch.display()),
+            "--export-all",
+        ]);
+        let _daemon = spawn(cmd).unwrap();
+        poll("daemon listening", Duration::from_secs(5), || {
+            let out = RealRunner
+                .run(&Cmd::new("git", Duration::from_secs(1)).args(["ls-remote", &url]))?;
+            Ok((out.success().then_some(()), out.error_text()))
+        })
+        .unwrap();
+        let mut report = Report::default();
+        assert!(report.step("open", || bail!("forced failed open")).is_err());
+    }
+    poll("daemon stopped", Duration::from_secs(5), || {
+        let stopped = std::net::TcpStream::connect(("127.0.0.1", port)).is_err();
+        Ok((
+            stopped.then_some(()),
+            "daemon listener survived failed open".into(),
+        ))
+    })
+    .unwrap();
+}
+
+#[test]
+fn unnamed_coordinator_ownership_requires_its_launch_kind_and_project_tokens() {
+    let world = World::new();
+    let project = world.project("journey-own", "owned.sock");
+    project
+        .update_coordinator(|c| c.launch.kind = "pi".into())
+        .unwrap();
+    let c = project.coordinator().unwrap();
+    let mut a = crate::herdr::Agent {
+        workspace_id: c.workspace_id.clone(),
+        tab_id: c.tab_id.clone(),
+        pane_id: c.pane_id.clone(),
+        cwd: c.cwd.clone(),
+        agent: "pi".into(),
+        tokens: [
+            ("project".into(), project.slug.clone()),
+            ("thread".into(), "coordinator".into()),
+        ]
+        .into(),
+        ..Default::default()
+    };
+    assert!(owned_coordinator(&project.slug, &c, &a));
+    a.name = "foreign".into();
+    assert!(!owned_coordinator(&project.slug, &c, &a));
+    a.name.clear();
+    a.tokens.clear();
+    assert!(!owned_coordinator(&project.slug, &c, &a));
 }
 
 #[test]
