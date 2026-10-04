@@ -1,7 +1,9 @@
 """Boundary tests for the destructive tools; live proof is ./prove."""
 import importlib.machinery
 import importlib.util
+import os
 from pathlib import Path
+import subprocess
 import tempfile
 import unittest
 from unittest import mock
@@ -70,6 +72,41 @@ class WallBoundaryTests(unittest.TestCase):
             value = {'providers': {'opencode-go': row}}
             self.assertFalse(guest.remove_empty_provider(value))
             self.assertEqual(value['providers']['opencode-go'], row)
+
+    def test_reinstall_streams_over_ssh_without_root_writes_through_symlinks(self):
+        build = self.home / 'build'
+        build.mkdir()
+        binary = build / 'herdr-ade'
+        binary.write_bytes(b'new sandbox executable')
+        stub = self.home / 'stub'
+        stub.mkdir()
+        (stub / 'ha').write_text('#!/bin/sh\nexit 0\n')
+        (stub / 'ha').chmod(0o755)
+        for box in [False, True]:
+            home = self.home / ('box' if box else 'local')
+            (home / 'bin').mkdir(parents=True)
+            (home / 'bin/herdr-ade').symlink_to(self.outside)
+            (home / 'bin/herdr-ade.next').symlink_to(self.outside)
+
+            def sandbox_ssh(command, target_box, **kwargs):
+                self.assertEqual(target_box, box)
+                self.assertEqual(kwargs['stdin'].name, str(binary))
+                return subprocess.run(['bash', '-c', command], check=True,
+                    env=dict(os.environ, HOME=str(home), PATH=f'{stub}:/usr/bin:/bin'),
+                    **kwargs)
+
+            with mock.patch.object(host, 'HOME', self.home if box else home), \
+                    mock.patch.object(host, 'require_root'), \
+                    mock.patch.object(host, 'ssh', side_effect=sandbox_ssh), \
+                    mock.patch.object(host.shutil, 'copy2', side_effect=AssertionError('root write')), \
+                    mock.patch.object(host.sys, 'argv', ['wall', 'fault', 'install', str(build)] +
+                                      (['--box'] if box else [])):
+                host.main()
+            self.assertEqual(self.outside.read_text(), 'untouched')
+            self.assertFalse((home / 'bin/herdr-ade').is_symlink())
+            self.assertEqual((home / 'bin/herdr-ade').read_bytes(), binary.read_bytes())
+            self.assertEqual(list((home / 'bin').glob('herdr-ade.*')),
+                             [home / 'bin/herdr-ade.next'])
 
     def test_reset_refuses_an_existing_shared_filesystem(self):
         base = self.home / 'base'

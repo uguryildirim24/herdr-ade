@@ -22,13 +22,13 @@ def run(*args, **kwargs):
     return subprocess.run(list(map(str, args)), check=True, **kwargs)
 
 
-def ssh(command=None, box=False):
+def ssh(command=None, box=False, **kwargs):
     args = ['ssh', '-F', '/dev/null', '-i', str(BASE / 'client'),
             '-o', 'IdentitiesOnly=yes', '-o', 'StrictHostKeyChecking=yes',
             '-o', f'UserKnownHostsFile={BASE}/known_hosts', '-p',
             str(BOX_PORT if box else PORT), f'{"wallbox" if box else "wall"}@127.0.0.1']
     args += ['-t'] if command is None else [command]
-    return run(*args)
+    return run(*args, **kwargs)
 
 
 def wait_port(port):
@@ -279,12 +279,14 @@ def main():
             current = home / 'bin/herdr-ade'
             if source == current.resolve():
                 sys.exit('choose a different build')
-            # Atomic swap; never run production harness install machinery.
-            temporary = current.with_name('herdr-ade.next')
-            shutil.copy2(source, temporary)
-            run('chown', f'{"wallbox" if args.box else "wall"}:', temporary)
-            temporary.replace(current)
-            ssh('ha --version; ha ticker start; ha ticker status', args.box)
+            # Stream into the unprivileged, mount-confined SSH session. Root
+            # must never write through sandbox-controlled paths or symlinks.
+            with source.open('rb') as binary:
+                ssh('set -eu; temporary=$(mktemp "$HOME/bin/herdr-ade.XXXXXX"); '
+                    'trap \'rm -f "$temporary"\' EXIT; cat > "$temporary"; '
+                    'chmod 755 "$temporary"; mv -fT "$temporary" "$HOME/bin/herdr-ade"; '
+                    'trap - EXIT; ha --version; ha ticker start; ha ticker status',
+                    args.box, stdin=binary)
         else:
             command = ['python3', '$HOME/tools/guest.py', 'fault', args.kind, *args.arguments]
             ssh('python3 "$HOME/tools/guest.py" ' + shlex.join(command[2:]), args.box)

@@ -153,8 +153,10 @@ scripted checkpoint claims.
   clock (`project::now` and direct `jiff::Timestamp::now` calls; Runner deadlines
   separately use monotonic time). Host time is never changed. Clock skew is not
   testable in v1 without a future shared clock boundary.
-- Install atomically swaps **only sandbox herdr-ade**, then replaces that root's
-  ticker. It deliberately creates a mixed-build window with existing agents,
+- Install streams the named build over sandbox SSH and atomically swaps
+  **only sandbox herdr-ade** as the unprivileged sandbox account, then replaces
+  that root's ticker. Root never writes through sandbox-controlled symlinks.
+  It deliberately creates a mixed-build window with existing agents,
   pi guard and helper binaries, as D24 needs. Pick a genuinely different build;
   log versions and hashes before/after. It never calls production `ha harness`.
 
