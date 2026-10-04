@@ -271,6 +271,29 @@ def stop():
         subprocess.run(['pkill', '-KILL', '-u', user], check=False)
 
 
+def uninstall():
+    require_root()
+    stop()
+    if INSTANCE.number:
+        run('systemctl', 'stop', INSTANCE.slice)
+    if os.path.ismount(HOME):
+        run('umount', HOME)
+    for user in [BOX_USER, USER]:
+        try:
+            pwd.getpwnam(user)
+        except KeyError:
+            continue
+        run('userdel', user)
+    shutil.rmtree(HOME, ignore_errors=True)
+    shutil.rmtree(BASE, ignore_errors=True)
+    for port in [PORT, BOX_PORT]:
+        Path(f'/etc/systemd/system/{UNIT}-{port}.service').unlink(missing_ok=True)
+    if INSTANCE.number:
+        Path(f'/etc/systemd/system/{INSTANCE.slice}').unlink(missing_ok=True)
+    run('systemctl', 'daemon-reload')
+    print(f'Uninstalled instance {INSTANCE.number}: accounts, services, tmpfs and private stage links.')
+
+
 def reset():
     require_root()
     if not (BASE / 'tools/guest.py').is_file():
@@ -422,6 +445,7 @@ def main():
     p.add_argument('--node', default='/home/ubuntu/.local/bin/node')
     p.add_argument('--npm', default='/home/ubuntu/.local/bin/npm')
     sub.add_parser('reset')
+    sub.add_parser('uninstall')
     sub.add_parser('list')
     sub.add_parser('logout')
     p = sub.add_parser('prove')
@@ -446,6 +470,8 @@ def main():
         install(args)
     elif args.command == 'reset':
         reset()
+    elif args.command == 'uninstall':
+        uninstall()
     elif args.command == 'list':
         list_instances()
     elif args.command == 'logout':

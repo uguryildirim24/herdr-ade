@@ -34,6 +34,33 @@ class GateTests(unittest.TestCase):
                 self.assertIn('WALL GATE INCOMPLETE: gate instance busy', output.getvalue())
                 run.assert_not_called()
 
+    def test_added_slots_require_explicit_post_rollout_provisioning(self):
+        with tempfile.TemporaryDirectory() as home:
+            directory = Path(home)
+            with mock.patch.object(gate, 'WALL_BASE', directory), \
+                    mock.patch.object(gate, 'LOCK_DIR', directory), \
+                    mock.patch.object(gate.sys, 'argv', ['gate', '--slot-set', '9']), \
+                    mock.patch.object(gate.Gate, 'run') as run, \
+                    contextlib.redirect_stdout(io.StringIO()) as output:
+                self.assertEqual(gate.main(), 1)
+                self.assertIn('added slot set not provisioned', output.getvalue())
+                run.assert_not_called()
+                self.assertFalse(list(directory.glob('instance-*.lock')))
+            for instance in gate.SLOT_SETS[1]:
+                manifest = directory / f'herdr-wall-{instance}' / 'tools/guest.py'
+                manifest.parent.mkdir(parents=True)
+                manifest.touch()
+            with mock.patch.object(gate, 'WALL_BASE', directory), \
+                    mock.patch.object(gate, 'LOCK_DIR', directory), \
+                    mock.patch.object(gate.sys, 'argv', ['gate', '--slot-set', '9']), \
+                    mock.patch.object(gate.Gate, 'run') as run, \
+                    mock.patch.object(gate.Gate, 'finish', return_value=[]), \
+                    mock.patch.object(signal, 'signal'), \
+                    contextlib.redirect_stdout(io.StringIO()) as output:
+                self.assertEqual(gate.main(), 0)
+                self.assertIn('WALL SLOTS (9, 10, 11, 12)', output.getvalue())
+                run.assert_called_once()
+
     def test_timeout_has_bounded_capture_and_reset_before_failure_result(self):
         with tempfile.TemporaryDirectory() as home:
             evidence = Path(home) / 'evidence'

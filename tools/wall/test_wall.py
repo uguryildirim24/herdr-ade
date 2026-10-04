@@ -166,6 +166,27 @@ class WallBoundaryTests(unittest.TestCase):
                     mock.call(['pkill', '-KILL', '-u', f'wall{n}'], check=False),
                     mock.call(['pkill', '-KILL', '-u', f'wallbox{n}'], check=False)])
 
+    def test_uninstall_removes_only_selected_users_mount_and_units(self):
+        self.addCleanup(host.select, 0)
+        host.select(12)
+        home, base = self.home / 'slot-home', self.home / 'slot-base'
+        with mock.patch.object(host, 'HOME', home), mock.patch.object(host, 'BASE', base), \
+                mock.patch.object(host, 'require_root'), mock.patch.object(host, 'stop') as stop, \
+                mock.patch.object(host, 'run') as run, \
+                mock.patch.object(host.os.path, 'ismount', return_value=True), \
+                mock.patch.object(host.pwd, 'getpwnam'), \
+                mock.patch.object(host.shutil, 'rmtree') as remove, \
+                mock.patch.object(host.Path, 'unlink') as unlink:
+            host.uninstall()
+        stop.assert_called_once_with()
+        self.assertEqual(run.call_args_list, [
+            mock.call('systemctl', 'stop', 'herdrwall12.slice'),
+            mock.call('umount', home), mock.call('userdel', 'wallbox12'),
+            mock.call('userdel', 'wall12'), mock.call('systemctl', 'daemon-reload')])
+        self.assertEqual(remove.call_args_list, [
+            mock.call(home, ignore_errors=True), mock.call(base, ignore_errors=True)])
+        self.assertEqual(unlink.call_count, 3)
+
     def test_reboot_and_disconnect_use_only_selected_box_cgroup(self):
         self.addCleanup(host.select, 0)
         host.select(2)
@@ -326,13 +347,13 @@ class WallBoundaryTests(unittest.TestCase):
         self.addCleanup(host.select, 0)
         auth = self.home / 'flag-auth'
         auth.mkdir()
-        commands = [['install', '--build', '/new/build'], ['reset'], ['enter', 'true'],
+        commands = [['install', '--build', '/new/build'], ['reset'], ['uninstall'], ['enter', 'true'],
                     ['fault', 'clock', '0'], ['evidence', str(self.home / 'evidence')],
                     ['prove', str(self.home / 'proof'), '/alternate'], ['list'], ['logout']]
         for command in commands:
             with self.subTest(command=command), mock.patch.object(host.sys, 'argv', ['wall', '--instance', '12', *command]), \
                     mock.patch.object(host, 'require_root'), mock.patch.object(host, 'install'), \
-                    mock.patch.object(host, 'reset'), mock.patch.object(host, 'ssh'), \
+                    mock.patch.object(host, 'reset'), mock.patch.object(host, 'uninstall'), mock.patch.object(host, 'ssh'), \
                     mock.patch.object(host, 'fault'), mock.patch.object(host, 'run'), \
                     mock.patch.object(host, 'list_instances'), mock.patch.object(host, 'shared_auth'), \
                     mock.patch.object(host, 'AUTH', auth), mock.patch.object(host.Path, 'write_text'):

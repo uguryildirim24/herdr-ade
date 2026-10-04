@@ -8,9 +8,13 @@ The first slot in the acquired set runs prove and the final fixture journey;
 three regression workers own the remaining slots. Additional repros queue on
 those workers, never sharing a slot concurrently. Manual use of a reserved
 slot must hold `/home/ubuntu/.cache/herdr-wall-gate/instance-N.lock`.
-The gate acquires a complete set before building or changing any instance,
-releasing partial claims before trying the other set. Two campaigns can run
-at once; both sets busy makes a lane exit 75 without mutation.
+The gate acquires a complete provisioned set before building or changing any
+instance, releasing partial claims before trying the other set. Two campaigns
+can run at once; both sets busy makes a lane exit 75 without mutation.
+9–12 are enabled only when all four have been explicitly installed after the
+host-tool rollout. Never provision them while current older wall tools can
+install: their shared-auth validation rejects the extra accounts. Pre-landing
+concurrency tests use private lock directories without touching `wall-auth`.
 Each executable resets only the passed instance, prints EXPECTED and ACTUAL,
 and returns nonzero while the defect exists. Repros need an installed build.
 The gate discovers every `*/repro`; a missing/non-executable/broken repro cannot
@@ -38,7 +42,10 @@ host tools. `--alternate-build /build/debug` supplies an existing different ADE
 image for prove's mixed-build install fault (default: oci's installed build).
 An absent or identical alternate is INCOMPLETE, never a pretend install proof.
 Pinned pi is reused across ADE binary stages; reset is offline.
-`--slot-set 9` restricts development runs to 9–12 without touching busy 5–8.
+`--slot-set 9` restricts runs to already-provisioned 9–12 without touching
+busy 5–8; an absent added set is INCOMPLETE without account creation.
+Use the wall controller's `uninstall` on 9–12 after an authorized temporary
+proof window to remove users/group memberships, services, slices and mounts.
 
 Exactly one `WALL GATE PASS`, `WALL GATE FAIL: <round>: <reason>` or
 `WALL GATE INCOMPLETE: <reason>` line is emitted, with an evidence path and

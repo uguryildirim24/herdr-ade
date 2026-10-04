@@ -25,6 +25,7 @@ FAULTS = 'kill-pane kill-process ticker disconnect reboot fill corrupt clock ins
 INSTANCES = (5, 6, 7, 8)
 SLOT_SETS = (INSTANCES, (9, 10, 11, 12))
 LOCK_DIR = Path('/home/ubuntu/.cache/herdr-wall-gate')
+WALL_BASE = Path('/var/lib')
 BUDGET = 1500
 CLEANUP = 90
 
@@ -334,7 +335,16 @@ def main():
     parser.add_argument('--slot-set', type=int, choices=[5, 9],
                         help='use only the set starting at this instance (default: either free set)')
     args = parser.parse_args()
-    slot_sets = tuple(s for s in SLOT_SETS if args.slot_set is None or s[0] == args.slot_set)
+    # Do not provision added accounts during a pre-landing lane/review gate.
+    # The installer enables the second set only after all host wall tools have
+    # the new range; older tools reject those accounts in shared wall-auth.
+    slot_sets = tuple(s for s in SLOT_SETS
+                      if (args.slot_set is None or s[0] == args.slot_set)
+                      and (s[0] == 5 or all(
+                          (WALL_BASE / f'herdr-wall-{n}' / 'tools/guest.py').is_file() for n in s)))
+    if not slot_sets:
+        print('WALL GATE INCOMPLETE: added slot set not provisioned; install after rollout')
+        return 1
     review = os.environ.get('ADE_WALL_REVIEW') == '1'
     with slots(LOCK_DIR, review, slot_sets) as instances:
         if instances is None:

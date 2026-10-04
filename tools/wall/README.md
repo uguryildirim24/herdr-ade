@@ -13,7 +13,7 @@ Every command accepts `--instance N` before its verb, N = 1..12.
 
 - **1–4:** manually assigned wall-lane slots; use only your assigned instance.
 - **5–8 and 9–12:** two independent four-slot sets for `tools/wall/gate`.
-  Each invocation takes whichever full set is free. The first instance runs
+  Each invocation takes whichever provisioned full set is free. The first instance runs
   prove and the final journey; the remaining three run regressions concurrently.
   `--slot-set 9` restricts a development run to the added set. Each slot has a
   nonblocking lock (`/home/ubuntu/.cache/herdr-wall-gate/instance-N.lock`);
@@ -25,6 +25,22 @@ Every command accepts `--instance N` before its verb, N = 1..12.
   releases them, and the next admission removes stale files. A scheduler lock
   serializes only reservation/slot claims, never running campaigns.
   Never use a reserved slot manually without holding its corresponding lock.
+
+### Second-set rollout
+
+Do not provision 9–12 from a pre-landing worktree: older host wall tools reject
+those supplementary `wall-auth` members, breaking their installs on 1–8.
+Land this change and update every host wall tool that can install an instance
+before provisioning the second set. The install step then runs `wall --instance
+N install --build BUILD` for N = 9..12. Gates do not create an absent second set:
+all four installed instance manifests must exist before they can select it.
+Until rollout, gates retain 5–8; `--slot-set 9` reports INCOMPLETE without mutation.
+
+`sudo tools/wall/wall --instance N uninstall` stops that instance's SSH units
+and slice, kills its accounts' processes, unmounts its tmpfs, deletes its users
+(and their supplementary group memberships), home, private stage links and
+unit files. It leaves shared stages and the shared login intact. Use it to
+remove a temporary second set immediately after an authorized proof window.
 
 Instance N uses
 `wallN`/`wallboxN`, `/home/wall-N` (box beneath it), ports `22285+2*N` and
