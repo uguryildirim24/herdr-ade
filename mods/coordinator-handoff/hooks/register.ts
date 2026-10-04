@@ -7,7 +7,11 @@ const NOTE_PROMPT = `Write a fresh coordinator handoff, concrete and without nar
 - The one next action
 - Traps already hit
 - Commands and facts worked out this session that aren't in the harness records
-The transcript may begin with a previous handoff. Carry forward only items still open or still true, and write about what changed since. Do not summarize an old summary wholesale.`;
+The transcript may begin with a previous handoff. Carry forward only items still open or still true, and write about what changed since. Do not summarize an old summary wholesale.
+
+Prioritize operating facts over activity history. When work finishes, carry forward the still-true mechanism, interface, decision, constraint or caveat and its scope and conditions—not merely the completion label, receipt or file pointer. Compress repetitive completion history before dropping such facts. Keep their concrete bindings; do not infer a fact the transcript does not establish.
+
+Use a compact fact ledger inside the required sections: one entry per fact, one location per fact. Prefer terse key-value or semicolon-separated clauses to narrative explanation, and share scope or provenance instead of repeating it. Retain every substantive condition, caveat and concrete binding. Use short evidence pointers rather than retelling the steps taken to obtain the evidence.`;
 
 export const register: Register = (on) => {
   on('session.compact', async ($, e, next) => {

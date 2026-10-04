@@ -69,7 +69,11 @@ test('slow fork cannot wedge compaction', async ($, on) => {
 
 test('ha alone assembles the handoff and the mod returns its message protocol', async ($, on) => {
   setup(on);
-  on('model.fork', () => ({ value: { isAnswered: true, text: 'fresh session note', usage } }));
+  on('model.fork', (_, e) => {
+    expect(e.prompt).toContain('Prioritize operating facts over activity history.');
+    expect(e.prompt).toContain('one entry per fact, one location per fact.');
+    return { value: { isAnswered: true, text: 'fresh session note', usage } };
+  });
   on('process.run', (_, e) => {
     expect(e.argv).toEqual([`${home}/.local/bin/ha`, 'handoff', 'demo', '--note-file', '-']);
     expect(e.init?.stdin).toBe('fresh session note');
