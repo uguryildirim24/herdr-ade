@@ -1,21 +1,37 @@
 #!/usr/bin/python3
 """Host controller. Privileged operations have fixed sandbox-only targets."""
 import argparse
+import datetime
+import fcntl
+import grp
+import hashlib
+import json
 import os
 from pathlib import Path
 import pwd
 import shlex
 import shutil
+import signal
 import socket
 import subprocess
 import sys
 import time
 
-HOME = Path('/home/wall')
-BASE = Path('/var/lib/herdr-wall')
-UNIT = 'herdr-wall'
-PORT = 22285
-BOX_PORT = 22286
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from instance import AUTH, STAGES, Instance
+
+INSTANCE = Instance()
+HOME, BASE, UNIT = INSTANCE.home, INSTANCE.base, INSTANCE.unit
+PORT, BOX_PORT = INSTANCE.port, INSTANCE.box_port
+USER, BOX_USER = INSTANCE.user, INSTANCE.box_user
+
+
+def select(number):
+    global INSTANCE, HOME, BASE, UNIT, PORT, BOX_PORT, USER, BOX_USER
+    INSTANCE = Instance(number)
+    HOME, BASE, UNIT = INSTANCE.home, INSTANCE.base, INSTANCE.unit
+    PORT, BOX_PORT = INSTANCE.port, INSTANCE.box_port
+    USER, BOX_USER = INSTANCE.user, INSTANCE.box_user
 
 
 def run(*args, **kwargs):
@@ -26,7 +42,7 @@ def ssh(command=None, box=False, **kwargs):
     args = ['ssh', '-F', '/dev/null', '-i', str(BASE / 'client'),
             '-o', 'IdentitiesOnly=yes', '-o', 'StrictHostKeyChecking=yes',
             '-o', f'UserKnownHostsFile={BASE}/known_hosts', '-p',
-            str(BOX_PORT if box else PORT), f'{"wallbox" if box else "wall"}@127.0.0.1']
+            str(BOX_PORT if box else PORT), f'{BOX_USER if box else USER}@127.0.0.1']
     args += ['-t'] if command is None else [command]
     return run(*args, **kwargs)
 
@@ -47,43 +63,115 @@ def require_root():
         sys.exit('Use sudo tools/wall/wall for the host controller; agents enter over SSH.')
 
 
+def shared_auth():
+    try:
+        group = grp.getgrnam('wall-auth')
+    except KeyError:
+        run('groupadd', 'wall-auth')
+        group = grp.getgrnam('wall-auth')
+    allowed = {user for n in range(9) for user in (Instance(n).user, Instance(n).box_user)}
+    if set(group.gr_mem) - allowed:
+        sys.exit('wall-auth contains a non-sandbox account')
+    for name in sorted(allowed - set(group.gr_mem)):
+        try:
+            pwd.getpwnam(name)
+        except KeyError:
+            continue
+        run('usermod', '-aG', 'wall-auth', name)
+    AUTH.mkdir(mode=0o2770, exist_ok=True)
+    os.chown(AUTH, 0, group.gr_gid)
+    AUTH.chmod(0o2770)
+    file = AUTH / 'auth.json'
+    if not file.exists():
+        file.write_text('{}\n')
+    os.chown(file, 0, group.gr_gid)
+    file.chmod(0o660)
+
+
+def stage(args):
+    sources = {name: (Path(args.herdr) if name == 'herdr' else Path(args.build) / name).resolve()
+               for name in ['herdr', 'herdr-ade', 'herdr-pi', 'herdr-rundown']}
+    sources['node'] = Path(args.node).resolve()
+    hashes = {name: hashlib.sha256(path.read_bytes()).hexdigest() for name, path in sources.items()}
+    key = hashlib.sha256(json.dumps(hashes, sort_keys=True).encode()).hexdigest()
+    STAGES.mkdir(mode=0o755, exist_ok=True)
+    with (STAGES / '.lock').open('w') as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        staged = STAGES / key
+        if not staged.exists():
+            temporary = STAGES / (key + '.building')
+            if temporary.exists():
+                shutil.rmtree(temporary)
+            (temporary / 'bin').mkdir(parents=True)
+            for name, source in sources.items():
+                shutil.copy2(source, temporary / 'bin' / name)
+                if name != 'node':
+                    run('strip', temporary / 'bin' / name)
+            npm = Path(args.npm).resolve().parent.parent
+            shutil.copytree(npm, temporary / 'npm')
+            (temporary / 'empty-npmrc').write_text('')
+            env = {'HOME': str(temporary), 'PATH': f'{temporary}/bin:/usr/bin:/bin',
+                   'NPM_CONFIG_USERCONFIG': '/dev/null',
+                   'NPM_CONFIG_GLOBALCONFIG': str(temporary / 'empty-npmrc')}
+            run(temporary / 'bin/node', temporary / 'npm/bin/npm-cli.js', 'install',
+                '--ignore-scripts', '--no-audit', '--no-fund', '--prefix', temporary / 'pi',
+                '@earendil-works/pi-coding-agent@0.99.1', env=env)
+            # Sandbox-only: locks must resolve the shared auth.json symlink,
+            # rather than independently locking each account's path.
+            backend = temporary / 'pi/node_modules/@earendil-works/pi-coding-agent/dist/core/auth-storage.js'
+            text = backend.read_text()
+            if text.count('realpath: false') != 2:
+                sys.exit('pinned pi auth lock implementation changed')
+            backend.write_text(text.replace('realpath: false', 'realpath: true'))
+            version = subprocess.check_output([sources['herdr-ade'], '--version'], text=True).strip()
+            build_id = version.split('+', 1)[1].split('.', 1)[0].removesuffix('-dirty')
+            commit = subprocess.check_output(['git', '-C', Path(__file__).resolve().parents[2],
+                                              'rev-parse', f'{build_id}^{{commit}}'], text=True).strip()
+            (temporary / 'build.json').write_text(json.dumps(dict(version=version, commit=commit,
+                                                                  hashes=hashes), indent=2) + '\n')
+            temporary.rename(staged)
+        return staged
+
+
 def install(args):
     require_root()
     BASE.mkdir(mode=0o700, parents=True, exist_ok=True)
-    for name, home in [('wall', HOME), ('wallbox', HOME / 'box')]:
+    shared_auth()
+    for name, home in [(USER, HOME), (BOX_USER, HOME / 'box')]:
         try:
             pwd.getpwnam(name)
         except KeyError:
             run('useradd', '--no-create-home', '--home-dir', home, '--shell', '/bin/bash', name)
-            # Public-key-only sshd rejects locked accounts. Random password is
-            # never retained; password authentication is disabled on both ports.
             run('chpasswd', input=f'{name}:{os.urandom(32).hex()}\n', text=True)
         account = pwd.getpwnam(name)
         if Path(account.pw_dir) != home or account.pw_uid == 0:
             sys.exit(f'{name} already exists with an unsafe identity/home')
         groups = subprocess.check_output(['id', '-nG', name], text=True).split()
-        if groups != [name]:
-            sys.exit(f'{name} must have only its private group, got {groups}')
-    (BASE / 'bin').mkdir(exist_ok=True)
-    for name in ['herdr', 'herdr-ade', 'herdr-pi', 'herdr-rundown']:
-        source = Path(args.herdr) if name == 'herdr' else Path(args.build) / name
-        shutil.copy2(source.resolve(), BASE / 'bin' / name)
-        run('strip', BASE / 'bin' / name)
-    shutil.copy2(Path(args.node).resolve(), BASE / 'bin/node')
-    # Only the npm executable package, never the source account's config/cache.
-    npm = Path(args.npm).resolve().parent.parent
-    shutil.copytree(npm, BASE / 'npm', dirs_exist_ok=True)
-    (BASE / 'empty-npmrc').write_text('')
-    env = {'HOME': str(BASE), 'PATH': f'{BASE}/bin:/usr/bin:/bin',
-           'NPM_CONFIG_USERCONFIG': '/dev/null', 'NPM_CONFIG_GLOBALCONFIG': str(BASE / 'empty-npmrc')}
-    run(BASE / 'bin/node', BASE / 'npm/bin/npm-cli.js', 'install', '--ignore-scripts',
-        '--no-audit', '--no-fund', '--prefix', BASE / 'pi',
-        '@earendil-works/pi-coding-agent@0.99.1', env=env)
+        if set(groups) - {name, 'wall-auth'}:
+            sys.exit(f'{name} must have only its private and wall-auth groups, got {groups}')
+        run('usermod', '-aG', 'wall-auth', name)
+    staged = stage(args)
+    for name in ['bin', 'npm', 'pi', '.npm']:
+        path = BASE / name
+        if path.is_symlink():
+            path.unlink()
+        elif path.exists():
+            shutil.rmtree(path)
+        path.symlink_to(staged / name, target_is_directory=True)
+    shutil.copy2(staged / 'build.json', BASE / 'build.json')
     shutil.copytree(Path(__file__).resolve().parent, BASE / 'tools', dirs_exist_ok=True)
     if not (BASE / 'client').exists():
         run('ssh-keygen', '-q', '-t', 'ed25519', '-N', '', '-f', BASE / 'client')
         run('ssh-keygen', '-q', '-t', 'ed25519', '-N', '', '-f', BASE / 'host')
-    for port, user in [(PORT, 'wall'), (BOX_PORT, 'wallbox')]:
+    if INSTANCE.number:
+        Path(f'/etc/systemd/system/{INSTANCE.slice}').write_text('''[Unit]
+Description=Wall instance aggregate resource limits
+[Slice]
+MemoryMax=2G
+TasksMax=512
+''')
+    slice_setting = f'Slice={INSTANCE.slice}\n' if INSTANCE.number else ''
+    for port, user in [(PORT, USER), (BOX_PORT, BOX_USER)]:
         (BASE / f'sshd-{port}').write_text(f'''Port {port}
 ListenAddress 127.0.0.1
 HostKey {BASE}/host
@@ -100,22 +188,15 @@ X11Forwarding no
 PermitTunnel no
 Subsystem sftp internal-sftp
 ''')
-    pub = (BASE / 'host.pub').read_text().split()
-    (BASE / 'known_hosts').write_text(''.join(
-        f'[127.0.0.1]:{p} {pub[0]} {pub[1]}\n' for p in [PORT, BOX_PORT]))
-    # Each port has its own cgroup: connection loss stops only sshd; reboot
-    # kills the box's herdr/ticker/lanes too, not wall's local coordinator.
-    for port in [PORT, BOX_PORT]:
-        unit = f'{UNIT}-{port}'
-        Path(f'/etc/systemd/system/{unit}.service').write_text(f'''[Unit]
+        Path(f'/etc/systemd/system/{UNIT}-{port}.service').write_text(f'''[Unit]
 Description=Isolated wall sandbox SSH {port}
 [Service]
-ExecStart=/bin/sh -c 'mkdir -p /run/sshd; exec /usr/sbin/sshd -D -e -f {BASE}/sshd-{port}'
+{slice_setting}ExecStart=/bin/sh -c 'mkdir -p /run/sshd; exec /usr/sbin/sshd -D -e -f {BASE}/sshd-{port}'
 KillMode=control-group
 ProtectHome=tmpfs
-BindPaths={HOME}
+BindPaths={HOME} {AUTH}
 ProtectSystem=strict
-ReadWritePaths={HOME}
+ReadWritePaths={HOME} {AUTH}
 PrivateDevices=yes
 TemporaryFileSystem=/tmp:rw,nosuid,nodev,mode=1777,size=32M /var/tmp:rw,nosuid,nodev,mode=1777,size=32M /dev/shm:rw,nosuid,nodev,mode=1777,size=16M /run:rw,nosuid,nodev,size=16M
 BindReadOnlyPaths=/run/systemd/resolve/stub-resolv.conf
@@ -127,6 +208,9 @@ RestrictSUIDSGID=yes
 MemoryMax=2G
 TasksMax=512
 ''')
+    pub = (BASE / 'host.pub').read_text().split()
+    (BASE / 'known_hosts').write_text(''.join(
+        f'[127.0.0.1]:{p} {pub[0]} {pub[1]}\n' for p in [PORT, BOX_PORT]))
     run('systemctl', 'daemon-reload')
     reset()
 
@@ -134,8 +218,7 @@ TasksMax=512
 def stop():
     for port in [PORT, BOX_PORT]:
         run('systemctl', 'stop', f'{UNIT}-{port}')
-    # Cgroups catch descendants, including detached tickers and pane shells.
-    for user in ['wall', 'wallbox']:
+    for user in [USER, BOX_USER]:
         subprocess.run(['pkill', '-KILL', '-u', user], check=False)
 
 
@@ -147,12 +230,12 @@ def reset():
     HOME.mkdir(parents=True, exist_ok=True)
     if os.path.ismount(HOME):
         if subprocess.check_output(['findmnt', '-n', '-o', 'FSTYPE', HOME], text=True).strip() != 'tmpfs':
-            sys.exit('Refusing to wipe a non-tmpfs /home/wall')
+            sys.exit(f'Refusing to wipe a non-tmpfs {HOME}')
         run('umount', HOME)
     elif any(HOME.iterdir()):
-        sys.exit('Refusing to wipe a non-mounted, nonempty /home/wall')
-    run('mount', '-t', 'tmpfs', '-o', 'size=2048M,nosuid,nodev,mode=0755', 'herdr-wall', HOME)
-    for user, home in [('wall', HOME), ('wallbox', HOME / 'box')]:
+        sys.exit(f'Refusing to wipe a non-mounted, nonempty {HOME}')
+    run('mount', '-t', 'tmpfs', '-o', 'size=2048M,nosuid,nodev,mode=0755', UNIT, HOME)
+    for user, home in [(USER, HOME), (BOX_USER, HOME / 'box')]:
         home.mkdir(exist_ok=True)
         (home / '.ssh').mkdir(mode=0o700)
         (home / '.ssh/authorized_keys').write_text((BASE / 'client.pub').read_text())
@@ -160,6 +243,8 @@ def reset():
         for binary in (BASE / 'bin').iterdir():
             shutil.copy2(binary, home / 'bin' / binary.name)
         shutil.copytree(BASE / 'tools', home / 'tools')
+        with (home / 'tools/env.sh').open('a') as env:
+            env.write(f'\nexport WALL_INSTANCE={INSTANCE.number}\n')
         shutil.copytree(BASE / 'pi', home / 'pi-package', symlinks=True)
         shutil.copytree(BASE / 'npm', home / 'npm', symlinks=True)
         shutil.copytree(BASE / '.npm/_cacache', home / '.npm/_cacache', symlinks=True)
@@ -170,10 +255,8 @@ def reset():
         shutil.copy2(home / 'tools/pi', home / 'bin/wall-pi')
         (home / 'bin/ha').symlink_to('herdr-ade')
         run('chown', '-R', f'{user}:{user}', home)
-    # Restore box ownership after chown of the outer home; wall can reach the
-    # scratch bare remote but not the box account's private state.
     run('chmod', '700', HOME / 'box')
-    run('chown', '-R', 'wallbox:wallbox', HOME / 'box')
+    run('chown', '-R', f'{BOX_USER}:{BOX_USER}', HOME / 'box')
     for port in [PORT, BOX_PORT]:
         run('systemctl', 'start', f'{UNIT}-{port}')
     wait_port(PORT)
@@ -184,112 +267,160 @@ def reset():
     with (HOME / 'box/.ssh/authorized_keys').open('a') as keys:
         keys.write((HOME / '.ssh/box_key.pub').read_text())
     shutil.copy2(BASE / 'known_hosts', HOME / '.ssh/known_hosts')
-    run('chown', 'wall:wall', HOME / '.ssh/known_hosts')
+    run('chown', f'{USER}:{USER}', HOME / '.ssh/known_hosts')
     ssh('python3 "$HOME/tools/guest.py" connect')
-    print('Reset complete: 2048 MiB tmpfs, two isolated users/SSH servers, no provider credentials.')
+    (BASE / 'last-reset').write_text(datetime.datetime.now(datetime.timezone.utc).isoformat() + '\n')
+    print(f'Reset complete: instance {INSTANCE.number}, 2048 MiB tmpfs; shared login retained.')
+
+
+def list_instances():
+    for n in range(9):
+        instance = Instance(n)
+        metadata = instance.base / 'build.json'
+        installed = (instance.base / 'tools/guest.py').is_file()
+        print(f'instance {n if n else "default"}: {"installed" if installed else "not installed"}')
+        if not installed:
+            continue
+        if metadata.exists():
+            build = json.loads(metadata.read_text())
+            print(f'  build: {build["version"]}; commit: {build["commit"]}')
+        else:
+            # Read-only inventory of the active v1 sandbox, never reinstall it.
+            result = subprocess.run([str(instance.base / 'bin/herdr-ade'), '--version'],
+                                    capture_output=True, text=True, check=False)
+            version = result.stdout.strip()
+            commit = version.split('+', 1)[1].split('.', 1)[0] if '+' in version else 'unknown'
+            print(f'  build: {version}; commit: {commit} (v1 compiled ID)')
+        reset_time = instance.base / 'last-reset'
+        print(f'  last reset: {reset_time.read_text().strip() if reset_time.exists() else "unrecorded (v1)"}')
+        run('df', '-h', instance.home)
+        subprocess.run(['ps', '-u', f'{instance.user},{instance.box_user}', '-o', 'pid,comm,args'], check=False)
+
+
+def fault(args):
+    builtin = {'kill-pane', 'kill-process', 'ticker', 'disconnect', 'reboot',
+               'fill', 'corrupt', 'clock', 'install'}
+    extension = None
+    if args.kind not in builtin:
+        extension = Path(__file__).resolve().parent / 'faults' / args.kind
+        if (Path(args.kind).name != args.kind or extension.is_symlink()
+                or not extension.is_file() or not os.access(extension, os.X_OK)):
+            sys.exit('unknown fault: expected an executable in tools/wall/faults')
+    if args.when:
+        ssh('python3 "$HOME/tools/guest.py" wait ' + shlex.join(args.when), args.box)
+    time.sleep(max(0, args.after))
+    if extension:
+        run(extension, '--instance', str(INSTANCE.number),
+            *(['--box'] if args.box else []), *args.arguments)
+    elif args.kind in ['disconnect', 'reboot']:
+        seconds = float(args.arguments[0]) if args.arguments else 3
+        if not 0 <= seconds <= 300:
+            sys.exit('duration must be 0..300 seconds')
+        unit = f'{UNIT}-{BOX_PORT}'
+        if args.kind == 'disconnect':
+            cgroup = subprocess.check_output(['systemctl', 'show', '-p', 'ControlGroup',
+                                               '--value', unit], text=True).strip()
+            if not cgroup or cgroup == '/':
+                sys.exit('box cgroup is not running')
+            pids = set()
+            for file in (Path('/sys/fs/cgroup') / cgroup.lstrip('/')).rglob('cgroup.procs'):
+                for pid in file.read_text().split():
+                    proc = Path('/proc') / pid
+                    if proc.exists() and (proc / 'comm').read_text().strip() == 'sshd':
+                        pids.add(int(pid))
+            try:
+                for pid in pids:
+                    os.kill(pid, signal.SIGSTOP)
+                time.sleep(seconds)
+            finally:
+                for pid in pids:
+                    try:
+                        os.kill(pid, signal.SIGCONT)
+                    except ProcessLookupError:
+                        pass
+            print(f'box SSH transport paused/restored ({sorted(pids)}); lane processes preserved')
+        else:
+            run('systemctl', 'stop', unit)
+            time.sleep(seconds)
+            run('systemctl', 'start', unit)
+            wait_port(BOX_PORT)
+            ssh('python3 "$HOME/tools/guest.py" boot', box=True)
+            print('box rebooted: old cgroup killed, disk preserved, new server/ticker')
+    elif args.kind == 'install':
+        if len(args.arguments) != 1:
+            sys.exit('install needs a directory with a different herdr-ade binary')
+        source = Path(args.arguments[0]).resolve() / 'herdr-ade'
+        home = HOME / 'box' if args.box else HOME
+        if source == (home / 'bin/herdr-ade').resolve():
+            sys.exit('choose a different build')
+        with source.open('rb') as binary:
+            ssh('set -eu; temporary=$(mktemp "$HOME/bin/herdr-ade.XXXXXX"); '
+                'trap \'rm -f "$temporary"\' EXIT; cat > "$temporary"; '
+                'chmod 755 "$temporary"; mv -fT "$temporary" "$HOME/bin/herdr-ade"; '
+                'trap - EXIT; ha --version; ha ticker start; ha ticker status',
+                args.box, stdin=binary)
+    else:
+        ssh('python3 "$HOME/tools/guest.py" ' + shlex.join(['fault', args.kind, *args.arguments]), args.box)
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--instance', type=int, choices=range(1, 9))
     sub = parser.add_subparsers(dest='command', required=True)
     p = sub.add_parser('install')
     p.add_argument('--build', required=True, help='directory containing current ADE binaries')
-    p.add_argument('--herdr', required=True)
-    p.add_argument('--node', required=True)
-    p.add_argument('--npm', required=True, help='npm-cli.js executable link')
+    p.add_argument('--herdr', default='/home/ubuntu/.local/bin/herdr')
+    p.add_argument('--node', default='/home/ubuntu/.local/bin/node')
+    p.add_argument('--npm', default='/home/ubuntu/.local/bin/npm')
     sub.add_parser('reset')
+    sub.add_parser('list')
+    sub.add_parser('logout')
+    p = sub.add_parser('prove')
+    p.add_argument('destination')
+    p.add_argument('alternate_build')
     p = sub.add_parser('enter')
     p.add_argument('--box', action='store_true')
     p.add_argument('shell_command', nargs='?')
     p = sub.add_parser('fault')
-    p.add_argument('kind', choices=['kill-pane', 'kill-process', 'ticker', 'disconnect', 'reboot',
-                                    'fill', 'corrupt', 'clock', 'install'])
+    p.add_argument('kind')
     p.add_argument('arguments', nargs='*')
     p.add_argument('--after', type=float, default=0)
-    p.add_argument('--when', nargs=2, metavar=('THREAD', 'PHASE'), help='wait for scripted phase before injection')
+    p.add_argument('--when', nargs=2, metavar=('THREAD', 'PHASE'))
     p.add_argument('--box', action='store_true')
     p = sub.add_parser('evidence')
-    p.add_argument('destination', help='new host evidence directory (outside confined disk)')
+    p.add_argument('destination')
     args = parser.parse_args()
+    if args.instance is not None:
+        select(args.instance)
     require_root()
     if args.command == 'install':
         install(args)
     elif args.command == 'reset':
         reset()
+    elif args.command == 'list':
+        list_instances()
+    elif args.command == 'logout':
+        shared_auth()
+        (AUTH / 'auth.json').write_text('{}\n')
+        print('Shared sandbox login removed (all instances).')
+    elif args.command == 'prove':
+        run(Path(__file__).with_name('prove'), '--instance', str(INSTANCE.number),
+            args.destination, args.alternate_build)
     elif args.command == 'enter':
         ssh(args.shell_command, args.box)
+    elif args.command == 'fault':
+        fault(args)
     elif args.command == 'evidence':
-        dest = Path(args.destination).absolute()
+        dest = Path(args.destination).resolve()
+        # Never put evidence inside any reset path or into the shared login.
+        if any(dest.is_relative_to(Instance(n).home) or dest.is_relative_to(Instance(n).base)
+               for n in range(9)) or dest.is_relative_to(AUTH) or dest.is_relative_to(STAGES):
+            sys.exit('evidence must be outside sandbox/state/staging paths')
         dest.mkdir(exist_ok=False, parents=True)
-        # Deliberate allowlist: never export auth.json, SSH keys or pi sessions.
         for box in [False, True]:
             with (dest / ('box.tar' if box else 'local.tar')).open('wb') as output:
-                args_ssh = ['ssh', '-F', '/dev/null', '-i', str(BASE / 'client'),
-                            '-o', 'IdentitiesOnly=yes', '-o', 'StrictHostKeyChecking=yes',
-                            '-o', f'UserKnownHostsFile={BASE}/known_hosts', '-p',
-                            str(BOX_PORT if box else PORT),
-                            f'{"wallbox" if box else "wall"}@127.0.0.1',
-                            'python3 "$HOME/tools/guest.py" evidence']
-                run(*args_ssh, stdout=output)
+                ssh('python3 "$HOME/tools/guest.py" evidence', box, stdout=output)
         print(dest)
-    elif args.command == 'fault':
-        if args.when:
-            ssh('python3 "$HOME/tools/guest.py" wait ' + shlex.join(args.when), args.box)
-        time.sleep(max(0, args.after))
-        if args.kind in ['disconnect', 'reboot']:
-            seconds = float(args.arguments[0]) if args.arguments else 3
-            if not 0 <= seconds <= 300:
-                sys.exit('duration must be 0..300 seconds')
-            unit = f'{UNIT}-{BOX_PORT}'
-            if args.kind == 'disconnect':
-                # Stop only SSH transport processes in this fixed cgroup.
-                # Pane agents, herdr and ticker keep running during the outage.
-                cgroup = subprocess.check_output(['systemctl','show','-p','ControlGroup',
-                                                   '--value',unit], text=True).strip()
-                pids = set()
-                for file in (Path('/sys/fs/cgroup') / cgroup.lstrip('/')).rglob('cgroup.procs'):
-                    for pid in file.read_text().split():
-                        proc = Path('/proc') / pid
-                        if proc.exists() and (proc / 'comm').read_text().strip() == 'sshd':
-                            pids.add(int(pid))
-                import signal
-                try:
-                    for pid in pids:
-                        os.kill(pid, signal.SIGSTOP)
-                    time.sleep(seconds)
-                finally:
-                    for pid in pids:
-                        try:
-                            os.kill(pid, signal.SIGCONT)
-                        except ProcessLookupError:
-                            pass
-                print(f'box SSH transport paused/restored ({sorted(pids)}); lane processes preserved')
-            else:
-                run('systemctl', 'stop', unit)
-                time.sleep(seconds)
-                run('systemctl', 'start', unit)
-                wait_port(BOX_PORT)
-                ssh('python3 "$HOME/tools/guest.py" boot', box=True)
-                print('box rebooted: old cgroup killed, disk preserved, new server/ticker')
-        elif args.kind == 'install':
-            if len(args.arguments) != 1:
-                sys.exit('install needs a directory with a different herdr-ade binary')
-            source = Path(args.arguments[0]).resolve() / 'herdr-ade'
-            home = HOME / 'box' if args.box else HOME
-            current = home / 'bin/herdr-ade'
-            if source == current.resolve():
-                sys.exit('choose a different build')
-            # Stream into the unprivileged, mount-confined SSH session. Root
-            # must never write through sandbox-controlled paths or symlinks.
-            with source.open('rb') as binary:
-                ssh('set -eu; temporary=$(mktemp "$HOME/bin/herdr-ade.XXXXXX"); '
-                    'trap \'rm -f "$temporary"\' EXIT; cat > "$temporary"; '
-                    'chmod 755 "$temporary"; mv -fT "$temporary" "$HOME/bin/herdr-ade"; '
-                    'trap - EXIT; ha --version; ha ticker start; ha ticker status',
-                    args.box, stdin=binary)
-        else:
-            command = ['python3', '$HOME/tools/guest.py', 'fault', args.kind, *args.arguments]
-            ssh('python3 "$HOME/tools/guest.py" ' + shlex.join(command[2:]), args.box)
 
 
 if __name__ == '__main__':

@@ -18,7 +18,7 @@ if (args.includes('--wall-check')) {
   console.log('OK'); process.exit(0);
 }
 const home = process.env.HOME;
-if (!['/home/wall', '/home/wall/box'].includes(home)) throw Error('sandbox HOME required');
+if (!/^\/home\/wall(?:-[1-8])?(?:\/box)?$/.test(home)) throw Error('sandbox HOME required');
 const pane = process.env.HERDR_PANE_ID;
 if (!pane) throw Error('herdr pane required');
 const session = crypto.randomUUID();

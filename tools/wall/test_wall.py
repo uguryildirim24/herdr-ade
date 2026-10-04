@@ -1,6 +1,9 @@
 """Boundary tests for the destructive tools; live proof is ./prove."""
 import importlib.machinery
 import importlib.util
+import io
+import tarfile
+from types import SimpleNamespace
 import os
 from pathlib import Path
 import subprocess
@@ -108,9 +111,133 @@ class WallBoundaryTests(unittest.TestCase):
             self.assertEqual(list((home / 'bin').glob('herdr-ade.*')),
                              [home / 'bin/herdr-ade.next'])
 
+    def test_successful_open_does_not_double_start_async_coordinator(self):
+        project = self.project
+        (project / '.state').mkdir()
+        (project / '.state/coordinator.json').write_text('{"agent_name":"coordinator", "pane_id":"w1:p1"}')
+        (project / '.state/coordinator-hook.json').write_text('{"pane":"w1:p1"}')
+        with mock.patch.object(guest, 'HOME', self.home), \
+                mock.patch.object(guest.subprocess, 'run', return_value=SimpleNamespace(returncode=0)), \
+                mock.patch.object(guest.subprocess, 'check_output', return_value='request test-request'), \
+                mock.patch.object(guest, 'run') as run:
+            guest.open_project()
+        run.assert_not_called()
+        self.assertEqual((self.home / 'request').read_text(), 'test-request')
+
     def test_scripted_reviewer_uses_reviewer_skill_before_mid_review(self):
         subprocess.run(['node', str(Path(__file__).with_name('test_scripted_agent.js'))],
                        check=True)
+
+    def test_instance_names_preserve_default_and_do_not_overlap(self):
+        from instance import Instance
+        default = Instance()
+        self.assertEqual((default.home, default.base, default.user, default.box_user,
+                          default.unit, default.port, default.box_port, default.machine),
+                         (Path('/home/wall'), Path('/var/lib/herdr-wall'), 'wall', 'wallbox',
+                          'herdr-wall', 22285, 22286, 'wall-box'))
+        instances = [Instance(n) for n in range(9)]
+        for field in ['home', 'base', 'user', 'box_user', 'unit', 'machine']:
+            self.assertEqual(len({getattr(i, field) for i in instances}), 9)
+        self.assertEqual(len({p for i in instances for p in [i.port, i.box_port]}), 18)
+        for n in [-1, 9]:
+            with self.assertRaises(ValueError):
+                Instance(n)
+
+    def test_two_instance_resets_only_stop_their_own_units_and_uids(self):
+        self.addCleanup(host.select, 0)
+        for n in [2, 3]:
+            host.select(n)
+            with mock.patch.object(host, 'run') as run, mock.patch.object(host.subprocess, 'run') as pkill:
+                host.stop()
+                self.assertEqual(run.call_args_list, [
+                    mock.call('systemctl', 'stop', f'herdr-wall-{n}-{22285 + 2*n}'),
+                    mock.call('systemctl', 'stop', f'herdr-wall-{n}-{22286 + 2*n}')])
+                self.assertEqual(pkill.call_args_list, [
+                    mock.call(['pkill', '-KILL', '-u', f'wall{n}'], check=False),
+                    mock.call(['pkill', '-KILL', '-u', f'wallbox{n}'], check=False)])
+
+    def test_reboot_and_disconnect_use_only_selected_box_cgroup(self):
+        self.addCleanup(host.select, 0)
+        host.select(2)
+        args = SimpleNamespace(kind='reboot', arguments=['0'], box=False, when=None, after=0)
+        with mock.patch.object(host, 'run') as run, mock.patch.object(host, 'ssh') as ssh, \
+                mock.patch.object(host, 'wait_port') as wait:
+            host.fault(args)
+            self.assertEqual(run.call_args_list, [
+                mock.call('systemctl', 'stop', 'herdr-wall-2-22290'),
+                mock.call('systemctl', 'start', 'herdr-wall-2-22290')])
+            wait.assert_called_once_with(22290)
+            ssh.assert_called_once_with('python3 "$HOME/tools/guest.py" boot', box=True)
+        args.kind = 'disconnect'
+        with mock.patch.object(host.subprocess, 'check_output', return_value='/system.slice/herdr-wall-2-22290.service') as output, \
+                mock.patch.object(host.os, 'kill') as kill, \
+                mock.patch.object(host.Path, 'rglob', return_value=[]):
+            host.fault(args)
+            output.assert_called_once_with(['systemctl', 'show', '-p', 'ControlGroup', '--value',
+                                            'herdr-wall-2-22290'], text=True)
+            kill.assert_not_called()
+
+    def test_foreign_thread_and_foreign_uid_are_refused(self):
+        threads = self.project / '.state/threads'
+        threads.mkdir(parents=True)
+        threads.joinpath('t-0001.toml').write_text('id = "t-0001"\npane_id = "local-pane"\n')
+        with self.assertRaises(StopIteration), mock.patch.object(guest.os, 'kill') as kill:
+            guest.fault('kill-process', ['t-0002'])
+        kill.assert_not_called()
+        # An absolute foreign record path cannot substitute for a local ID.
+        with self.assertRaises(StopIteration):
+            guest.fault('kill-pane', [str(self.outside)])
+
+    def test_reset_never_removes_shared_auth_and_evidence_excludes_it(self):
+        auth = self.home / 'shared-auth/auth.json'
+        auth.parent.mkdir()
+        auth.write_text('{"test":"sandbox-token"}')
+        agent = self.home / '.herdr-ade/pi/agent'
+        agent.mkdir(parents=True)
+        (agent / 'auth.json').symlink_to(auth)
+        self.project.joinpath('record.toml').write_text('id = "t-0001"')
+        stream = io.BytesIO()
+        with mock.patch.object(guest, 'HOME', self.home), \
+                mock.patch.object(guest, 'ROOT', self.home / '.herdr-ade'), \
+                mock.patch.object(guest.sys, 'stdout', SimpleNamespace(buffer=stream)):
+            guest.evidence()
+        with tarfile.open(fileobj=io.BytesIO(stream.getvalue())) as archive:
+            self.assertFalse(any('auth' in name for name in archive.getnames()))
+        self.assertNotIn(b'sandbox-token', stream.getvalue())
+        self.assertNotIn('AUTH', host.reset.__code__.co_names)
+        self.assertEqual(auth.read_text(), '{"test":"sandbox-token"}')
+
+    def test_additional_fault_dispatches_with_instance_and_rejects_traversal(self):
+        self.addCleanup(host.select, 0)
+        host.select(3)
+        args = SimpleNamespace(kind='example', arguments=['argument'], box=True, when=None, after=0)
+        with mock.patch.object(host.Path, 'is_file', return_value=True), \
+                mock.patch.object(host.Path, 'is_symlink', return_value=False), \
+                mock.patch.object(host.os, 'access', return_value=True), mock.patch.object(host, 'run') as run:
+            host.fault(args)
+            run.assert_called_once_with(Path(host.__file__).resolve().parent / 'faults/example',
+                                        '--instance', '3', '--box', 'argument')
+            args.kind = '../wall'
+            with self.assertRaises(SystemExit):
+                host.fault(args)
+        args.kind = 'does-not-exist'
+        with self.assertRaises(SystemExit):
+            host.fault(args)
+
+    def test_every_command_accepts_numbered_instance(self):
+        self.addCleanup(host.select, 0)
+        commands = [['install', '--build', '/new/build'], ['reset'], ['enter', 'true'],
+                    ['fault', 'clock', '0'], ['evidence', str(self.home / 'evidence')],
+                    ['prove', str(self.home / 'proof'), '/alternate'], ['list'], ['logout']]
+        for command in commands:
+            with self.subTest(command=command), mock.patch.object(host.sys, 'argv', ['wall', '--instance', '8', *command]), \
+                    mock.patch.object(host, 'require_root'), mock.patch.object(host, 'install'), \
+                    mock.patch.object(host, 'reset'), mock.patch.object(host, 'ssh'), \
+                    mock.patch.object(host, 'fault'), mock.patch.object(host, 'run'), \
+                    mock.patch.object(host, 'list_instances'), mock.patch.object(host, 'shared_auth'), \
+                    mock.patch.object(host.Path, 'write_text'):
+                host.main()
+                self.assertEqual(host.INSTANCE.number, 8)
 
     def test_reset_refuses_an_existing_shared_filesystem(self):
         base = self.home / 'base'
