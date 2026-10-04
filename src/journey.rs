@@ -453,12 +453,11 @@ fn stop_session(ctx: &Ctx, owned: &OwnedSession) -> Result<()> {
 // Herdr can drop the launch name while Pi's session hook still identifies the
 // same agent. Do not mistake that unnamed occupant for a foreign replacement.
 fn owned_coordinator(slug: &str, c: &project::Coordinator, a: &crate::herdr::Agent) -> bool {
-    crate::coordinator::agent_matches(c, a)
-        || (a.name.is_empty()
-            && crate::coordinator::agent_on_pane(c, a)
-            && a.agent == c.launch.kind
-            && a.tokens.get("project").is_some_and(|p| p == slug)
-            && a.tokens.get("thread").is_some_and(|t| t == "coordinator"))
+    crate::coordinator::agent_on_pane(c, a)
+        && (a.name.is_empty() || a.name == c.agent_name)
+        && a.agent == c.launch.kind
+        && a.tokens.get("project").is_some_and(|p| p == slug)
+        && a.tokens.get("thread").is_some_and(|t| t == "coordinator")
 }
 
 fn cleanup_effect(errors: &mut Vec<String>, name: &str, action: impl FnOnce() -> Result<()>) {

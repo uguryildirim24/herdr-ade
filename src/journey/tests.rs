@@ -379,6 +379,7 @@ struct Actor {
     pane: String,
     cwd: String,
     name: String,
+    tokens: std::collections::BTreeMap<String, String>,
     agent: bool,
     alive: bool,
     child: Child,
@@ -443,10 +444,8 @@ impl Runner for Lifecycle<'_> {
                         .unwrap();
                         if a.name.is_empty() {
                             entry["agent"] = "pi".into();
-                            entry["tokens"] = serde_json::json!({
-                                "project": "journey-deadline", "thread": "coordinator"
-                            });
                         }
+                        entry["tokens"] = serde_json::to_value(&a.tokens).unwrap();
                         entry.to_string()
                     } else {
                         pane_json(&a.workspace, &a.tab, &a.pane, &a.cwd)
@@ -514,6 +513,7 @@ fn actor(lane: &thread::Thread) -> Actor {
         pane: lane.pane_id.clone(),
         cwd: lane.cwd.clone(),
         name: lane.agent_name.clone(),
+        tokens: Default::default(),
         agent: true,
         alive: true,
         child: sleeper(),
@@ -654,8 +654,13 @@ fn deadline_shutdown(pending: bool) {
         tab: c.tab_id.clone(),
         pane: c.pane_id.clone(),
         cwd: c.cwd.clone(),
-        // A failed Pi open can lose its launch name, not its pane identity.
+        // A failed Pi open can lose its launch name, not its ownership tokens.
         name: String::new(),
+        tokens: [
+            ("project".into(), project.slug.clone()),
+            ("thread".into(), "coordinator".into()),
+        ]
+        .into(),
         agent: true,
         alive: true,
         child: sleeper(),
@@ -668,6 +673,7 @@ fn deadline_shutdown(pending: bool) {
         pane: "initial:p1".into(),
         cwd: c.cwd.clone(),
         name: String::new(),
+        tokens: Default::default(),
         agent: false,
         alive: true,
         child: sleeper(),
@@ -679,6 +685,7 @@ fn deadline_shutdown(pending: bool) {
         pane: "other:p1".into(),
         cwd: "/other-project".into(),
         name: "other-agent".into(),
+        tokens: Default::default(),
         agent: true,
         alive: true,
         child: sleeper(),
@@ -835,6 +842,190 @@ fn deadline_shutdown(pending: bool) {
     );
 }
 
+// Exercise actual coordinator::open twice. Only Herdr transport is scripted;
+// every spawned coordinator and the isolated server are real sleeper children.
+struct FailedSecondOpen<'a> {
+    lifecycle: &'a Lifecycle<'a>,
+    project: &'a Project,
+    starts: Cell<u32>,
+    claims: RefCell<std::collections::BTreeMap<String, std::collections::BTreeMap<String, String>>>,
+}
+impl Runner for FailedSecondOpen<'_> {
+    fn run(&self, cmd: &Cmd) -> Result<Output> {
+        let line = cmd.display();
+        if line.contains("report-metadata") {
+            // Ownership cannot expire during a five-minute readiness wait.
+            assert!(!cmd.args.iter().any(|a| a == "--ttl-ms"));
+            let pane = cmd.args[2].clone();
+            let mut claims = self.claims.borrow_mut();
+            let tokens = claims.entry(pane).or_default();
+            for pair in cmd.args.windows(2).filter(|pair| pair[0] == "--token") {
+                let (key, value) = pair[1].split_once('=').unwrap();
+                tokens.insert(key.into(), value.into());
+            }
+            return Ok(ok(r#"{"result":{}}"#));
+        }
+        if line.contains("workspace create") {
+            let n = self.starts.get() + 1;
+            return Ok(ok(&serde_json::json!({"result":{"root_pane":{
+                "workspace_id":format!("w{n}"), "tab_id":format!("w{n}:t1"), "pane_id":format!("w{n}:p1")
+            }}}).to_string()));
+        }
+        if line.contains("agent start") && cmd.args.iter().any(|a| a == "--pane") {
+            let n = self.starts.get() + 1;
+            self.starts.set(n);
+            let c = self.project.coordinator().unwrap();
+            let tokens = self
+                .claims
+                .borrow()
+                .get(&c.pane_id)
+                .cloned()
+                .unwrap_or_default();
+            self.lifecycle.actors.borrow_mut().push(Actor {
+                machine: String::new(),
+                workspace: c.workspace_id.clone(),
+                tab: c.tab_id.clone(),
+                pane: c.pane_id.clone(),
+                cwd: c.cwd.clone(),
+                name: String::new(),
+                tokens,
+                agent: true,
+                alive: true,
+                child: sleeper(),
+            });
+            if n == 2 {
+                return Ok(crate::runner::fake::fail(
+                    1,
+                    r#"{"error":{"code":"agent_name_not_found","message":"launch name released after spawn"}}"#,
+                ));
+            }
+            return Ok(ok(&serde_json::json!({"result":{"agent":{
+                "workspace_id":c.workspace_id,"tab_id":c.tab_id,"pane_id":c.pane_id,
+                "cwd":c.cwd,"agent":"pi","agent_status":"working"
+            }}})
+            .to_string()));
+        }
+        self.lifecycle.run(cmd)
+    }
+}
+
+#[test]
+fn failed_second_open_keeps_start_tokens_and_tears_down_every_spawned_process() {
+    let world = World::new();
+    std::fs::write(
+        world.ctx().config_dir.join("config.toml"),
+        "[routing]\ndefault = 'test_pi'\n[recipes.test_pi]\nkind = 'pi'\nprovider = 'opencode-go'\nargs = ['--provider', 'opencode-go', '--model', 'deepseek-v4.1-flash', '--thinking', 'high', '--no-skills']\n",
+    )
+    .unwrap();
+    world.runner.on("tab rename", ok(r#"{"result":{}}"#));
+    world.runner.on("tab list", ok(r#"{"result":{"tabs":[]}}"#));
+    world.runner.on(
+        "plugin pane open",
+        ok(r#"{"result":{"plugin_pane":{"pane":{"tab_id":"rundown"}}}}"#),
+    );
+    let project = project::create(&world.root, "journey-second-open", "", vec![]).unwrap();
+    own(&project);
+    let socket = world.home.path().join("second-open.sock");
+    std::fs::write(&socket, "owned incarnation").unwrap();
+    let session = OwnedSession {
+        name: format!("scratch-{}", project.slug),
+        inode: crate::ticker::socket_inode(&socket),
+        socket,
+    };
+    let server = sleeper();
+    let lifecycle = Lifecycle {
+        inner: &world.runner,
+        endpoint: Ctx {
+            runner: &RealRunner,
+            ..world.ctx()
+        },
+        actors: Rc::new(RefCell::new(Vec::new())),
+        session: session.clone(),
+        running: Cell::new(true),
+        server_pid: server.id(),
+        calls: RefCell::new(Vec::new()),
+    };
+    let runner = FailedSecondOpen {
+        lifecycle: &lifecycle,
+        project: &project,
+        starts: Cell::new(0),
+        claims: RefCell::new(Default::default()),
+    };
+    let ctx = Ctx {
+        runner: &runner,
+        ..world.ctx()
+    };
+    let options = crate::coordinator::OpenOptions {
+        session: crate::paths::SessionFlags {
+            socket: Some(session.socket.clone()),
+            session: None,
+        },
+        reprime: false,
+        rebind: false,
+        recipe: None,
+        recipe_basis: None,
+    };
+    crate::coordinator::open(&ctx, &project.slug, &options).unwrap();
+    let first = project.coordinator().unwrap();
+    crate::herdr::Herdr::new(ctx.env.herdr_bin(), &first.socket, &runner)
+        .tab_close(&first.tab_id)
+        .unwrap();
+    crate::coordinator::close(&ctx, &project.slug).unwrap();
+    let error = crate::coordinator::open(&ctx, &project.slug, &options).unwrap_err();
+    assert!(format!("{error:#}").contains("agent_name_not_found"));
+    assert_eq!(runner.starts.get(), 2);
+    assert_eq!(project.coordinator().unwrap().generation, 2);
+    let mut resources = RunResources {
+        server: Some(server),
+        session: Some(session),
+    };
+    let report = Report {
+        project: project.slug.clone(),
+        created: true,
+        ..Default::default()
+    };
+    let stopped = shutdown_failed_run(
+        &ctx,
+        &report,
+        &mut resources,
+        Instant::now() + Duration::from_secs(5),
+    );
+    // A counterfactual failure must not leak the regression's own server child.
+    if stopped.is_err() {
+        let server = resources.server.as_mut().unwrap();
+        let _ = server.kill();
+        let _ = server.wait();
+    }
+    stopped.unwrap();
+    assert!(!lifecycle.running.get());
+    assert!(
+        resources
+            .server
+            .as_mut()
+            .unwrap()
+            .try_wait()
+            .unwrap()
+            .is_some()
+    );
+    for actor in lifecycle.actors.borrow_mut().iter_mut() {
+        assert!(!actor.alive && actor.child.try_wait().unwrap().is_some());
+        assert_eq!(actor.tokens.get("project"), Some(&project.slug));
+        assert_eq!(
+            actor.tokens.get("thread").map(String::as_str),
+            Some("coordinator")
+        );
+    }
+    assert_eq!(
+        lifecycle
+            .calls
+            .borrow()
+            .iter()
+            .filter(|cmd| cmd.display().contains("session delete"))
+            .count(),
+        1
+    );
+}
+
 #[test]
 fn mac_seal_window_starts_at_launch_claim_not_placement() {
     let world = World::new();
@@ -951,8 +1142,13 @@ fn unnamed_coordinator_ownership_requires_its_launch_kind_and_project_tokens() {
     assert!(owned_coordinator(&project.slug, &c, &a));
     a.name = "foreign".into();
     assert!(!owned_coordinator(&project.slug, &c, &a));
-    a.name.clear();
+    a.name = c.agent_name.clone();
     a.tokens.clear();
+    assert!(
+        !owned_coordinator(&project.slug, &c, &a),
+        "even a matching name is not ownership"
+    );
+    a.name.clear();
     assert!(!owned_coordinator(&project.slug, &c, &a));
 }
 

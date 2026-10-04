@@ -787,6 +787,21 @@ impl<'a> Herdr<'a> {
         self.call(&args, CALL_TIMEOUT).map(|_| ())
     }
 
+    /// Ownership outlives readiness waits and ticker outages; unlike display
+    /// state, these tokens must not expire while the owned process is alive.
+    pub(crate) fn pane_claim_tokens(
+        &self,
+        pane: &str,
+        tokens: &[(&str, &str)],
+    ) -> Result<(), HerdrError> {
+        let pairs: Vec<String> = tokens.iter().map(|(k, v)| format!("{k}={v}")).collect();
+        let mut args = vec!["pane", "report-metadata", pane, "--source", SOURCE];
+        for pair in &pairs {
+            args.extend(["--token", pair]);
+        }
+        self.call(&args, CALL_TIMEOUT).map(|_| ())
+    }
+
     pub(crate) fn pane_clear_tokens(&self, pane: &str, names: &[&str]) -> Result<(), HerdrError> {
         let mut args = vec!["pane", "report-metadata", pane, "--source", SOURCE];
         for name in names {

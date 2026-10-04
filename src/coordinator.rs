@@ -270,6 +270,7 @@ fn recover_observed(
         state.intent = "start".into();
         save_recovery(project, &state)?;
         let spec = &record.launch;
+        claim_tokens(herdr, &project.slug, &record.pane_id)?;
         match herdr.agent_start_opts(&crate::herdr::AgentStart {
             name: &record.agent_name,
             kind: &spec.kind,
@@ -456,12 +457,16 @@ pub(crate) fn restore_agent_name(
     Ok(Some(agent.clone()))
 }
 
-pub(crate) fn report_tokens(herdr: &Herdr, slug: &str, pane_id: &str) {
-    let _ = herdr.pane_report_tokens(
+fn claim_tokens(herdr: &Herdr, slug: &str, pane_id: &str) -> Result<()> {
+    herdr.pane_claim_tokens(
         pane_id,
         &[("project", slug), ("thread", "coordinator"), ("rank", "0")],
-        TOKEN_TTL,
-    );
+    )?;
+    Ok(())
+}
+
+pub(crate) fn report_tokens(herdr: &Herdr, slug: &str, pane_id: &str) {
+    let _ = claim_tokens(herdr, slug, pane_id);
 }
 
 pub(crate) struct OpenOptions {
@@ -547,10 +552,10 @@ pub(crate) fn open(ctx: &Ctx, slug: &str, options: &OpenOptions) -> Result<()> {
             c.closed_by_rolf_at.clear();
             c.reopen_requested = false;
         })?;
+        claim_tokens(&herdr, slug, &record.pane_id)?;
         crate::hook::install(ctx, &project, &record.launch.kind, &record.pane_id)?;
         sync_label(&herdr, &record.workspace_id, &label);
         let _ = herdr.agent_focus(&record.pane_id);
-        report_tokens(&herdr, slug, &record.pane_id);
         crate::rundown::ensure_tab(&herdr, &record.workspace_id, &ctx.root, slug, &label)?;
         if options.reprime
             && let Err(error) = deliver_or_defer(&project, &herdr, record, &agent, &prompt, true)
@@ -712,6 +717,11 @@ pub(crate) fn open(ctx: &Ctx, slug: &str, options: &OpenOptions) -> Result<()> {
         }
     })?;
 
+    // Establish ownership before any launch can spawn a process, including
+    // reopen after close. A failed/killed readiness call must leave the tokens
+    // that qualify this binding for teardown. Failure to claim starts no agent.
+    claim_tokens(&herdr, slug, &record.pane_id)?;
+
     // Preserve the old pane as the ticker's re-link trigger. A fresh project
     // has no existing lanes to carry; reopening a closed binding may have
     // lanes even though the old coordinator record was cleared.
@@ -754,7 +764,6 @@ pub(crate) fn open(ctx: &Ctx, slug: &str, options: &OpenOptions) -> Result<()> {
             record.pane_id
         ),
     }
-    report_tokens(&herdr, slug, &record.pane_id);
     crate::rundown::ensure_tab(&herdr, &record.workspace_id, &ctx.root, slug, &label)?;
     drop(binding);
     ticker::start(ctx)?;
