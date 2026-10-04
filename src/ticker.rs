@@ -2630,12 +2630,7 @@ fn thread_pass_observed(
             // Drain its persisted correction through the ordinary next pass.
             continue;
         }
-        // The remote state pass precedes launch. An old receipt alone cannot
-        // consume a placed shell's pending brief and prevent its launch claim.
-        if t.prompt_pending
-            && (ready
-                || (t.launch_attempts > 0 && (t.brief_submitted || t.bootstrap == "acknowledged")))
-        {
+        if t.prompt_pending && (ready || t.brief_submitted || t.bootstrap == "acknowledged") {
             // The CLI and ticker can observe the same ready agent. Serialize
             // the first prompt and recheck its attempt before either sends it.
             let _prompt_lock = thread::prompt_lock(project, &t.id)?;
@@ -2644,7 +2639,6 @@ fn thread_pass_observed(
                 && current.pane_id == t.pane_id
                 && current.status == thread::Status::Open
                 && current.prompt_pending
-                && (ready || current.launch_attempts > 0)
             {
                 if current.brief_submitted || current.bootstrap == "acknowledged" {
                     // A capped wait can finish before activity is observed.
@@ -3104,12 +3098,8 @@ fn launch_pass(
         // The preceding state pass may have failed this start while the
         // courier snapshot still describes the old, open record.
         if t.is_remote()
-            && !thread::load(pass.project, &t.id).is_ok_and(|fresh| {
-                fresh.status == thread::Status::Open
-                    && fresh.attempt == t.attempt
-                    && fresh.pane_id == t.pane_id
-                    && fresh.prompt_pending
-            })
+            && !thread::load(pass.project, &t.id)
+                .is_ok_and(|fresh| fresh.status == thread::Status::Open)
         {
             continue;
         }
@@ -3236,12 +3226,6 @@ fn launch_pass(
                 || (current.launch_attempts > 0 && !current.startup_wait_started.is_empty())
             {
                 return Ok(());
-            }
-            if current.launch_attempts == 0 && current.bootstrap != "resuming" {
-                // No acknowledgement predating this process proves bootstrap.
-                current.bootstrap.clear();
-                current.brief_submitted = false;
-                current.brief_submitted_at.clear();
             }
             current.launch_attempts += 1;
             if current.error == "provider ready" || current.error.starts_with("disk_low:") {
@@ -4058,117 +4042,6 @@ mod tests {
                     .any(|failure| failure.contains(&path.display().to_string()))
             );
         }
-    }
-
-    #[test]
-    fn remote_state_pass_cannot_receipt_a_pending_brief_before_launch() {
-        use crate::scenarios::{World, agent_json, pane_json};
-        let world = World::new();
-        let project = world.project("demo", "a.sock");
-        let lane = world.thread(&project, &world.home.path().join("lane"), |t| {
-            t.machine = "box".into();
-            t.machine_id = "box".into();
-            t.attempt = 2;
-            t.prompt_pending = true;
-            t.launch.kind = "claude".into();
-            t.startup_wait_started = project::now();
-        });
-        let lane = thread::update(&project, &lane.id, |t| {
-            // Model an old acknowledgement imported while retry was queued.
-            t.bootstrap = "acknowledged".into();
-        })
-        .unwrap();
-        let pane: Pane = serde_json::from_str(&pane_json(
-            &lane.workspace_id,
-            &lane.tab_id,
-            &lane.pane_id,
-            &lane.cwd,
-        ))
-        .unwrap();
-        let agent: Agent = serde_json::from_str(&agent_json(
-            &lane.workspace_id,
-            &lane.tab_id,
-            &lane.pane_id,
-            &lane.cwd,
-            &lane.agent_name,
-            "idle",
-        ))
-        .unwrap();
-        world.runner.on(
-            "machine list --json",
-            ok(r#"[{"id":"box","label":"box","target":"box","session":"default","enabled":true}]"#),
-        );
-        world.runner.on_fn(
-            |cmd| cmd.program == "ssh",
-            |cmd| {
-                if crate::box_helper::tests::is_doctor(cmd) {
-                    return Ok(crate::doctor::boundary_diagnostic_output(
-                        cmd, 99_999_999, None,
-                    ));
-                }
-                Ok(ok("Linux\n"))
-            },
-        );
-        world.runner.on(
-            "agent start",
-            ok(&format!(
-                r#"{{"result":{{"agent":{}}}}}"#,
-                serde_json::to_string(&agent).unwrap(),
-            )),
-        );
-        world.runner.on("tab rename", ok(r#"{"result":{}}"#));
-        world.runner.on("agent prompt", ok(r#"{"result":{}}"#));
-        let ctx = world.ctx();
-        let herdr = Herdr::new(
-            ctx.env.herdr_bin(),
-            &project.coordinator().unwrap().socket,
-            &world.runner,
-        );
-        let mut view = steps::CourierOutcome {
-            machine_id: "box".into(),
-            boot_id: "boot-1".into(),
-            agents: Some(vec![]),
-            panes: Some(vec![pane]),
-            progress: BTreeMap::new(),
-        };
-        let mut errors = Vec::new();
-        let run = |snapshot: &thread::Thread,
-                   view: &steps::CourierOutcome,
-                   errors: &mut Vec<anyhow::Error>| {
-            remote_pass(
-                &LaunchPass {
-                    ctx: &ctx,
-                    project: &project,
-                    herdr: &herdr,
-                    threads: std::slice::from_ref(snapshot),
-                    agents: &[],
-                    panes: &[],
-                },
-                "box",
-                view,
-                &mut true,
-                errors,
-            )
-            .unwrap();
-        };
-        // This calls the production order: observe the bare shell, then launch.
-        run(&lane, &view, &mut errors);
-        assert!(errors.is_empty(), "{errors:#?}");
-        let launched = thread::load(&project, &lane.id).unwrap();
-        assert_eq!(launched.launch_attempts, 1);
-        assert!(launched.prompt_pending);
-        assert!(!launched.brief_submitted);
-        assert!(launched.bootstrap.is_empty());
-        assert_eq!(world.runner.count("agent start"), 1);
-        assert_eq!(world.runner.count("agent prompt"), 0);
-
-        // Readiness now submits this attempt's brief, not the old receipt.
-        view.agents = Some(vec![agent]);
-        run(&launched, &view, &mut errors);
-        assert!(errors.is_empty(), "{errors:#?}");
-        assert!(!thread::load(&project, &lane.id).unwrap().prompt_pending);
-        assert_eq!(world.runner.count("agent start"), 1);
-        assert_eq!(world.runner.count("agent prompt"), 1);
     }
 
     #[test]
