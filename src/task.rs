@@ -477,6 +477,10 @@ pub(crate) fn drop_task(
         .iter()
         .map(|id| crate::thread::load(project, id))
         .collect::<Result<Vec<_>>>()?;
+    // Hold the same repository locks as review allocation and landing until
+    // cancellation, task retirement and lane retirement are durable.
+    let _operations = crate::review::task_drop_locks(ctx, &attempts)?;
+    crate::review::cancel_task_reviews(ctx, project, &attempts)?;
     let events = crate::events::checked(project)?;
     let reviews = crate::review::list(project)?;
     let task = update(project, id, |task| {
@@ -1206,6 +1210,11 @@ pub(crate) fn view_with_evidence(
         };
         return view;
     }
+    if lane.status == crate::thread::Status::Resolved && !lane.cancellation_reason.is_empty() {
+        view.state = State::Open;
+        view.next = "start a new attempt or drop the task".into();
+        return view;
+    }
     if let Some(seal) = crate::review::sealed(&evidence.events, lane) {
         view.state = State::Finished;
         view.next = if evidence.lane_done(lane) {
@@ -1247,11 +1256,7 @@ pub(crate) fn view_with_evidence(
     }
     if lane.status == crate::thread::Status::Resolved {
         view.state = State::Open;
-        view.next = if lane.cancellation_reason.is_empty() {
-            "lane ended without done; retry or attest its stored report".into()
-        } else {
-            "cancelled".into()
-        };
+        view.next = "lane ended without done; retry or attest its stored report".into();
     }
     view
 }

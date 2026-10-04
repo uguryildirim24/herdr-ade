@@ -1,0 +1,15 @@
+#!/usr/bin/env python3
+"""Permanent pile recovery regression, promoted from the live pile findings."""
+import argparse
+from pathlib import Path
+import subprocess
+
+parser = argparse.ArgumentParser()
+parser.add_argument('--instance', type=int, required=True, choices=range(1, 9))
+args = parser.parse_args()
+here = Path(__file__).resolve().parent
+command = ['sudo', '-n', str(here.parents[1] / 'wall'), '--instance', str(args.instance)]
+subprocess.run(command + ['reset'], check=True)
+result = subprocess.run(command + ['enter',
+    'python3 "$HOME/tools/regressions/D53/scenarios.py" cancel-projection'])
+raise SystemExit(result.returncode)

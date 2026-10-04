@@ -729,6 +729,15 @@ pub(crate) fn start(ctx: &Ctx, slug: &str, repo: Option<&str>) -> Result<Option<
     let pile = pending(&project, &row.path, &events, &reviewer_ids(&project)?);
     start_locked(ctx, &project, row, pile, &events)
 }
+/// Interrupted retirement must not put a dropped seal back in the pile.
+fn dropped_attempts(tasks: Vec<crate::task::Task>) -> std::collections::BTreeSet<String> {
+    tasks
+        .into_iter()
+        .filter(|task| !task.dropped.is_empty())
+        .flat_map(|task| task.attempts)
+        .collect()
+}
+
 fn start_locked(
     ctx: &Ctx,
     project: &Project,
@@ -736,6 +745,13 @@ fn start_locked(
     pile: Vec<Thread>,
     events: &[crate::contracts::Event],
 ) -> Result<Option<Review>> {
+    // Automatic allocation may have read its pile before acquiring the lock.
+    // Unreadable evidence still goes to a reviewer for diagnosis, not landing.
+    let dropped = dropped_attempts(crate::task::list_with_errors(project).0);
+    let pile: Vec<_> = pile
+        .into_iter()
+        .filter(|lane| !dropped.contains(&lane.id))
+        .collect();
     if pile.is_empty() {
         return Ok(None);
     }
@@ -2059,6 +2075,28 @@ fn land_with_install(
     review: &mut Review,
     install: impl FnOnce() -> Result<String>,
 ) -> Result<()> {
+    // The repository operation lock held by every landing caller also guards
+    // task drops. Revalidate on recovery too, including a pending publication.
+    let (tasks, errors) = crate::task::list_with_errors(project);
+    if let Some(error) = errors.into_iter().next() {
+        return Err(error);
+    }
+    let dropped = dropped_attempts(tasks);
+    for member in &review.members {
+        if dropped.contains(&member.thread) {
+            return Err(crate::refusal::error(
+                format!("{} task dropped during review", member.thread),
+                review.command(
+                    project,
+                    if review.fast_forward {
+                        "retry"
+                    } else {
+                        "cancel"
+                    },
+                ),
+            ));
+        }
+    }
     let git = Git::new(ctx.runner, &review.repo);
     let candidate = review
         .verdict
@@ -2326,6 +2364,40 @@ fn cancel_record_with_retention(
     review.phase = Phase::Cancelled;
     save(project, review)
 }
+/// Sorted repository locks serialize multi-repository drops without lock-order
+/// inversions. Keep them through the task's durable retirement boundary.
+pub(crate) fn task_drop_locks(ctx: &Ctx, attempts: &[Thread]) -> Result<Vec<OperationLock>> {
+    attempts
+        .iter()
+        .filter(|lane| !lane.repo.is_empty())
+        .map(|lane| repo_identity(&lane.repo))
+        .collect::<std::collections::BTreeSet<_>>()
+        .iter()
+        .map(|repo| operation_lock(ctx, &repo.to_string_lossy()))
+        .collect()
+}
+
+/// Cancel frozen membership before recording the drop. A landed review retains
+/// its ordinary recovery path and refuses cancellation before any task edit.
+pub(crate) fn cancel_task_reviews(ctx: &Ctx, project: &Project, attempts: &[Thread]) -> Result<()> {
+    for mut review in list(project)? {
+        if !review.phase.closed()
+            && review
+                .members
+                .iter()
+                .any(|member| attempts.iter().any(|lane| lane.id == member.thread))
+        {
+            cancel_record(
+                ctx,
+                project,
+                &mut review,
+                "member task dropped; rebuilding the pile",
+            )?;
+        }
+    }
+    Ok(())
+}
+
 pub(crate) fn cancel_for_diagnosis(ctx: &Ctx, project: &Project, id: &str) -> Result<()> {
     let record = load(project, id)?;
     let _lock = try_operation_lock(ctx, &record.repo)?
