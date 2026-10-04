@@ -100,7 +100,18 @@ pub(crate) fn display_name(name: &str, slug: &str) -> String {
 /// Callers retain their locks/revision guards. An error after rename means the
 /// complete new record is visible, but its persistence has not been acknowledged.
 pub(crate) fn write_atomic(path: &Path, contents: &[u8]) -> Result<()> {
-    write_atomic_with(path, contents, |io| io.run())
+    write_atomic_with(path, contents, None, |io| io.run())
+}
+
+/// Read-modify-write callers retain their lock and the exact bytes they read.
+/// Recheck after staging/syncing, so an interrupted record is not overwritten
+/// by the earlier successful read.
+pub(crate) fn write_atomic_if_unchanged(
+    path: &Path,
+    contents: &[u8],
+    expected: &[u8],
+) -> Result<()> {
+    write_atomic_with(path, contents, Some(expected), |io| io.run())
 }
 
 // Keep the real persistence sequence injectable without replacing its ordering.
@@ -125,6 +136,7 @@ impl ReplaceIo<'_> {
 fn write_atomic_with(
     path: &Path,
     contents: &[u8],
+    expected: Option<&[u8]>,
     mut io: impl FnMut(ReplaceIo<'_>) -> std::io::Result<()>,
 ) -> Result<()> {
     let dir = path.parent().context("path has no parent")?;
@@ -132,6 +144,14 @@ fn write_atomic_with(
     let result = (|| -> Result<()> {
         io(ReplaceIo::Write(&mut file, contents))?;
         io(ReplaceIo::FileSync(&file))?;
+        if let Some(expected) = expected {
+            let current = std::fs::read(path)?;
+            anyhow::ensure!(
+                current == expected,
+                "record_changed: {} changed during the update; replacement not published",
+                path.display()
+            );
+        }
         io(ReplaceIo::Rename(&tmp, path))?;
         io(ReplaceIo::DirectorySync(dir))?;
         Ok(())

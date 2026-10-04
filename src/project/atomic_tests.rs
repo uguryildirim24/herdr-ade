@@ -20,7 +20,7 @@ fn success_acknowledges_only_write_file_sync_rename_directory_sync() {
     let path = dir.path().join("record.json");
     std::fs::write(&path, OLD).unwrap();
     let mut completed = Vec::new();
-    let result = write_atomic_with(&path, NEW, |io| {
+    let result = write_atomic_with(&path, NEW, None, |io| {
         let name = stage(&io);
         if name == "directory-sync" {
             // Rename has already published a complete record, not an empty file.
@@ -50,7 +50,7 @@ fn each_persistence_failure_is_explicit_and_reopen_never_reads_partial_bytes() {
                 std::fs::write(&path, OLD).unwrap();
             }
             let mut attempted = Vec::new();
-            let result = write_atomic_with(&path, NEW, |io| {
+            let result = write_atomic_with(&path, NEW, None, |io| {
                 let name = stage(&io);
                 attempted.push(name);
                 if name == *failure {
@@ -101,7 +101,7 @@ fn competing_locked_writers_use_distinct_temp_names_and_complete_records() {
                 barrier.wait();
                 let _lock = lock_file(lock).unwrap();
                 let bytes = serde_json::to_vec(&serde_json::json!({"writer": writer})).unwrap();
-                write_atomic_with(path, &bytes, |io| {
+                write_atomic_with(path, &bytes, None, |io| {
                     if let ReplaceIo::Rename(tmp, destination) = &io {
                         assert_eq!(*destination, path);
                         assert_eq!(tmp.parent(), path.parent());
@@ -206,4 +206,38 @@ fn historical_state_plan_roundtrip_keeps_records_and_done_counts() {
     let after = crate::plan::load(&reopened).unwrap().unwrap();
     assert_eq!(after, before);
     assert_eq!(count(&after), 1);
+}
+
+#[test]
+fn d30_record_damage_during_replacement_sync_is_not_overwritten() {
+    for damage in [Some(b"{invalid wall record\n".as_slice()), None] {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("t-0001.toml");
+        std::fs::write(&path, OLD).unwrap();
+        let result = write_atomic_with(&path, NEW, Some(OLD), |io| {
+            let sync = matches!(io, ReplaceIo::FileSync(_));
+            io.run()?;
+            if sync {
+                // The replacement is complete and synced, but not published.
+                if let Some(bytes) = damage {
+                    std::fs::write(&path, bytes)?;
+                } else {
+                    std::fs::remove_file(&path)?;
+                }
+            }
+            Ok(())
+        });
+        let error = format!("{:#}", result.unwrap_err());
+        assert!(error.contains(&path.display().to_string()), "{error}");
+        if let Some(bytes) = damage {
+            assert_eq!(std::fs::read(&path).unwrap(), bytes);
+        } else {
+            assert!(!path.exists(), "deleted record was resurrected");
+        }
+        // Refusal also removes the staged replacement, not the damaged record.
+        assert_eq!(
+            std::fs::read_dir(dir.path()).unwrap().count(),
+            usize::from(damage.is_some())
+        );
+    }
 }

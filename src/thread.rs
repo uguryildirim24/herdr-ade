@@ -385,6 +385,10 @@ pub(crate) fn report_reference(project: &Project, thread: &Thread) -> Option<Str
 }
 
 pub(crate) fn load(project: &Project, id: &str) -> Result<Thread> {
+    read_record(project, id).map(|(record, _)| record)
+}
+
+fn read_record(project: &Project, id: &str) -> Result<(Thread, String)> {
     validate_id(id)?;
     let path = record_path(project, id);
     #[cfg(test)]
@@ -413,7 +417,7 @@ pub(crate) fn load(project: &Project, id: &str) -> Result<Thread> {
         });
         record.cleanup_reason.clear();
     }
-    Ok(record)
+    Ok((record, text))
 }
 
 pub(crate) fn list_with_errors(project: &Project) -> (Vec<Thread>, Vec<anyhow::Error>) {
@@ -589,7 +593,7 @@ pub(crate) fn update_checked(
     change: impl FnOnce(&mut Thread) -> Result<()>,
 ) -> Result<Thread> {
     let _lock = project.lock()?;
-    let mut thread = load(project, id)?;
+    let (mut thread, expected) = read_record(project, id)?;
     let before = thread.clone();
     change(&mut thread)?;
     if thread.attempt != before.attempt || thread.pane_id != before.pane_id {
@@ -654,7 +658,11 @@ pub(crate) fn update_checked(
         }
     }
     thread.updated = project::now();
-    write_record(project, &thread)?;
+    project::write_atomic_if_unchanged(
+        &record_path(project, id),
+        toml::to_string(&thread)?.as_bytes(),
+        expected.as_bytes(),
+    )?;
     Ok(thread)
 }
 
@@ -2017,6 +2025,49 @@ mod tests {
                 .line
                 .contains("follow-up 2 was not delivered")
         );
+    }
+
+    #[test]
+    fn d30_update_preserves_a_lane_damaged_after_its_read() {
+        for damaged in ["{invalid wall record\n", "id = \"cut", ""] {
+            let world = crate::scenarios::World::new();
+            let project = world.project("demo", "a.sock");
+            let lane = world.thread(&project, world.home.path(), |t| {
+                t.status = Status::Open;
+                t.brief_submitted = true;
+                t.prompt_pending = false;
+                t.last_state = "idle".into();
+            });
+            let path = record_path(&project, &lane.id);
+            // Pause an observation writer after its successful read, then
+            // interrupt the on-disk record before it publishes its replacement.
+            let result = update_checked(&project, &lane.id, |t| {
+                std::fs::write(&path, damaged)?;
+                t.last_state = "working".into();
+                Ok(())
+            });
+            let actual = std::fs::read_to_string(&path).unwrap();
+            println!(
+                "EXPECTED: damaged lane bytes retained, writer fails; ACTUAL: writer_ok={}, record={actual:?}",
+                result.is_ok()
+            );
+            assert!(result.is_err(), "writer replaced an unreadable lane");
+            assert!(format!("{:#}", result.unwrap_err()).contains(&path.display().to_string()));
+            assert_eq!(actual, damaged);
+            // A later recovery update cannot repair it from a stale snapshot.
+            assert!(update(&project, &lane.id, |t| t.recovery_pending = true).is_err());
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), damaged);
+            let view = crate::project_view::View::load(&world.ctx(), &project, None).unwrap();
+            let work = view
+                .sections
+                .iter()
+                .find(|s| s.name == "Current work")
+                .unwrap()
+                .render();
+            assert!(work.contains("Unreadable lane"), "{work}");
+            assert!(work.contains(&path.display().to_string()), "{work}");
+            assert!(!work.contains("[Working]"), "{work}");
+        }
     }
 
     #[test]
