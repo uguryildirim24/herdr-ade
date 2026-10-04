@@ -1,0 +1,29 @@
+#!/usr/bin/env python3
+"""Read interrupted records through real command surfaces, restoring each fixture."""
+import json
+from support import Sandbox, SETUP
+
+box = Sandbox()
+box.reset()
+box.guest(SETUP)
+paths = json.loads(box.guest('import json\nprint(json.dumps({k: str(next(state.glob(p)).relative_to(state)) for k,p in '+repr({
+    'thread':'threads/t-0001.toml', 'task':'tasks/*.toml', 'review':'reviews/*.toml',
+    'event':'events/*.toml', 'plan':'plan.toml', 'note':'notes/*.json',
+    'coordinator':'coordinator.json', 'inbox':'inbox/*.md', 'outbox':'notice-batch.json'})+'.items()}))').stdout)
+commands = {
+    'thread':['overview','wall','--json'], 'task':['task','list','wall','--json'],
+    'review':['overview','wall','--json'], 'event':['task','show','wall','job-0001','--json'],
+    'plan':['plan','show','wall','--json'], 'note':['context','wall','--peek','--json'],
+    'coordinator':['overview','wall','--json'], 'inbox':['inbox','list','wall','--json'],
+    'outbox':['context','wall','--peek','--json'],
+}
+for kind, path in paths.items():
+    original = json.loads(box.guest('import json\nprint(json.dumps((state/'+repr(path)+').read_text()))').stdout)
+    for condition in ['unreadable','truncated','empty']:
+        print('CASE', kind, condition, flush=True)
+        print('CASE', kind, condition, flush=True, file=box.log)
+        box.apply_condition(path, condition)
+        box.ha(*commands[kind], check=False)
+        box.guest('(state/'+repr(path)+').write_text('+repr(original)+')')
+box.evidence()
+print('Matrix complete: observations are in commands.log; this is coverage, not a PASS assertion.')

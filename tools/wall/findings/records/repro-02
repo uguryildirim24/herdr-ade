@@ -1,0 +1,24 @@
+#!/usr/bin/env python3
+"""R02: unreadable inbox notices must stay visible as unavailable evidence."""
+import json
+import sys
+from support import Sandbox, SETUP
+
+box = Sandbox()
+box.reset()
+box.guest(SETUP)
+items = json.loads(box.ha('inbox','list','wall','--json').stdout)['data']['items']
+assert len(items) == 1 and items[0]['kind'] == 'coordinator-draft', items
+path = 'inbox/' + items[0]['id'] + '.md'
+original = json.loads(box.guest('import json\nprint(json.dumps((state/'+repr(path)+').read_text()))').stdout)
+found = []
+for condition in ['unreadable','truncated','empty']:
+    box.guest('(state/'+repr(path)+').write_text('+repr(original)+')')
+    box.apply_condition(path, condition)
+    result = box.ha('inbox','list','wall','--json',check=False)
+    bug = result.returncode == 0 and json.loads(result.stdout)['data']['items'] == []
+    found.append(bug)
+    print('EXPECTED:', condition, 'notice remains visible as unreadable, or list fails with its path')
+    print('ACTUAL:', condition, 'R02 reproduced: successful empty inbox' if bug else 'R02 signature absent; see command result')
+box.evidence()
+sys.exit(1 if any(found) else 0)
