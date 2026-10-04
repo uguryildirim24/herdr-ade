@@ -1837,6 +1837,38 @@ fn journey_d22_needs_an_independent_review_while_the_later_lane_is_unsealed() {
 }
 
 #[test]
+fn journey_d22_starts_automatically_only_after_the_later_lane_exists() {
+    let fx = configured();
+    assert!(start(&fx.world.ctx(), "demo", None).unwrap().is_none());
+    let lock = try_operation_lock(&fx.world.ctx(), fx.repo.to_str().unwrap())
+        .unwrap()
+        .unwrap();
+    let (mac, _) = lane(&fx, 1);
+    let now = "2026-09-18T10:01:05Z".parse().unwrap();
+    tick_observed_at(&fx.world.ctx(), &fx.project, |_| true, now).unwrap();
+    assert!(list(&fx.project).unwrap().is_empty());
+    let (later, _) = lane_unsealed(&fx, 2);
+    thread::update(&fx.project, &later, |t| {
+        t.created = "2026-09-18T10:01:02Z".into()
+    })
+    .unwrap();
+    // Reuse the allocation-before-binding fixture; this is not a manual start.
+    let reviewer = fx.thread("pile reviewer");
+    thread::update(&fx.project, &reviewer, |t| {
+        t.role = "reviewer".into();
+        t.review_id = "review-1".into();
+        t.pane_id.clear();
+    })
+    .unwrap();
+    drop(lock);
+    tick_observed_at(&fx.world.ctx(), &fx.project, |_| true, now).unwrap();
+    let review = list(&fx.project).unwrap().remove(0);
+    assert_eq!(review.members.len(), 1);
+    assert_eq!(review.members[0].thread, mac);
+    assert!(crate::journey::independent_review(Some(&review), &later, false).unwrap());
+}
+
+#[test]
 fn post_install_observation_failure_reports_without_undoing_landing_facts_or_counts() {
     let fx = configured();
     lane(&fx, 1);

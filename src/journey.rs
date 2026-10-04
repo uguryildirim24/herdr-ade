@@ -917,6 +917,11 @@ fn run_steps(
     let mut mac = String::new();
     let mut mac_seal = String::new();
     let mut box_lane = String::new();
+    // Keep automatic review from winning the race before the later lane exists.
+    // Releasing the existing operation lock (not a manual review start) makes
+    // the ticker exercise D22 with an older seal AND an unsealed later lane.
+    let review_start_lock = crate::review::try_operation_lock(ctx, &repo.to_string_lossy())?
+        .context("journey review start lock busy")?;
     report.step("Mac lane seals", || {
         mac = start_lane(ctx, &slug, &repo, &small, "local", &mac_brief, &request)?;
         mac_seal = bounded_poll(deadline, "Mac seal", OBSERVE, || seal(&project, &mac))?;
@@ -943,6 +948,7 @@ fn run_steps(
                 lane.placement_reason
             );
         }
+        drop(review_start_lock);
         let review = bounded_poll(
             deadline,
             "automatic review must not wait for later box lane",
