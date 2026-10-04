@@ -380,14 +380,13 @@ pub(super) fn validate(cmd: &Cmd) -> Check {
     if args == ["--version"] || args == ["--help"] {
         return Ok(());
     }
-    if args
-        .iter()
-        .take_while(|arg| arg.as_str() != "--")
-        .any(|arg| matches!(arg.as_str(), "--help" | "-h"))
-    {
-        return Ok(());
-    }
     let command = args.get(..2).ok_or("missing herdr command")?;
+    if matches!(command[1].as_str(), "help" | "--help" | "-h") {
+        return one_of(
+            &command[0],
+            "agent pane workspace tab plugin session machine notification integration api status",
+        );
+    }
     let path = format!("{} {}", command[0], command[1]);
     args = &args[2..];
     let path = if matches!(
@@ -395,6 +394,9 @@ pub(super) fn validate(cmd: &Cmd) -> Check {
         "plugin pane" | "plugin action" | "plugin log"
     ) {
         let sub = args.first().ok_or("missing plugin subcommand")?;
+        if matches!(sub.as_str(), "help" | "--help" | "-h") {
+            return Ok(());
+        }
         let path = format!("{path} {sub}");
         args = &args[1..];
         path
@@ -454,6 +456,25 @@ pub(super) fn validate(cmd: &Cmd) -> Check {
         ),
         other => return Err(format!("unmodelled herdr contract: {other}")),
     };
+    // cli/spec.rs recognizes help immediately after a known command path,
+    // not inside literal positionals, option values or later invalid options.
+    if args
+        .first()
+        .is_some_and(|arg| matches!(arg.as_str(), "--help" | "-h"))
+    {
+        return Ok(());
+    }
+    // agent wait also has its own help branch after parsing earlier options.
+    if path == "agent wait"
+        && let Some(index) = args
+            .iter()
+            .enumerate()
+            .skip(1)
+            .find(|(_, arg)| matches!(arg.as_str(), "help" | "--help" | "-h"))
+            .map(|(index, _)| index)
+    {
+        args = &args[..index];
+    }
     let expanded;
     if matches!(path.as_str(), "pane read" | "pane wait-output") {
         expanded = args
@@ -886,6 +907,19 @@ mod tests {
             vec!["agent", "rename", "w1:p1", "two words"],
             vec!["agent", "prompt", "w1:p1", ""],
             vec!["agent", "prompt", "w1:p1", "text", "--timeout", "1"],
+            vec!["agent", "prompt", "w1:p1", "--help", "--timeout", "1"],
+            vec![
+                "agent",
+                "start",
+                "worker",
+                "--kind",
+                "pi",
+                "--pane",
+                "w1:p1",
+                "--timeout",
+                "1000",
+                "--help",
+            ],
             vec!["agent", "wait", "w1:p1", "--until", "starting"],
             vec!["agent", "wait", "w1:p1", "--timeout", "-1"],
             vec!["pane", "read", "w1:p1", "--source", "screen"],
@@ -1020,7 +1054,11 @@ mod tests {
                 "--timeout",
                 "0",
             ],
+            vec!["agent", "start", "--help"],
+            vec!["agent", "prompt", "w1:p1", "--help"],
             vec!["agent", "wait", "w1:p1", "--timeout", "0"],
+            vec!["agent", "wait", "w1:p1", "--timeout", "0", "--help"],
+            vec!["agent", "wait", "help", "--timeout", "0"],
             vec![
                 "agent",
                 "start",
