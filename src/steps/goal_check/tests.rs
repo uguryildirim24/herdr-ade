@@ -590,9 +590,10 @@ fn scoped_wait_survives_independent_work_and_replacement_then_answer_rechecks_on
     let answer_path = f.project.record_dir("requests").join("q-answer.json");
     let mut answer: serde_json::Value =
         serde_json::from_slice(&std::fs::read(&answer_path).unwrap()).unwrap();
-    answer["at"] = (jiff::Timestamp::now() + jiff::SignedDuration::from_secs(1))
-        .to_string()
-        .into();
+    answer["at"] = (crate::project::now().parse::<jiff::Timestamp>().unwrap()
+        + jiff::SignedDuration::from_secs(1))
+    .to_string()
+    .into();
     crate::project::write_json(&answer_path, &answer).unwrap();
     reconcile(&f.project, Some(&replacement), 50).unwrap();
     let answer_check = load(&f.project);
