@@ -125,6 +125,8 @@ struct DeleteIntent {
     topology: String,
     #[serde(default)]
     started: bool,
+    #[serde(default)]
+    sockets: BTreeMap<String, String>,
 }
 
 impl DeleteIntent {
@@ -135,7 +137,7 @@ impl DeleteIntent {
     }
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "action", rename_all = "snake_case")]
 enum DeleteStep {
     Workspace {
@@ -189,9 +191,46 @@ fn paths_overlap(a: &str, b: &str) -> bool {
     if a.is_empty() || b.is_empty() {
         return false;
     }
-    let a = std::fs::canonicalize(a).unwrap_or_else(|_| PathBuf::from(a));
-    let b = std::fs::canonicalize(b).unwrap_or_else(|_| PathBuf::from(b));
+    let a = canonical_target(Path::new(a));
+    let b = canonical_target(Path::new(b));
     a.starts_with(&b) || b.starts_with(&a)
+}
+
+// Resolve an existing ancestor too: a not-yet-created /var child still
+// overlaps its /private/var parent on macOS.
+fn canonical_target(path: &Path) -> PathBuf {
+    canonical_target_cached(path, &mut BTreeMap::new()).0
+}
+
+fn canonical_target_cached(
+    path: &Path,
+    cache: &mut BTreeMap<PathBuf, (PathBuf, bool)>,
+) -> (PathBuf, bool) {
+    if let Some(value) = cache.get(path) {
+        return value.clone();
+    }
+    let value = match (path.parent(), path.file_name()) {
+        (Some(parent), Some(name)) if parent != path && !parent.as_os_str().is_empty() => {
+            let (parent, exists) = canonical_target_cached(parent, cache);
+            let target = parent.join(name);
+            if exists {
+                match std::fs::canonicalize(&target) {
+                    Ok(target) => (target, true),
+                    Err(_) => (target, false),
+                }
+            } else {
+                // Descendants of an absent ancestor cannot exist. Cache only
+                // within this ownership observation, never across effects.
+                (target, false)
+            }
+        }
+        _ => match std::fs::canonicalize(path) {
+            Ok(path) => (path, true),
+            Err(_) => (path.to_path_buf(), false),
+        },
+    };
+    cache.insert(path.to_path_buf(), value.clone());
+    value
 }
 
 fn readable_threads(project: &Project) -> Result<Vec<thread::Thread>> {
@@ -255,20 +294,29 @@ fn other_ownership(ctx: &Ctx, slug: &str) -> Result<Vec<OtherProjectOwnership>> 
 }
 
 fn other_projects_using_repo(others: &[OtherProjectOwnership], repo: &Repo) -> Vec<String> {
+    let mut cache = BTreeMap::new();
+    let mut overlaps = |a: &str, b: &str| {
+        if a.is_empty() || b.is_empty() {
+            return false;
+        }
+        let a = canonical_target_cached(Path::new(a), &mut cache).0;
+        let b = canonical_target_cached(Path::new(b), &mut cache).0;
+        a.starts_with(&b) || b.starts_with(&a)
+    };
     others
         .iter()
         .filter(|owner| {
             owner.repos.iter().any(|candidate| {
-                paths_overlap(&candidate.path, &repo.path)
+                overlaps(&candidate.path, &repo.path)
                     || candidate
                         .box_path
                         .as_deref()
                         .zip(repo.box_path.as_deref())
-                        .is_some_and(|(a, b)| paths_overlap(a, b))
+                        .is_some_and(|(a, b)| overlaps(a, b))
             }) || owner.threads.iter().any(|record| {
-                paths_overlap(&record.repo, &repo.path)
+                overlaps(&record.repo, &repo.path)
                     || repo.box_path.as_deref().is_some_and(|box_path| {
-                        record.is_remote() && paths_overlap(&record.worktree_path, box_path)
+                        record.is_remote() && overlaps(&record.worktree_path, box_path)
                     })
             })
         })
@@ -277,20 +325,22 @@ fn other_projects_using_repo(others: &[OtherProjectOwnership], repo: &Repo) -> V
 }
 
 fn other_projects_using_path(others: &[OtherProjectOwnership], path: &Path) -> Vec<String> {
-    let path = path.to_string_lossy();
+    let mut cache = BTreeMap::new();
+    let path = canonical_target_cached(path, &mut cache).0;
+    let mut overlaps = |candidate: &Path| {
+        let candidate = canonical_target_cached(candidate, &mut cache).0;
+        candidate.starts_with(&path) || path.starts_with(&candidate)
+    };
     others
         .iter()
         .filter(|owner| {
             owner.repos.iter().any(|repo| {
-                paths_overlap(&repo.path, &path)
+                overlaps(Path::new(&repo.path))
                     || repo
                         .box_path
                         .as_deref()
-                        .is_some_and(|p| paths_overlap(p, &path))
-            }) || owner
-                .paths
-                .iter()
-                .any(|candidate| paths_overlap(&candidate.to_string_lossy(), &path))
+                        .is_some_and(|p| overlaps(Path::new(p)))
+            }) || owner.paths.iter().any(|candidate| overlaps(candidate))
         })
         .map(|owner| owner.slug.clone())
         .collect()
@@ -622,16 +672,13 @@ fn topology(ctx: &Ctx, project: &Project, threads: &[thread::Thread]) -> Result<
     });
     let mut targets = BTreeMap::new();
     for t in threads.iter().filter(|t| t.is_remote()) {
-        targets.insert(
+        let profile = remote::machine_profile(
+            ctx.runner,
+            &ctx.env.herdr_bin(),
+            &ctx.config_dir,
             t.machine_route(),
-            remote::machine_profile(
-                ctx.runner,
-                &ctx.env.herdr_bin(),
-                &ctx.config_dir,
-                t.machine_route(),
-            )?
-            .target,
-        );
+        )?;
+        targets.insert(t.machine_route(), (profile.target, profile.session));
     }
     let lanes: Vec<_> = threads
         .iter()
@@ -822,7 +869,10 @@ fn build_plan(ctx: &Ctx, project: &Project, github: bool) -> Result<DeleteIntent
         .cloned()
         .collect();
     let mut steps = Vec::new();
-    if let Some(c) = readable_coordinator(project)? {
+    let coordinator = readable_coordinator(project)?;
+    // Retiring a session also retires its lane terminals. Empty session
+    // bindings identify nothing and must never fall back to another server.
+    if let Some(c) = coordinator.as_ref().filter(|c| !c.socket.is_empty()) {
         let mut workspaces = BTreeSet::new();
         let mut tabs: BTreeSet<(String, String)> = BTreeSet::new();
         if !c.workspace_id.is_empty() {
@@ -883,9 +933,10 @@ fn build_plan(ctx: &Ctx, project: &Project, github: bool) -> Result<DeleteIntent
                 });
             }
         }
-    } else if threads
-        .iter()
-        .any(|t| !t.workspace_id.is_empty() || !t.tab_id.is_empty() || !t.pane_id.is_empty())
+    } else if coordinator.is_none()
+        && threads
+            .iter()
+            .any(|t| !t.workspace_id.is_empty() || !t.tab_id.is_empty() || !t.pane_id.is_empty())
     {
         bail!("cannot stop the project's lanes because it has no coordinator session record");
     }
@@ -1047,10 +1098,32 @@ fn build_plan(ctx: &Ctx, project: &Project, github: bool) -> Result<DeleteIntent
             .collect(),
         worktrees: threads.iter().map(|t| t.worktree_path.clone()).collect(),
         completed: BTreeSet::new(),
-        steps: Some(steps),
         topology: topology(ctx, project, &threads)?,
         started: false,
+        sockets: steps_sockets(ctx, &steps)?,
+        steps: Some(steps),
     })
+}
+
+fn check_server(
+    ctx: &Ctx,
+    project: &Project,
+    plan: &DeleteIntent,
+    socket: &str,
+    machine: &str,
+) -> Result<()> {
+    if terminal_gone(socket, machine)? {
+        return Ok(());
+    }
+    if let Some(expected) = plan.sockets.get(&terminal_key(socket, machine)) {
+        if terminal_identity(ctx, socket, machine)?.as_ref() != Some(expected) {
+            bail!("server identity changed: {socket}");
+        }
+    } else if topology(ctx, project, &readable_threads(project)?)? != plan.topology {
+        // Historical journals qualify a live terminal only by their topology.
+        bail!("cannot identify live server from stale deletion plan: {socket}");
+    }
+    Ok(())
 }
 
 fn check_step(ctx: &Ctx, project: &Project, plan: &DeleteIntent, step: &DeleteStep) -> Result<()> {
@@ -1060,12 +1133,18 @@ fn check_step(ctx: &Ctx, project: &Project, plan: &DeleteIntent, step: &DeleteSt
             socket,
             machine,
             id,
-        } => terminal_users(&others, socket, machine, id, true),
+        } => {
+            check_server(ctx, project, plan, socket, machine)?;
+            terminal_users(&others, socket, machine, id, true)
+        }
         DeleteStep::Tab {
             socket,
             machine,
             id,
-        } => terminal_users(&others, socket, machine, id, false),
+        } => {
+            check_server(ctx, project, plan, socket, machine)?;
+            terminal_users(&others, socket, machine, id, false)
+        }
         DeleteStep::Github { name, identity } => {
             if github_identity(ctx, name)? != *identity {
                 bail!("GitHub identity changed: {name}");
@@ -1132,12 +1211,170 @@ fn check_step(ctx: &Ctx, project: &Project, plan: &DeleteIntent, step: &DeleteSt
     Ok(())
 }
 
+fn render_plan(path: &Path, plan: &DeleteIntent) {
+    println!("Deletion plan: {}", path.display());
+    for (i, step) in plan
+        .steps
+        .as_ref()
+        .expect("validated plan")
+        .iter()
+        .enumerate()
+    {
+        println!(
+            "  {}: {step:?}{}",
+            i + 1,
+            if plan.completed.contains(&i.to_string()) {
+                " (completed)"
+            } else {
+                ""
+            }
+        );
+    }
+}
+
 fn deletion_path(root: &Path, slug: &str) -> PathBuf {
     root.join(".deletions").join(format!("{slug}.toml"))
 }
 
 fn save_plan(path: &Path, plan: &DeleteIntent) -> Result<()> {
     crate::project::write_atomic(path, toml::to_string(plan)?.as_bytes())
+}
+
+fn terminal_key(socket: &str, machine: &str) -> String {
+    if machine.is_empty() {
+        socket.into()
+    } else {
+        format!("machine:{machine}")
+    }
+}
+
+fn terminal_identity(ctx: &Ctx, socket: &str, machine: &str) -> Result<Option<String>> {
+    if machine.is_empty() {
+        file_identity(ctx, "", socket)
+    } else {
+        let profile =
+            remote::machine_profile(ctx.runner, &ctx.env.herdr_bin(), &ctx.config_dir, machine)?;
+        Ok(Some(serde_json::to_string(&(
+            profile.target,
+            profile.session,
+        ))?))
+    }
+}
+
+fn steps_sockets(ctx: &Ctx, steps: &[DeleteStep]) -> Result<BTreeMap<String, String>> {
+    let mut sockets = BTreeMap::new();
+    for step in steps {
+        if let DeleteStep::Workspace {
+            socket, machine, ..
+        }
+        | DeleteStep::Tab {
+            socket, machine, ..
+        } = step
+            && let Some(identity) = terminal_identity(ctx, socket, machine)?
+        {
+            sockets.insert(terminal_key(socket, machine), identity);
+        }
+    }
+    Ok(sockets)
+}
+
+fn terminal_gone(socket: &str, machine: &str) -> Result<bool> {
+    // Timeout isn't absence. Only a local absent socket or a refused
+    // connection proves this server cannot still own the terminal.
+    #[cfg(unix)]
+    if machine.is_empty() && Path::new(socket).is_absolute() {
+        use std::os::unix::fs::FileTypeExt;
+        match std::fs::symlink_metadata(socket) {
+            Ok(metadata) if !metadata.file_type().is_socket() => return Ok(false),
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(true),
+            Err(error) => return Err(error.into()),
+        }
+        match std::os::unix::net::UnixStream::connect(socket) {
+            Ok(_) => {}
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused
+                ) =>
+            {
+                return Ok(true);
+            }
+            Err(error) => return Err(error.into()),
+        }
+    }
+    Ok(false)
+}
+
+fn step_gone(ctx: &Ctx, step: &DeleteStep) -> Result<bool> {
+    match step {
+        DeleteStep::Workspace {
+            socket, machine, ..
+        }
+        | DeleteStep::Tab {
+            socket, machine, ..
+        } => terminal_gone(socket, machine),
+        DeleteStep::Trash { path, machine, .. } => Ok(file_identity(ctx, machine, path)?.is_none()),
+        DeleteStep::Prune { repo, machine, .. } => Ok(file_identity(ctx, machine, repo)?.is_none()),
+        DeleteStep::Github { .. } => Ok(false),
+    }
+}
+
+fn recover_plan(ctx: &Ctx, project: &Project, plan: &mut DeleteIntent) -> Result<()> {
+    // Recompute local/box targets without resolving already-deleted GitHub
+    // repositories. No fresh target may expand an interrupted deletion.
+    let current = build_plan(ctx, project, false)?;
+    let old = plan.steps.as_ref().expect("validated plan");
+    for step in current.steps.as_ref().expect("built plan") {
+        if step_gone(ctx, step)? {
+            continue;
+        }
+        if !old.contains(step) {
+            bail!(
+                "project resource bindings changed to a different live resource; refusing stale deletion plan: {step:?}"
+            );
+        }
+        if let DeleteStep::Workspace {
+            socket, machine, ..
+        }
+        | DeleteStep::Tab {
+            socket, machine, ..
+        } = step
+            && plan.sockets.get(&terminal_key(socket, machine))
+                != current.sockets.get(&terminal_key(socket, machine))
+        {
+            bail!("server identity changed; refusing stale deletion plan: {socket}");
+        }
+    }
+    for (i, step) in old.iter().enumerate() {
+        if plan.completed.contains(&i.to_string()) {
+            continue;
+        }
+        let retired = matches!(step, DeleteStep::Workspace { .. } | DeleteStep::Tab { .. })
+            && !current.steps.as_ref().expect("built plan").contains(step);
+        if !retired {
+            check_step(ctx, project, plan, step)?;
+        }
+        if retired || step_gone(ctx, step)? {
+            plan.completed.insert(i.to_string());
+        }
+    }
+    plan.topology = current.topology;
+    Ok(())
+}
+
+pub(crate) fn cancel_delete(ctx: &Ctx, slug: &str) -> Result<()> {
+    crate::project::validate_slug(slug)?;
+    let path = deletion_path(&ctx.root, slug);
+    std::fs::create_dir_all(path.parent().expect("journal directory"))?;
+    let _journal = crate::project::lock_file(&path.with_extension("lock"))?;
+    let plan: DeleteIntent = toml::from_str(&std::fs::read_to_string(&path)?)?;
+    if !plan.completed.is_empty() {
+        bail!("deletion has completed steps; resume it instead of cancelling");
+    }
+    std::fs::remove_file(&path)?;
+    println!("Cancelled deletion plan for `{slug}`; project remains archived if deletion started.");
+    Ok(())
 }
 
 /// Preview freezes exactly the steps execution will use. Execution keeps both
@@ -1210,8 +1447,8 @@ pub(crate) fn delete(ctx: &Ctx, slug: &str, delete_github: bool, preview: bool) 
         );
     }
     let mut plan = match saved {
-        // A fresh preview may replace an unstarted snapshot. Once effects have
-        // begun, even preview must render the frozen plan, never expand it.
+        // A fresh preview may replace a snapshot that has never started.
+        // Started journals are qualified against current resources below.
         Some(plan) if preview && !plan.started => build_plan(ctx, &project, delete_github)?,
         Some(plan) if plan.finished() => match plan.steps.as_ref().and_then(|steps| steps.last()) {
             Some(DeleteStep::Trash {
@@ -1229,7 +1466,30 @@ pub(crate) fn delete(ctx: &Ctx, slug: &str, delete_github: bool, preview: bool) 
         Some(plan) => plan,
         None => build_plan(ctx, &project, delete_github)?,
     };
-    let steps = plan.steps.as_ref().ok_or_else(|| anyhow::anyhow!("historical deletion intent has no identity-qualified execution plan; nothing was deleted"))?;
+    let changed = topology(ctx, &project, &readable_threads(&project)?)? != plan.topology;
+    if plan.started && !plan.finished() {
+        if plan.completed.is_empty() {
+            for step in plan.steps.as_ref().expect("validated plan") {
+                if !changed
+                    || !matches!(step, DeleteStep::Workspace { .. } | DeleteStep::Tab { .. })
+                {
+                    check_step(ctx, &project, &plan, step)?;
+                }
+            }
+            if changed {
+                recover_plan(ctx, &project, &mut plan)?;
+            }
+            // No effects were receipted: replace the old snapshot completely.
+            plan = build_plan(ctx, &project, delete_github)?;
+            println!("Replaced an unstarted plan for `{slug}` (no completed steps).");
+            render_plan(&path, &plan);
+        } else if changed {
+            recover_plan(ctx, &project, &mut plan)?;
+        }
+    } else if changed && !preview {
+        bail!("project resource bindings changed since preview; refusing stale deletion plan");
+    }
+    let steps = plan.steps.as_ref().expect("validated plan");
     if preview {
         save_plan(&path, &plan)?;
         println!("Archive keeps `{slug}` and its files available for unarchive.");
@@ -1254,9 +1514,6 @@ pub(crate) fn delete(ctx: &Ctx, slug: &str, delete_github: bool, preview: bool) 
             }
         );
         return Ok(());
-    }
-    if topology(ctx, &project, &readable_threads(&project)?)? != plan.topology {
-        bail!("project resource bindings changed since preview; refusing stale deletion plan");
     }
     // Preflight all remaining targets and trash tools before closing anything.
     let local_trash = Trash::local(ctx)?;
@@ -1286,6 +1543,12 @@ pub(crate) fn delete(ctx: &Ctx, slug: &str, delete_github: bool, preview: bool) 
         }
         let step = &plan.steps.as_ref().expect("checked")[i];
         check_step(ctx, &project, &plan, step)?;
+        if step_gone(ctx, step)? {
+            println!("skipped resource already gone: {step:?}");
+            plan.completed.insert(key);
+            save_plan(&path, &plan)?;
+            continue;
+        }
         match step {
             DeleteStep::Workspace {
                 socket,
@@ -2326,7 +2589,7 @@ mod tests {
     }
 
     #[test]
-    fn another_preview_can_refresh_unstarted_bindings_but_not_started_steps() {
+    fn another_preview_can_refresh_a_started_plan_without_completed_steps() {
         let world = World::new();
         let project = world.project("demo", "a.sock");
         delete(&world.ctx(), "demo", false, true).unwrap();
@@ -2344,10 +2607,227 @@ mod tests {
         std::fs::create_dir_all(&later).unwrap();
         world.add_repo(&project, later.to_str().unwrap());
         delete(&world.ctx(), "demo", false, true).unwrap();
-        assert_eq!(
+        assert_ne!(
             serde_json::to_value(persisted(&world, "demo").steps).unwrap(),
             serde_json::to_value(refreshed.steps).unwrap()
         );
+    }
+
+    #[test]
+    fn started_without_effects_replans_after_the_binding_is_retired() {
+        let mut world = World::new();
+        let project = world.project("demo", "a.sock");
+        world.runner = crate::runner::fake::FakeRunner::new();
+        mock_trash(&world);
+        world.runner.on(
+            "workspace close",
+            crate::runner::fake::fail(1, "fixture stop failure"),
+        );
+        assert!(delete(&world.ctx(), "demo", false, false).is_err());
+        let old = persisted(&world, "demo");
+        assert!(old.started && old.completed.is_empty());
+        project
+            .update_coordinator(|c| {
+                c.socket.clear();
+                c.workspace_id.clear();
+                c.tab_id.clear();
+                c.pane_id.clear();
+            })
+            .unwrap();
+        delete(&world.ctx(), "demo", false, false).unwrap();
+        let new = persisted(&world, "demo");
+        assert_ne!(old.topology, new.topology);
+        assert!(new.finished());
+        assert_eq!(world.runner.count("workspace close"), 1);
+    }
+
+    #[test]
+    fn partial_plan_resumes_when_its_server_and_binding_are_gone() {
+        let world = World::new();
+        let project = world.project("demo", "a.sock");
+        world.thread(&project, world.home.path(), |t| t.worktree_path.clear());
+        let first = world.home.path().join("first");
+        let second = world.home.path().join("second");
+        for path in [&first, &second] {
+            std::fs::create_dir_all(path).unwrap();
+            world.add_repo(&project, path.to_str().unwrap());
+        }
+        delete(&world.ctx(), "demo", false, true).unwrap();
+        let mut plan = persisted(&world, "demo");
+        plan.started = true;
+        let completed = plan.steps.as_ref().unwrap().iter().position(|s|
+            matches!(s, DeleteStep::Trash { path, .. } if same_path(path, first.to_str().unwrap()))
+        ).unwrap();
+        plan.completed.insert(completed.to_string());
+        save_plan(&deletion_path(&world.root, "demo"), &plan).unwrap();
+        std::fs::remove_dir(&first).unwrap();
+        std::fs::remove_file(&project.coordinator().unwrap().socket).unwrap();
+        // A retained workspace on an absent server must also be skipped.
+        mock_trash(&world);
+        delete(&world.ctx(), "demo", false, true).unwrap();
+        let resumed = persisted(&world, "demo");
+        assert!(resumed.completed.contains(&completed.to_string()));
+        assert!(resumed.completed.contains("0"));
+        project
+            .update_coordinator(|c| {
+                c.socket.clear();
+                c.workspace_id.clear();
+                c.tab_id.clear();
+                c.pane_id.clear();
+            })
+            .unwrap();
+        delete(&world.ctx(), "demo", false, false).unwrap();
+        assert!(persisted(&world, "demo").finished());
+        assert_eq!(trashed(&world, &first), 0);
+        assert_eq!(trashed(&world, &second), 1);
+        assert_eq!(world.runner.count("workspace close"), 0);
+    }
+
+    #[test]
+    fn started_plans_refuse_a_different_live_binding() {
+        for partial in [false, true] {
+            let world = World::new();
+            let project = world.project("demo", "a.sock");
+            let repo = world.home.path().join("repo");
+            std::fs::create_dir_all(&repo).unwrap();
+            world.add_repo(&project, repo.to_str().unwrap());
+            delete(&world.ctx(), "demo", false, true).unwrap();
+            let mut plan = persisted(&world, "demo");
+            plan.started = true;
+            if partial {
+                plan.completed.insert("1".into());
+            }
+            save_plan(&deletion_path(&world.root, "demo"), &plan).unwrap();
+            project
+                .update_coordinator(|c| {
+                    c.workspace_id = "w9".into();
+                    c.tab_id = "w9:t1".into();
+                    c.pane_id = "w9:p1".into();
+                })
+                .unwrap();
+            mock_trash(&world);
+            assert!(
+                delete(&world.ctx(), "demo", false, false)
+                    .unwrap_err()
+                    .to_string()
+                    .contains("different live resource")
+            );
+            assert_eq!(world.runner.count("workspace close"), 0);
+            assert_eq!(trash_calls(&world), 0);
+            assert_eq!(persisted(&world, "demo").completed, plan.completed);
+        }
+    }
+
+    #[test]
+    fn a_changed_box_target_or_session_refuses_the_old_terminal_ids() {
+        for change in ["target = \"elsewhere\"", "session = \"other-session\""] {
+            let world = World::new();
+            let project = world.project("demo", "a.sock");
+            world.thread(&project, world.home.path(), |t| {
+                t.machine = "box".into();
+                t.worktree_path.clear();
+            });
+            world.runner.on("machine list", ok("[]"));
+            delete(&world.ctx(), "demo", false, true).unwrap();
+            let mut plan = persisted(&world, "demo");
+            plan.started = true;
+            save_plan(&deletion_path(&world.root, "demo"), &plan).unwrap();
+            let config = world.home.path().join("cfg/config.toml");
+            let text = std::fs::read_to_string(&config).unwrap();
+            let from = if change.starts_with("target") {
+                "target = \"box\""
+            } else {
+                "session = \"default\""
+            };
+            std::fs::write(config, text.replace(from, change)).unwrap();
+            mock_trash(&world);
+            assert!(
+                delete(&world.ctx(), "demo", false, false)
+                    .unwrap_err()
+                    .to_string()
+                    .contains("server identity changed")
+            );
+            assert_eq!(world.runner.count("workspace close"), 0);
+            assert_eq!(trash_calls(&world), 0);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_replaced_live_server_is_not_closed_by_its_old_terminal_ids() {
+        let world = World::new();
+        let project = world.project("demo", "a.sock");
+        let socket = world.home.path().join("a.sock");
+        std::fs::remove_file(&socket).unwrap();
+        let original = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+        delete(&world.ctx(), "demo", false, true).unwrap();
+        let mut plan = persisted(&world, "demo");
+        plan.started = true;
+        save_plan(&deletion_path(&world.root, "demo"), &plan).unwrap();
+        std::fs::rename(&socket, world.home.path().join("original.sock")).unwrap();
+        let _replacement = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+        mock_trash(&world);
+        assert!(
+            delete(&world.ctx(), "demo", false, false)
+                .unwrap_err()
+                .to_string()
+                .contains("server identity changed")
+        );
+        assert_eq!(world.runner.count("workspace close"), 0);
+        assert_eq!(trash_calls(&world), 0);
+        assert!(project.dir().exists());
+        drop(original);
+    }
+
+    #[test]
+    fn cancel_drops_only_a_plan_without_completed_steps() {
+        let world = World::new();
+        let project = world.project("demo", "a.sock");
+        delete(&world.ctx(), "demo", false, true).unwrap();
+        let mut plan = persisted(&world, "demo");
+        plan.started = true;
+        save_plan(&deletion_path(&world.root, "demo"), &plan).unwrap();
+        project.set_status(Status::Archived).unwrap();
+        cancel_delete(&world.ctx(), "demo").unwrap();
+        assert!(!deletion_path(&world.root, "demo").exists());
+        assert!(project.dir().exists());
+        assert_eq!(project.status(), Status::Archived);
+        save_plan(&deletion_path(&world.root, "demo"), &plan).unwrap();
+        plan.completed.insert("0".into());
+        save_plan(&deletion_path(&world.root, "demo"), &plan).unwrap();
+        assert!(
+            cancel_delete(&world.ctx(), "demo")
+                .unwrap_err()
+                .to_string()
+                .contains("completed steps")
+        );
+        assert!(deletion_path(&world.root, "demo").exists());
+        assert_eq!(trash_calls(&world), 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_stopped_server_socket_is_skipped_and_alias_children_overlap() {
+        let world = World::new();
+        let socket = world.home.path().join("stopped.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+        assert!(!terminal_gone(socket.to_str().unwrap(), "").unwrap());
+        drop(listener);
+        // Concurrent spawn tests may briefly inherit a descriptor between
+        // fork and exec. Wait for the socket's actual shutdown, not just Drop.
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while !terminal_gone(socket.to_str().unwrap(), "").unwrap() {
+            assert!(std::time::Instant::now() < deadline);
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let parent = world.home.path().join("parent");
+        let alias = world.home.path().join("alias");
+        std::fs::create_dir(&parent).unwrap();
+        std::os::unix::fs::symlink(&parent, &alias).unwrap();
+        assert!(paths_overlap(
+            alias.join("missing-child").to_str().unwrap(),
+            parent.to_str().unwrap()
+        ));
     }
 
     #[test]
