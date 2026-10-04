@@ -16,6 +16,19 @@ function validatePolicy() {
   if (![policy.cwd, policy.root, policy.state, policy.ade].every((value) => typeof value === 'string' && path.isAbsolute(value)) || !policy.branch) throw new Error('execution_policy_invalid: missing absolute binding');
 }
 
+// A scratch ADE root under /tmp could otherwise be recreated in the private
+// tmpfs: harmless to the host, but falsely reported as a successful control
+// write. Refuse control-root destinations explicitly; namespace isolation is
+// still the enforcement boundary for symlinks and all ordinary tool effects.
+export function validateMutationPath(filename) {
+  const target = path.resolve(policy.cwd, filename);
+  const inside = (base) => {
+    const relative = path.relative(base, target);
+    return relative === '' || (!path.isAbsolute(relative) && relative !== '..' && !relative.startsWith('..' + path.sep));
+  };
+  if (inside(policy.root) && !inside(policy.cwd)) throw new Error('execution_control_write_denied: ADE control records are not lane files');
+}
+
 function setup() {
   if (initialized) return;
   validatePolicy();
@@ -116,16 +129,41 @@ export async function seal(action, reason, signal) {
 
 export default function (pi) {
   validatePolicy();
-  // --no-tools starts with NOTHING active, even if this extension cannot load.
-  // Only the successfully loaded backend activates tools; no builtin fallback.
-  pi.on('session_start', () => { pi.setActiveTools(['bash', 'ade']); });
-  pi.on('tool_call', (event) => !['bash', 'ade'].includes(event.toolName) ? { block: true, reason: 'tool has no isolated backend' } : undefined);
+  // --no-builtin-tools starts with host tools INACTIVE even if we cannot load.
+  // --no-tools would prevent activating extension tools too (Pi 0.99.1).
+  const names = ['bash', 'read', 'write', 'edit', 'ade'];
+  pi.registerFlag('ade-execution-probe', { description: 'Report bounded CLI tool provenance without a model request', type: 'boolean', default: false });
+  pi.on('session_start', (_event, ctx) => {
+    pi.setActiveTools(names);
+    if (pi.getFlag('ade-execution-probe')) {
+      // Run after all trusted session_start handlers, so the observed loadout is
+      // what the first turn would actually see, not just our requested names.
+      setImmediate(() => {
+        const active = pi.getActiveTools();
+        const tools = pi.getAllTools().filter(tool => active.includes(tool.name));
+        console.error('ADE_BOUNDARY_TOOLS=' + JSON.stringify(tools.map(tool => ({ name: tool.name, source: tool.sourceInfo }))));
+        ctx.shutdown();
+      });
+    }
+  });
+  pi.on('tool_call', (event) => !names.includes(event.toolName) ? { block: true, reason: 'tool has no isolated backend' } : undefined);
   pi.registerTool({ name: 'bash', label: 'bash (isolated)', description: `Run shell/file/build commands in the lane filesystem boundary. No host credentials. Tool network ${policy.network === 'allowed' ? 'allowed' : 'denied'}. Use ade for skill/sealing, not ha in bash.`,
     parameters: Type.Object({ command: Type.String(), timeout: Type.Optional(Type.Number()) }),
     async execute(_id, params, signal) { return text(await runSandbox(['/bin/bash', '--noprofile', '--norc', '-c', params.command], signal, params.timeout)); } });
-  pi.registerTool({ name: 'ade', label: 'ADE authorized seal', description: 'Bound lane skill or ha done/waiting/failed. done transfers the private lane commit, then runs the existing authorized seal/publish path. No other control or publication operation.',
+  // All file operations run INSIDE the same namespace as bash. Passing JSON
+  // as an argv value (never shell text) also preserves literal paths/content.
+  pi.registerTool({ name: 'read', label: 'read (isolated)', description: 'Read a text file inside the lane boundary, optionally by one-based line offset and limit.',
+    parameters: Type.Object({ path: Type.String(), offset: Type.Optional(Type.Number()), limit: Type.Optional(Type.Number()) }),
+    async execute(_id, params, signal) { return text(await runSandbox(['/tool-bin/node', '-e', "const fs=require('fs'),p=JSON.parse(process.argv[1]); const lines=fs.readFileSync(p.path,'utf8').split('\\n'); const start=Math.max(0,(p.offset||1)-1); console.log(lines.slice(start,start+Math.min(p.limit||2000,2000)).join('\\n').slice(0,50000));", JSON.stringify(params)], signal)); } });
+  pi.registerTool({ name: 'write', label: 'write (isolated)', executionMode: 'sequential', description: 'Write a file inside the lane boundary, creating parent directories.',
+    parameters: Type.Object({ path: Type.String(), content: Type.String() }),
+    async execute(_id, params, signal) { validateMutationPath(params.path); return text(await runSandbox(['/tool-bin/node', '-e', "const fs=require('fs'),path=require('path'),p=JSON.parse(process.argv[1]); fs.mkdirSync(path.dirname(p.path),{recursive:true}); fs.writeFileSync(p.path,p.content); console.log('Wrote '+p.path);", JSON.stringify(params)], signal)); } });
+  pi.registerTool({ name: 'edit', label: 'edit (isolated)', executionMode: 'sequential', description: 'Replace one unique exact text match inside the lane boundary.',
+    parameters: Type.Object({ path: Type.String(), oldText: Type.String(), newText: Type.String() }),
+    async execute(_id, params, signal) { validateMutationPath(params.path); return text(await runSandbox(['/tool-bin/node', '-e', "const fs=require('fs'),p=JSON.parse(process.argv[1]),s=fs.readFileSync(p.path,'utf8'); const i=s.indexOf(p.oldText); if(!p.oldText||i<0||s.indexOf(p.oldText,i+p.oldText.length)>=0) throw Error('oldText must match exactly once'); fs.writeFileSync(p.path,s.slice(0,i)+p.newText+s.slice(i+p.oldText.length)); console.log('Edited '+p.path);", JSON.stringify(params)], signal)); } });
+  pi.registerTool({ name: 'ade', label: 'ADE authorized seal', executionMode: 'sequential', description: 'Bound lane skill or ha done/waiting/failed. done transfers the private lane commit, then runs the existing authorized seal/publish path. No other control or publication operation.',
     parameters: Type.Object({ action: Type.Union(['skill', 'done', 'waiting', 'failed'].map((action) => Type.Literal(action))), reason: Type.Optional(Type.String()) }),
     async execute(_id, params, signal) { return text(await seal(params.action, params.reason, signal)); } });
   pi.on('user_bash', async (event) => ({ result: { output: await runSandbox(['/bin/bash', '--noprofile', '--norc', '-c', event.command]), exitCode: 0, cancelled: false, truncated: false } }));
-  pi.on('before_agent_start', (event) => ({ systemPrompt: event.systemPrompt + '\nADE execution: Linux bubblewrap tool boundary. Only bash and ade are available. Use bash for reading/editing/building and ade(action=skill) for the lane skill; ade(action=done) is ha done. Provider/auth and trusted runtime stay outside; no worktree extensions or MCP load. ' + (policy.network === 'allowed' ? 'Tool network is allowed for dependency acquisition and research. ' : 'Tool network is denied by the frozen recipe. ') + 'Cargo/npm/uv use the writable lane-private home/cache. Build/artifact state persists in /build and the worktree.' }));
+  pi.on('before_agent_start', (event) => ({ systemPrompt: event.systemPrompt + '\nADE execution: Linux bubblewrap tool boundary. Only isolated bash, read, write, edit and the narrow ade bridge are available. Use ade(action=skill) for the lane skill; ade(action=done) is ha done. Provider/auth and trusted runtime stay outside; no worktree extensions or MCP load. ' + (policy.network === 'allowed' ? 'Tool network is allowed for dependency acquisition and research. ' : 'Tool network is denied by the frozen recipe. ') + 'Cargo/npm/uv use the writable lane-private home/cache. Build/artifact state persists in /build and the worktree.' }));
 }
