@@ -7096,7 +7096,7 @@ mod tests {
     fn successful_child_exit_without_a_ticker_is_a_startup_failure() {
         let root = tempfile::tempdir().unwrap();
         let error = spawn_and_confirm(
-            spawn_command(Path::new("/bin/true"), root.path()),
+            spawn_command(Path::new("/usr/bin/true"), root.path()),
             root.path(),
         )
         .unwrap_err();
@@ -9606,6 +9606,7 @@ mod tests {
             ok(r#"{"result":{"process_info":{"pane_id":"w1:p1","foreground_processes":[]}}}"#),
         );
         runner.on("agent start", ok(r#"{"result":{"agent":{"pane_id":"w1:p1","tab_id":"w1:t1","workspace_id":"w1","cwd":"/repo"}}}"#));
+        runner.on("report-metadata", ok(r#"{"result":{}}"#));
         let ctx = Ctx {
             env: &f.env,
             root: f.root.clone(),

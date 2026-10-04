@@ -305,8 +305,10 @@ fn undated_mac_shaped_reviews_use_the_integration_reflog_without_writing_records
         &merged.to_string(),
     );
     assert_eq!(
-        git(&repo, &["show", "-s", "--format=%cI", &candidate], old),
-        "2020-01-01T00:00:00+00:00"
+        git(&repo, &["show", "-s", "--format=%cI", &candidate], old)
+            .parse::<jiff::Timestamp>()
+            .unwrap(),
+        old.parse::<jiff::Timestamp>().unwrap()
     );
     ade(home.path(), &["new", "adeherdr"]);
     let mut review = landed_review("");

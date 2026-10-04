@@ -270,6 +270,7 @@ fn recover_observed(
         state.intent = "start".into();
         save_recovery(project, &state)?;
         let spec = &record.launch;
+        claim_tokens(herdr, &project.slug, &record.pane_id)?;
         match herdr.agent_start_opts(&crate::herdr::AgentStart {
             name: &record.agent_name,
             kind: &spec.kind,
@@ -456,12 +457,16 @@ pub(crate) fn restore_agent_name(
     Ok(Some(agent.clone()))
 }
 
-pub(crate) fn report_tokens(herdr: &Herdr, slug: &str, pane_id: &str) {
-    let _ = herdr.pane_report_tokens(
+fn claim_tokens(herdr: &Herdr, slug: &str, pane_id: &str) -> Result<()> {
+    herdr.pane_claim_tokens(
         pane_id,
         &[("project", slug), ("thread", "coordinator"), ("rank", "0")],
-        TOKEN_TTL,
-    );
+    )?;
+    Ok(())
+}
+
+pub(crate) fn report_tokens(herdr: &Herdr, slug: &str, pane_id: &str) {
+    let _ = claim_tokens(herdr, slug, pane_id);
 }
 
 pub(crate) struct OpenOptions {
@@ -547,10 +552,10 @@ pub(crate) fn open(ctx: &Ctx, slug: &str, options: &OpenOptions) -> Result<()> {
             c.closed_by_rolf_at.clear();
             c.reopen_requested = false;
         })?;
+        claim_tokens(&herdr, slug, &record.pane_id)?;
         crate::hook::install(ctx, &project, &record.launch.kind, &record.pane_id)?;
         sync_label(&herdr, &record.workspace_id, &label);
         let _ = herdr.agent_focus(&record.pane_id);
-        report_tokens(&herdr, slug, &record.pane_id);
         crate::rundown::ensure_tab(&herdr, &record.workspace_id, &ctx.root, slug, &label)?;
         if options.reprime
             && let Err(error) = deliver_or_defer(&project, &herdr, record, &agent, &prompt, true)
@@ -712,6 +717,11 @@ pub(crate) fn open(ctx: &Ctx, slug: &str, options: &OpenOptions) -> Result<()> {
         }
     })?;
 
+    // Establish ownership before any launch can spawn a process, including
+    // reopen after close. A failed/killed readiness call must leave the tokens
+    // that qualify this binding for teardown. Failure to claim starts no agent.
+    claim_tokens(&herdr, slug, &record.pane_id)?;
+
     // Preserve the old pane as the ticker's re-link trigger. A fresh project
     // has no existing lanes to carry; reopening a closed binding may have
     // lanes even though the old coordinator record was cleared.
@@ -754,7 +764,6 @@ pub(crate) fn open(ctx: &Ctx, slug: &str, options: &OpenOptions) -> Result<()> {
             record.pane_id
         ),
     }
-    report_tokens(&herdr, slug, &record.pane_id);
     crate::rundown::ensure_tab(&herdr, &record.workspace_id, &ctx.root, slug, &label)?;
     drop(binding);
     ticker::start(ctx)?;
@@ -1744,6 +1753,7 @@ mod tests {
                 .unwrap();
             let before = project.coordinator().unwrap();
             let runner = FakeRunner::new();
+            runner.on("report-metadata", ok(r#"{"result":{}}"#));
             let observations = std::cell::Cell::new(0);
             runner.on_fn(
                 |cmd| cmd.display().contains("pane process-info"),
@@ -1888,6 +1898,58 @@ mod tests {
                 .count(),
             1
         );
+    }
+
+    #[test]
+    fn idle_pi_footer_primes_on_the_recorded_isolated_socket_without_overwriting_a_draft() {
+        use crate::runner::fake::{FakeRunner, ok};
+        let world = crate::scenarios::World::new();
+        let project = world.project("journey-prime", "isolated.sock");
+        project
+            .update_coordinator(|c| {
+                c.prime_pending = true;
+                c.launch.kind = "pi".into();
+            })
+            .unwrap();
+        let record = project.coordinator().unwrap();
+        let agent = Agent {
+            pane_id: record.pane_id.clone(),
+            tab_id: record.tab_id.clone(),
+            workspace_id: record.workspace_id.clone(),
+            cwd: record.cwd.clone(),
+            agent: "pi".into(),
+            agent_status: "idle".into(),
+            ..Agent::default()
+        };
+        let screen = "────────────────\n\x1b[7m \x1b[0m\n────────────────\n~/.herdr-ade/journey\n0.0%/388k (auto) (opencode-go) deepseek-v4.1-flash • high\n";
+        let runner = FakeRunner::new();
+        let live = std::rc::Rc::new(std::cell::RefCell::new(
+            screen.replace("\x1b[7m ", "Rolf's draft\x1b[7m "),
+        ));
+        let read = live.clone();
+        runner.on_fn(
+            |cmd| cmd.display().contains("pane read"),
+            move |_| Ok(ok(&read.borrow())),
+        );
+        runner.on("agent prompt", ok(r#"{"result":{}}"#));
+        let herdr = Herdr::new("herdr", &record.socket, &runner);
+        let _binding = project.coordinator_lock().unwrap();
+        deliver_or_defer(&project, &herdr, &record, &agent, "prime", false).unwrap();
+        assert_eq!(runner.count("agent prompt"), 0);
+        *live.borrow_mut() = screen.into();
+        deliver_or_defer(&project, &herdr, &record, &agent, "prime", false).unwrap();
+        assert_eq!(runner.count("agent prompt"), 1);
+        let current = project.coordinator().unwrap();
+        assert!(current.prime_sent && current.prime_pending);
+        assert!(
+            current.bootstrap.is_empty(),
+            "transport is not the context receipt"
+        );
+        assert!(runner.calls.borrow().iter().all(|cmd| {
+            cmd.env
+                .iter()
+                .any(|(key, value)| key == "HERDR_SOCKET_PATH" && value == &record.socket)
+        }));
     }
 
     #[test]

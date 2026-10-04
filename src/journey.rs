@@ -13,6 +13,7 @@ use crate::runner::{Cmd, Output, Runner};
 const CLAUDE_PROBE_RECIPE: &str = "claude_journey_probe";
 const COMMAND: Duration = Duration::from_secs(60);
 const OBSERVE: Duration = Duration::from_secs(180);
+const LAUNCH: Duration = Duration::from_secs(300);
 const WHOLE_RUN: Duration = Duration::from_secs(720);
 const SHUTDOWN: Duration = Duration::from_secs(120);
 
@@ -449,6 +450,16 @@ fn stop_session(ctx: &Ctx, owned: &OwnedSession) -> Result<()> {
     Ok(())
 }
 
+// Herdr can drop the launch name while Pi's session hook still identifies the
+// same agent. Do not mistake that unnamed occupant for a foreign replacement.
+fn owned_coordinator(slug: &str, c: &project::Coordinator, a: &crate::herdr::Agent) -> bool {
+    crate::coordinator::agent_on_pane(c, a)
+        && (a.name.is_empty() || a.name == c.agent_name)
+        && a.agent == c.launch.kind
+        && a.tokens.get("project").is_some_and(|p| p == slug)
+        && a.tokens.get("thread").is_some_and(|t| t == "coordinator")
+}
+
 fn cleanup_effect(errors: &mut Vec<String>, name: &str, action: impl FnOnce() -> Result<()>) {
     if let Err(error) = action() {
         errors.push(format!("{name}: {error:#}"));
@@ -576,7 +587,7 @@ fn shutdown_failed_run(
                 let agents = herdr.agent_list()?;
                 if agents
                     .iter()
-                    .any(|a| a.pane_id == c.pane_id && !crate::coordinator::agent_matches(c, a))
+                    .any(|a| a.pane_id == c.pane_id && !owned_coordinator(&report.project, c, a))
                 {
                     bail!("coordinator occupant changed; nothing stopped");
                 }
@@ -638,7 +649,7 @@ fn shutdown_failed_run(
                         .any(|l| crate::thread::agent_matches(l, a))
                         && !coordinator
                             .as_ref()
-                            .is_some_and(|c| crate::coordinator::agent_matches(c, a))
+                            .is_some_and(|c| owned_coordinator(&report.project, c, a))
                 }) {
                     bail!("unowned agent in isolated session; session not stopped");
                 }
@@ -646,7 +657,12 @@ fn shutdown_failed_run(
                 // panes allocated just before a command wrapper timed out.
                 // Stop that exact incarnation, not merely the observed agents.
             }
-            stop_session(&ctx, session)
+            stop_session(&ctx, session)?;
+            command(
+                &ctx,
+                Cmd::new(ctx.env.herdr_bin(), COMMAND).args(["session", "delete", &session.name]),
+            )?;
+            Ok(())
         });
     }
     if let Some(server) = resources.server.as_mut() {
@@ -662,20 +678,30 @@ fn shutdown_failed_run(
     if !errors.is_empty() {
         bail!("shutdown not fully verified: {}", errors.join("; "));
     }
-    Ok("owned agents/panes stopped; isolated session stopped; project, checkouts, refs and evidence retained".into())
+    Ok("owned agents/panes stopped; isolated session stopped and deleted; project, checkouts, refs and evidence retained".into())
 }
 
 struct Process(Child);
 impl Drop for Process {
     fn drop(&mut self) {
+        // `git daemon` may be a wrapper with a git-daemon child. Killing only
+        // the wrapper leaves its listener alive. The group was created here.
+        unsafe {
+            unsafe extern "C" {
+                fn kill(pid: i32, sig: i32) -> i32;
+            }
+            let _ = kill(-(self.0.id() as i32), 9);
+        }
         let _ = self.0.kill();
         let _ = self.0.wait();
     }
 }
 
 fn spawn(mut cmd: Command) -> Result<Process> {
+    use std::os::unix::process::CommandExt;
     Ok(Process(
-        cmd.stdin(Stdio::null())
+        cmd.process_group(0)
+            .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .spawn()?,
@@ -717,6 +743,29 @@ fn seal(project: &Project, id: &str) -> Result<(Option<String>, String)> {
             lane.status, lane.pane_id, lane.observation_error
         ),
     ))
+}
+
+// Placement sets startup_wait_started too. Only a nonzero launch_attempts
+// makes it the ticker's agent-start claim rather than time spent in the queue.
+fn launch_claim(project: &Project, id: &str) -> Result<(Option<(Instant, i64)>, String)> {
+    let (_, state) = seal(project, id)?;
+    let lane = crate::thread::load(project, id)?;
+    if lane.launch_attempts == 0 || lane.startup_wait_started.is_empty() {
+        return Ok((None, format!("{state}; launch claim not observed")));
+    }
+    let claimed = lane.startup_wait_started.parse::<jiff::Timestamp>()?;
+    let queued = claimed
+        .duration_since(lane.created.parse::<jiff::Timestamp>()?)
+        .as_secs()
+        .max(0);
+    let elapsed = Duration::from_secs(
+        jiff::Timestamp::now()
+            .duration_since(claimed)
+            .as_secs()
+            .max(0) as u64,
+    );
+    let seal_deadline = Instant::now() + OBSERVE.saturating_sub(elapsed);
+    Ok((Some((seal_deadline, queued)), state))
 }
 
 fn sealed_sha(project: &Project, id: &str) -> Result<String> {
@@ -984,8 +1033,24 @@ fn run_steps(
         resources.session = Some(observe_session(ctx, &session)?);
         ha(ctx, &["open", &slug, "--session", &session, "--recipe", small, "--basis", &request])?;
         bounded_poll(deadline, "coordinator bootstrap", Duration::from_secs(90), || {
+            // Exercise the shared production prime path in this image, even
+            // when a hand-run is testing a fix before the installed ticker has
+            // it. The lifecycle/writer locks and prime_sent receipt prevent a
+            // duplicate submission by the ticker on the same root.
+            let _binding = project.coordinator_lock()?;
             let c = project.coordinator().context("coordinator binding absent")?;
-            let registered = crate::herdr::Herdr::new(ctx.env.herdr_bin(), &c.socket, ctx.runner).agent_list()?.iter().any(|a| crate::coordinator::agent_matches(&c, a));
+            let herdr = crate::herdr::Herdr::new(ctx.env.herdr_bin(), &c.socket, ctx.runner);
+            let agents = herdr.agent_list()?;
+            let agent = crate::coordinator::restore_agent_name(&project, &herdr, &c, &agents)?;
+            if let Some(agent) = &agent {
+                crate::coordinator::deliver_or_defer(
+                    &project, &herdr, &c, agent,
+                    &crate::coordinator::priming_prompt(&crate::coordinator::current_prefix(&ctx.root)?, &slug),
+                    false,
+                )?;
+            }
+            let c = project.coordinator().context("coordinator binding absent")?;
+            let registered = agent.is_some();
             Ok(((registered && c.bootstrap == "acknowledged" && !c.prime_pending).then_some(()), format!("registered={registered}, bootstrap={}, prime_pending={}", c.bootstrap, c.prime_pending)))
         })?;
         let c = project.coordinator().context("coordinator absent")?;
@@ -1011,8 +1076,9 @@ fn run_steps(
         crate::review::try_operation_lock(ctx, &repo.to_string_lossy())?
             .context("journey review start lock busy")?,
     );
-    let mac_ready = report.optional_step(
-        "Mac lane seals",
+    let mut mac_launch = None;
+    let mac_launched = report.optional_step(
+        "Mac lane launched",
         (|| {
             let small = available(&small)?;
             if !opened {
@@ -1022,7 +1088,27 @@ fn run_steps(
         })(),
         |small| {
             mac = start_lane(ctx, &slug, &repo, small, "local", &mac_brief, &request)?;
-            mac_seal = bounded_poll(deadline, "Mac seal", OBSERVE, || seal(&project, &mac))?;
+            let claim = bounded_poll(deadline, "Mac launch claim", LAUNCH, || {
+                launch_claim(&project, &mac)
+            })?;
+            mac_launch = Some(claim);
+            Ok(format!("Mac lane launched after {} s: {mac}", claim.1))
+        },
+    )?;
+    let mac_ready = report.optional_step(
+        "Mac lane seals",
+        mac_launch
+            .filter(|_| mac_launched)
+            .context("Mac launch probe was skipped"),
+        |(seal_deadline, queued)| {
+            mac_seal = bounded_poll(deadline.min(seal_deadline), "Mac seal", OBSERVE, || {
+                seal(&project, &mac)
+            })
+            .with_context(|| {
+                format!(
+                    "Mac lane launched after {queued} s; seal window is 180 s from launch claim"
+                )
+            })?;
             let sha = sealed_sha(&project, &mac)?;
             git(ctx, &repo, &["cat-file", "-e", &format!("{sha}:mac.txt")])?;
             Ok(format!(

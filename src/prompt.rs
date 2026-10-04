@@ -373,9 +373,13 @@ pub(crate) fn coordinator_input_clear(screen: &str) -> bool {
             && separator(&rows[2].text)
             && rows[1].text.trim().is_empty()
             && rows[1].inverse.iter().any(|inverse| *inverse)
-            && lines[i + 3..]
-                .iter()
-                .all(|line| line.text.trim().is_empty())
+            // Pi renders its cwd and usage/model footer below the editor.
+            // Draft ownership is determined inside the two borders, not by
+            // these status rows (or the launch command in scrollback).
+            && lines[i + 3..].iter().all(|line| {
+                line.text.trim().is_empty()
+                    || !line.inverse.iter().any(|inverse| *inverse)
+            })
     }) {
         return true;
     }
@@ -874,6 +878,24 @@ mod tests {
             "❯ \x1b[0m\x1b[2many news?\x1b[22m and my words\n"
         ));
         assert!(!coordinator_input_clear("unfamiliar editor\n"));
+    }
+
+    #[test]
+    fn pi_footer_does_not_block_priming_but_a_draft_does() {
+        let screen = concat!(
+            "pi --provider opencode-go --model deepseek-v4.1-flash\n",
+            "~/.herdr-ade/journey ❯ pi --provider opencode-go\n\n",
+            "\x1b[38;2;151;118;229m────────────────────────\x1b[0m\n",
+            "\x1b[0m\x1b[7m \x1b[0m                       \n",
+            "\x1b[38;2;151;118;229m────────────────────────\x1b[0m\n",
+            "~/.herdr-ade/journey\n",
+            "0.0%/388k (auto)   (opencode-go) deepseek-v4.1-flash • high\n"
+        );
+        assert!(coordinator_input_clear(screen));
+        assert!(!coordinator_input_clear(
+            &screen.replace("\x1b[7m \x1b[0m", "Rolf's draft\x1b[7m \x1b[0m")
+        ));
+        assert!(!coordinator_input_clear(&screen.replace("\x1b[7m ", " ")));
     }
 
     #[test]
