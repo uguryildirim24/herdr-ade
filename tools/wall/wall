@@ -278,21 +278,21 @@ def list_instances():
         instance = Instance(n)
         metadata = instance.base / 'build.json'
         installed = (instance.base / 'tools/guest.py').is_file()
-        print(f'instance {n if n else "default"}: {"installed" if installed else "not installed"}')
+        print(f'instance {n if n else "default"}: {"installed" if installed else "not installed"}', flush=True)
         if not installed:
             continue
         if metadata.exists():
             build = json.loads(metadata.read_text())
-            print(f'  build: {build["version"]}; commit: {build["commit"]}')
+            print(f'  build: {build["version"]}; commit: {build["commit"]}', flush=True)
         else:
             # Read-only inventory of the active v1 sandbox, never reinstall it.
             result = subprocess.run([str(instance.base / 'bin/herdr-ade'), '--version'],
                                     capture_output=True, text=True, check=False)
             version = result.stdout.strip()
             commit = version.split('+', 1)[1].split('.', 1)[0] if '+' in version else 'unknown'
-            print(f'  build: {version}; commit: {commit} (v1 compiled ID)')
+            print(f'  build: {version}; commit: {commit} (v1 compiled ID)', flush=True)
         reset_time = instance.base / 'last-reset'
-        print(f'  last reset: {reset_time.read_text().strip() if reset_time.exists() else "unrecorded (v1)"}')
+        print(f'  last reset: {reset_time.read_text().strip() if reset_time.exists() else "unrecorded (v1)"}', flush=True)
         run('df', '-h', instance.home)
         subprocess.run(['ps', '-u', f'{instance.user},{instance.box_user}', '-o', 'pid,comm,args'], check=False)
 
