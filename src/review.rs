@@ -2571,6 +2571,44 @@ pub(crate) fn require_follow_up(project: &Project, id: &str) -> Result<()> {
     }
     Ok(())
 }
+/// Recovery advice must use the same review ownership boundary as execution.
+/// A reviewer is replaced by review retry; a member cannot be retried until
+/// its active review has been cancelled.
+pub(crate) fn thread_retry_command(
+    project: &Project,
+    lane: &Thread,
+    reviews: &[Review],
+    reason: &str,
+) -> String {
+    if let Some(review) = reviews.iter().find(|review| {
+        !review.phase.closed()
+            && review.phase != Phase::Cancelling
+            && !review.fast_forward
+            && (review.reviewer.as_deref() == Some(lane.id.as_str())
+                || review.members.iter().any(|member| member.thread == lane.id))
+    }) {
+        return review.command(
+            project,
+            if review.reviewer.as_deref() == Some(lane.id.as_str()) {
+                "retry"
+            } else {
+                "cancel"
+            },
+        );
+    }
+    format!(
+        "ha thread retry {} {} --reason {}",
+        crate::remote::quote(&project.slug),
+        crate::remote::quote(&lane.id),
+        // Keep the existing human-readable rendering for the standard reason.
+        if reason == "retry failed startup" {
+            "\"retry failed startup\"".into()
+        } else {
+            crate::remote::quote(reason)
+        }
+    )
+}
+
 pub(crate) fn require_resolvable(project: &Project, id: &str) -> Result<()> {
     for record in list(project)? {
         if !record.phase.closed()

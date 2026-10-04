@@ -44,6 +44,78 @@ fn parse_refs(output: &str) -> BTreeMap<String, String> {
         .collect()
 }
 
+/// Publish a mutable lane ref without losing unrecognised remote work. A
+/// recorded seal of this lane authorises replacing its ancestors, not another
+/// lane's commits. Archive the observed tip before leasing the branch move.
+pub(crate) fn publish_lane(
+    runner: &dyn Runner,
+    project: &Project,
+    lane: &Thread,
+    url: &str,
+    sha: &str,
+) -> Result<()> {
+    let git = Git::new(runner, &lane.repo);
+    let reference = format!("refs/heads/{}", lane.branch);
+    let remote = refs(runner, &lane.repo, Some(url))?;
+    let old = remote.get(&lane.branch);
+    if old.is_some_and(|old| old == sha) {
+        return Ok(());
+    }
+    if let Some(old) = old {
+        let seals = crate::events::checked_for_thread(project, &lane.id)?;
+        // The old object may no longer be reachable from the rebased checkout.
+        git.run(&["fetch", "--no-tags", url, old])?;
+        let done: Vec<_> = seals
+            .iter()
+            .filter_map(|event| event.payload.done.as_ref())
+            .collect();
+        let mut recognised = done.iter().any(|seal| old == &seal.sha);
+        if !recognised {
+            for seal in done.iter().rev() {
+                if git.is_ancestor(old, &seal.sha)? {
+                    recognised = true;
+                    break;
+                }
+            }
+        }
+        if !recognised {
+            bail!(
+                "lane_publish_refused: {} remote tip {old} is not a recorded seal of lane {} or its ancestor; refusing to replace it with {sha}",
+                lane.branch,
+                lane.id
+            );
+        }
+        let archive = crate::ops::seal_ref(&lane.branch, old);
+        match remote.get(&archive) {
+            Some(actual) if actual != old => bail!(
+                "lane_publish_refused: seal ref {archive} is {actual}, not {old}; refusing branch move to {sha}"
+            ),
+            Some(_) => {}
+            None => {
+                let archive_ref = format!("refs/heads/{archive}");
+                let lease = format!("--force-with-lease={archive_ref}:");
+                git.run(&["push", &lease, url, &format!("{old}:{archive_ref}")])?;
+            }
+        }
+    }
+    let lease = format!(
+        "--force-with-lease={reference}:{}",
+        old.map_or("", String::as_str)
+    );
+    git.run(&["push", &lease, url, &format!("{sha}:{reference}")])?;
+    let published = refs(runner, &lane.repo, Some(url))?;
+    if published.get(&lane.branch).map(String::as_str) != Some(sha) {
+        bail!(
+            "lane_publish_mismatch: {} remote tip is {}, not {sha}",
+            lane.branch,
+            published
+                .get(&lane.branch)
+                .map_or("missing", String::as_str)
+        );
+    }
+    Ok(())
+}
+
 fn checked_out(runner: &dyn Runner, repo: &str) -> Result<BTreeSet<String>> {
     let output =
         Git::new(runner, repo)
@@ -450,6 +522,105 @@ mod tests {
         );
         String::from_utf8(out.stdout).unwrap().trim().to_string()
     }
+    #[test]
+    fn rebased_lane_publication_archives_old_tip_and_leases_the_move() {
+        // Also cover a remote tip which is an ancestor, rather than the exact
+        // recorded seal (the Mac may have published before a final commit).
+        for ancestor in [false, true] {
+            let (fx, bare) = configured();
+            let (id, old) = fx.lane(1);
+            let lane = thread::load(&fx.project, &id).unwrap();
+            let url = bare.path().to_str().unwrap();
+            run(&fx.repo, &["push", "-q", url, &lane.branch]);
+            let recorded = if ancestor {
+                crate::testkit::commit_file(
+                    std::path::Path::new(&lane.worktree_path),
+                    "final",
+                    "final",
+                    "final",
+                )
+            } else {
+                old.clone()
+            };
+            fx.seal_done(&id, 1, 1, &recorded, "first seal");
+            // A rewritten commit with no ancestry relationship to the old tip.
+            let new = run(
+                &fx.repo,
+                &["commit-tree", "HEAD^{tree}", "-p", "main", "-m", "rebased"],
+            );
+            fx.seal_done(&id, 2, 1, &new, "rebased seal");
+            publish_lane(fx.world.ctx().runner, &fx.project, &lane, url, &new).unwrap();
+            let published = refs(fx.world.ctx().runner, &lane.repo, Some(url)).unwrap();
+            assert_eq!(published[&lane.branch], new);
+            assert_eq!(published[&crate::ops::seal_ref(&lane.branch, &old)], old);
+            let calls = fx.world.runner.calls.borrow();
+            let branch_push = calls
+                .iter()
+                .find(|cmd| {
+                    cmd.args
+                        .contains(&format!("{new}:refs/heads/{}", lane.branch))
+                })
+                .unwrap();
+            assert!(branch_push.args.contains(&format!(
+                "--force-with-lease=refs/heads/{}:{old}",
+                lane.branch
+            )));
+            let archive_push = calls
+                .iter()
+                .position(|cmd| {
+                    cmd.args.contains(&format!(
+                        "{old}:refs/heads/{}",
+                        crate::ops::seal_ref(&lane.branch, &old)
+                    ))
+                })
+                .unwrap();
+            let branch_push = calls
+                .iter()
+                .position(|cmd| {
+                    cmd.args
+                        .contains(&format!("{new}:refs/heads/{}", lane.branch))
+                })
+                .unwrap();
+            assert!(archive_push < branch_push);
+        }
+    }
+
+    #[test]
+    fn lane_publication_refuses_unknown_remote_tip_even_if_sealed_by_another_lane() {
+        let (fx, bare) = configured();
+        let (id, old) = fx.lane(1);
+        let (other, unknown) = fx.lane(2);
+        fx.seal_done(&other, 1, 1, &unknown, "other lane seal");
+        fx.seal_done(&id, 1, 1, &old, "own seal");
+        let lane = thread::load(&fx.project, &id).unwrap();
+        let url = bare.path().to_str().unwrap();
+        run(
+            &fx.repo,
+            &[
+                "push",
+                "-q",
+                url,
+                &format!("{unknown}:refs/heads/{}", lane.branch),
+            ],
+        );
+        let error = publish_lane(fx.world.ctx().runner, &fx.project, &lane, url, &old)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("lane_publish_refused"), "{error}");
+        assert!(error.contains(&unknown) && error.contains(&old), "{error}");
+        let published = refs(fx.world.ctx().runner, &lane.repo, Some(url)).unwrap();
+        assert_eq!(published[&lane.branch], unknown);
+        assert!(!published.contains_key(&crate::ops::seal_ref(&lane.branch, &unknown)));
+        assert!(
+            !fx.world
+                .runner
+                .calls
+                .borrow()
+                .iter()
+                .any(|cmd| cmd.args.iter().any(|arg| arg == "push"))
+        );
+    }
+
     #[test]
     fn timed_out_deletion_is_not_success_even_if_a_retry_could_find_absence() {
         let runner = crate::runner::fake::FakeRunner::new();

@@ -183,8 +183,13 @@ fn action_row(
                 },
                 if absent {
                     format!(
-                        "retry with a continuation reason: ha thread retry {} {} --reason \"input is ready; continue preserved work\"",
-                        project.slug, t.id
+                        "retry with a continuation reason: {}",
+                        crate::review::thread_retry_command(
+                            project,
+                            t,
+                            reviews,
+                            "input is ready; continue preserved work",
+                        )
                     )
                 } else if unknown {
                     "process unknown; check the connection before choosing prompt or retry".into()
@@ -226,7 +231,7 @@ fn action_row(
         row.group = Group::WaitingOnYou;
         row.note = format!(
             "process absent; unsealed attempt — {}",
-            crate::threads::retry_command(&project.slug, &t.id)
+            crate::review::thread_retry_command(project, t, reviews, "retry failed startup")
         );
     } else if unknown && t.status != Status::Failed {
         row.group = Group::Unknown;
