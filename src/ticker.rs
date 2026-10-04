@@ -2703,6 +2703,23 @@ fn thread_pass_observed(
                 } else {
                     // Staging is not proof of delivery. Persist its deadline
                     // before calling herdr, including interruption before send.
+                    let remote_prefix;
+                    let prefix = if current.is_remote() {
+                        let machine = crate::remote::declaration_for_route(
+                            ctx.runner,
+                            &ctx.env.herdr_bin(),
+                            &ctx.config_dir,
+                            current.machine_route(),
+                        )?;
+                        remote_prefix = format!(
+                            "{} --root {}",
+                            crate::remote::quote(&machine.ade_bin),
+                            crate::remote::quote(&machine.root)
+                        );
+                        &remote_prefix
+                    } else {
+                        prefix
+                    };
                     let prompt = thread::launch_prompt(prefix, slug, &current);
                     thread::update(project, &t.id, |record| {
                         record.brief_submitted = true;
@@ -5122,6 +5139,7 @@ mod tests {
                     record.machine = "box".into();
                 }
             });
+            world.runner.on("machine list --json", ok("[]"));
             // The command timed out without a server submission, as t-0607's
             // box log shows. Staging must not become an infinite delivery latch.
             world.runner.on(
@@ -8812,6 +8830,13 @@ mod tests {
         assert_eq!(prompts.len(), expected_prompts);
         if !resuming {
             assert!(prompts[0].contains("skill lane"));
+            if remote {
+                assert!(prompts[0].contains("/home/agent/.local/bin/herdr-ade"));
+                assert!(prompts[0].contains("/home/agent/.herdr-ade"));
+            } else {
+                assert!(prompts[0].contains("`ha skill lane`"));
+                assert!(!prompts[0].contains("/home/agent/.local/bin/herdr-ade"));
+            }
             assert!(prompts[0].contains("brief.md"));
             assert!(prompts[expected_prompts - 2].contains(&lane.report_path()));
             assert!(
