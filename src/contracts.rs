@@ -453,18 +453,21 @@ pub(crate) struct PlanStep {
 
 /// `<project>/.state/plan.toml` (SPEC-talk §6.5).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
-#[serde(default)]
 pub(crate) struct Plan {
     pub(crate) schema: u32,
+    #[serde(default)]
     pub(crate) revision: u64,
+    #[serde(default)]
     pub(crate) next_step: u64,
     pub(crate) goal: String,
     /// Historical outcome fields; new outcomes are authored in `does`.
-    #[serde(skip_serializing_if = "String::is_empty")]
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub(crate) kind: String,
-    #[serde(skip_serializing_if = "String::is_empty")]
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub(crate) what_you_get: String,
+    #[serde(default)]
     pub(crate) does: String,
+    #[serde(default)]
     pub(crate) steps: Vec<PlanStep>,
 }
 

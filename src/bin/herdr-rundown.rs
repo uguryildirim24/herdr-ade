@@ -246,6 +246,7 @@ fn empty_card(title: String) -> view::Card {
         about: String::new(),
         steps: vec![],
         read_error: String::new(),
+        plan_unreadable: false,
         activity: Default::default(),
         needs_you_items: vec![],
         harness: Default::default(),

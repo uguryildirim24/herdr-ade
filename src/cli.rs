@@ -2034,6 +2034,28 @@ mod tests {
     }
 
     #[test]
+    fn cancel_failed_first_transition_returns_command_failure() {
+        let fx = crate::testkit::fixture();
+        let id = fx.thread("Running lane");
+        let path = fx.project.record_dir("threads").join(format!("{id}.toml"));
+        let before = std::fs::read(&path).unwrap();
+        // An unusable writer lock fails the initial durable transition while
+        // leaving the record readable; cleanup must not turn this into success.
+        let lock = fx.project.state_dir().join("lock");
+        std::fs::remove_file(&lock).ok();
+        std::fs::create_dir(&lock).unwrap();
+        let command =
+            Cli::try_parse_from(["ha", "thread", "cancel", "demo", &id, "--reason", "stop"])
+                .unwrap()
+                .command;
+        let error = dispatch_with_start(fx.world.ctx(), command, None).unwrap_err();
+        assert!(format!("{error:#}").contains("directory"), "{error:#}");
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        assert_eq!(fx.world.runner.count("tab close"), 0);
+        // ade_main maps this Err to ExitCode::FAILURE, never a cancelled receipt.
+    }
+
+    #[test]
     fn plan_mutations_share_the_same_receipt_and_sentence() {
         let fx = crate::testkit::fixture();
         result(&fx, &["plan", "set", "demo", "--does", "Deliver it"]);

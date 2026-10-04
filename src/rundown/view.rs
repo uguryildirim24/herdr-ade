@@ -74,6 +74,8 @@ struct PlanView {
     #[serde(default)]
     what_you_get: String,
     steps: Vec<Step>,
+    #[serde(default)]
+    error: String,
 }
 
 /// One project's rundown.
@@ -84,6 +86,7 @@ pub(crate) struct Card {
     pub(crate) about: String,
     pub(crate) steps: Vec<Step>,
     pub(crate) read_error: String,
+    pub(crate) plan_unreadable: bool,
     pub(crate) activity: Activity,
     pub(crate) needs_you_items: Vec<String>,
     pub(crate) harness: Harness,
@@ -147,6 +150,7 @@ impl Card {
                         .unwrap_or_default(),
                     steps: readable_steps(&plan["steps"]),
                     read_error: format!("Rundown read failed: {error}"),
+                    plan_unreadable: true,
                     activity: serde_json::from_value(reply["activity"].clone()).unwrap_or_default(),
                     needs_you_items: serde_json::from_value(reply["needs_you_items"].clone())
                         .unwrap_or_default(),
@@ -168,6 +172,7 @@ impl Card {
             about,
             steps: plan.steps,
             read_error: view.read_error,
+            plan_unreadable: !plan.error.is_empty(),
             activity: view.activity,
             needs_you_items: view.needs_you_items,
             harness: view.harness,
@@ -502,6 +507,9 @@ fn tile(color: Rgb, ink: Rgb, bold: bool, mark: char) -> String {
 
 /// A chunky bar that warms from teal to green as it fills, and the count.
 fn progress(card: &Card, width: usize) -> String {
+    if card.plan_unreadable {
+        return cut("Progress unreadable", width);
+    }
     let total = card.steps.len();
     let done = card.count(Mark::Done);
     let label = format!("{done} of {total}");
@@ -599,6 +607,22 @@ mod tests {
     }
 
     #[test]
+    fn unreadable_plan_never_renders_zero_progress() {
+        let card = Card::from_view(
+            "Demo",
+            &json!({
+                "plan":{"schema":1,"revision":0,"steps":[],"error":"unreadable record: /project/.state/plan.toml"},
+                "read_error":"unreadable record: /project/.state/plan.toml"
+            }),
+        )
+        .unwrap();
+        let screen = render(&card, 80, 24, "").join("\n");
+        assert!(screen.contains("unreadable record"));
+        assert!(screen.contains("Progress unreadable"));
+        assert!(!screen.contains("0 of 0"));
+    }
+
+    #[test]
     fn outcomes_are_literal_and_unknown_replies_are_errors() {
         let outcome =
             "Compare red.md and blue.md: report differences; retain names (Rolf, 2026-09-25).";
@@ -662,6 +686,7 @@ mod tests {
             about: String::new(),
             steps: vec![],
             read_error: String::new(),
+            plan_unreadable: false,
             activity: Activity::default(),
             needs_you_items: vec![],
             harness: Harness::default(),

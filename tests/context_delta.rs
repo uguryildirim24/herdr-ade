@@ -64,8 +64,9 @@ impl Fixture {
     }
 
     fn plan(&self, count: usize) {
-        let mut plan =
-            String::from("schema = 1\nrevision = 1\nkind = 'tool'\ndoes = 'fixture outcome'\n");
+        let mut plan = String::from(
+            "schema = 1\ngoal = 'Historical goal'\nrevision = 1\nkind = 'tool'\ndoes = 'fixture outcome'\n",
+        );
         for n in 1..=count {
             plan.push_str(&format!(
                 "\n[[steps]]\nid = 's-{n:03}'\ntext = 'fixture step {n}'\n"

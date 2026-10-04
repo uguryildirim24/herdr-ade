@@ -545,7 +545,17 @@ impl Project {
     }
 
     pub(crate) fn coordinator(&self) -> Option<Coordinator> {
-        read_json(&self.state_dir().join("coordinator.json"))
+        match self.read_coordinator() {
+            Ok(record) => record,
+            Err(error) => {
+                eprintln!("{error:#}");
+                None
+            }
+        }
+    }
+
+    pub(crate) fn read_coordinator(&self) -> Result<Option<Coordinator>> {
+        read_json_checked(&self.state_dir().join("coordinator.json"))
     }
 
     /// Read-modify-write of `coordinator.json` under the lock: re-reads the
@@ -555,7 +565,7 @@ impl Project {
         change: impl FnOnce(&mut Coordinator),
     ) -> Result<Coordinator> {
         let _lock = self.lock()?;
-        let mut record = self.coordinator().unwrap_or_default();
+        let mut record = self.read_coordinator()?.unwrap_or_default();
         change(&mut record);
         record.updated = now();
         write_json(&self.state_dir().join("coordinator.json"), &record)?;
@@ -598,6 +608,17 @@ fn machine_hold_path(root: &Path, machine: &str) -> Result<PathBuf> {
 pub(crate) fn read_json<T: serde::de::DeserializeOwned>(path: &Path) -> Option<T> {
     let text = std::fs::read_to_string(path).ok()?;
     serde_json::from_str(&text).ok()
+}
+
+/// Absence is not corruption. Mutating readers must not overwrite an unreadable record.
+pub(crate) fn read_json_checked<T: serde::de::DeserializeOwned>(path: &Path) -> Result<Option<T>> {
+    match std::fs::read_to_string(path) {
+        Ok(text) => serde_json::from_str(&text)
+            .map(Some)
+            .with_context(|| format!("unreadable record: {}", path.display())),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error).with_context(|| format!("unreadable record: {}", path.display())),
+    }
 }
 
 pub(crate) fn write_json<T: Serialize>(path: &Path, value: &T) -> Result<()> {
@@ -1263,6 +1284,7 @@ mod tests {
             .unwrap();
         }
         let plan = crate::contracts::Plan {
+            schema: 1,
             steps: vec![crate::contracts::PlanStep {
                 id: "s-1".into(),
                 tasks: ids,
@@ -1341,6 +1363,25 @@ mod tests {
         assert!(parse_project_md("+++\nname = \"X\"\n").is_err());
         let (_, body) = parse_project_md("+++\nname = \"X\"\n+++").unwrap();
         assert_eq!(body, "");
+    }
+
+    #[test]
+    fn unreadable_coordinator_identity_cannot_be_overwritten_with_defaults() {
+        let root = tempfile::tempdir().unwrap();
+        let project = create(root.path(), "demo", "", vec![]).unwrap();
+        assert!(project.read_coordinator().unwrap().is_none());
+        let path = project.state_dir().join("coordinator.json");
+        for text in ["", "{", r#"{"pane_id":5}"#] {
+            std::fs::write(&path, text).unwrap();
+            let error = project.read_coordinator().unwrap_err();
+            assert!(format!("{error:#}").contains(&path.display().to_string()));
+            assert!(
+                project
+                    .update_coordinator(|c| c.pane_id = "new".into())
+                    .is_err()
+            );
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), text);
+        }
     }
 
     #[test]

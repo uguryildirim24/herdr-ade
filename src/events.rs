@@ -436,6 +436,22 @@ pub(crate) fn list_checked(project: &Project) -> (Vec<Event>, bool) {
     (events, readable)
 }
 
+/// Retain paths and causes for surfaces that must show unreadable seal evidence.
+pub(crate) fn read_errors(project: &Project) -> Vec<anyhow::Error> {
+    TICKER_LISTS
+        .with(|cache| {
+            cache
+                .borrow_mut()
+                .as_mut()
+                .map(|cache| cache.records.read(dir(project), |id| load(project, id)).1)
+        })
+        .unwrap_or_else(|| {
+            crate::record_cache::Records::default()
+                .read(dir(project), |id| load(project, id))
+                .1
+        })
+}
+
 pub(crate) fn list(project: &Project) -> Vec<Event> {
     list_checked(project).0
 }

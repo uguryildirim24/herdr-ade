@@ -191,7 +191,7 @@ fn review_install_dates_and_after_install_results_are_read_only_facts() {
         home.path(),
         "adeherdr",
         "plan.toml",
-        json!({"schema":1,"revision":1,"steps":[{"id":"s-1","text":"Make the screen readable","threads":["t-0001"]}]}),
+        json!({"schema":1,"goal":"Historical goal","revision":1,"steps":[{"id":"s-1","text":"Make the screen readable","threads":["t-0001"]}]}),
     );
     for (notice, expected) in [
         ("", "not run yet"),
@@ -336,7 +336,7 @@ fn undated_mac_shaped_reviews_use_the_integration_reflog_without_writing_records
         home.path(),
         "adeherdr",
         "plan.toml",
-        json!({"schema":1,"revision":1,"steps":[{"id":"s-1","text":"Make yesterday’s work visible","tasks":["job-0001"]}]}),
+        json!({"schema":1,"goal":"Historical goal","revision":1,"steps":[{"id":"s-1","text":"Make yesterday’s work visible","tasks":["job-0001"]}]}),
     );
     let state = home.path().join("root/adeherdr/.state");
     let facts: Vec<_> = [

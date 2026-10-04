@@ -18,6 +18,9 @@ pub(crate) struct Item {
     pub(crate) summary: String,
     /// Sealed event id when this item is a delivery projection.
     pub(crate) event: String,
+    /// Read/parse failure including its path; never an ordinary notice.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) unreadable: Option<String>,
     /// Optional message body.
     #[serde(skip)]
     pub(crate) body: String,
@@ -27,19 +30,26 @@ pub(crate) fn inbox_dir(project: &Project) -> PathBuf {
     project.record_dir("inbox")
 }
 
-fn parse(text: &str) -> Option<Item> {
+fn parse(text: &str) -> Result<Option<Item>> {
     let item = parse_record(text)?;
-    (!removed_kind(&item.kind)).then_some(item)
+    Ok((!removed_kind(&item.kind)).then_some(item))
 }
 
-fn parse_record(text: &str) -> Option<Item> {
-    let rest = text.strip_prefix("+++\n")?;
+fn parse_record(text: &str) -> Result<Item> {
+    let rest = text
+        .strip_prefix("+++\n")
+        .context("missing notice frontmatter")?;
     let (front, body) = rest
         .split_once("\n+++\n")
-        .or_else(|| Some((rest.strip_suffix("\n+++")?, "")))?;
-    let mut item: Item = toml::from_str(front).ok()?;
+        .or_else(|| Some((rest.strip_suffix("\n+++")?, "")))
+        .context("interrupted write: missing notice frontmatter end")?;
+    let mut item: Item = toml::from_str(front)?;
+    validate_id(&item.id)?;
+    if item.kind.is_empty() {
+        bail!("missing notice kind");
+    }
     item.body = body.trim_matches('\n').to_string();
-    Some(item)
+    Ok(item)
 }
 
 /// Old projections are ignored on read; no migration or replacement files.
@@ -122,6 +132,7 @@ pub(crate) fn write(
         // One line, no control characters: summaries are printed in the digest.
         summary,
         event: String::new(),
+        unreadable: None,
         body: String::new(),
     };
     let mut text = format!("+++\n{}+++\n", toml::to_string(&item)?);
@@ -177,6 +188,7 @@ pub(crate) fn write_event(
             })
             .collect(),
         event: event.id.clone(),
+        unreadable: None,
         body: String::new(),
     };
     let text = format!("+++\n{}+++\n", toml::to_string(&item)?);
@@ -223,15 +235,48 @@ pub(crate) fn prune_done(project: &Project, days: u64) {
 
 /// Unhandled items, oldest first. Event ids do not start with a timestamp.
 pub(crate) fn unhandled(project: &Project) -> Vec<Item> {
-    let Ok(entries) = std::fs::read_dir(inbox_dir(project)) else {
-        return Vec::new();
+    fn unreadable(path: &std::path::Path, error: impl std::fmt::Display) -> Item {
+        let detail = format!("unreadable record: {}: {error}", path.display());
+        Item {
+            id: path
+                .file_stem()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .into_owned(),
+            kind: "unreadable-record".into(),
+            summary: detail.clone(),
+            unreadable: Some(detail),
+            ..Default::default()
+        }
+    }
+    let dir = inbox_dir(project);
+    let entries = match std::fs::read_dir(&dir) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Vec::new(),
+        Err(error) => return vec![unreadable(&dir, error)],
     };
-    let mut items: Vec<Item> = entries
-        .flatten()
-        .filter(|e| e.file_name().to_string_lossy().ends_with(".md"))
-        .filter_map(|e| std::fs::read_to_string(e.path()).ok())
-        .filter_map(|text| parse(&text))
-        .collect();
+    let mut items = Vec::new();
+    for entry in entries {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(error) => {
+                items.push(unreadable(&dir, error));
+                continue;
+            }
+        };
+        let path = entry.path();
+        if !entry.file_name().to_string_lossy().ends_with(".md") {
+            continue;
+        }
+        match std::fs::read_to_string(&path)
+            .map_err(anyhow::Error::from)
+            .and_then(|text| parse_record(&text))
+        {
+            Ok(item) if !removed_kind(&item.kind) => items.push(item),
+            Ok(_) => {}
+            Err(error) => items.push(unreadable(&path, error)),
+        }
+    }
     items.sort_by(|a, b| a.created.cmp(&b.created).then_with(|| a.id.cmp(&b.id)));
     items
 }
@@ -356,8 +401,9 @@ pub(crate) fn done_bound(
             continue;
         }
         let item = std::fs::read_to_string(&from)
-            .ok()
-            .and_then(|text| parse(&text));
+            .map_err(anyhow::Error::from)
+            .and_then(|text| parse(&text))
+            .with_context(|| format!("unreadable record: {}", from.display()))?;
         if let Some(item) = &item
             && !item.event.is_empty()
         {
@@ -408,6 +454,49 @@ mod tests {
             "+++\nid = \"{id}\"\nkind = \"note\"\nsubject = \"r\"\ncreated = \"2026-09-17T00:00:00Z\"\nsummary = \"s\"\n+++\n{body}"
         );
         std::fs::write(inbox_dir(project).join(format!("{id}.md")), text).unwrap();
+    }
+
+    #[test]
+    fn unreadable_notices_stay_visible_beside_readable_historical_notices() {
+        let root = tempfile::tempdir().unwrap();
+        let project = project::create(root.path(), "demo", "", vec![]).unwrap();
+        write_item(&project, "healthy", "historical message");
+        for text in [
+            "",
+            "+++\nid = 'broken'\nkind = [",
+            "+++\n+++\n",
+            "not frontmatter",
+        ] {
+            let path = inbox_dir(&project).join("broken.md");
+            std::fs::write(&path, text).unwrap();
+            let items = unhandled(&project);
+            assert_eq!(items.len(), 2);
+            let broken = items.iter().find(|item| item.id == "broken").unwrap();
+            assert_eq!(broken.kind, "unreadable-record");
+            assert!(
+                broken
+                    .unreadable
+                    .as_ref()
+                    .unwrap()
+                    .contains(&path.display().to_string())
+            );
+            assert!(broken.summary.contains("unreadable record"));
+            assert!(
+                items
+                    .iter()
+                    .any(|item| item.id == "healthy" && item.unreadable.is_none())
+            );
+            assert!(done_bound(&project, &["broken".into()], false, None).is_err());
+            assert!(path.exists());
+        }
+        let path = inbox_dir(&project).join("broken.md");
+        std::fs::remove_file(&path).unwrap();
+        std::fs::create_dir(&path).unwrap();
+        assert!(
+            unhandled(&project)
+                .iter()
+                .any(|item| item.unreadable.is_some())
+        );
     }
 
     #[test]

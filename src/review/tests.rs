@@ -2147,6 +2147,7 @@ fn partial_no_change_research_cannot_unlock_dependents_but_evidenced_no_change_c
     )
     .unwrap();
     let mut plan = crate::contracts::Plan {
+        schema: 1,
         does: "Exhaustive evidence before implementation".into(),
         steps: vec![
             crate::contracts::PlanStep {

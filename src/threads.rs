@@ -1920,13 +1920,16 @@ fn cancel_with_retention(
         keep_checkout,
         ..Default::default()
     });
+    // Failure here is not cleanup failure: cancellation has not happened.
+    // Only after this write succeeds may retirement become best effort.
+    begin_retirement(&project, &record, &request, "cancelled")?;
     let outcome = retire(
         ctx,
         &project,
         &record,
         request,
         "cancelled",
-        true,
+        false,
         &mut CleanupViews::default(),
     )
     .unwrap_or_else(|error| retirement_failure(&project, &record, error));

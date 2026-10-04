@@ -615,7 +615,8 @@ fn coordinator_notice_at(
 
 fn enqueue(project: &Project, entry: OutboxEntry, now: u64) -> Result<()> {
     let _writer = crate::prompt::writer_lock(project)?;
-    let mut batch: NoticeBatch = project::read_json(&batch_path(project)).unwrap_or_default();
+    let mut batch: NoticeBatch =
+        project::read_json_checked(&batch_path(project))?.unwrap_or_default();
     if !batch.entries.iter().any(|old| old.source == entry.source) {
         if batch.entries.is_empty() {
             batch.first_at = now;
@@ -633,7 +634,7 @@ fn enqueue(project: &Project, entry: OutboxEntry, now: u64) -> Result<()> {
 }
 
 fn flush_notices_at(project: &Project, herdr: &Herdr<'_>, pane: &str, now: u64) -> Result<bool> {
-    if project.coordinator().is_some_and(|record| {
+    if project.read_coordinator()?.is_some_and(|record| {
         crate::adapters::dependency_waiting(
             &project.root,
             crate::contracts::MACHINE_LOCAL,
@@ -656,7 +657,8 @@ fn flush_notices_at(project: &Project, herdr: &Herdr<'_>, pane: &str, now: u64) 
     if !crate::prompt::coordinator_prompt_clear(project, herdr, pane)? {
         return Ok(false);
     }
-    let mut batch: NoticeBatch = project::read_json(&batch_path(project)).unwrap_or_default();
+    let mut batch: NoticeBatch =
+        project::read_json_checked(&batch_path(project))?.unwrap_or_default();
     let binding = wake_binding(project);
     let mut cursor: WakeCursor = project::read_json(&wake_path(project)).unwrap_or_default();
     let before = batch.entries.len();
@@ -728,11 +730,11 @@ fn flush_notices_at(project: &Project, herdr: &Herdr<'_>, pane: &str, now: u64) 
 
 /// The cheap ticker flushes even when no new transitions arrive.
 pub(crate) fn flush_coordinator_notices(ctx: &Ctx, project: &Project) -> Result<bool> {
-    let Some(c) = project.coordinator() else {
+    let batch = project::read_json_checked::<NoticeBatch>(&batch_path(project))?;
+    let Some(c) = project.read_coordinator()? else {
         return Ok(false);
     };
-    if project::read_json::<NoticeBatch>(&batch_path(project)).is_none_or(|b| b.entries.is_empty())
-    {
+    if batch.is_none_or(|b| b.entries.is_empty()) {
         return Ok(true);
     }
     let herdr = Herdr::new(ctx.env.herdr_bin(), &c.socket, ctx.runner);
@@ -1519,6 +1521,26 @@ mod tests {
     use super::*;
     use crate::scenarios::{World, agent_json};
     use crate::ticker::{ObservationView, observation_pass};
+
+    #[test]
+    fn unreadable_outbox_is_never_replaced_or_flushed_as_empty() {
+        let world = World::new();
+        let project = world.project("demo", "a.sock");
+        let path = batch_path(&project);
+        for text in ["", "{", r#"{"entries":"broken"}"#] {
+            std::fs::write(&path, text).unwrap();
+            let error = enqueue(
+                &project,
+                OutboxEntry::new(NoticeSource::Transition("new".into()), "new notice"),
+                1,
+            )
+            .unwrap_err();
+            assert!(format!("{error:#}").contains("unreadable record"));
+            assert!(flush_coordinator_notices(&world.ctx(), &project).is_err());
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), text);
+            assert_eq!(world.runner.count("agent prompt"), 0);
+        }
+    }
 
     #[test]
     fn historical_pr_check_in_ticker_state_does_not_prevent_loading() {
