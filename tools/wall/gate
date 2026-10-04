@@ -6,7 +6,7 @@ All transcripts/captures are outside the candidate and the disposable instances.
 """
 import argparse
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from contextlib import ExitStack
+from contextlib import ExitStack, contextmanager
 import fcntl
 import hashlib
 import json
@@ -23,7 +23,8 @@ import time
 TOOLS = Path(__file__).resolve().parent
 FAULTS = 'kill-pane kill-process ticker disconnect reboot fill corrupt clock install'
 INSTANCES = (5, 6, 7, 8)
-REGRESSION_INSTANCES = INSTANCES[1:]
+SLOT_SETS = (INSTANCES, (9, 10, 11, 12))
+LOCK_DIR = Path('/home/ubuntu/.cache/herdr-wall-gate')
 BUDGET = 1500
 CLEANUP = 90
 
@@ -45,14 +46,15 @@ def findings(path, clock=False):
 
 
 class Gate:
-    def __init__(self, evidence, candidate, alternate):
+    def __init__(self, evidence, candidate, alternate, instances=INSTANCES):
         self.evidence = evidence
         self.candidate = candidate
         self.alternate = alternate
         self.started = time.monotonic()
         self.deadline = self.started + BUDGET - CLEANUP
         self.round = 'build'
-        self.wall = self.wall_command(5)
+        self.instances = instances
+        self.wall = self.wall_command(instances[0])
         self.touched = set()
         self.processes = set()
         self.mutex = threading.Lock()
@@ -169,14 +171,14 @@ class Gate:
             raise Incomplete('prove install: sandbox image did not change')
 
     def campaign(self, repros):
-        # Three slot-owning workers; queued repros reuse a slot only after its
-        # previous capture. Prove exclusively owns 5 throughout the campaign.
-        assignments = {instance: repros[index::len(REGRESSION_INSTANCES)]
-                       for index, instance in enumerate(REGRESSION_INSTANCES)}
+        # Prove owns the first slot; three workers exclusively own the rest.
+        regression_instances = self.instances[1:]
+        assignments = {instance: repros[index::len(regression_instances)]
+                       for index, instance in enumerate(regression_instances)}
         (self.evidence / 'regression-instances.json').write_text(json.dumps(
             {repro.parent.name: instance for instance, batch in assignments.items() for repro in batch},
             indent=2) + '\n')
-        with ThreadPoolExecutor(max_workers=len(INSTANCES)) as executor:
+        with ThreadPoolExecutor(max_workers=len(self.instances)) as executor:
             futures = [executor.submit(self.round_job, 'prove', self.prove)]
             futures += [executor.submit(self.regressions, instance, batch)
                         for instance, batch in assignments.items()]
@@ -210,7 +212,7 @@ class Gate:
         self.round = 'install'
         # The first install creates the hash-addressed stage once. Subsequent
         # installs attach that same stage, with private writable guest copies.
-        for instance in INSTANCES:
+        for instance in self.instances:
             self.touched.add(instance)
             wall = self.wall_command(instance)
             self.command([*wall, 'install', '--build', build], f'install-{instance}')
@@ -265,7 +267,7 @@ class Gate:
             return errors
 
         # Four serial 55-second resets cannot fit the cleanup reservation.
-        with ThreadPoolExecutor(max_workers=len(INSTANCES)) as executor:
+        with ThreadPoolExecutor(max_workers=len(self.instances)) as executor:
             errors = [error for batch in executor.map(clean, sorted(self.touched)) for error in batch]
         try:
             self.snapshot('ubuntu-after')
@@ -274,24 +276,76 @@ class Gate:
         return errors
 
 
+@contextmanager
+def slots(lock_dir, review=False, slot_sets=SLOT_SETS):
+    """Serialize admission, not campaigns. A held reservation dies with its process."""
+    lock_dir.mkdir(parents=True, exist_ok=True)
+    reservation = None
+    deadline = time.monotonic() + BUDGET
+    try:
+        with ExitStack() as held:
+            while True:
+                acquired = None
+                with (lock_dir / 'scheduler.lock').open('a') as scheduler:
+                    fcntl.flock(scheduler, fcntl.LOCK_EX)
+                    if review and reservation is None:
+                        fd, name = tempfile.mkstemp(prefix='review-', suffix='.pending', dir=lock_dir)
+                        reservation = Path(name)
+                        pending = held.enter_context(os.fdopen(fd, 'w'))
+                        fcntl.flock(pending, fcntl.LOCK_EX)
+                    live_reviews = False
+                    for path in lock_dir.glob('review-*.pending'):
+                        with path.open('a') as pending:
+                            try:
+                                fcntl.flock(pending, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                            except BlockingIOError:
+                                live_reviews = True
+                            else:
+                                path.unlink()
+                    if review or not live_reviews:
+                        for instances in slot_sets:
+                            with ExitStack() as attempt:
+                                try:
+                                    for instance in instances:
+                                        lock = attempt.enter_context(
+                                            (lock_dir / f'instance-{instance}.lock').open('a'))
+                                        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                                except BlockingIOError:
+                                    continue
+                                held.enter_context(attempt.pop_all())
+                                acquired = instances
+                                break
+                    if acquired and reservation:
+                        reservation.unlink()
+                if acquired or not review or time.monotonic() >= deadline:
+                    yield acquired
+                    return
+                time.sleep(0.1)
+    finally:
+        if reservation:
+            reservation.unlink(missing_ok=True)
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--candidate', type=Path, default=Path.cwd(), help='review worktree (default: cwd)')
     parser.add_argument('--alternate-build', type=Path, default=Path('/home/ubuntu/.local/bin'),
                         help='existing alternate ADE build for the mixed-build fault')
+    parser.add_argument('--slot-set', type=int, choices=[5, 9],
+                        help='use only the set starting at this instance (default: either free set)')
     args = parser.parse_args()
-    lock_dir = Path('/home/ubuntu/.cache/herdr-wall-gate')
-    lock_dir.mkdir(parents=True, exist_ok=True)
-    with ExitStack() as locks:
-        for instance in INSTANCES:
-            lock = locks.enter_context((lock_dir / f'instance-{instance}.lock').open('a'))
-            try:
-                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            except BlockingIOError:
-                print('WALL GATE INCOMPLETE: gate instance busy (retryable; exit 75)')
-                return 75
-        evidence = Path(tempfile.mkdtemp(prefix='wall-gate-', dir=lock_dir))
-        gate = Gate(evidence, args.candidate.resolve(), args.alternate_build.resolve())
+    slot_sets = tuple(s for s in SLOT_SETS if args.slot_set is None or s[0] == args.slot_set)
+    review = os.environ.get('ADE_WALL_REVIEW') == '1'
+    with slots(LOCK_DIR, review, slot_sets) as instances:
+        if instances is None:
+            print('WALL GATE INCOMPLETE: gate instance busy (retryable; exit 75)')
+            return 75
+        evidence = Path(tempfile.mkdtemp(prefix='wall-gate-', dir=LOCK_DIR))
+        (evidence / 'slots.json').write_text(json.dumps(dict(
+            instances=instances, review=review, pid=os.getpid(),
+            started=time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime()))) + '\n')
+        print(f'WALL SLOTS {instances}; review={review}; evidence={evidence}', flush=True)
+        gate = Gate(evidence, args.candidate.resolve(), args.alternate_build.resolve(), instances)
         result, code = 'WALL GATE PASS', 0
 
         def interrupted(signum, _frame):

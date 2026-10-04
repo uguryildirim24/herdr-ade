@@ -11,8 +11,8 @@ class Instance:
     number: int = 0
 
     def __post_init__(self):
-        if not 0 <= self.number <= 8:
-            raise ValueError('instance must be 1..8 (omit for the default)')
+        if not 0 <= self.number <= 12:
+            raise ValueError('instance must be 1..12 (omit for the default)')
 
     @property
     def home(self):

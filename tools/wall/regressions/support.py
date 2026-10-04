@@ -19,7 +19,7 @@ def set_instance(number):
 
 def repro_args(description):
     parser = argparse.ArgumentParser(description=description)
-    parser.add_argument('--instance', type=int, choices=range(1, 9), required=True)
+    parser.add_argument('--instance', type=int, choices=range(1, 13), required=True)
     parser.add_argument('--evidence', type=Path, help='new host evidence directory')
     args = parser.parse_args()
     set_instance(args.instance)

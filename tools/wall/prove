@@ -4,7 +4,7 @@ set -euo pipefail
 if [[ $EUID != 0 ]]; then echo 'Run sudo tools/wall/wall [--instance N] prove <new evidence dir> <alternate build dir>' >&2; exit 2; fi
 instance=0
 if [[ ${1:-} == --instance ]]; then instance=${2:?instance}; shift 2; fi
-[[ $instance =~ ^[0-8]$ ]] || { echo 'instance must be 0..8' >&2; exit 2; }
+[[ $instance =~ ^([0-9]|1[0-2])$ ]] || { echo 'instance must be 0..12' >&2; exit 2; }
 controller=$(dirname "$(readlink -f "$0")")/wall
 wall() {
   if [[ $1 == enter ]]; then

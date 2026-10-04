@@ -60,6 +60,7 @@ fn wall_reuses_the_reviewer_target_without_changing_other_gate_environments() {
     };
     let env = gate_environment(BTreeMap::new(), Some("/build/demo-t-0003"), &gate);
     assert_eq!(env.get("CARGO_TARGET_DIR").unwrap(), "/build/demo-t-0003");
+    assert_eq!(env.get("ADE_WALL_REVIEW").unwrap(), "1");
     gate.command = "cargo test".into();
     assert!(gate_environment(BTreeMap::new(), Some("/build/demo-t-0003"), &gate).is_empty());
 }
@@ -122,10 +123,16 @@ fn busy_retries_the_same_seal_without_coordinator_or_new_verdict() {
     let fx = configured();
     lane(&fx, 1);
     let mut review = prepared(&fx);
-    review.gates = vec![project::Gate {
-        command: "tools/wall/gate".into(),
-        ..Default::default()
-    }];
+    review.gates = vec![
+        project::Gate {
+            command: "cargo test".into(),
+            ..Default::default()
+        },
+        project::Gate {
+            command: "tools/wall/gate".into(),
+            ..Default::default()
+        },
+    ];
     let candidate = candidate(&fx, &review);
     seal_verdict(
         &fx,
@@ -140,10 +147,11 @@ fn busy_retries_the_same_seal_without_coordinator_or_new_verdict() {
     let observed = busy.clone();
     fx.world.runner.on_fn(
         |cmd| cmd.program == "sh",
-        move |_| {
+        move |cmd| {
+            let wall = cmd.args.iter().any(|arg| arg.contains("tools/wall/gate"));
             Ok(crate::runner::Output {
-                code: Some(if observed.get() { 75 } else { 0 }),
-                stdout: if observed.get() {
+                code: Some(if wall && observed.get() { 75 } else { 0 }),
+                stdout: if wall && observed.get() {
                     "WALL GATE INCOMPLETE: gate instance busy (retryable; exit 75)\n".into()
                 } else {
                     "WALL GATE PASS\n".into()
@@ -163,8 +171,14 @@ fn busy_retries_the_same_seal_without_coordinator_or_new_verdict() {
             .iter()
             .any(|n| n.line.contains("gate instance busy"))
     );
+    assert_eq!(fx.world.runner.count("sh -c"), 2);
     busy.set(false);
     advance(&fx.world.ctx(), &fx.project, &mut review).unwrap();
+    assert_eq!(
+        fx.world.runner.count("sh -c"),
+        3,
+        "retry must run only wall"
+    );
     assert_eq!(review.phase, Phase::Complete);
     assert!(
         review
@@ -172,6 +186,117 @@ fn busy_retries_the_same_seal_without_coordinator_or_new_verdict() {
             .iter()
             .any(|n| n.line.contains("WALL GATE PASS"))
     );
+}
+
+#[test]
+fn busy_receipt_reuse_invalidates_changed_candidate_selection_and_logs() {
+    for change in ["candidate", "selection", "logs", "environment", "seal"] {
+        let fx = configured();
+        lane(&fx, 1);
+        let mut review = prepared(&fx);
+        review.gates = vec![
+            project::Gate {
+                command: "cargo test".into(),
+                ..Default::default()
+            },
+            project::Gate {
+                command: "tools/wall/gate".into(),
+                ..Default::default()
+            },
+        ];
+        let mut tip = candidate(&fx, &review);
+        let busy = std::rc::Rc::new(std::cell::Cell::new(true));
+        let observed = busy.clone();
+        fx.world.runner.on_fn(
+            |cmd| cmd.program == "sh",
+            move |cmd| {
+                let wall = cmd.args.iter().any(|arg| arg.contains("tools/wall/gate"));
+                Ok(crate::runner::Output {
+                    code: Some(if wall && observed.get() { 75 } else { 0 }),
+                    stdout: if wall && observed.get() {
+                        "WALL GATE INCOMPLETE: gate instance busy (retryable; exit 75)\n".into()
+                    } else {
+                        "WALL GATE PASS\n".into()
+                    },
+                    stderr: String::new(),
+                    timed_out: false,
+                })
+            },
+        );
+        let git = Git::new(&fx.world.runner, &review.repo);
+        assert!(
+            observed_gates(
+                &fx.world.ctx(),
+                &fx.project,
+                &review,
+                &tip,
+                &git,
+                &mut String::new()
+            )
+            .unwrap_err()
+            .downcast_ref::<WallGateBusy>()
+            .is_some()
+        );
+        // First prove reuse on this same candidate, then invalidate that proof.
+        assert!(
+            observed_gates(
+                &fx.world.ctx(),
+                &fx.project,
+                &review,
+                &tip,
+                &git,
+                &mut String::new()
+            )
+            .unwrap_err()
+            .downcast_ref::<WallGateBusy>()
+            .is_some()
+        );
+        assert_eq!(
+            fx.world.runner.count("sh -c"),
+            3,
+            "same candidate reruns only wall"
+        );
+        match change {
+            "candidate" => {
+                tip = commit_file(
+                    Path::new(&review.repo),
+                    "src/new.rs",
+                    "new",
+                    "changed candidate",
+                );
+            }
+            "selection" => review.gates_note = "changed selection".into(),
+            "environment" => {
+                review.gates[0]
+                    .env
+                    .insert("NEW_ENV".into(), "changed".into());
+            }
+            "seal" => review.verdict_event = "new-seal".into(),
+            "logs" => {
+                let receipt = receipts(&fx.project, &review)
+                    .into_iter()
+                    .find(|r| r.gate.command == "cargo test")
+                    .unwrap();
+                std::fs::write(fx.project.state_dir().join(receipt.stdout), "corrupt").unwrap();
+            }
+            _ => unreachable!(),
+        }
+        busy.set(false);
+        observed_gates(
+            &fx.world.ctx(),
+            &fx.project,
+            &review,
+            &tip,
+            &git,
+            &mut String::new(),
+        )
+        .unwrap();
+        assert_eq!(
+            fx.world.runner.count("sh -c"),
+            5,
+            "must rerun both after {change}"
+        );
+    }
 }
 
 fn verdict_record(review: &Review, candidate: &str) -> Verdict {

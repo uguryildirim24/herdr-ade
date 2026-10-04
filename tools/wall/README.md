@@ -9,14 +9,21 @@ The omitted flag preserves the original default: `wall`/`wallbox`, `/home/wall`,
 ports 22285/22286, units `herdr-wall-PORT`, and saved machine `wall-box`.
 **Do not reset/install/fault the default while another lane uses it.**
 
-Every command accepts `--instance N` before its verb, N = 1..8.
+Every command accepts `--instance N` before its verb, N = 1..12.
 
 - **1–4:** manually assigned wall-lane slots; use only your assigned instance.
-- **5–8:** reserved together for `tools/wall/gate` on every herdr-ade review.
-  Instance 5 runs prove and the final fixture journey; independent regression
-  workers use 6, 7 and 8 concurrently. The gate holds one nonblocking lock per
-  slot (`/home/ubuntu/.cache/herdr-wall-gate/instance-N.lock`). Any occupied lock
-  yields the same retryable `gate instance busy` exit 75 before build/install.
+- **5–8 and 9–12:** two independent four-slot sets for `tools/wall/gate`.
+  Each invocation takes whichever full set is free. The first instance runs
+  prove and the final journey; the remaining three run regressions concurrently.
+  `--slot-set 9` restricts a development run to the added set. Each slot has a
+  nonblocking lock (`/home/ubuntu/.cache/herdr-wall-gate/instance-N.lock`);
+  partial claims are released before trying the other set. Both sets busy yields
+  retryable `gate instance busy` exit 75 before build/install.
+  ADE sets `ADE_WALL_REVIEW=1`: the review reserves admission and waits up to
+  1500 seconds for a set. Pending reviews make lanes exit 75 even if a set is
+  free. Reservation files beside the locks are flock-held; process exit/crash
+  releases them, and the next admission removes stale files. A scheduler lock
+  serializes only reservation/slot claims, never running campaigns.
   Never use a reserved slot manually without holding its corresponding lock.
 
 Instance N uses
@@ -41,7 +48,7 @@ hashes, in root-owned `/var/lib/herdr-wall-builds`. Instances share this
 read-only stage, with private writable executable copies for fault injection.
 No old v1 stage is reused. Install another instance with the same `--build` to
 reuse the stage; a later `install --build NEW` refreshes only its selected
-instance. `list` inventories all nine slots, build version/commit, processes,
+instance. `list` inventories all thirteen slots, build version/commit, processes,
 tmpfs use and last reset. An untouched v1 default has no reset/build metadata;
 its existing version is read without installing or stopping it.
 

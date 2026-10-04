@@ -145,11 +145,11 @@ class WallBoundaryTests(unittest.TestCase):
                           default.unit, default.port, default.box_port, default.machine),
                          (Path('/home/wall'), Path('/var/lib/herdr-wall'), 'wall', 'wallbox',
                           'herdr-wall', 22285, 22286, 'wall-box'))
-        instances = [Instance(n) for n in range(9)]
+        instances = [Instance(n) for n in range(13)]
         for field in ['home', 'base', 'user', 'box_user', 'unit', 'machine']:
-            self.assertEqual(len({getattr(i, field) for i in instances}), 9)
-        self.assertEqual(len({p for i in instances for p in [i.port, i.box_port]}), 18)
-        for n in [-1, 9]:
+            self.assertEqual(len({getattr(i, field) for i in instances}), 13)
+        self.assertEqual(len({p for i in instances for p in [i.port, i.box_port]}), 26)
+        for n in [-1, 13]:
             with self.assertRaises(ValueError):
                 Instance(n)
 
@@ -268,7 +268,7 @@ class WallBoundaryTests(unittest.TestCase):
         auth = self.home / 'shared-auth'
         auth.mkdir()
         file = auth / 'auth.json'
-        allowed = [user for n in range(9) for user in
+        allowed = [user for n in range(13) for user in
                    (host.Instance(n).user, host.Instance(n).box_user)]
         group = SimpleNamespace(gr_gid=os.getgid(), gr_mem=allowed)
         with mock.patch.object(host, 'AUTH', auth), \
@@ -330,14 +330,14 @@ class WallBoundaryTests(unittest.TestCase):
                     ['fault', 'clock', '0'], ['evidence', str(self.home / 'evidence')],
                     ['prove', str(self.home / 'proof'), '/alternate'], ['list'], ['logout']]
         for command in commands:
-            with self.subTest(command=command), mock.patch.object(host.sys, 'argv', ['wall', '--instance', '8', *command]), \
+            with self.subTest(command=command), mock.patch.object(host.sys, 'argv', ['wall', '--instance', '12', *command]), \
                     mock.patch.object(host, 'require_root'), mock.patch.object(host, 'install'), \
                     mock.patch.object(host, 'reset'), mock.patch.object(host, 'ssh'), \
                     mock.patch.object(host, 'fault'), mock.patch.object(host, 'run'), \
                     mock.patch.object(host, 'list_instances'), mock.patch.object(host, 'shared_auth'), \
                     mock.patch.object(host, 'AUTH', auth), mock.patch.object(host.Path, 'write_text'):
                 host.main()
-                self.assertEqual(host.INSTANCE.number, 8)
+                self.assertEqual(host.INSTANCE.number, 12)
 
     def test_reset_refuses_an_existing_shared_filesystem(self):
         base = self.home / 'base'

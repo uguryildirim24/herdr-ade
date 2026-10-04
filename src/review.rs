@@ -1285,7 +1285,8 @@ fn gate_command(
     );
     // Capture uses the shared Runner, including process-group timeout and full
     // streamed logs. SSH transports those same streams; no second executor.
-    let timeout = std::time::Duration::from_secs(1800);
+    // A review may wait one campaign budget for admission, then run its own.
+    let timeout = std::time::Duration::from_secs(if wall_gate(gate) { 3300 } else { 1800 });
     if let Some(target) = target {
         let assignments = environment
             .iter()
@@ -1331,10 +1332,11 @@ fn gate_environment(
 ) -> BTreeMap<String, String> {
     // The host wall gate reuses the reviewer's build, but does not inherit its
     // lane boundary. Other gates retain their existing environment contract.
-    if wall_gate(gate)
-        && let Some(target) = cargo_target
-    {
-        environment.insert("CARGO_TARGET_DIR".into(), target.into());
+    if wall_gate(gate) {
+        if let Some(target) = cargo_target {
+            environment.insert("CARGO_TARGET_DIR".into(), target.into());
+        }
+        environment.insert("ADE_WALL_REVIEW".into(), "1".into());
     }
     environment.extend(gate.env.clone());
     environment
@@ -1405,10 +1407,11 @@ fn observed_gates(
             .collect(),
         selected: gates.clone(),
     };
-    project::write_atomic(
-        &evidence_dir.join(format!("{candidate}-selection.toml")),
-        toml::to_string(&selection)?.as_bytes(),
-    )?;
+    let selection_path = evidence_dir.join(format!("{candidate}-selection.toml"));
+    let selection_text = toml::to_string(&selection)?;
+    let same_selection =
+        std::fs::read_to_string(&selection_path).is_ok_and(|previous| previous == selection_text);
+    project::write_atomic(&selection_path, selection_text.as_bytes())?;
     if gates.is_empty() {
         return Ok(Vec::new());
     }
@@ -1419,9 +1422,52 @@ fn observed_gates(
         environment,
         cargo_target,
     } = gate_context(ctx, project, review)?;
+    // Only a busy retry of this exact selection can reuse execution proof.
+    // Validate seal, candidate, command/environment and full log hashes again.
+    let receipts: Vec<GateReceipt> = if same_selection {
+        std::fs::read_dir(&evidence_dir)?
+            .filter_map(|entry| {
+                let path = entry.ok()?.path().join("receipt.toml");
+                toml::from_str(&std::fs::read_to_string(path).ok()?).ok()
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
+    let busy_retry = receipts.iter().any(|receipt| {
+        let env = gate_environment(environment.clone(), cargo_target.as_deref(), &receipt.gate);
+        let cmd = gate_command(&receipt.gate, candidate, &cwd, &env, target.as_deref());
+        wall_gate(&receipt.gate)
+            && receipt.exit == Some(75)
+            && receipt.establishes(project, review, candidate, &cmd, &machine)
+            && std::fs::read_to_string(project.state_dir().join(&receipt.stdout)).is_ok_and(|log| {
+                log.lines()
+                    .any(|line| line.starts_with("WALL GATE INCOMPLETE: gate instance busy"))
+            })
+    });
     let mut runs = Vec::new();
     for (index, gate) in gates.into_iter().enumerate() {
         let environment = gate_environment(environment.clone(), cargo_target.as_deref(), &gate);
+        let cmd = gate_command(&gate, candidate, &cwd, &environment, target.as_deref());
+        if busy_retry
+            && !wall_gate(&gate)
+            && receipts
+                .iter()
+                .filter(|receipt| {
+                    receipt.gate == gate
+                        && receipt.event == review.verdict_event
+                        && receipt.candidate == candidate
+                        && receipt.machine == machine
+                })
+                .max_by_key(|receipt| receipt.started.parse::<jiff::Timestamp>().ok())
+                .is_some_and(|receipt| receipt.matches(project, review, candidate, &cmd, &machine))
+        {
+            runs.push(GateRun {
+                command: gate.command,
+                exit: 0,
+            });
+            continue;
+        }
         let started = jiff::Timestamp::now().to_string();
         let run_dir = evidence_dir.join(format!("{candidate}-{index}-{started}"));
         std::fs::create_dir(&run_dir)?;
@@ -1430,7 +1476,6 @@ fn observed_gates(
             stdout: run_dir.join("stdout.log"),
             stderr: run_dir.join("stderr.log"),
         };
-        let cmd = gate_command(&gate, candidate, &cwd, &environment, target.as_deref());
         let capture = ctx
             .runner
             .capture(&cmd, ctx.runner.is_real().then_some(&logs));

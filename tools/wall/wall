@@ -90,7 +90,7 @@ def shared_auth():
     except KeyError:
         run('groupadd', 'wall-auth')
         group = grp.getgrnam('wall-auth')
-    allowed = {user for n in range(9) for user in (Instance(n).user, Instance(n).box_user)}
+    allowed = {user for n in range(13) for user in (Instance(n).user, Instance(n).box_user)}
     if set(group.gr_mem) - allowed:
         sys.exit('wall-auth contains a non-sandbox account')
     for name in sorted(allowed - set(group.gr_mem)):
@@ -323,7 +323,7 @@ def reset():
 
 
 def list_instances():
-    for n in range(9):
+    for n in range(13):
         instance = Instance(n)
         metadata = instance.base / 'build.json'
         installed = (instance.base / 'tools/guest.py').is_file()
@@ -414,7 +414,7 @@ def fault(args):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--instance', type=int, choices=range(1, 9))
+    parser.add_argument('--instance', type=int, choices=range(1, 13))
     sub = parser.add_subparsers(dest='command', required=True)
     p = sub.add_parser('install')
     p.add_argument('--build', required=True, help='directory containing current ADE binaries')
@@ -465,7 +465,7 @@ def main():
         dest = Path(args.destination).resolve()
         # Never put evidence inside any reset path or into the shared login.
         if any(dest.is_relative_to(Instance(n).home) or dest.is_relative_to(Instance(n).base)
-               for n in range(9)) or dest.is_relative_to(AUTH) or dest.is_relative_to(STAGES):
+               for n in range(13)) or dest.is_relative_to(AUTH) or dest.is_relative_to(STAGES):
             sys.exit('evidence must be outside sandbox/state/staging paths')
         dest.mkdir(exist_ok=False, parents=True)
         for box in [False, True]:

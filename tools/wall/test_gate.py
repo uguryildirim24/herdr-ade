@@ -1,5 +1,6 @@
 """The wall gate must not turn contention, omitted rounds or timeouts green."""
 import contextlib
+import fcntl
 import io
 import json
 import os
@@ -8,6 +9,7 @@ import signal
 import subprocess
 import tempfile
 import threading
+import time
 import unittest
 from unittest import mock
 
@@ -18,16 +20,19 @@ gate = load('wall_gate', 'gate')
 
 class GateTests(unittest.TestCase):
     def test_busy_is_retryable_and_does_not_build_or_reset(self):
-        with tempfile.TemporaryDirectory() as home, \
-                mock.patch.object(gate.Path, 'mkdir'), \
-                mock.patch.object(gate.Path, 'open', return_value=open(Path(home) / 'lock', 'w')), \
-                mock.patch.object(gate.fcntl, 'flock', side_effect=BlockingIOError), \
-                mock.patch.object(gate.sys, 'argv', ['gate']), \
-                mock.patch.object(gate.Gate, 'run') as run, \
-                contextlib.redirect_stdout(io.StringIO()) as output:
-            self.assertEqual(gate.main(), 75)
-            self.assertIn('WALL GATE INCOMPLETE: gate instance busy', output.getvalue())
-            run.assert_not_called()
+        with tempfile.TemporaryDirectory() as home, contextlib.ExitStack() as held:
+            directory = Path(home)
+            for instances in gate.SLOT_SETS:
+                for instance in instances:
+                    lock = held.enter_context((directory / f'instance-{instance}.lock').open('a'))
+                    fcntl.flock(lock, fcntl.LOCK_EX)
+            with mock.patch.object(gate, 'LOCK_DIR', directory), \
+                    mock.patch.object(gate.sys, 'argv', ['gate']), \
+                    mock.patch.object(gate.Gate, 'run') as run, \
+                    contextlib.redirect_stdout(io.StringIO()) as output:
+                self.assertEqual(gate.main(), 75)
+                self.assertIn('WALL GATE INCOMPLETE: gate instance busy', output.getvalue())
+                run.assert_not_called()
 
     def test_timeout_has_bounded_capture_and_reset_before_failure_result(self):
         with tempfile.TemporaryDirectory() as home:
@@ -45,7 +50,8 @@ class GateTests(unittest.TestCase):
                 self.assertLessEqual(subject.deadline, subject.started + gate.BUDGET)
 
             with mock.patch.object(gate.sys, 'argv', ['gate']), \
-                    mock.patch.object(gate.fcntl, 'flock'), \
+                    mock.patch.object(gate, 'LOCK_DIR', Path(home)), \
+                    mock.patch.dict(os.environ, ADE_WALL_REVIEW='0'), \
                     mock.patch.object(gate.tempfile, 'mkdtemp', return_value=str(evidence)), \
                     mock.patch.object(gate.Gate, 'run', run), \
                     mock.patch.object(gate.Gate, 'command', command), \
@@ -121,27 +127,81 @@ class GateTests(unittest.TestCase):
             self.assertLess(names.index('loop-install'), names.index('loop-build'))
             self.assertLess(names.index('loop-build'), names.index('loop'))
 
-    def test_each_reserved_slot_can_block_the_gate_without_any_work(self):
-        for busy in range(len(gate.INSTANCES)):
-            with self.subTest(instance=gate.INSTANCES[busy]), tempfile.TemporaryDirectory() as home:
-                opened = []
+    def test_each_reserved_slot_blocks_its_set_and_releases_partial_locks(self):
+        for instances in gate.SLOT_SETS:
+            for busy in instances:
+                with self.subTest(instance=busy), tempfile.TemporaryDirectory() as home:
+                    directory = Path(home)
+                    with (directory / f'instance-{busy}.lock').open('a') as lock:
+                        fcntl.flock(lock, fcntl.LOCK_EX)
+                        with gate.slots(directory, slot_sets=(instances,)) as assigned:
+                            self.assertIsNone(assigned)
+                        for instance in instances:
+                            if instance != busy:
+                                with (directory / f'instance-{instance}.lock').open('a') as probe:
+                                    fcntl.flock(probe, fcntl.LOCK_EX | fcntl.LOCK_NB)
 
-                def lock_file(*args, **kwargs):
-                    file = open(Path(home) / f'lock-{len(opened)}', 'w')
-                    opened.append(file)
-                    return file
+    def test_lane_yields_to_pending_review_then_review_runs_first(self):
+        with tempfile.TemporaryDirectory() as home, contextlib.ExitStack() as held:
+            directory = Path(home)
+            for instances in gate.SLOT_SETS:
+                held.enter_context(gate.slots(directory, slot_sets=(instances,)))
+            acquired, release = threading.Event(), threading.Event()
+            assignment = []
 
-                with mock.patch.object(gate.Path, 'mkdir'), \
-                        mock.patch.object(gate.Path, 'open', side_effect=lock_file), \
-                        mock.patch.object(gate.fcntl, 'flock', side_effect=[None] * busy + [BlockingIOError]), \
-                        mock.patch.object(gate.sys, 'argv', ['gate']), \
-                        mock.patch.object(gate.Gate, 'run') as run, \
-                        contextlib.redirect_stdout(io.StringIO()) as output:
-                    self.assertEqual(gate.main(), 75)
-                self.assertTrue(all(file.closed for file in opened))
-                self.assertEqual(len(opened), busy + 1)
-                run.assert_not_called()
-                self.assertIn('gate instance busy', output.getvalue())
+            def review():
+                with gate.slots(directory, review=True) as instances:
+                    assignment.append(instances)
+                    acquired.set()
+                    release.wait(5)
+
+            worker = threading.Thread(target=review)
+            worker.start()
+            try:
+                deadline = time.monotonic() + 5
+                while not list(directory.glob('review-*.pending')) and time.monotonic() < deadline:
+                    time.sleep(0.01)
+                self.assertTrue(list(directory.glob('review-*.pending')))
+                with gate.slots(directory) as instances:
+                    self.assertIsNone(instances)
+                held.close()
+                self.assertTrue(acquired.wait(5))
+                self.assertIn(assignment[0], gate.SLOT_SETS)
+            finally:
+                release.set()
+                worker.join(5)
+            self.assertFalse(worker.is_alive())
+            self.assertFalse(list(directory.glob('review-*.pending')))
+
+    def test_expired_review_reservation_does_not_block_lanes(self):
+        with tempfile.TemporaryDirectory() as home:
+            directory = Path(home)
+            # A crash releases flock but leaves the reservation directory entry.
+            stale = directory / 'review-dead.pending'
+            with stale.open('w') as reservation:
+                fcntl.flock(reservation, fcntl.LOCK_EX)
+                with gate.slots(directory) as instances:
+                    self.assertIsNone(instances)
+            with gate.slots(directory) as instances:
+                self.assertEqual(instances, gate.SLOT_SETS[0])
+            self.assertFalse(stale.exists())
+
+    def test_two_gates_hold_disjoint_sets_concurrently(self):
+        with tempfile.TemporaryDirectory() as home:
+            directory = Path(home)
+            with gate.slots(directory) as first:
+                with gate.slots(directory) as second:
+                    self.assertEqual(first, (5, 6, 7, 8))
+                    self.assertEqual(second, (9, 10, 11, 12))
+                    with gate.slots(directory) as third:
+                        self.assertIsNone(third)
+                    subject = gate.Gate(directory, directory, directory, second)
+                    self.assertEqual(subject.wall[-1], '9')
+                    repros = [directory / f'D{i}' / 'repro' for i in range(6)]
+                    with mock.patch.object(subject, 'prove'), \
+                            mock.patch.object(subject, 'regressions') as run:
+                        subject.campaign(repros)
+                    self.assertEqual({call.args[0] for call in run.call_args_list}, {10, 11, 12})
 
     def test_regression_slots_and_prove_really_overlap_without_sharing(self):
         with tempfile.TemporaryDirectory() as home:
