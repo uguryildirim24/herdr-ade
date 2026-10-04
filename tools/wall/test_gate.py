@@ -44,7 +44,15 @@ class GateTests(unittest.TestCase):
                 calls.append((args, name))
                 self.assertLessEqual(subject.deadline, subject.started + gate.BUDGET)
 
-            with mock.patch.object(gate.sys, 'argv', ['gate']), \
+            # The timeout fixture must not acquire locks in the real host
+            # cache (which is read-only inside a lane boundary).
+            def fixture_path(value):
+                if str(value) == '/home/ubuntu/.cache/herdr-wall-gate':
+                    return Path(home) / 'locks'
+                return Path(value)
+
+            with mock.patch.object(gate, 'Path', side_effect=fixture_path), \
+                    mock.patch.object(gate.sys, 'argv', ['gate']), \
                     mock.patch.object(gate.fcntl, 'flock'), \
                     mock.patch.object(gate.tempfile, 'mkdtemp', return_value=str(evidence)), \
                     mock.patch.object(gate.Gate, 'run', run), \
