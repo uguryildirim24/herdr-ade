@@ -44,6 +44,10 @@ fn fresh_open_starts_and_primes_or_reports_a_hard_failure_with_a_retry() {
         std::fs::write(&herdr, r#"#!/bin/sh
 printf '%s\n' "$*" >> "$HOME/herdr-calls"
 case "$1 $2" in
+  'remote-api-bridge ')
+    IFS= read -r input
+    printf '%s\n' "$input" > "$HOME/herdr-input"
+    printf '%s\n' '{"result":{}}' ;;
   'agent list') printf '%s\n' '{"result":{"agents":[]}}' ;;
   'pane list') printf '%s\n' '{"result":{"panes":[]}}' ;;
   'workspace create') printf '%s\n' '{"result":{"root_pane":{"workspace_id":"w1","tab_id":"w1:t1","pane_id":"w1:p1"}}}' ;;
@@ -114,9 +118,18 @@ esac
                 stdout.contains("opened `demo`") && stdout.contains("added the Rundown tab"),
                 "{stdout}"
             );
+            assert!(calls.contains("remote-api-bridge"), "{calls}");
+            let input: serde_json::Value = serde_json::from_str(
+                &std::fs::read_to_string(home.path().join("herdr-input")).unwrap(),
+            )
+            .unwrap();
+            assert_eq!(input["method"], "agent.prompt");
+            assert_eq!(input["params"]["target"], "w1:p1");
             assert!(
-                calls.contains("agent prompt w1:p1 You are the coordinator"),
-                "{calls}"
+                input["params"]["text"]
+                    .as_str()
+                    .unwrap()
+                    .starts_with("You are the coordinator")
             );
             assert!(root.join("demo/.claude/settings.local.json").exists());
         } else if matches!(mode, "timeout" | "agent_not_ready") {
@@ -127,7 +140,7 @@ esac
                 "{stdout}"
             );
             assert!(
-                !calls.contains("agent prompt") && !calls.contains("agent wait"),
+                !calls.contains("remote-api-bridge") && !calls.contains("agent wait"),
                 "{calls}"
             );
         } else {
@@ -147,7 +160,7 @@ esac
                 "{stderr}"
             );
             assert!(
-                !calls.contains("agent prompt") && !calls.contains("agent wait"),
+                !calls.contains("remote-api-bridge") && !calls.contains("agent wait"),
                 "{calls}"
             );
             assert!(

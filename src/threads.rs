@@ -2196,8 +2196,9 @@ pub(crate) fn record_follow_up_delivery(
     Ok(())
 }
 
-/// Herdr's PTY/activity errors may follow submission. Only these explicit
-/// refusals prove no prompt was written and permit another delivery attempt.
+/// Herdr's PTY/activity errors may follow submission. An exec failure or an
+/// explicit pre-submission refusal proves no prompt was written and permits
+/// another delivery attempt.
 pub(crate) fn prompt_refused_before_submission(error: &crate::herdr::HerdrError) -> bool {
     matches!(
         error.code.as_str(),
@@ -6476,6 +6477,13 @@ mod tests {
                 fail(
                     1,
                     r#"{"error":{"code":"agent_blocked","message":"dialog opened"}}"#,
+                ),
+                FollowUpState::Queued,
+            ),
+            (
+                fail(
+                    1,
+                    r#"{"error":{"code":"exec_failed","message":"could not execute herdr: Argument list too long (os error 7)"}}"#,
                 ),
                 FollowUpState::Queued,
             ),
