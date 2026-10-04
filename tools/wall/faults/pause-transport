@@ -13,7 +13,7 @@ import subprocess
 import time
 
 parser = argparse.ArgumentParser(description=__doc__)
-parser.add_argument('--instance', choices=['default'], default='default')
+parser.add_argument('--instance', choices=['default', '0'], default='default')
 parser.add_argument('seconds', type=float)
 args = parser.parse_args()
 if os.geteuid() != 0:

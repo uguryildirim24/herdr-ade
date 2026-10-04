@@ -19,7 +19,9 @@ All confirmed runs used this lane's own build:
 - The pre-install default actually reported `0.1.0+81e7e5f.1791081237`, not the
   older version anticipated by the brief. No faults ran against that build.
 
-**Default instance only.** These are v1 commands: no numbered-instance flag.
+**Default instance only.** These commands omit the instance flag and work
+with both v1 and the current wall controller. The two scoped fault helpers
+accept `default` and the current dispatcher's `0`; they reject sandboxes 1–8.
 Do not run these repros while another person is using the default sandbox.
 Each executable resets both default accounts, uses only scripted agents, prints
 EXPECTED/ACTUAL, captures evidence, and exits **1 for its reproduced defect**.

@@ -300,6 +300,18 @@ class WallBoundaryTests(unittest.TestCase):
         with self.assertRaises(SystemExit):
             host.fault(args)
 
+    def test_recovery_faults_accept_default_dispatch_and_refuse_numbered_sandboxes(self):
+        faults = Path(__file__).parent / 'faults'
+        for name in ['crash-service', 'pause-transport']:
+            for instance in ['0', 'default', '1', '8']:
+                with self.subTest(fault=name, instance=instance):
+                    # Help exits before fault injection, but argparse validates
+                    # the preceding selector exactly as wall's dispatcher does.
+                    result = subprocess.run(
+                        [str(faults / name), '--instance', instance, '--help'],
+                        capture_output=True, text=True)
+                    self.assertEqual(result.returncode, 0 if instance in ['0', 'default'] else 2)
+
     def test_every_command_accepts_numbered_instance(self):
         self.addCleanup(host.select, 0)
         auth = self.home / 'flag-auth'

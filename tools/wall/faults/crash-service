@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """SIGKILL one default-wall service, from its unprivileged SSH account.
 
-The v1 wall has no instance selector. Reject every numbered instance rather
-than routing it to the default sandbox accidentally. Never accepts a PID.
+Accept the default instance as named by v1 or as 0 by the current dispatcher.
+Reject every numbered sandbox rather than routing it to default. Never accepts a PID.
 """
 import argparse
 from pathlib import Path
@@ -10,7 +10,7 @@ import shlex
 import subprocess
 
 parser = argparse.ArgumentParser(description=__doc__)
-parser.add_argument('--instance', choices=['default'], default='default')
+parser.add_argument('--instance', choices=['default', '0'], default='default')
 parser.add_argument('--box', action='store_true')
 parser.add_argument('service', choices=['server', 'ticker'])
 args = parser.parse_args()
