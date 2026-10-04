@@ -214,9 +214,10 @@ mod tests {
             .find(|pane| pane["id"].as_str() == Some(ENTRYPOINT))
             .unwrap();
         assert_eq!(pane["placement"].as_str(), Some("tab"));
+        assert_eq!(pane["command"][0].as_str(), Some("/bin/sh"));
         assert_eq!(
-            pane["command"][0].as_str(),
-            Some("target/release/herdr-rundown")
+            pane["command"][2].as_str(),
+            Some("exec \"$HOME/.local/bin/herdr-rundown\" \"$@\"")
         );
         assert!(
             manifest["actions"]

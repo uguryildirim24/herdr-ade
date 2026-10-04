@@ -49,6 +49,13 @@ impl From<SessionArgs> for SessionFlags {
 enum Command {
     #[command(hide = true)]
     InstallCheck,
+    #[command(hide = true)]
+    InstallRundownCheck,
+    #[command(hide = true)]
+    InstallJourneyStart {
+        #[arg(long)]
+        review: Option<String>,
+    },
     /// Create a project folder with its skeleton files
     New {
         name: String,
@@ -1183,8 +1190,15 @@ pub fn run() -> Result<()> {
 
     // The installed image's read-only probe must not wake a ticker or render
     // context. Its entire output is numbers and readability, not project text.
-    if matches!(cli.command, Command::InstallCheck) {
-        return install_check(&ctx);
+    match &cli.command {
+        Command::InstallCheck => return install_check(&ctx),
+        Command::InstallRundownCheck => {
+            return installed_check_reply(crate::harness::reopened_rundown_check(&ctx));
+        }
+        Command::InstallJourneyStart { review } => {
+            return install_journey_start(&ctx, review.as_deref());
+        }
+        _ => {}
     }
     // A diagnostic transport executes explicit probes only, never project
     // discovery or ticker wake-up on the target machine.
@@ -1256,6 +1270,24 @@ fn install_check(ctx: &Ctx) -> Result<()> {
     Ok(())
 }
 
+fn installed_check_reply(result: Result<Option<String>>) -> Result<()> {
+    println!(
+        "{}",
+        serde_json::to_string(&crate::harness::InstalledCheck::from_result(result))?
+    );
+    Ok(())
+}
+
+fn install_journey_start(ctx: &Ctx, review: Option<&str>) -> Result<()> {
+    installed_check_reply((|| {
+        let review = review
+            .map(|review| review.split_once('/').context("expected PROJECT/REVIEW"))
+            .transpose()?;
+        crate::journey::after_install(ctx, review)?;
+        Ok(None)
+    })())
+}
+
 fn dispatch_with_start(
     ctx: Ctx<'_>,
     command: Command,
@@ -1263,6 +1295,10 @@ fn dispatch_with_start(
 ) -> Result<()> {
     match command {
         Command::InstallCheck => install_check(&ctx),
+        Command::InstallRundownCheck => {
+            installed_check_reply(crate::harness::reopened_rundown_check(&ctx))
+        }
+        Command::InstallJourneyStart { review } => install_journey_start(&ctx, review.as_deref()),
         Command::New { name, goal, repos } => {
             let repos = repos
                 .iter()

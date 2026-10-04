@@ -39,6 +39,9 @@ struct Passes {
     pid: u32,
     build: String,
     started: String,
+    // Historical observations have no install boundary.
+    #[serde(default)]
+    eligible_after: Option<String>,
     passes: Vec<Vec<String>>,
 }
 
@@ -47,6 +50,8 @@ struct InstallRequest {
     pid: u32,
     build: String,
     started: String,
+    #[serde(default)]
+    eligible_after: Option<String>,
 }
 
 fn installed_ticker(root: &Path) -> Result<InstallRequest> {
@@ -54,7 +59,10 @@ fn installed_ticker(root: &Path) -> Result<InstallRequest> {
         crate::ticker::LockState::Held(info) => Ok(InstallRequest {
             pid: info.pid,
             build: info.version,
-            started: info.started,
+            started: info.started.clone(),
+            eligible_after: project::read_json::<InstallRequest>(&boundary_path(root, info.pid))
+                .filter(|request| request.started == info.started)
+                .and_then(|request| request.eligible_after),
         }),
         _ => bail!("installed ticker ownership is unknown"),
     }
@@ -65,6 +73,18 @@ fn pass_path(root: &Path, pid: u32) -> std::path::PathBuf {
         .join(format!("{pid}.json"))
 }
 
+fn boundary_path(root: &Path, pid: u32) -> std::path::PathBuf {
+    root.join(".ticker.first-passes")
+        .join(format!("{pid}.install.json"))
+}
+
+fn arm_observation(root: &Path, request: &mut InstallRequest) -> Result<()> {
+    request.eligible_after = Some(jiff::Timestamp::now().to_string());
+    // Only the ticker writes Passes. Publishing a separate boundary avoids
+    // racing a pass already in flight when installation completes.
+    project::write_json(&boundary_path(root, request.pid), request)
+}
+
 pub(crate) fn ticker_started(root: &Path, started: &str) -> Result<()> {
     std::fs::create_dir_all(root.join(".ticker.first-passes"))?;
     project::write_json(
@@ -73,17 +93,35 @@ pub(crate) fn ticker_started(root: &Path, started: &str) -> Result<()> {
             pid: std::process::id(),
             build: crate::VERSION.into(),
             started: started.into(),
+            eligible_after: None,
             passes: Vec::new(),
         },
     )
 }
 
 // Called only at the end of a FULL pass, never from partial health publication.
-pub(crate) fn ticker_pass(root: &Path, failures: &[String]) -> Result<()> {
+pub(crate) fn ticker_pass(root: &Path, pass_started: &str, failures: &[String]) -> Result<()> {
     let path = pass_path(root, std::process::id());
     let Some(mut record) = project::read_json::<Passes>(&path) else {
         return Ok(());
     };
+    if let Some(boundary) = project::read_json::<InstallRequest>(&boundary_path(root, record.pid))
+        && boundary.started == record.started
+        && crate::build::same_commit(&boundary.build, &record.build)
+        && boundary.eligible_after != record.eligible_after
+    {
+        record.eligible_after = boundary.eligible_after;
+        record.passes.clear();
+    }
+    // A pass that straddled completion may contain the install's own skew.
+    // Only passes begun after all target machines finished can judge it.
+    if let Some(eligible_after) = &record.eligible_after {
+        let start: jiff::Timestamp = pass_started.parse()?;
+        let boundary: jiff::Timestamp = eligible_after.parse()?;
+        if start <= boundary {
+            return Ok(());
+        }
+    }
     if record.pid == std::process::id() && record.passes.len() < 2 {
         record.passes.push(failures.to_vec());
         project::write_json(&path, &record)?;
@@ -1387,7 +1425,9 @@ pub(crate) fn run(ctx: &Ctx, review: Option<(&str, &str)>) -> Result<()> {
                 let record = project::read_json::<Passes>(&pass_path(&ctx.root, request.pid))
                     .unwrap_or_default();
                 Ok((
-                    (record.pid == request.pid && record.started == request.started)
+                    (record.pid == request.pid
+                        && record.started == request.started
+                        && record.eligible_after == request.eligible_after)
                         .then(|| observation_result(&record, &request.build))
                         .flatten(),
                     format!(
@@ -1486,7 +1526,17 @@ pub(crate) fn after_install(ctx: &Ctx, current: Option<(&str, &str)>) -> Result<
     if request_path.exists() {
         return Ok(());
     }
-    let request = installed_ticker(&ctx.root)?;
+    let mut request = installed_ticker(&ctx.root)?;
+    if !crate::build::same_commit(&request.build, crate::VERSION) {
+        bail!(
+            "installed ticker build {} does not match {}",
+            request.build,
+            crate::VERSION
+        );
+    }
+    // This entry point is called only after every target's installation and
+    // process observation has finished. Earlier passes remain pending.
+    arm_observation(&ctx.root, &mut request)?;
     project::write_create_only(&request_path, serde_json::to_string(&request)?.as_bytes())?;
     let log = std::fs::File::create(dir.join(format!("install-{key}.log")))?;
     let bin = ctx.env.home.join(".local/bin/herdr-ade");
@@ -1553,13 +1603,112 @@ mod tests {
     fn only_first_two_completed_passes_are_retained() {
         let dir = tempfile::tempdir().unwrap();
         ticker_started(dir.path(), "this-run").unwrap();
-        ticker_pass(dir.path(), &["missing socket".into()]).unwrap();
-        ticker_pass(dir.path(), &[]).unwrap();
-        ticker_pass(dir.path(), &["later unrelated failure".into()]).unwrap();
+        ticker_pass(
+            dir.path(),
+            "2026-10-04T09:00:00Z",
+            &["missing socket".into()],
+        )
+        .unwrap();
+        ticker_pass(dir.path(), "2026-10-04T09:01:00Z", &[]).unwrap();
+        ticker_pass(
+            dir.path(),
+            "2026-10-04T09:02:00Z",
+            &["later unrelated failure".into()],
+        )
+        .unwrap();
         let record: Passes =
             project::read_json(&pass_path(dir.path(), std::process::id())).unwrap();
         assert_eq!(record.passes.len(), 2);
         assert_eq!(record.passes[0], ["missing socket"]);
+    }
+
+    #[test]
+    fn install_window_and_straddling_passes_are_pending_not_failures() {
+        let dir = tempfile::tempdir().unwrap();
+        ticker_started(dir.path(), "installed-start").unwrap();
+        let skew = vec![format!(
+            "version_skew: box runs older harness; home build {}",
+            crate::VERSION
+        )];
+        ticker_pass(dir.path(), "2026-10-04T08:48:11Z", &skew).unwrap();
+        ticker_pass(dir.path(), "2026-10-04T08:48:12Z", &skew).unwrap();
+        let mut request = InstallRequest {
+            pid: std::process::id(),
+            build: crate::VERSION.into(),
+            started: "installed-start".into(),
+            eligible_after: None,
+        };
+        arm_observation(dir.path(), &mut request).unwrap();
+        let before = |boundary: &str| {
+            boundary
+                .parse::<jiff::Timestamp>()
+                .unwrap()
+                .checked_sub(Duration::from_secs(1))
+                .unwrap()
+                .to_string()
+        };
+        ticker_pass(
+            dir.path(),
+            &before(request.eligible_after.as_ref().unwrap()),
+            &skew,
+        )
+        .unwrap();
+        let record: Passes = project::read_json(&pass_path(dir.path(), request.pid)).unwrap();
+        // The old record cannot satisfy a request with a new install boundary.
+        assert_ne!(record.eligible_after, request.eligible_after);
+        let after = request
+            .eligible_after
+            .as_ref()
+            .unwrap()
+            .parse::<jiff::Timestamp>()
+            .unwrap()
+            .checked_add(Duration::from_secs(1))
+            .unwrap()
+            .to_string();
+        ticker_pass(dir.path(), &after, &[]).unwrap();
+        let record: Passes = project::read_json(&pass_path(dir.path(), request.pid)).unwrap();
+        assert_eq!(record.eligible_after, request.eligible_after);
+        assert_eq!(record.passes, vec![Vec::<String>::new()]);
+        assert!(
+            observation_result(&record, crate::VERSION)
+                .unwrap()
+                .contains("PASS")
+        );
+    }
+
+    #[test]
+    fn box_skew_after_install_completion_remains_a_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        ticker_started(dir.path(), "installed-start").unwrap();
+        let mut request = InstallRequest {
+            pid: std::process::id(),
+            build: crate::VERSION.into(),
+            started: "installed-start".into(),
+            eligible_after: None,
+        };
+        arm_observation(dir.path(), &mut request).unwrap();
+        let after = request
+            .eligible_after
+            .as_ref()
+            .unwrap()
+            .parse::<jiff::Timestamp>()
+            .unwrap()
+            .checked_add(Duration::from_secs(1))
+            .unwrap()
+            .to_string();
+        let skew = vec![format!(
+            "version_skew: box runs older harness; home build {}",
+            crate::VERSION
+        )];
+        ticker_pass(dir.path(), &after, &skew).unwrap();
+        ticker_pass(dir.path(), &after, &skew).unwrap();
+        let record: Passes = project::read_json(&pass_path(dir.path(), request.pid)).unwrap();
+        assert_eq!(record.eligible_after, request.eligible_after);
+        let result = observation_result(&record, crate::VERSION).unwrap();
+        assert!(
+            result.contains("FAIL")
+                && result.contains("second full pass still missing: version_skew")
+        );
     }
 
     #[test]

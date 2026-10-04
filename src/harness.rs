@@ -710,6 +710,48 @@ fn installed_snapshot(ctx: &Ctx) -> Result<Vec<check::ProjectCheck>> {
     serde_json::from_str(&output.stdout).context("installed binary did not return install counts")
 }
 
+/// Only transport and the rollback decision belong to the installing process.
+/// The replacement defines the expectations and returns a typed receipt.
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(tag = "outcome", rename_all = "snake_case")]
+pub(crate) enum InstalledCheck {
+    Passed { evidence: Option<String> },
+    Failed { reason: String },
+}
+
+impl InstalledCheck {
+    pub(crate) fn from_result(result: Result<Option<String>>) -> Self {
+        match result {
+            Ok(evidence) => Self::Passed { evidence },
+            Err(error) => Self::Failed {
+                reason: format!("{error:#}"),
+            },
+        }
+    }
+
+    fn into_result(self) -> Result<Option<String>> {
+        match self {
+            Self::Passed { evidence } => Ok(evidence),
+            Self::Failed { reason } => bail!("{reason}"),
+        }
+    }
+}
+
+fn installed_check(ctx: &Ctx, command: &str, args: &[String]) -> Result<Option<String>> {
+    let bin = ctx.env.home.join(".local/bin/herdr-ade");
+    let output = ctx.runner.run(
+        &Cmd::new(bin.to_string_lossy(), INSTALL_TIMEOUT)
+            .args(["--root", &ctx.root.to_string_lossy(), command])
+            .args(args.iter().cloned()),
+    )?;
+    if !output.success() {
+        bail!("installed {command} failed: {}", output.error_text());
+    }
+    serde_json::from_str::<InstalledCheck>(&output.stdout)
+        .context("installed check did not return a typed receipt")?
+        .into_result()
+}
+
 fn rollback<T>(
     ctx: &Ctx,
     previous: PreviousBinaries,
@@ -735,6 +777,15 @@ fn rollback<T>(
         }
     }
     previous.discard()?;
+    // Plugin commands resolve the restored installed copies. Replace the
+    // running panes too, even when failure preceded render validation.
+    if let Err(error) = crate::rundown::reopen_existing(ctx) {
+        checks.result = format!(
+            "{reason}; binaries restored on mac, Rundown reopen failed: {error:#}, boxes untouched"
+        );
+        checks.record(&ctx.config_dir)?;
+        bail!("{}", checks.result);
+    }
     checks.result = format!("{reason}; rolled back on mac, boxes untouched");
     checks.record(&ctx.config_dir)?;
     bail!("{}", checks.result)
@@ -1364,7 +1415,7 @@ fn defer_to_earlier_reviews(ctx: &Ctx, current: Option<(&str, &str)>) -> Result<
 
 /// Check the screen actually produced by the replacement, not another JSON
 /// fixture. Read only the harness project's pane, never another project's prose.
-fn reopened_rundown_check(ctx: &Ctx) -> Result<Option<String>> {
+pub(crate) fn reopened_rundown_check(ctx: &Ctx) -> Result<Option<String>> {
     let observations: serde_json::Value =
         crate::project::read_json(&ctx.root.join(".rundown-reopen.json"))
             .context("Rundown reopen observations missing")?;
@@ -1539,7 +1590,8 @@ fn install_for(ctx: &Ctx, current: Option<(&str, &str)>) -> Result<InstallOutcom
     if let Some(reason) = check::regression(&checks.before, &checks.after) {
         return rollback(ctx, previous, &mut checks, &reason);
     }
-    let rundown_changed = previous.changed(&ctx.env.home, "herdr-rundown")?;
+    let rundown_changed = previous.changed(&ctx.env.home, "herdr-rundown")?
+        || previous.changed(&ctx.env.home, "herdr-ade")?;
     checks.result = format!("installed on mac; {}", checks.summary());
     checks.record(&ctx.config_dir)?;
     #[cfg(target_os = "macos")]
@@ -1549,8 +1601,8 @@ fn install_for(ctx: &Ctx, current: Option<(&str, &str)>) -> Result<InstallOutcom
         }
     }
     let rundown_result = if rundown_changed {
-        let result =
-            crate::rundown::reopen_existing(ctx).and_then(|()| reopened_rundown_check(ctx));
+        let result = crate::rundown::reopen_existing(ctx)
+            .and_then(|()| installed_check(ctx, "install-rundown-check", &[]));
         match result {
             Ok(result) => result.unwrap_or_else(|| {
                 "Rundown renders: not checked (no reopened adeherdr pane)".into()
@@ -1560,10 +1612,7 @@ fn install_for(ctx: &Ctx, current: Option<(&str, &str)>) -> Result<InstallOutcom
                     "REGRESSION: Rundown renders: FAIL {}",
                     crate::project_view::one_line(&format!("{error:#}"))
                 );
-                let result = rollback(ctx, previous, &mut checks, &reason);
-                // The failed replacement must not remain on screen after restoring binaries.
-                let _ = crate::rundown::reopen_existing(ctx);
-                return result;
+                return rollback(ctx, previous, &mut checks, &reason);
             }
         }
     } else {
@@ -1581,9 +1630,8 @@ fn install_for(ctx: &Ctx, current: Option<(&str, &str)>) -> Result<InstallOutcom
         .flat_map(|repo| &repo.binaries)
         .find(|binary| binary.name == "herdr-ade")
         .map(|binary| binary.version.clone());
-    let processes = local_process_proofs(ctx, plugin_version.as_deref())?;
-
-    // Finish with this invocation's image even if its on-disk binary changed.
+    // Finish box provisioning before replacing the installing ticker. A
+    // ticker-driven landing cannot resume until its replacement takes over.
     let mut boxes = Vec::new();
     for label in remote::declared_machine_labels(&ctx.config_dir)? {
         let mut result = BoxInstall {
@@ -1669,6 +1717,7 @@ fn install_for(ctx: &Ctx, current: Option<(&str, &str)>) -> Result<InstallOutcom
         }
         boxes.push(result);
     }
+    let processes = local_process_proofs(ctx, plugin_version.as_deref())?;
     let coordinator_hooks = crate::hook::reinstall_open(ctx)?;
     let mut machines = vec!["mac".to_string()];
     machines.extend(
@@ -1688,7 +1737,14 @@ fn install_for(ctx: &Ctx, current: Option<(&str, &str)>) -> Result<InstallOutcom
     checks
         .result
         .push_str("; ticker first full pass pending; journey pending");
-    if let Err(error) = crate::journey::after_install(ctx, current) {
+    let journey_args = current
+        .map(|(slug, id)| vec!["--review".into(), format!("{slug}/{id}")])
+        .unwrap_or_default();
+    // An incomplete target install has no observation boundary yet. Do not
+    // judge its expected skew as an after-install regression.
+    if !boxes.iter().any(BoxInstall::pending)
+        && let Err(error) = installed_check(ctx, "install-journey-start", &journey_args)
+    {
         checks
             .result
             .push_str(&format!("; post-install checks FAIL: {error:#}"));
@@ -1818,6 +1874,75 @@ mod tests {
                 error
             );
         }
+    }
+
+    #[test]
+    fn plugin_entrypoints_resolve_installed_images_after_build_and_rollback() {
+        let home = tempfile::tempdir().unwrap();
+        let repo = home.path().join("checkout");
+        let release = repo.join("target/release");
+        let bin_dir = home.path().join(".local/bin");
+        std::fs::create_dir_all(&release).unwrap();
+        std::fs::create_dir_all(&bin_dir).unwrap();
+        for bin in ["herdr-ade", "herdr-rundown"] {
+            write_version_binary(&bin_dir.join(bin), &format!("{bin} restored"), "");
+            write_version_binary(&release.join(bin), &format!("{bin} checkout-build"), "");
+        }
+        let manifest: toml::Value = toml::from_str(include_str!("../herdr-plugin.toml")).unwrap();
+        assert!(manifest.get("build").is_none());
+        let resolve = |expected: &str| {
+            for group in ["startup", "actions", "panes"] {
+                for entry in manifest[group].as_array().unwrap() {
+                    let argv: Vec<_> = entry["command"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .map(|arg| arg.as_str().unwrap())
+                        .collect();
+                    let output = RealRunner
+                        .run(
+                            &Cmd::new(argv[0], VERSION_TIMEOUT)
+                                .args(argv[1..].iter().copied())
+                                .env("HOME", home.path().to_string_lossy())
+                                .cwd(&repo),
+                        )
+                        .unwrap();
+                    assert!(output.success(), "{}", output.error_text());
+                    assert!(output.stdout.contains(expected), "{}", output.stdout);
+                    assert!(!output.stdout.contains("checkout-build"));
+                }
+            }
+        };
+        resolve("restored");
+        let mut previous = PreviousBinaries::new(home.path()).unwrap();
+        for bin in ["herdr-ade", "herdr-rundown"] {
+            previous.remember(home.path(), bin).unwrap();
+            let staged = bin_dir.join(format!(".{bin}.new"));
+            write_version_binary(&staged, &format!("{bin} installed-new"), "");
+            std::fs::rename(staged, bin_dir.join(bin)).unwrap();
+        }
+        resolve("installed-new");
+        let env = crate::paths::Env::for_test(home.path(), &[]);
+        let ctx = Ctx {
+            env: &env,
+            root: home.path().join("root"),
+            config_dir: home.path().join("config"),
+            runner: &RealRunner,
+            detached_ticker: false,
+        };
+        std::fs::create_dir_all(&ctx.config_dir).unwrap();
+        let mut checks = check::InstallCheck {
+            before: vec![],
+            after: vec![],
+            result: String::new(),
+        };
+        assert!(rollback::<()>(&ctx, previous, &mut checks, "simulated failure").is_err());
+        resolve("restored");
+        assert!(
+            std::fs::read_to_string(release.join("herdr-rundown"))
+                .unwrap()
+                .contains("checkout-build")
+        );
     }
 
     #[cfg(target_os = "macos")]
@@ -2272,11 +2397,13 @@ mod tests {
 
     #[test]
     fn installed_image_checks_counts_and_rolls_back_before_any_box_command() {
-        for (done, total, records_load, regresses) in [
-            (0, 1, true, true),
-            (1, 1, false, true),
-            (2, 3, true, false),
-            (1, 2, true, false),
+        for (done, total, records_load, render_error, regresses) in [
+            (0, 1, true, None, true),
+            (1, 1, false, None, true),
+            (2, 3, true, None, false),
+            (1, 2, true, None, false),
+            (1, 1, true, Some("Rundown read failed: missing field"), true),
+            (1, 1, true, Some("step count not rendered"), true),
         ] {
             let home = tempfile::tempdir().unwrap();
             let root = home.path().join("root");
@@ -2375,7 +2502,36 @@ mod tests {
                     build: crate::VERSION.into(),
                 },
             });
-            std::fs::write(&source, format!("#!/bin/sh\nif [ \"$1\" = --version ]; then echo 'herdr-ade {}'; else case \"$*\" in *'ticker status') printf '%s\\n' '{}' ;; *) printf '%s\\n' '{}' ;; esac; fi\n", crate::VERSION, status, json)).unwrap();
+            // A future installed build accepts activity before progress;
+            // this installer's own render rules reject that arrangement.
+            let screen = "Adeherdr\nActivity first\n████ 1 of 1";
+            assert!(rundown_screen_error(screen, "Adeherdr", "1 of 1").is_some());
+            let screen_path = repo.join("screen");
+            std::fs::write(
+                &screen_path,
+                match render_error {
+                    Some("step count not rendered") => "Adeherdr\nActivity first\n",
+                    Some(_) => "Adeherdr\nRundown read failed: missing field\n████ 1 of 1",
+                    None => screen,
+                },
+            )
+            .unwrap();
+            // This child's checker intentionally has different rules, and
+            // actually reads the screen (including both broken-render cases).
+            let child_check = format!(
+                r#"
+                {{ read -r title; read -r activity; read -r progress; }} < '{}'
+                if [ "$activity" != 'Activity first' ]; then
+                    printf '%s\n' '{{"outcome":"failed","reason":"Rundown read failed: missing field"}}'
+                elif [ "$progress" != '████ 1 of 1' ]; then
+                    printf '%s\n' '{{"outcome":"failed","reason":"step count not rendered"}}'
+                else
+                    printf '%s\n' '{{"outcome":"passed","evidence":"new-layout accepted"}}'
+                fi
+            "#,
+                screen_path.display()
+            );
+            std::fs::write(&source, format!("#!/bin/sh\nif [ \"$1\" = --version ]; then echo 'herdr-ade {}'; else case \"$*\" in *'ticker status') printf '%s\\n' '{}' ;; *'install-rundown-check') {} ;; *'install-journey-start') printf '%s\\n' '{{\"outcome\":\"passed\",\"evidence\":null}}' ;; *) printf '%s\\n' '{}' ;; esac; fi\n", crate::VERSION, status, child_check, json)).unwrap();
             let before_image = std::fs::read(installed_dir.join("herdr-ade")).unwrap();
             let runner = FakeRunner::new();
             runner.on("rev-parse HEAD", ok("new1234"));
@@ -2389,6 +2545,8 @@ mod tests {
                         || cmd.program == "mv"
                         || cmd.args == ["--version"]
                         || cmd.display().contains("install-check")
+                        || cmd.display().contains("install-rundown-check")
+                        || cmd.display().contains("install-journey-start")
                         || cmd.display().contains("ticker start")
                         || cmd.display().contains("ticker status")
                 },
@@ -2438,12 +2596,12 @@ mod tests {
             assert_eq!(record["after"][0]["done"], done, "{result:?}; {record}");
             assert!(!record.to_string().contains("private project text"));
             if regresses {
-                assert!(
-                    result
-                        .unwrap_err()
-                        .to_string()
-                        .contains("rolled back on mac, boxes untouched")
-                );
+                let error = result.unwrap_err().to_string();
+                assert!(error.contains("rolled back on mac, boxes untouched"));
+                if let Some(reason) = render_error {
+                    assert!(error.contains(reason), "{error}");
+                    assert_eq!(runner.count("install-rundown-check"), 1);
+                }
                 for bin in Kind::Plugin.binaries() {
                     assert_eq!(
                         std::fs::read_to_string(install_record(&installed_dir, bin)).unwrap(),
@@ -2460,6 +2618,9 @@ mod tests {
             } else {
                 let outcome = result.unwrap();
                 assert!(outcome.summary().contains("records load"));
+                assert!(outcome.checks.result.contains("new-layout accepted"));
+                assert_eq!(runner.count("install-rundown-check"), 1);
+                assert_eq!(runner.count("install-journey-start"), 1);
                 assert!(
                     serde_json::to_value(outcome)
                         .unwrap()
@@ -2601,6 +2762,10 @@ mod tests {
             let runner = FakeRunner::new();
             runner.on("machine list --json", ok("[]"));
             runner.on("install-check", ok("[]"));
+            runner.on(
+                "install-journey-start",
+                ok(r#"{"outcome":"passed","evidence":null}"#),
+            );
             runner.on("ticker status", ok(&current_receipt()));
             runner.on_fn(
                 |cmd| cmd.program == "git" && cmd.display().contains("rev-parse HEAD"),
@@ -2646,6 +2811,25 @@ mod tests {
                 detached_ticker: false,
             };
             let outcome = install(&ctx).unwrap();
+            let calls = runner.calls.borrow();
+            let last_box = calls.iter().rposition(|cmd| cmd.program == "ssh").unwrap();
+            let local_ticker = calls
+                .iter()
+                .position(|cmd| cmd.program != "ssh" && cmd.display().contains("ticker status"))
+                .unwrap();
+            let journey = calls
+                .iter()
+                .position(|cmd| cmd.display().contains("install-journey-start"));
+            assert!(last_box < local_ticker);
+            if fail_first {
+                assert!(
+                    journey.is_none(),
+                    "incomplete target install must remain pending"
+                );
+            } else {
+                assert!(local_ticker < journey.unwrap());
+            }
+            drop(calls);
             assert_eq!(outcome.boxes.len(), 2);
             assert_eq!(outcome.box_failed(), fail_first);
             assert_eq!(
