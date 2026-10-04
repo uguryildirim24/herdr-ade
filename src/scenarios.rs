@@ -1640,6 +1640,8 @@ fn forty_minute_sleep_defers_dark_wakes_and_imports_seals_before_resuming_starts
         push_remote: None,
         install_required: false,
         fast_forward: false,
+        merged_at: String::new(),
+        installed_at: String::new(),
         push: false,
         install: false,
         install_result: String::new(),

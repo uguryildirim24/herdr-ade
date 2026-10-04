@@ -94,8 +94,13 @@ pub(crate) struct Review {
     pub push_remote: Option<String>,
     pub install_required: bool,
     pub fast_forward: bool,
+    /// Historical reviews have no dated landing evidence.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub merged_at: String,
     pub push: bool,
     pub install: bool,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub installed_at: String,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub install_result: String,
     pub close: bool,
@@ -877,8 +882,10 @@ fn start_locked(
         push_remote: row.push_remote.or(row.publish_url),
         install_required: harness_row.is_some(),
         fast_forward: false,
+        merged_at: String::new(),
         push: false,
         install: false,
+        installed_at: String::new(),
         install_result: String::new(),
         close: false,
         prune: false,
@@ -2111,6 +2118,7 @@ fn land_with_install(
             }
         }
         review.fast_forward = true;
+        review.merged_at = project::now();
         save(project, review)?;
     }
     // Idempotent lane markers are written only after the durable FF boundary.
@@ -2179,6 +2187,9 @@ fn land_with_install(
             }
         }
         review.install = true;
+        if review.install_required {
+            review.installed_at = project::now();
+        }
         save(project, review)?;
     }
     if !review.close {
