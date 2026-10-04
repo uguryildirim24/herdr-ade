@@ -307,7 +307,10 @@ fn generated_repository_passes_the_actual_box_start_preflight_with_real_git() {
     own(&project);
     let settings = project::Settings {
         repos: vec![project::Repo {
-            path: repo.to_string_lossy().into_owned(),
+            path: std::fs::canonicalize(&repo)
+                .unwrap()
+                .to_string_lossy()
+                .into_owned(),
             branch: Some("main".into()),
             push_remote: Some("journey".into()),
             box_path: Some("/box/journey-preflight/repo".into()),

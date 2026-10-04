@@ -74,7 +74,7 @@ esac
         let run = |args: &[&str]| {
             Command::new(BIN)
                 .env_clear()
-                .env("HOME", home.path())
+                .env("HOME", std::fs::canonicalize(home.path()).unwrap())
                 .env("PATH", "/usr/bin:/bin")
                 .env("HERDR_BIN_PATH", &herdr)
                 .env("HERDR_SOCKET_PATH", home.path().join("fixture.sock"))
