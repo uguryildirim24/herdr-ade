@@ -2647,9 +2647,16 @@ fn complete_nonzero_gate_is_failed_and_notice_keeps_failing_lines_and_disagreeme
     let mut ctx = fx.world.ctx();
     ctx.runner = &crate::runner::RealRunner;
     let git = Git::new(ctx.runner, &review.repo);
-    let error = observed_gates(&ctx, &fx.project, &review, &candidate, &git)
-        .unwrap_err()
-        .to_string();
+    let error = observed_gates(
+        &ctx,
+        &fx.project,
+        &review,
+        &candidate,
+        &git,
+        &mut String::new(),
+    )
+    .unwrap_err()
+    .to_string();
     assert!(error.starts_with("gate failed:"), "{error}");
     assert!(error.contains("exit 101"));
     assert!(error.contains("reviewer verdict MERGE disagrees"));
@@ -2666,9 +2673,16 @@ fn complete_nonzero_gate_is_failed_and_notice_keeps_failing_lines_and_disagreeme
     assert!(!review.fast_forward);
     // A gate's own 125 is failure too; only ADE's checker marker is unknown.
     review.gates[0].command = "exit 125".into();
-    let error = observed_gates(&ctx, &fx.project, &review, &candidate, &git)
-        .unwrap_err()
-        .to_string();
+    let error = observed_gates(
+        &ctx,
+        &fx.project,
+        &review,
+        &candidate,
+        &git,
+        &mut String::new(),
+    )
+    .unwrap_err()
+    .to_string();
     assert!(error.starts_with("gate failed:"), "{error}");
     assert!(error.contains("exit 125"));
 }
@@ -2699,9 +2713,16 @@ fn gate_transport_error_is_not_established() {
     let mut ctx = fx.world.ctx();
     ctx.runner = &Transport;
     let git = Git::new(ctx.runner, &review.repo);
-    let error = observed_gates(&ctx, &fx.project, &review, &candidate, &git)
-        .unwrap_err()
-        .to_string();
+    let error = observed_gates(
+        &ctx,
+        &fx.project,
+        &review,
+        &candidate,
+        &git,
+        &mut String::new(),
+    )
+    .unwrap_err()
+    .to_string();
     assert!(error.contains("not established"), "{error}");
     assert!(error.contains("connection reset by peer"));
     assert!(!error.contains("gate failed:"));
