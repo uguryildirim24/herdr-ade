@@ -7977,6 +7977,7 @@ mod tests {
             gates_note: String::new(),
             selected_gates: vec![],
             reviewer: None,
+            review_machine: None,
             phase: crate::review::Phase::Reviewing,
             verdict: None,
             verdict_event: String::new(),

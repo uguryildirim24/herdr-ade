@@ -1628,6 +1628,7 @@ fn forty_minute_sleep_defers_dark_wakes_and_imports_seals_before_resuming_starts
         gates_note: String::new(),
         selected_gates: vec![],
         reviewer: Some("t-0001".into()),
+        review_machine: None,
         phase: crate::review::Phase::Reviewing,
         verdict: None,
         verdict_event: String::new(),
