@@ -1,0 +1,12 @@
+# Sandbox-only runtime registration. No builds, installs or startup actions.
+id = "herdr-ade"
+name = "ADE wall sandbox"
+version = "0.1.0"
+min_herdr_version = "0.9.1"
+platforms = ["linux"]
+
+[[panes]]
+id = "rundown"
+title = "Rundown"
+placement = "tab"
+command = ["bin/herdr-rundown"]
