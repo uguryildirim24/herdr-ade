@@ -250,7 +250,7 @@ fn local_journey(missing_pi: bool) {
     } else {
         assert_eq!(lanes, 1);
         assert!(notice.contains("PASS open and prime coordinator"));
-        assert!(notice.contains("Mac lane launched after 0 s"));
+        assert!(notice.contains("Mac lane launch window starts 0 s after placement"));
         assert!(notice.contains("PASS Mac lane seals"));
         assert!(notice.contains("PASS reviewer merges, landing pushes"));
         let repo = scratch.join("repo");
@@ -861,6 +861,32 @@ fn mac_seal_window_starts_at_launch_claim_not_placement() {
     // Polling late must not grant a fresh 180-second window.
     thread::update(&project, &lane.id, |lane| {
         lane.startup_wait_started = (now - jiff::SignedDuration::from_secs(181)).to_string();
+    })
+    .unwrap();
+    let (seal_deadline, _) = launch_claim(&project, &lane.id).unwrap().0.unwrap();
+    assert!(seal_deadline <= Instant::now());
+}
+
+#[test]
+fn mac_launch_poll_can_observe_a_ready_lane_after_the_claim_was_cleared() {
+    let world = World::new();
+    let project = world.project("journey-ready-window", "owned.sock");
+    let now = jiff::Timestamp::now();
+    let lane = thread::allocate(&project, |lane| {
+        lane.created = (now - jiff::SignedDuration::from_secs(161)).to_string();
+        lane.launch_attempts = 1;
+        lane.status = thread::Status::Open;
+        lane.brief_submitted = true;
+        lane.brief_submitted_at = now.to_string();
+        // This is the ordinary ready-pass state, not an unlaunched shell.
+        lane.startup_wait_started.clear();
+    })
+    .unwrap();
+    let (seal_deadline, seconds) = launch_claim(&project, &lane.id).unwrap().0.unwrap();
+    assert_eq!(seconds, 161);
+    assert!(seal_deadline.saturating_duration_since(Instant::now()) > Duration::from_secs(178));
+    thread::update(&project, &lane.id, |lane| {
+        lane.brief_submitted_at = (now - jiff::SignedDuration::from_secs(181)).to_string();
     })
     .unwrap();
     let (seal_deadline, _) = launch_claim(&project, &lane.id).unwrap().0.unwrap();

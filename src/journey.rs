@@ -748,13 +748,21 @@ fn seal(project: &Project, id: &str) -> Result<(Option<String>, String)> {
 
 // Placement sets startup_wait_started too. Only a nonzero launch_attempts
 // makes it the ticker's agent-start claim rather than time spent in the queue.
+// Readiness clears that transient claim. If the poll missed it, the recorded
+// brief submission also proves launch and bounds the seal window without
+// granting a fresh window on every poll. Neither date is the queued shell's age.
 fn launch_claim(project: &Project, id: &str) -> Result<(Option<(Instant, i64)>, String)> {
     let (_, state) = seal(project, id)?;
     let lane = crate::thread::load(project, id)?;
-    if lane.launch_attempts == 0 || lane.startup_wait_started.is_empty() {
+    let start = if lane.startup_wait_started.is_empty() {
+        &lane.brief_submitted_at
+    } else {
+        &lane.startup_wait_started
+    };
+    if lane.launch_attempts == 0 || start.is_empty() {
         return Ok((None, format!("{state}; launch claim not observed")));
     }
-    let claimed = lane.startup_wait_started.parse::<jiff::Timestamp>()?;
+    let claimed = start.parse::<jiff::Timestamp>()?;
     let queued = claimed
         .duration_since(lane.created.parse::<jiff::Timestamp>()?)
         .as_secs()
@@ -1093,7 +1101,10 @@ fn run_steps(
                 launch_claim(&project, &mac)
             })?;
             mac_launch = Some(claim);
-            Ok(format!("Mac lane launched after {} s: {mac}", claim.1))
+            Ok(format!(
+                "Mac lane launch window starts {} s after placement: {mac}",
+                claim.1
+            ))
         },
     )?;
     let mac_ready = report.optional_step(
@@ -1107,7 +1118,7 @@ fn run_steps(
             })
             .with_context(|| {
                 format!(
-                    "Mac lane launched after {queued} s; seal window is 180 s from launch claim"
+                    "Mac lane launch window starts {queued} s after placement; seal window is 180 s from recorded launch claim or brief submission"
                 )
             })?;
             let sha = sealed_sha(&project, &mac)?;

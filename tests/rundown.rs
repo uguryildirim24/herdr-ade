@@ -82,7 +82,13 @@ fn fixture(home: &Path) -> jiff::Timestamp {
         "threads/t-0040.toml",
         json!({"id":"t-0040", "status":"open", "attempt":1, "machine":"oci", "last_group":"working", "last_state":"working", "last_state_change":at(2400), "last_observed":now.to_string()}),
     );
-    steps.push(json!({"id":"s-now", "text":"Make tomorrow’s changes visible", "state":"left", "threads":["t-0040"]}));
+    record(
+        home,
+        "adeherdr",
+        "tasks/job-0010.toml",
+        json!({"id":"job-0010", "title":"Current work", "authority":["request:fixture"], "acceptance":["Visible change works"], "attempts":["t-0040"]}),
+    );
+    steps.push(json!({"id":"s-now", "text":"Make tomorrow’s changes visible", "state":"left", "tasks":["job-0010"]}));
     record(
         home,
         "adeherdr",
@@ -94,7 +100,7 @@ fn fixture(home: &Path) -> jiff::Timestamp {
         "+++\nid = \"login\"\nkind = \"login\"\nsubject = \"t-0099\"\nsummary = \"Sign in through your browser\"\ncreated = \"2026-10-04T10:00:00Z\"\n+++\nSign in through your browser\n",
     );
     write(home.join("root/adeherdr/.state/goal-check.json"), json!({"waits":[
-        [{"kind":"wait","tasks":["job-0001"],"party":"Rolf","condition":"Choose the next direction"},"evidence"],
+        [{"kind":"wait","tasks":["job-0010"],"party":"Rolf","condition":"Choose the next direction"},"evidence"],
         [{"kind":"wait","tasks":[],"party":"harness","condition":"Internal retry"},"evidence"]
     ]}).to_string());
     now

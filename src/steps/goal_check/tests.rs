@@ -585,6 +585,14 @@ fn scoped_wait_survives_independent_work_and_replacement_then_answer_rechecks_on
     assert_eq!(load(&f.project).waits[0].0, wait);
     crate::prompt::record_test_request(&f.project, "q-answer", "Choose the reversible route")
         .unwrap();
+    // Requests are rounded to seconds. Give this later request a later fixture
+    // time, rather than depending on directory order when both round equally.
+    let request_path = f.project.record_dir("requests").join("q-answer.json");
+    let mut request: serde_json::Value = project::read_json(&request_path).unwrap();
+    request["at"] = (jiff::Timestamp::now() + jiff::SignedDuration::from_secs(2))
+        .to_string()
+        .into();
+    project::write_json(&request_path, &request).unwrap();
     reconcile(&f.project, Some(&replacement), 50).unwrap();
     let answer_check = load(&f.project);
     assert!(answer_check.disposition.is_none());
@@ -846,6 +854,7 @@ fn answer_retires_only_that_partys_open_waits_and_keeps_evidence() {
         view.needs_you.is_empty(),
         "retired wait cannot return via old lane text"
     );
+    assert_eq!(view.rundown()["needs_you_items"], serde_json::json!([]));
     reconcile(&f.project, None, 20).unwrap();
     assert_eq!(load(&f.project), check);
     record(
@@ -948,6 +957,7 @@ fn historical_seven_wait_shape_loads_and_projects_no_stale_needs_you() {
     let view = crate::project_view::View::capture(&f.project, &settings, None, None);
     assert!(view.needs_you.is_empty());
     assert_eq!(view.rundown()["needs_you"], "");
+    assert_eq!(view.rundown()["needs_you_items"], serde_json::json!([]));
     assert!(!view.render(&["Plan"]).contains("Wait for"));
     assert_eq!(before, std::fs::read(path(&f.project)).unwrap());
 }
