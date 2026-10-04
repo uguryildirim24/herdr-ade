@@ -54,6 +54,9 @@ pub(crate) struct Verdict {
     /// Unclassified historical rejections remain merits rejections.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub evidence_only: bool,
+    /// Harness-classified REJECT judging only withdrawn conditions.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub withdrawn_only: bool,
     #[serde(default)]
     pub without: BTreeMap<String, String>,
     /// Historical declarations remain readable, but are never mechanical proof.
@@ -826,7 +829,7 @@ fn start_locked(
 }
 fn task(project: &Project, review: &Review) -> String {
     let mut out = format!(
-        "Run `ha skill reviewer`. Review the whole repository pile {}. Your checkout owns the candidate, starting at frozen integration base `{}`. Merge every included SHA below (preserve any merges/fixes already in a recovered checkout); resolve conflicts, fix small issues, and judge each original acceptance criterion. ADE runs the path-selected gates on your sealed candidate, on your machine, before landing. Do not push or install.\n\n",
+        "Run `ha skill reviewer`. Review the whole repository pile {}. Your checkout owns the candidate, starting at frozen integration base `{}`. Merge every included SHA below (preserve any merges/fixes already in a recovered checkout); resolve conflicts, fix small issues, and judge each original required acceptance criterion not withdrawn. ADE runs the path-selected gates on your sealed candidate, on your machine, before landing. Do not push or install.\n\n",
         review.id, review.base
     );
     for member in &review.members {
@@ -855,7 +858,7 @@ fn task(project: &Project, review: &Review) -> String {
             gate.command, gate.env
         ));
     }
-    out.push_str(&format!("\nWrite a report with TOML front matter:\n+++\nreview = \"{}\"\nverdict = \"MERGE\" # or REJECT\ncandidate = \"<your exact HEAD>\"\n# Gate execution receipts are recorded by ADE, not declared here.\n# Optional: without = {{ t-0001 = \"one-line reason\" }}\n# For REJECT solely because the review packet or member records are incomplete/unreadable:\n# evidence_only = true\n# Never use evidence_only for implementation defects, failed criteria, or mixed reasons.\n\n# Repeat for each included task's required criterion:\n[[acceptance]]\nthread = \"<member thread>\"\nevent = \"<member seal from the packet>\"\ncriterion = 1\ncondition = \"<exact original acceptance condition>\"\nestablished = true # false means not established; fix or exclude this member\nevidence = \"<durable artifact and behavior/journey references>\"\n+++\n\nIf excluding lanes, rebuild from the integration base without those lanes; their commits must not remain ancestors of your candidate. For every original required criterion, cite durable artifact/behavior evidence or say not established; gates alone do not prove semantics. Include findings and actual journey evidence. Commit repository changes if any, leave runtime deliverables untracked, then `ha done`. Output in another repository belongs in the report.\n", review.id));
+    out.push_str(&format!("\nWrite a report with TOML front matter:\n+++\nreview = \"{}\"\nverdict = \"MERGE\" # or REJECT\ncandidate = \"<your exact HEAD>\"\n# Gate execution receipts are recorded by ADE, not declared here.\n# Optional: without = {{ t-0001 = \"one-line reason\" }}\n# For REJECT solely because the review packet or member records are incomplete/unreadable:\n# evidence_only = true\n# Never use evidence_only for implementation defects, failed criteria, or mixed reasons.\n\n# Repeat for each included task's required criterion not withdrawn:\n[[acceptance]]\nthread = \"<member thread>\"\nevent = \"<member seal from the packet>\"\ncriterion = 1\ncondition = \"<exact original acceptance condition>\"\nestablished = true # false means not established; fix or exclude this member\nevidence = \"<durable artifact and behavior/journey references>\"\n+++\n\nIf excluding lanes, rebuild from the integration base without those lanes; their commits must not remain ancestors of your candidate. For every original required criterion not withdrawn, cite durable artifact/behavior evidence or say not established; gates alone do not prove semantics. Keep original criterion numbers. Withdrawn conditions are not required and must not be judged; any acceptance row for a withdrawn criterion is ignored, never a reason to reject. Include findings and actual journey evidence. Commit repository changes if any, leave runtime deliverables untracked, then `ha done`. Output in another repository belongs in the report.\n", review.id));
     out
 }
 /// This text becomes part of the reviewer's own immutable launch brief. Never
@@ -889,6 +892,31 @@ fn member_packet(project: &Project, member: &Member) -> String {
             task.id,
             task.authority.join(", ")
         ));
+        for withdrawal in &task.withdrawn {
+            out.push_str(&format!(
+                "  Withdrawn criterion {}: {} — NOT REQUIRED; must not be judged. Reason: {}. Withdrawn via coordinator `ha task drop` at {}; individual identity not recorded.\n",
+                withdrawal.acceptance,
+                task.acceptance[withdrawal.acceptance - 1],
+                withdrawal.reason,
+                withdrawal.at,
+            ));
+        }
+        if !task.withdrawn.is_empty() {
+            let required = (1..=task.acceptance.len())
+                .filter(|criterion| {
+                    !task
+                        .withdrawn
+                        .iter()
+                        .any(|row| row.acceptance == *criterion)
+                })
+                .map(|criterion| criterion.to_string())
+                .collect::<Vec<_>>()
+                .join(", ");
+            out.push_str(&format!(
+                "  Required acceptance rows for {}: {required} (original numbering; omit withdrawn criteria).\n",
+                task.id
+            ));
+        }
         if let Some(judgment) = &task.acceptance_review {
             out.push_str(&format!(
                 "  Coordinator judgment snapshot: {} at {}; seal {}, report artifact {}\n",
@@ -1015,7 +1043,12 @@ fn verdict(
             "evidence_only requires a whole-pile REJECT for missing review input, not exclusions or MERGE"
         );
     }
+    // Do not trust a reviewer-supplied classification. Persist only the
+    // classification derived from the sealed rows and current withdrawals.
+    verdict.withdrawn_only = false;
     if verdict.verdict == "REJECT" {
+        verdict.withdrawn_only = verdict.without.is_empty()
+            && rejection_only_withdrawn(project, review, &crate::task::report_criteria(&text)?);
         return Ok(verdict);
     }
     if verdict.without.len() == review.members.len() {
@@ -1427,8 +1460,55 @@ fn verify_gate_receipts(
     Ok(())
 }
 
+/// Unknown rows, mixed failures and unreadable records cannot turn a merits
+/// rejection into a retry. Missing required judgments still need a fresh review;
+/// this classification never establishes acceptance or authorizes landing.
+fn rejection_only_withdrawn(
+    project: &Project,
+    review: &Review,
+    criteria: &[crate::contracts::CriterionEvidence],
+) -> bool {
+    let (tasks, errors) = crate::task::list_with_errors(project);
+    if !errors.is_empty() {
+        return false;
+    }
+    let failed = criteria
+        .iter()
+        .filter(|row| !row.established || row.evidence.trim().is_empty())
+        .collect::<Vec<_>>();
+    !failed.is_empty()
+        && failed.iter().all(|row| {
+            review.members.iter().any(|member| {
+                member.thread == row.thread
+                    && member.event == row.event
+                    && tasks.iter().any(|task| {
+                        task.attempts.contains(&member.thread)
+                            && row
+                                .criterion
+                                .checked_sub(1)
+                                .and_then(|index| task.acceptance.get(index))
+                                == Some(&row.condition)
+                            && task
+                                .withdrawn
+                                .iter()
+                                .any(|withdrawal| withdrawal.acceptance == row.criterion)
+                    })
+            })
+        })
+}
+
+impl Verdict {
+    fn needs_fresh_review(&self) -> bool {
+        self.evidence_only || self.withdrawn_only
+    }
+}
+
 fn defer_members(project: &Project, review: &Review) -> Result<()> {
-    if review.verdict.as_ref().is_some_and(|v| v.evidence_only) {
+    if review
+        .verdict
+        .as_ref()
+        .is_some_and(Verdict::needs_fresh_review)
+    {
         return Ok(());
     }
     for member in &review.members {
@@ -1620,7 +1700,9 @@ fn advance(ctx: &Ctx, project: &Project, review: &mut Review) -> Result<()> {
                 .verdict
                 .as_ref()
                 .map(|v| {
-                    if v.evidence_only {
+                    if v.withdrawn_only {
+                        "only withdrawn criteria failed; not a failed review; starting a fresh review of the same members with the corrected packet".into()
+                    } else if v.evidence_only {
                         "review evidence incomplete; members remain eligible for a fresh review"
                             .into()
                     } else {
@@ -1631,7 +1713,8 @@ fn advance(ctx: &Ctx, project: &Project, review: &mut Review) -> Result<()> {
                 .unwrap_or_else(|| "reviewer rejected the pile".into());
             queue_notice(review, format!("REVIEW {} rejected: {reason}", review.id));
             // Merits rejections need new member seals. Missing review input
-            // leaves the original seals eligible for a fresh packet/reviewer.
+            // or judgments of withdrawn criteria leave the original seals
+            // eligible for a fresh packet/reviewer.
             defer_members(project, review)?;
             save(project, review)?;
             crate::threads::resolve_automatically(ctx, project, &reviewer.id, "review rejected");
@@ -2015,7 +2098,7 @@ pub(crate) fn retry(ctx: &Ctx, slug: &str, repo: Option<&str>) -> Result<Option<
     let row = repository(ctx, &project, repo)?;
     let _lock = operation_lock(ctx, &row.path)?;
     let Some((home, mut record)) = active_for_repo(ctx, &row.path)? else {
-        // A decided evidence-only review closed its reviewer, not its members.
+        // A decided input/withdrawal-only review closed its reviewer, not its members.
         // Start a new review under today's contract rather than reopen a
         // resolved process or erase historical verdict evidence.
         if list(&project)?
@@ -2024,7 +2107,10 @@ pub(crate) fn retry(ctx: &Ctx, slug: &str, repo: Option<&str>) -> Result<Option<
             .find(|review| same_repo(&review.repo, &row.path))
             .is_some_and(|review| {
                 review.phase == Phase::Rejected
-                    && review.verdict.as_ref().is_some_and(|v| v.evidence_only)
+                    && review
+                        .verdict
+                        .as_ref()
+                        .is_some_and(Verdict::needs_fresh_review)
             })
         {
             let events = crate::events::checked(&project)?;

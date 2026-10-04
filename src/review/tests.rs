@@ -3,6 +3,7 @@ use crate::testkit::{Fx, commit_file, fixture, git};
 
 mod holds;
 mod starts;
+mod withdrawals;
 use std::path::Path;
 
 fn configured() -> Fx {
@@ -103,6 +104,7 @@ fn landing_verdict(review: &mut Review, candidate: &str) {
         gates: vec![],
         gates_note: String::new(),
         evidence_only: false,
+        withdrawn_only: false,
     });
     review.phase = Phase::Landing;
 }
@@ -147,6 +149,7 @@ fn seal_verdict(
         review: review.id.clone(),
         candidate: candidate.into(),
         evidence_only: false,
+        withdrawn_only: false,
         without,
         gates,
         gates_note: String::new(),
