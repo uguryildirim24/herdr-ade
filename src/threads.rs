@@ -1856,6 +1856,25 @@ pub struct CancelOutcome {
 /// not complete. The resolved record is written before external cleanup, so
 /// no ticker can relaunch it while its session is unreachable.
 pub fn cancel(ctx: &Ctx, slug: &str, id: &str, reason: &str) -> Result<CancelOutcome> {
+    cancel_with_retention(ctx, slug, id, reason, false)
+}
+
+pub(crate) fn cancel_preserving_checkout(
+    ctx: &Ctx,
+    slug: &str,
+    id: &str,
+    reason: &str,
+) -> Result<CancelOutcome> {
+    cancel_with_retention(ctx, slug, id, reason, true)
+}
+
+fn cancel_with_retention(
+    ctx: &Ctx,
+    slug: &str,
+    id: &str,
+    reason: &str,
+    keep_checkout: bool,
+) -> Result<CancelOutcome> {
     let project = Project::load(&ctx.root, slug)?;
     let reason = reason.trim();
     if reason.is_empty() {
@@ -1872,6 +1891,7 @@ pub fn cancel(ctx: &Ctx, slug: &str, id: &str, reason: &str) -> Result<CancelOut
     let recorded_reason = record.cancellation_reason.clone();
     let request = record.retirement_request(RetirementRequest {
         authority: RetirementAuthority::Cancel,
+        keep_checkout,
         ..Default::default()
     });
     let outcome = retire(
@@ -2750,7 +2770,9 @@ fn retire(
         // than trying to read links from the now-absent checkout.
         let preservation_complete =
             request.preserved && (already_removed || record.worktree_path.is_empty());
-        let mut removal_refusal = None;
+        let mut removal_refusal = request
+            .keep_checkout
+            .then(|| "diagnostic retention: checkout and ref kept".to_string());
         let (mut final_copy, mut copy_notes) = if preservation_complete && !request.skip_copy {
             ("complete".to_string(), Vec::new())
         } else if request.skip_copy {
@@ -2772,6 +2794,14 @@ fn retire(
                     }
                     ("partial".to_string(), notes)
                 }
+                CopyOutcome::Failed(error) if request.keep_checkout => {
+                    // Preservation is retryable; it must not keep a cancelled
+                    // agent running. Its untouched checkout is still evidence.
+                    (
+                        "pending".into(),
+                        vec![format!("final copy pending: {error}")],
+                    )
+                }
                 CopyOutcome::Failed(error) => {
                     bail!(
                         "the final copy failed ({error}); not resolving. `--skip-copy` resolves without it."
@@ -2792,7 +2822,7 @@ fn retire(
             removal_refusal = Some(detail);
             true
         } else {
-            false
+            final_copy == "pending"
         };
 
         if removable && !already_removed {
@@ -2868,11 +2898,13 @@ fn retire(
             }
             thread::update(project, id, |t| t.worktree_path.clear())?;
         }
-        if already_removed || removal_refusal.is_none() {
+        if !request.keep_checkout && (already_removed || removal_refusal.is_none()) {
             crate::branches::resolved_thread(ctx, project, &resolved)?;
         }
-        remove_finished_build_folder(ctx, project, &resolved)?;
-        remove_scratch_session(ctx, &resolved)?;
+        if !request.keep_checkout {
+            remove_finished_build_folder(ctx, project, &resolved)?;
+            remove_scratch_session(ctx, &resolved)?;
+        }
         thread::update(project, id, |t| {
             t.cleanup_pending = preservation_pending;
             t.cleanup_reason = if preservation_pending {
@@ -2880,7 +2912,7 @@ fn retire(
             } else {
                 String::new()
             };
-            if !preservation_pending {
+            if !preservation_pending && !request.keep_checkout {
                 t.retirement = None;
             }
         })?;

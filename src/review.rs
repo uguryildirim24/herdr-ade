@@ -290,6 +290,28 @@ fn reviewer_ids(project: &Project) -> Result<std::collections::BTreeSet<String>>
     }
     Ok(ids)
 }
+/// Observation failures are verification facts, never a rollback or a lost install.
+pub(crate) fn post_install_result(
+    ctx: &Ctx,
+    slug: &str,
+    id: &str,
+    observation: &str,
+) -> Result<()> {
+    let project = Project::load(&ctx.root, slug)?;
+    let record = load(&project, id)?;
+    let _operation = try_operation_lock(ctx, &record.repo)?
+        .context("review operation busy; post-install result remains in journey notice")?;
+    let mut record = load(&project, id)?;
+    if record.install_result.contains(observation) {
+        return Ok(());
+    }
+    record.install_result = record
+        .install_result
+        .replace("; ticker first full pass pending; journey pending", "");
+    record.install_result.push_str(&format!("; {observation}"));
+    save(&project, &record)
+}
+
 fn queue_notice(review: &mut Review, line: String) {
     if !review.notices.iter().any(|n| n.line == line) {
         review.notices.push(crate::steps::Notice {
@@ -992,7 +1014,7 @@ fn prepare(ctx: &Ctx, project: &Project, review: &mut Review) -> Result<()> {
                     }),
                     task: task(project, review),
                     workflow: Some("reviewer".into()),
-                    recipe: None,
+                    recipe: crate::journey::reviewer_recipe(project),
                     task_id: String::new(),
                     review_id: review.id.clone(),
                     attach: Vec::new(),
@@ -2048,6 +2070,16 @@ fn prune_candidate(ctx: &Ctx, review: &Review) -> Result<()> {
     Ok(())
 }
 fn cancel_record(ctx: &Ctx, project: &Project, review: &mut Review, reason: &str) -> Result<()> {
+    cancel_record_with_retention(ctx, project, review, reason, false)
+}
+
+fn cancel_record_with_retention(
+    ctx: &Ctx,
+    project: &Project,
+    review: &mut Review,
+    reason: &str,
+    keep_checkout: bool,
+) -> Result<()> {
     if !review.fast_forward && review.phase == Phase::Landing {
         let git = Git::new(ctx.runner, &review.repo);
         let head = git
@@ -2072,18 +2104,42 @@ fn cancel_record(ctx: &Ctx, project: &Project, review: &mut Review, reason: &str
     review.attention = reason.into();
     save(project, review)?;
     if let Some(id) = &review.reviewer {
-        let outcome = crate::threads::cancel(ctx, &project.slug, id, reason)?;
+        let outcome = if keep_checkout {
+            crate::threads::cancel_preserving_checkout(ctx, &project.slug, id, reason)?
+        } else {
+            crate::threads::cancel(ctx, &project.slug, id, reason)?
+        };
         if outcome.state == "cleanup_pending" {
             bail!("reviewer cancellation cleanup pending: {id}");
         }
     }
     review.close = true;
     save(project, review)?;
-    prune_candidate(ctx, review)?;
-    review.prune = true;
+    if !keep_checkout {
+        prune_candidate(ctx, review)?;
+        review.prune = true;
+    }
     review.phase = Phase::Cancelled;
     save(project, review)
 }
+pub(crate) fn cancel_for_diagnosis(ctx: &Ctx, project: &Project, id: &str) -> Result<()> {
+    let record = load(project, id)?;
+    let _lock = try_operation_lock(ctx, &record.repo)?
+        .context("review operation busy; diagnosis cancellation pending")?;
+    let mut record = load(project, id)?;
+    // A landed review's publication/install remain facts and obligations.
+    if record.phase.closed() || record.fast_forward {
+        return Ok(());
+    }
+    cancel_record_with_retention(
+        ctx,
+        project,
+        &mut record,
+        "journey deadline or failure; retained for diagnosis",
+        true,
+    )
+}
+
 pub(crate) fn cancel(ctx: &Ctx, slug: &str, repo: Option<&str>) -> Result<()> {
     let project = Project::load(&ctx.root, slug)?;
     let row = repository(ctx, &project, repo)?;

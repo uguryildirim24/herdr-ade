@@ -886,6 +886,11 @@ pub(crate) fn run(ctx: &Ctx) -> Result<()> {
         }
         Health::finish_partial(root, &log);
     }
+    if let Err(error) = crate::journey::ticker_started(root, &info.started) {
+        log.line(&format!(
+            "first-pass install evidence unavailable: {error:#}"
+        ));
+    }
     let mut progress = Progress {
         pid: info.pid,
         started: info.started.clone(),
@@ -1194,6 +1199,11 @@ fn tick_with_steps(
         }
     }
     health.publish(&ctx.root, log);
+    if let Err(error) = crate::journey::ticker_pass(&ctx.root, &health.failures) {
+        log.line(&format!(
+            "could not publish first-pass install evidence: {error:#}"
+        ));
+    }
     if !step("pass complete") {
         return None;
     }

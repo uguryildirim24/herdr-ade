@@ -88,6 +88,8 @@ pub(crate) struct RetirementRequest {
     pub skip_copy: bool,
     pub discard_uncopied: bool,
     pub keep_pane: bool,
+    /// Stop processes but retain the checkout/ref and build evidence for diagnosis.
+    pub keep_checkout: bool,
 }
 
 /// `threads/<id>.toml`. An empty string means "not set". Paths are stored as
@@ -261,9 +263,12 @@ impl Thread {
     pub(crate) fn retirement_request(&self, mut request: RetirementRequest) -> RetirementRequest {
         if let Some(saved) = &self.retirement {
             if saved.authority == RetirementAuthority::Retained {
-                return saved.clone();
+                let mut pinned = saved.clone();
+                pinned.keep_checkout |= request.keep_checkout;
+                return pinned;
             }
             request.preserved = saved.preserved;
+            request.keep_checkout |= saved.keep_checkout;
         }
         request
     }

@@ -1839,6 +1839,45 @@ fn landing_recovers_ref_before_marker_and_install_failure_without_early_task_don
 }
 
 #[test]
+fn journey_d22_needs_an_independent_review_while_the_later_lane_is_unsealed() {
+    let fx = configured();
+    lane(&fx, 1);
+    let mut review = prepared(&fx);
+    assert!(!crate::journey::independent_review(None, "later", false).unwrap());
+    assert!(crate::journey::independent_review(Some(&review), "later", false).unwrap());
+    assert!(crate::journey::independent_review(Some(&review), "later", true).is_err());
+    let mut later = review.members[0].clone();
+    later.thread = "later".into();
+    review.members.push(later);
+    assert!(crate::journey::independent_review(Some(&review), "later", false).is_err());
+}
+
+#[test]
+fn post_install_observation_failure_reports_without_undoing_landing_facts_or_counts() {
+    let fx = configured();
+    lane(&fx, 1);
+    let mut review = prepared(&fx);
+    review.fast_forward = true;
+    review.push = true;
+    review.install_required = true;
+    review.install = true;
+    review.install_result = "installed on mac; plan counts unchanged; records load; ticker first full pass pending; journey pending".into();
+    save(&fx.project, &review).unwrap();
+    let counts = crate::plan::counts(&fx.project).unwrap();
+    let result = "REVIEW demo/review-1: ticker first full pass: FAIL: session EINVAL; transient: cleared by second full pass; JOURNEY PASS";
+    post_install_result(&fx.world.ctx(), &fx.project.slug, &review.id, result).unwrap();
+    post_install_result(&fx.world.ctx(), &fx.project.slug, &review.id, result).unwrap();
+    let record = load(&fx.project, &review.id).unwrap();
+    assert!(record.fast_forward && record.push && record.install);
+    assert_eq!(crate::plan::counts(&fx.project).unwrap(), counts);
+    assert!(record.attention.is_empty());
+    assert!(record.landing_summary().contains("FAIL: session EINVAL"));
+    assert!(record.landing_summary().contains("transient"));
+    assert!(!record.landing_summary().contains("pending"));
+    assert_eq!(record.install_result.matches(result).count(), 1);
+}
+
+#[test]
 fn landing_completes_while_a_merged_member_owes_cleanup() {
     let fx = configured();
     let (id, sha) = lane(&fx, 1);
