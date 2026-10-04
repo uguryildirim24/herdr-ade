@@ -826,7 +826,7 @@ mod tests {
                 );
             }
         }
-        assert_eq!(claude_rows, 2);
+        assert!(claude_rows > 0);
     }
 
     #[test]

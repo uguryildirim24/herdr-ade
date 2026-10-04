@@ -10,6 +10,7 @@ use crate::paths::Ctx;
 use crate::project::{self, Project};
 use crate::runner::{Cmd, Output, Runner};
 
+const CLAUDE_PROBE_RECIPE: &str = "claude_journey_probe";
 const COMMAND: Duration = Duration::from_secs(60);
 const OBSERVE: Duration = Duration::from_secs(180);
 const WHOLE_RUN: Duration = Duration::from_secs(720);
@@ -114,6 +115,8 @@ struct Step {
     name: String,
     seconds: f64,
     passed: bool,
+    #[serde(default)]
+    skipped: bool,
     evidence: String,
 }
 
@@ -137,6 +140,7 @@ impl Report {
             name: name.into(),
             seconds: started.elapsed().as_secs_f64(),
             passed: result.is_ok(),
+            skipped: false,
             evidence: match &result {
                 Ok(s) => s.clone(),
                 Err(e) => format!("{e:#}"),
@@ -145,11 +149,48 @@ impl Report {
         result.map(|_| ())
     }
 
+    // A missing prerequisite is incomplete, not a failed execution. Only the
+    // dependent step is skipped; callers continue with unrelated steps.
+    fn optional_step<T>(
+        &mut self,
+        name: &str,
+        prerequisite: Result<T>,
+        action: impl FnOnce(T) -> Result<String>,
+    ) -> Result<bool> {
+        match prerequisite {
+            Ok(value) => {
+                self.step(name, || action(value))?;
+                Ok(true)
+            }
+            Err(error) => {
+                self.steps.push(Step {
+                    name: name.into(),
+                    seconds: 0.0,
+                    passed: false,
+                    skipped: true,
+                    evidence: format!("{error:#}"),
+                });
+                Ok(false)
+            }
+        }
+    }
+
+    fn failed(&self) -> bool {
+        self.steps.iter().any(|s| !s.passed && !s.skipped)
+    }
+
+    fn complete(&self) -> bool {
+        self.steps.iter().all(|s| s.passed && !s.skipped)
+    }
+
     fn notice(&self) -> String {
         let mut text = self
             .steps
             .iter()
             .map(|s| {
+                if s.skipped {
+                    return format!("SKIP {}: {}", s.name, s.evidence);
+                }
                 format!(
                     "{} {} ({:.1}s): {}",
                     if s.passed { "PASS" } else { "FAIL" },
@@ -160,7 +201,10 @@ impl Report {
             })
             .collect::<Vec<_>>()
             .join("; ");
-        if self.steps.iter().any(|s| !s.passed) {
+        if self.steps.iter().any(|s| s.skipped) {
+            text.push_str("; FAIL (INCOMPLETE): skipped steps");
+        }
+        if !self.complete() {
             if self.deleted {
                 text.push_str(
                     "; project already removed; run-owned scratch kept for cleanup inspection",
@@ -205,20 +249,66 @@ pub(crate) fn reviewer_recipe(project: &Project) -> Option<String> {
     .then_some(owned.reviewer_recipe)
 }
 
-fn cheap_recipe(config: &crate::launch::LaunchConfig, claude: bool) -> Result<String> {
+fn claude_probe_recipe(config: &crate::launch::LaunchConfig) -> Result<String> {
+    let recipe = config
+        .recipes
+        .get(CLAUDE_PROBE_RECIPE)
+        .with_context(|| format!("probe recipe {CLAUDE_PROBE_RECIPE} is missing"))?;
+    if !recipe.enabled || recipe.kind != "claude" {
+        bail!("probe recipe {CLAUDE_PROBE_RECIPE} must be enabled and use Claude");
+    }
+    if !recipe
+        .args
+        .windows(2)
+        .any(|a| a == ["--model", "claude-haiku-4-5-20251001"])
+    {
+        bail!(
+            "probe recipe {CLAUDE_PROBE_RECIPE} must configure --model claude-haiku-4-5-20251001"
+        );
+    }
+    Ok(CLAUDE_PROBE_RECIPE.into())
+}
+
+fn available<T>(prerequisite: &Result<T>) -> Result<&T> {
+    prerequisite
+        .as_ref()
+        .map_err(|error| anyhow::anyhow!("{error:#}"))
+}
+
+struct BoxProbe {
+    label: String,
+    profile: crate::contracts::MachineProfile,
+    machine: crate::remote::MachineDeclaration,
+    scratch: String,
+    repo: String,
+}
+
+fn saved_box(ctx: &Ctx, slug: &str) -> Result<BoxProbe> {
+    let label = crate::remote::declared_machine_labels(&ctx.config_dir)?
+        .into_iter()
+        .next()
+        .context("no saved box configured")?;
+    let profile =
+        crate::remote::machine_profile(ctx.runner, &ctx.env.herdr_bin(), &ctx.config_dir, &label)?;
+    let machine = crate::remote::machine_declaration(&ctx.config_dir, &label)?;
+    let scratch = format!("{}/{slug}", machine.build.trim_end_matches('/'));
+    let repo = format!("{scratch}/repo");
+    Ok(BoxProbe {
+        label,
+        profile,
+        machine,
+        scratch,
+        repo,
+    })
+}
+
+fn cheap_recipe(config: &crate::launch::LaunchConfig) -> Result<String> {
     // Recipes have no numeric price field. Use the configured small model tier;
     // non-Claude bootstraps avoid pre-trusting the project (N7 tests a worktree).
     config
         .recipes
         .iter()
-        .filter(|(_, r)| {
-            r.enabled
-                && if claude {
-                    r.kind == "claude"
-                } else {
-                    r.kind == "pi"
-                }
-        })
+        .filter(|(_, r)| r.enabled && r.kind == "pi")
         .min_by_key(|(id, r)| {
             let text = format!("{} {}", id, r.args.join(" ")).to_lowercase();
             (
@@ -806,29 +896,9 @@ fn run_steps(
     let trust_repo = scratch.join("trust-repo");
     let session = format!("scratch-{slug}");
     let catalog = crate::launch::recipe_catalog(&ctx.config_dir)?;
-    let small = cheap_recipe(&catalog, false)?;
-    let claude = cheap_recipe(&catalog, true)?;
-    if !catalog.recipes[&claude]
-        .args
-        .iter()
-        .any(|a| a == "claude-haiku-4-5-20251001")
-    {
-        bail!(
-            "cheap Claude recipe {claude} must configure --model claude-haiku-4-5-20251001 for the throwaway probe"
-        );
-    }
-    let label = crate::remote::declared_machine_labels(&ctx.config_dir)?
-        .into_iter()
-        .next()
-        .context("no saved box configured")?;
-    let profile =
-        crate::remote::machine_profile(ctx.runner, &ctx.env.herdr_bin(), &ctx.config_dir, &label)?;
-    let machine = crate::remote::machine_declaration(&ctx.config_dir, &label)?;
-    if !machine.runs_kind(&catalog.recipes[&small].kind) {
-        bail!("box {label} does not run recipe {small}");
-    }
-    let box_scratch = format!("{}/{}", machine.build.trim_end_matches('/'), slug);
-    let box_repo = format!("{box_scratch}/repo");
+    let small = cheap_recipe(&catalog);
+    let claude = claude_probe_recipe(&catalog);
+    let box_probe = saved_box(ctx, &slug);
     // A loopback-only Git daemon plus an SSH reverse forward lets BOTH machines
     // use the same publish URL without GitHub or a copied credential. Landing's
     // push_remote is the local bare path, not the daemon URL.
@@ -852,11 +922,40 @@ fn run_steps(
             let matches = out.success() && out.stdout.split_whitespace().next() == Some(seed.as_str());
             Ok((matches.then_some(()), format!("expected own seed {seed}; received {}; {}", out.stdout.trim(), out.error_text())))
         })?;
+        ha(ctx, &["new", &slug, "--goal", "Automated journey owns all work. Coordinator: run ha context to acknowledge priming, then remain idle. Do not plan, start work, or prompt workers.", "--repo", repo.to_str().context("repo path")?])?;
+        created = true;
+        let project = Project::load(&ctx.root, &slug)?;
+        let (device, inode) = project_identity(&project)?;
+        project::write_json(&project.record_file("journey.json"), &Owned { slug: slug.clone(), reviewer_recipe: small.as_ref().cloned().unwrap_or_default(), device, inode })?;
+        let (mut settings, _) = project.read_project_md()?;
+        settings.repos[0].branch = Some("main".into());
+        settings.repos[0].push_remote = Some("journey".into());
+        settings.repos[0].gates = Some(Vec::new());
+        project::write_atomic(&project.project_md(), format!("+++\n{}+++\n", toml::to_string(&settings)?).as_bytes())?;
+        request = format!("request:{}", crate::prompt::record_pane_request(&project, "Automated journey requested after install: use a small Pi recipe and the shipped Claude Haiku probe for this throwaway project, write files, seal, review, land to its local bare remote, test Claude trust, delete only this project.")?);
+        Ok(format!("{slug}; local bare {}", bare.display()))
+    });
+    report.created = created;
+    new_result?;
+    let project = owned_project(ctx, &slug)?;
+    let box_ready = report.optional_step("box transport setup", (|| {
+        let box_probe = available(&box_probe)?;
+        let small = available(&small)?;
+        if !box_probe.machine.runs_kind(&catalog.recipes[small].kind) {
+            bail!("box {} does not run recipe {small}", box_probe.label);
+        }
+        Ok(box_probe)
+    })(), |box_probe| {
+        let profile = &box_probe.profile;
+        let machine = &box_probe.machine;
+        let box_scratch = &box_probe.scratch;
+        let box_repo = &box_probe.repo;
+        let seed = git(ctx, &repo, &["rev-parse", "HEAD"])?;
         let mut cmd = Command::new("ssh");
         cmd.args(["-NT", "-o", "BatchMode=yes", "-o", "ExitOnForwardFailure=yes", "-o", "ServerAliveInterval=10", "-o", "ServerAliveCountMax=2", "-R", &format!("127.0.0.1:{port}:127.0.0.1:{port}"), &profile.target]);
         tunnel = Some(spawn(cmd)?);
         // Refuse an existing folder rather than adopt somebody else's repo.
-        let script = crate::remote::with_path(&machine.path, &format!("set -e; test ! -e {dir}; mkdir {dir}; git clone {url} {repo} >&2; git -C {repo} config user.name Journey; git -C {repo} config user.email journey@localhost; git -C {repo} config commit.gpgsign false; stat -c '%d:%i' {dir}", dir=crate::remote::quote(&box_scratch), url=crate::remote::quote(&url), repo=crate::remote::quote(&box_repo)));
+        let script = crate::remote::with_path(&machine.path, &format!("set -e; test ! -e {dir}; mkdir {dir}; git clone {url} {repo} >&2; git -C {repo} config user.name Journey; git -C {repo} config user.email journey@localhost; git -C {repo} config commit.gpgsign false; stat -c '%d:%i' {dir}", dir=crate::remote::quote(box_scratch), url=crate::remote::quote(&url), repo=crate::remote::quote(box_repo)));
         bounded_poll(deadline, "box local-bare transport", Duration::from_secs(15), || {
             let out = crate::remote::ssh(ctx.runner, &profile.target, &format!("git ls-remote {} main", crate::remote::quote(&url)), None, Duration::from_secs(3))?;
             let matches = out.success() && out.stdout.split_whitespace().next() == Some(seed.as_str());
@@ -864,27 +963,15 @@ fn run_steps(
         })?;
         let out = crate::remote::ssh(ctx.runner, &profile.target, &script, None, COMMAND)?;
         if !out.success() { bail!("box scratch clone: {}", out.error_text()); }
-        ha(ctx, &["new", &slug, "--goal", "Automated journey owns all work. Coordinator: run ha context to acknowledge priming, then remain idle. Do not plan, start work, or prompt workers.", "--repo", repo.to_str().context("repo path")?])?;
-        created = true;
         box_identity = out.stdout.trim().into();
         if box_identity.is_empty() { bail!("box scratch identity missing"); }
-        let project = Project::load(&ctx.root, &slug)?;
-        let (device, inode) = project_identity(&project)?;
-        project::write_json(&project.record_file("journey.json"), &Owned { slug: slug.clone(), reviewer_recipe: small.clone(), device, inode })?;
         let (mut settings, _) = project.read_project_md()?;
-        settings.repos[0].branch = Some("main".into());
-        settings.repos[0].push_remote = Some("journey".into());
         settings.repos[0].box_path = Some(box_repo.clone());
         settings.repos[0].publish_url = Some(url.clone());
-        settings.repos[0].gates = Some(Vec::new());
         project::write_atomic(&project.project_md(), format!("+++\n{}+++\n", toml::to_string(&settings)?).as_bytes())?;
-        request = format!("request:{}", crate::prompt::record_pane_request(&project, "Automated journey requested after install: use the cheapest configured recipes for this throwaway project, write files, seal, review, land to its local bare remote, test Claude trust, delete only this project.")?);
-        Ok(format!("{slug}; local bare {}; box {label}; recipes {small}/{claude}", bare.display()))
-    });
-    report.created = created;
-    new_result?;
-    let project = owned_project(ctx, &slug)?;
-    report.step("open and prime coordinator", || {
+        Ok(format!("box {}: {box_repo}", box_probe.label))
+    })?;
+    let opened = report.optional_step("open and prime coordinator", available(&small), |small| {
         let mut server = Command::new(ctx.env.herdr_bin());
         server.args(["--session", &session, "server"]);
         use std::os::unix::process::CommandExt;
@@ -895,7 +982,7 @@ fn run_steps(
             Ok((exists.then_some(()), format!("session {session} absent")))
         })?;
         resources.session = Some(observe_session(ctx, &session)?);
-        ha(ctx, &["open", &slug, "--session", &session, "--recipe", &small, "--basis", &request])?;
+        ha(ctx, &["open", &slug, "--session", &session, "--recipe", small, "--basis", &request])?;
         bounded_poll(deadline, "coordinator bootstrap", Duration::from_secs(90), || {
             let c = project.coordinator().context("coordinator binding absent")?;
             let registered = crate::herdr::Herdr::new(ctx.env.herdr_bin(), &c.socket, ctx.runner).agent_list()?.iter().any(|a| crate::coordinator::agent_matches(&c, a));
@@ -906,7 +993,7 @@ fn run_steps(
         ha(ctx, &["close", &slug])?;
         // Automatic reviews need the project's session binding. Reopen an idle
         // session host after proving the first coordinator was primed and closed.
-        ha(ctx, &["open", &slug, "--session", &session, "--recipe", &small, "--basis", &request])?;
+        ha(ctx, &["open", &slug, "--session", &session, "--recipe", small, "--basis", &request])?;
         ha(ctx, &["review", &slug])?;
         Ok(format!("registered, context receipt acknowledged, closed {}; reopened idle session host; automatic reviews enabled", c.pane_id))
     })?;
@@ -920,59 +1007,92 @@ fn run_steps(
     // Keep automatic review from winning the race before the later lane exists.
     // Releasing the existing operation lock (not a manual review start) makes
     // the ticker exercise D22 with an older seal AND an unsealed later lane.
-    let review_start_lock = crate::review::try_operation_lock(ctx, &repo.to_string_lossy())?
-        .context("journey review start lock busy")?;
-    report.step("Mac lane seals", || {
-        mac = start_lane(ctx, &slug, &repo, &small, "local", &mac_brief, &request)?;
-        mac_seal = bounded_poll(deadline, "Mac seal", OBSERVE, || seal(&project, &mac))?;
-        let sha = sealed_sha(&project, &mac)?;
-        git(ctx, &repo, &["cat-file", "-e", &format!("{sha}:mac.txt")])?;
-        Ok(format!(
-            "{mac} sealed at {mac_seal}, commit {sha} contains mac.txt"
-        ))
-    })?;
-    report.step("later box lane and D22 automatic review", || {
-        // Records round to seconds: make later-start evidence unambiguous.
-        std::thread::sleep(Duration::from_secs(1));
-        box_lane = start_lane(ctx, &slug, &repo, &small, &label, &box_brief, &request)?;
-        let lane = crate::thread::load(&project, &box_lane)?;
-        if lane.created.parse::<jiff::Timestamp>()? <= mac_seal.parse::<jiff::Timestamp>()? {
-            bail!(
-                "D22 sequence not established: box creation {} <= Mac seal {mac_seal}",
-                lane.created
-            );
-        }
-        if !lane.is_remote() {
-            bail!(
-                "requested box lane fell back to local: {}",
-                lane.placement_reason
-            );
-        }
-        drop(review_start_lock);
-        let review = bounded_poll(
-            deadline,
-            "automatic review must not wait for later box lane",
-            OBSERVE,
-            || {
-                let records = crate::review::list(&project)?;
-                let ready = records
-                    .iter()
-                    .find(|r| r.members.iter().any(|m| m.thread == mac) && r.reviewer.is_some());
-                let (box_seal, state) = seal(&project, &box_lane)?;
-                let independent = independent_review(ready, &box_lane, box_seal.is_some())?;
-                Ok((
-                    ready.filter(|_| independent).cloned(),
-                    format!("{} reviews; {state}", records.len()),
-                ))
-            },
-        )?;
-        Ok(format!(
-            "{box_lane} on {label}; {} reviewer {} for older seal {mac}, excludes later lane",
-            review.id,
-            review.reviewer.unwrap_or_default()
-        ))
-    })?;
-    report.step("box seals, reviewer merges, landing pushes", || {
+    let mut review_start_lock = Some(
+        crate::review::try_operation_lock(ctx, &repo.to_string_lossy())?
+            .context("journey review start lock busy")?,
+    );
+    let mac_ready = report.optional_step(
+        "Mac lane seals",
+        (|| {
+            let small = available(&small)?;
+            if !opened {
+                bail!("coordinator probe was skipped");
+            }
+            Ok(small)
+        })(),
+        |small| {
+            mac = start_lane(ctx, &slug, &repo, small, "local", &mac_brief, &request)?;
+            mac_seal = bounded_poll(deadline, "Mac seal", OBSERVE, || seal(&project, &mac))?;
+            let sha = sealed_sha(&project, &mac)?;
+            git(ctx, &repo, &["cat-file", "-e", &format!("{sha}:mac.txt")])?;
+            Ok(format!(
+                "{mac} sealed at {mac_seal}, commit {sha} contains mac.txt"
+            ))
+        },
+    )?;
+    let box_started = report.optional_step(
+        "later box lane and D22 automatic review",
+        (|| {
+            let box_probe = available(&box_probe)?;
+            let small = available(&small)?;
+            if !box_ready {
+                bail!("box transport probe was skipped");
+            }
+            if !mac_ready {
+                bail!("Mac lane probe was skipped");
+            }
+            Ok((box_probe, small))
+        })(),
+        |(box_probe, small)| {
+            let label = &box_probe.label;
+            // Records round to seconds: make later-start evidence unambiguous.
+            std::thread::sleep(Duration::from_secs(1));
+            box_lane = start_lane(ctx, &slug, &repo, small, label, &box_brief, &request)?;
+            let lane = crate::thread::load(&project, &box_lane)?;
+            if lane.created.parse::<jiff::Timestamp>()? <= mac_seal.parse::<jiff::Timestamp>()? {
+                bail!(
+                    "D22 sequence not established: box creation {} <= Mac seal {mac_seal}",
+                    lane.created
+                );
+            }
+            if !lane.is_remote() {
+                bail!(
+                    "requested box lane fell back to local: {}",
+                    lane.placement_reason
+                );
+            }
+            drop(review_start_lock.take());
+            let review = bounded_poll(
+                deadline,
+                "automatic review must not wait for later box lane",
+                OBSERVE,
+                || {
+                    let records = crate::review::list(&project)?;
+                    let ready = records.iter().find(|r| {
+                        r.members.iter().any(|m| m.thread == mac) && r.reviewer.is_some()
+                    });
+                    let (box_seal, state) = seal(&project, &box_lane)?;
+                    let independent = independent_review(ready, &box_lane, box_seal.is_some())?;
+                    Ok((
+                        ready.filter(|_| independent).cloned(),
+                        format!("{} reviews; {state}", records.len()),
+                    ))
+                },
+            )?;
+            Ok(format!(
+                "{box_lane} on {label}; {} reviewer {} for older seal {mac}, excludes later lane",
+                review.id,
+                review.reviewer.unwrap_or_default()
+            ))
+        },
+    )?;
+    // A missing box must not hold the local lane's automatic review lock.
+    drop(review_start_lock);
+    report.optional_step("box seals", (|| {
+        available(&box_probe)?;
+        if !box_started { bail!("box lane probe was skipped"); }
+        Ok(())
+    })(), |()| {
         let at = bounded_poll(deadline, "box seal", OBSERVE, || seal(&project, &box_lane))?;
         let box_sha = sealed_sha(&project, &box_lane)?;
         git(
@@ -986,42 +1106,70 @@ fn run_steps(
                 &format!("{box_sha}:box.txt"),
             ],
         )?;
-        bounded_poll(deadline, "both landings", Duration::from_secs(240), || {
-            let reviews = crate::review::list(&project)?;
-            let landed = [&mac, &box_lane].iter().all(|id| {
-                reviews.iter().any(|r| {
-                    r.members.iter().any(|m| &m.thread == *id)
-                        && r.fast_forward
-                        && r.push
-                        && r.phase == crate::review::Phase::Complete
-                })
-            });
-            Ok((landed.then_some(()), serde_json::to_string(&reviews)?))
-        })?;
-        let local = git(ctx, &repo, &["rev-parse", "main"])?;
-        let pushed = git(
-            ctx,
-            scratch,
-            &[
-                "--git-dir",
-                bare.to_str().context("bare path")?,
-                "rev-parse",
-                "refs/heads/main",
-            ],
-        )?;
-        if local != pushed {
-            bail!("landing {local} != local bare {pushed}");
-        }
-        for file in ["mac.txt", "box.txt"] {
-            git(ctx, &repo, &["cat-file", "-e", &format!("main:{file}")])?;
-        }
-        Ok(format!(
-            "{box_lane} sealed at {at}; both reviewed, merged, pushed; local bare main={pushed}"
-        ))
+        Ok(format!("{box_lane} sealed at {at}; commit {box_sha} contains box.txt in the local bare remote"))
     })?;
-    report.step("Claude never-trusted folder", || {
+    report.optional_step(
+        "reviewer merges, landing pushes",
+        mac_ready
+            .then_some(())
+            .context("Mac lane probe was skipped"),
+        |()| {
+            let lanes = if box_started {
+                vec![&mac, &box_lane]
+            } else {
+                vec![&mac]
+            };
+            bounded_poll(deadline, "landings", Duration::from_secs(240), || {
+                let reviews = crate::review::list(&project)?;
+                let landed = lanes.iter().all(|id| {
+                    reviews.iter().any(|r| {
+                        r.members.iter().any(|m| &m.thread == *id)
+                            && r.fast_forward
+                            && r.push
+                            && r.phase == crate::review::Phase::Complete
+                    })
+                });
+                Ok((landed.then_some(()), serde_json::to_string(&reviews)?))
+            })?;
+            let local = git(ctx, &repo, &["rev-parse", "main"])?;
+            let pushed = git(
+                ctx,
+                scratch,
+                &[
+                    "--git-dir",
+                    bare.to_str().context("bare path")?,
+                    "rev-parse",
+                    "refs/heads/main",
+                ],
+            )?;
+            if local != pushed {
+                bail!("landing {local} != local bare {pushed}");
+            }
+            let files = if box_started {
+                vec!["mac.txt", "box.txt"]
+            } else {
+                vec!["mac.txt"]
+            };
+            for file in files {
+                git(ctx, &repo, &["cat-file", "-e", &format!("main:{file}")])?;
+            }
+            Ok(format!(
+                "{} reviewed, merged, pushed; local bare main={pushed}",
+                lanes
+                    .iter()
+                    .map(|id| id.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ))
+        },
+    )?;
+    report.optional_step("Claude never-trusted folder", (|| {
+        let claude = available(&claude)?;
+        if !opened { bail!("coordinator probe was skipped"); }
         prepare_repo(ctx, &trust_repo)?;
         prove_untrusted(ctx, &trust_repo)?;
+        Ok(claude)
+    })(), |claude| {
         let (mut settings, _) = project.read_project_md()?;
         settings.repos.push(crate::project::Repo {
             path: trust_repo.to_string_lossy().into_owned(),
@@ -1035,7 +1183,7 @@ fn run_steps(
         )?;
         let task = scratch.join("claude.md");
         brief(&task, "claude.txt", false)?;
-        let id = start_lane(ctx, &slug, &trust_repo, &claude, "local", &task, &request)?;
+        let id = start_lane(ctx, &slug, &trust_repo, claude, "local", &task, &request)?;
         bounded_poll(
             deadline,
             "Claude trust answer and seal",
@@ -1064,27 +1212,26 @@ fn run_steps(
         }
         // The generated box clone is not project-owned in lifecycle's plan.
         // It is removed only on success, by this run's exact reserved path.
-        let out = crate::remote::ssh(
-            ctx.runner,
-            &profile.target,
-            &format!(
-                "set -e; test \"$(stat -c '%d:%i' {dir})\" = {identity}; rm -rf -- {dir}",
-                dir = crate::remote::quote(&box_scratch),
-                identity = crate::remote::quote(&box_identity)
-            ),
-            None,
-            COMMAND,
-        )?;
-        if !out.success() {
-            bail!("box scratch cleanup: {}", out.error_text());
+        if box_ready {
+            let box_probe = available(&box_probe)?;
+            let out = crate::remote::ssh(
+                ctx.runner,
+                &box_probe.profile.target,
+                &format!(
+                    "set -e; test \"$(stat -c '%d:%i' {dir})\" = {identity}; rm -rf -- {dir}",
+                    dir = crate::remote::quote(&box_probe.scratch),
+                    identity = crate::remote::quote(&box_identity)
+                ),
+                None,
+                COMMAND,
+            )?;
+            if !out.success() {
+                bail!("box scratch cleanup: {}", out.error_text());
+            }
         }
-        stop_session(
-            ctx,
-            resources
-                .session
-                .as_ref()
-                .context("owned session receipt missing")?,
-        )?;
+        if let Some(session) = resources.session.as_ref() {
+            stop_session(ctx, session)?;
+        }
         if let Some(server) = resources.server.as_mut() {
             bounded_poll(deadline, "owned server exit", COMMAND, || {
                 Ok((
@@ -1093,12 +1240,14 @@ fn run_steps(
                 ))
             })?;
         }
-        command(
-            ctx,
-            Cmd::new(ctx.env.herdr_bin(), COMMAND).args(["session", "delete", &session]),
-        )?;
+        if resources.session.is_some() {
+            command(
+                ctx,
+                Cmd::new(ctx.env.herdr_bin(), COMMAND).args(["session", "delete", &session]),
+            )?;
+        }
         Ok(format!(
-            "ha delete {slug}; project absent, run-owned box clone and isolated session removed"
+            "ha delete {slug}; project absent, any run-owned box clone and isolated session removed"
         ))
     })?;
     drop(tunnel);
@@ -1173,17 +1322,18 @@ pub(crate) fn run(ctx: &Ctx, review: Option<(&str, &str)>) -> Result<()> {
     let journey_started = Instant::now();
     let mut resources = RunResources::default();
     if let Err(error) = run_steps(ctx, &scratch, &mut report, bounded.deadline, &mut resources)
-        && !report.steps.iter().any(|s| !s.passed)
+        && !report.failed()
     {
         report.steps.push(Step {
             name: "setup".into(),
             seconds: journey_started.elapsed().as_secs_f64(),
             passed: false,
+            skipped: false,
             evidence: format!("{error:#}"),
         });
     }
     report.deleted = report.created && !ctx.root.join(&report.project).exists();
-    if report.steps.iter().any(|s| !s.passed) {
+    if report.failed() {
         let retained = Report {
             project: report.project.clone(),
             created: report.created,
@@ -1218,7 +1368,7 @@ pub(crate) fn run(ctx: &Ctx, review: Option<(&str, &str)>) -> Result<()> {
     let coordinator = Project::load(&ctx.root, "adeherdr")?;
     crate::inbox::write(&coordinator, "journey", &report.project, &notice, &notice)?;
     println!("{notice}");
-    if report.steps.iter().all(|s| s.passed) {
+    if report.complete() {
         std::fs::remove_dir_all(scratch)?;
     }
     Ok(())
@@ -1422,16 +1572,157 @@ mod tests {
                 },
             );
         }
-        assert_eq!(cheap_recipe(&catalog, false).unwrap(), "small");
-        catalog.recipes.insert(
-            "haiku".into(),
-            crate::contracts::Recipe {
-                kind: "claude".into(),
-                args: vec!["--model".into(), "claude-haiku-4-5-20251001".into()],
-                ..Default::default()
-            },
+        assert_eq!(cheap_recipe(&catalog).unwrap(), "small");
+    }
+
+    #[test]
+    fn rolfs_opus_and_fable_only_config_selects_shipped_probe_by_id() {
+        let world = crate::scenarios::World::new();
+        std::fs::write(
+            world.ctx().config_dir.join("config.toml"),
+            r#"
+[recipes.claude_coordinator_opus]
+kind = "claude"
+args = ["--disallowedTools", "Agent", "--model", "claude-opus-5"]
+[recipes.claude_fable_xhigh]
+kind = "claude"
+args = ["--disallowedTools", "Agent", "--model", "claude-fable-5-1"]
+"#,
+        )
+        .unwrap();
+        let mut catalog = crate::launch::recipe_catalog(&world.ctx().config_dir).unwrap();
+        let probe = claude_probe_recipe(&catalog).unwrap();
+        assert_eq!(probe, CLAUDE_PROBE_RECIPE);
+        assert_eq!(
+            &catalog.recipes[&probe].args[..2],
+            ["--disallowedTools", "Agent"]
         );
-        assert_eq!(cheap_recipe(&catalog, true).unwrap(), "haiku");
+        // An unrelated, cheaper-sounding Claude recipe never wins selection.
+        catalog
+            .recipes
+            .insert("aaa_haiku".into(), catalog.recipes[&probe].clone());
+        assert_eq!(claude_probe_recipe(&catalog).unwrap(), probe);
+        let mut report = Report::default();
+        report
+            .optional_step(
+                "Claude never-trusted folder",
+                claude_probe_recipe(&catalog),
+                Ok,
+            )
+            .unwrap();
+        assert!(report.complete());
+        assert!(!report.failed());
+    }
+
+    #[test]
+    fn configured_probe_row_replaces_shipped_row_and_missing_model_is_a_skip() {
+        let world = crate::scenarios::World::new();
+        std::fs::write(world.ctx().config_dir.join("config.toml"), r#"
+[recipes.claude_journey_probe]
+kind = "claude"
+args = ["--disallowedTools", "Agent", "--model", "claude-haiku-4-5-20251001", "--custom-fixture-option"]
+plain = "Rolf's probe override"
+"#).unwrap();
+        let catalog = crate::launch::recipe_catalog(&world.ctx().config_dir).unwrap();
+        assert_eq!(claude_probe_recipe(&catalog).unwrap(), CLAUDE_PROBE_RECIPE);
+        assert_eq!(
+            catalog.recipes[CLAUDE_PROBE_RECIPE].plain,
+            "Rolf's probe override"
+        );
+        assert!(
+            catalog.recipes[CLAUDE_PROBE_RECIPE]
+                .args
+                .contains(&"--custom-fixture-option".into())
+        );
+        for row in [
+            "enabled = false\nargs = ['--model', 'claude-haiku-4-5-20251001']",
+            "args = ['--model', 'claude-opus-5']",
+            "args = ['--model', 'other', 'claude-haiku-4-5-20251001']",
+        ] {
+            std::fs::write(
+                world.ctx().config_dir.join("config.toml"),
+                format!("[recipes.claude_journey_probe]\nkind = 'claude'\n{row}\n"),
+            )
+            .unwrap();
+            let catalog = crate::launch::recipe_catalog(&world.ctx().config_dir).unwrap();
+            let mut report = Report::default();
+            assert!(
+                !report
+                    .optional_step(
+                        "Claude never-trusted folder",
+                        claude_probe_recipe(&catalog),
+                        |_| panic!("must not start an invalid probe")
+                    )
+                    .unwrap()
+            );
+            assert!(!report.complete());
+            assert!(!report.failed());
+            assert!(
+                report
+                    .notice()
+                    .contains("SKIP Claude never-trusted folder:")
+            );
+            assert!(!report.notice().contains("PASS"));
+        }
+    }
+
+    #[test]
+    fn removed_probe_skips_only_trust_and_keeps_the_journey_incomplete() {
+        let world = crate::scenarios::World::new();
+        let mut catalog = crate::launch::recipe_catalog(&world.ctx().config_dir).unwrap();
+        catalog.recipes.remove(CLAUDE_PROBE_RECIPE);
+        let mut report = Report::default();
+        let mut executed = Vec::new();
+        for step in ["new", "open", "Mac lane", "box lane", "review", "landing"] {
+            report
+                .step(step, || {
+                    executed.push(step);
+                    Ok("ran".into())
+                })
+                .unwrap();
+        }
+        assert!(
+            !report
+                .optional_step(
+                    "Claude never-trusted folder",
+                    claude_probe_recipe(&catalog),
+                    |_| panic!("probe prerequisite is missing")
+                )
+                .unwrap()
+        );
+        report
+            .step("delete", || {
+                executed.push("delete");
+                Ok("ran".into())
+            })
+            .unwrap();
+        assert_eq!(
+            executed,
+            [
+                "new", "open", "Mac lane", "box lane", "review", "landing", "delete"
+            ]
+        );
+        assert!(!report.complete());
+        assert!(!report.failed());
+        let text = report.notice();
+        assert!(text.contains(
+            "SKIP Claude never-trusted folder: probe recipe claude_journey_probe is missing"
+        ));
+        assert!(text.contains("PASS delete") && text.contains("INCOMPLETE"));
+        assert!(!text.contains("PASS Claude") && !text.contains("FAIL Claude"));
+        assert!(text.contains("FAIL (INCOMPLETE)"));
+        let loaded: Report =
+            serde_json::from_str(&serde_json::to_string(&report).unwrap()).unwrap();
+        assert!(!loaded.complete() && loaded.steps[6].skipped);
+    }
+
+    #[test]
+    fn historical_journey_steps_load_without_skip_field() {
+        let report: Report = serde_json::from_str(r#"{"project":"journey-old","steps":[{"name":"new","seconds":1.0,"passed":true,"evidence":"created"},{"name":"open","seconds":2.0,"passed":false,"evidence":"failed"}]}"#).unwrap();
+        assert!(report.failed());
+        assert!(!report.complete());
+        assert!(report.steps.iter().all(|step| !step.skipped));
+        assert!(report.notice().contains("PASS new") && report.notice().contains("FAIL open"));
     }
 
     #[test]
@@ -1465,6 +1756,7 @@ mod tests {
                 name: "new".into(),
                 seconds: 0.0,
                 passed: false,
+                skipped: false,
                 evidence: "collision".into(),
             }],
             ..Default::default()

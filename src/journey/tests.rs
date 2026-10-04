@@ -8,6 +8,262 @@ use crate::thread;
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
+// Drive the actual run_steps sequence with real scratch Git. Herdr/provider
+// results are scripted; this is not a live Mac or box installation proof.
+struct LocalJourney<'a> {
+    world: &'a World,
+    slug: &'a str,
+    socket: std::path::PathBuf,
+    sessions_read: Cell<usize>,
+    stopped: Cell<bool>,
+    calls: RefCell<Vec<Cmd>>,
+}
+
+impl Runner for LocalJourney<'_> {
+    fn run(&self, cmd: &Cmd) -> Result<Output> {
+        self.calls.borrow_mut().push(cmd.clone());
+        if cmd.program == "git" {
+            return RealRunner.run(cmd);
+        }
+        let line = cmd.display();
+        if line.contains("session list --json") {
+            let count = self.sessions_read.get();
+            self.sessions_read.set(count + 1);
+            let sessions = if count == 0 {
+                serde_json::json!([])
+            } else {
+                serde_json::json!([{"name": format!("scratch-{}", self.slug), "socket_path": self.socket, "running": !self.stopped.get()}])
+            };
+            return Ok(ok(&serde_json::json!({"sessions": sessions}).to_string()));
+        }
+        if line.contains("session stop") {
+            self.stopped.set(true);
+            return Ok(ok("{}"));
+        }
+        if line.contains("session delete") || line.contains("tab close") {
+            return Ok(ok("{}"));
+        }
+        if line.contains("agent list") {
+            let project = Project::load(&self.world.root, self.slug)?;
+            let c = project.coordinator().unwrap();
+            return Ok(ok(&format!(
+                "{{\"result\":{{\"agents\":[{}]}}}}",
+                agent_json(
+                    &c.workspace_id,
+                    &c.tab_id,
+                    &c.pane_id,
+                    &c.cwd,
+                    &c.agent_name,
+                    "working"
+                )
+            )));
+        }
+        if cmd.program.ends_with("herdr-ade") {
+            let at = cmd.args.iter().position(|a| a == "--json").unwrap() + 1;
+            let args = &cmd.args[at..];
+            let option =
+                |name: &str| args[args.iter().position(|a| a == name).unwrap() + 1].clone();
+            match args[0].as_str() {
+                "new" => {
+                    project::create(
+                        &self.world.root,
+                        self.slug,
+                        "journey",
+                        vec![project::Repo {
+                            path: option("--repo"),
+                            ..Default::default()
+                        }],
+                    )?;
+                }
+                "open" => {
+                    let project = Project::load(&self.world.root, self.slug)?;
+                    project.update_coordinator(|c| {
+                        c.socket = self.socket.to_string_lossy().into_owned();
+                        c.workspace_id = "w1".into();
+                        c.tab_id = "w1:t1".into();
+                        c.pane_id = "w1:p1".into();
+                        c.cwd = project.canonical_dir().to_string_lossy().into_owned();
+                        c.agent_name = format!("hp-{}-coordinator", self.slug);
+                        c.bootstrap = "acknowledged".into();
+                        c.prime_pending = false;
+                    })?;
+                }
+                "close" | "review" => {}
+                "thread" => {
+                    assert_eq!(option("--machine"), "local");
+                    let project = Project::load(&self.world.root, self.slug)?;
+                    let repo = std::path::PathBuf::from(option("--repo"));
+                    assert_eq!(option("--recipe"), "pi_opencode_deepseek");
+                    let sha = crate::testkit::commit_file(
+                        &repo,
+                        "mac.txt",
+                        "journey passed\n",
+                        "Mac probe",
+                    );
+                    crate::testkit::git(&repo, &["push", "journey", "main"]);
+                    let lane = thread::allocate(&project, |lane| {
+                        lane.repo = repo.to_string_lossy().into_owned();
+                        lane.status = thread::Status::Resolved;
+                    })?;
+                    let fx = crate::testkit::Fx {
+                        world: World::new(),
+                        project: project.clone(),
+                        repo: repo.clone(),
+                    };
+                    let event = fx.seal_done(&lane.id, 1, 1, &sha, "scripted Mac seal");
+                    let review = crate::review::Review {
+                        id: "review-1".into(),
+                        repo: repo.to_string_lossy().into_owned(),
+                        integration: "main".into(),
+                        base: sha.clone(),
+                        candidate_branch: String::new(),
+                        members: vec![crate::review::Member {
+                            thread: lane.id.clone(),
+                            attempt: 1,
+                            event,
+                            sha,
+                            branch: "main".into(),
+                            artifact: String::new(),
+                        }],
+                        gates: Vec::new(),
+                        selected_gates: Vec::new(),
+                        gates_note: String::new(),
+                        reviewer: Some("scripted-reviewer".into()),
+                        phase: crate::review::Phase::Complete,
+                        verdict: None,
+                        verdict_event: String::new(),
+                        reviewer_after: String::new(),
+                        checked_event: String::new(),
+                        retry_attempt: None,
+                        retry_generation: 0,
+                        moved: 0,
+                        refresh_tip: None,
+                        push_remote: Some("journey".into()),
+                        install_required: false,
+                        fast_forward: true,
+                        push: true,
+                        install: false,
+                        install_result: String::new(),
+                        close: true,
+                        prune: true,
+                        attention: String::new(),
+                        no_verdict_since: String::new(),
+                        notices: Vec::new(),
+                    };
+                    crate::review::save(&project, &review)?;
+                    return Ok(ok(&serde_json::json!({"data": {"id": lane.id}}).to_string()));
+                }
+                "delete" => {
+                    let project = owned_project(&self.world.ctx(), self.slug)?;
+                    std::fs::remove_dir_all(project.dir())?;
+                }
+                other => bail!("unexpected journey command {other}"),
+            }
+            return Ok(ok("{}"));
+        }
+        bail!("unexpected journey command {}", cmd.display())
+    }
+}
+
+#[test]
+fn missing_saved_box_and_probe_still_run_local_lane_review_landing_and_delete() {
+    local_journey(false);
+}
+
+#[test]
+fn missing_pi_recipe_skips_its_steps_but_still_creates_and_deletes() {
+    local_journey(true);
+}
+
+fn local_journey(missing_pi: bool) {
+    let world = World::new();
+    // No saved box; a disabled configured probe replaces the shipped one.
+    let mut config =
+        "[recipes.claude_journey_probe]\nkind = 'claude'\nenabled = false\n".to_string();
+    if missing_pi {
+        for (id, recipe) in crate::launch::recipe_catalog(&world.ctx().config_dir)
+            .unwrap()
+            .recipes
+        {
+            if recipe.kind == "pi" {
+                config.push_str(&format!("[recipes.{id}]\nkind = 'pi'\nenabled = false\n"));
+            }
+        }
+    }
+    std::fs::write(world.ctx().config_dir.join("config.toml"), config).unwrap();
+    let scratch = world.home.path().join("scratch");
+    std::fs::create_dir(&scratch).unwrap();
+    let socket = scratch.join("owned.sock");
+    std::fs::write(&socket, "").unwrap();
+    let driver = LocalJourney {
+        world: &world,
+        slug: "journey-missing-prerequisites",
+        socket,
+        sessions_read: Cell::new(0),
+        stopped: Cell::new(false),
+        calls: RefCell::new(Vec::new()),
+    };
+    // The session process itself is inert; ownership observations are scripted.
+    let env =
+        crate::paths::Env::for_test(world.home.path(), &[("HERDR_BIN_PATH", "/usr/bin/true")]);
+    let ctx = Ctx {
+        runner: &driver,
+        env: &env,
+        ..world.ctx()
+    };
+    let mut report = Report {
+        project: driver.slug.into(),
+        ..Default::default()
+    };
+    let mut resources = RunResources::default();
+    run_steps(
+        &ctx,
+        &scratch,
+        &mut report,
+        Instant::now() + Duration::from_secs(20),
+        &mut resources,
+    )
+    .unwrap();
+    report.deleted = !ctx.root.join(driver.slug).exists();
+    assert!(report.created && report.deleted);
+    assert!(!report.failed() && !report.complete());
+    let notice = report.notice();
+    assert!(notice.contains("PASS new") && notice.contains("PASS identity-qualified delete"));
+    assert!(notice.contains("SKIP box transport setup: no saved box configured"));
+    assert!(notice.contains("SKIP Claude never-trusted folder: probe recipe"));
+    assert!(notice.contains("INCOMPLETE"));
+    let calls = driver.calls.borrow();
+    assert!(!calls.iter().any(|cmd| cmd.program == "ssh"));
+    let lanes = calls
+        .iter()
+        .filter(|cmd| cmd.args.iter().any(|a| a == "thread"))
+        .count();
+    if missing_pi {
+        assert_eq!(lanes, 0);
+        assert!(notice.contains("SKIP open and prime coordinator: no enabled small recipe"));
+        assert!(notice.contains("SKIP Mac lane seals: no enabled small recipe"));
+    } else {
+        assert_eq!(lanes, 1);
+        assert!(notice.contains("PASS open and prime coordinator"));
+        assert!(notice.contains("PASS Mac lane seals"));
+        assert!(notice.contains("PASS reviewer merges, landing pushes"));
+        let repo = scratch.join("repo");
+        let bare = scratch.join("remote.git");
+        assert_eq!(
+            crate::testkit::git(&repo, &["rev-parse", "main"]),
+            crate::testkit::git(
+                &scratch,
+                &[
+                    "--git-dir",
+                    bare.to_str().unwrap(),
+                    "rev-parse",
+                    "refs/heads/main"
+                ]
+            )
+        );
+    }
+}
+
 fn own(project: &Project) {
     let (device, inode) = project_identity(project).unwrap();
     project::write_json(

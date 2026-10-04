@@ -39,3 +39,9 @@ provider = "opencode-go"
 args = ["--provider", "opencode-go", "--model", "muse-spark-1.3-contributor", "--thinking", "high", "--no-skills"]
 ready_timeout_ms = 300000
 plain = "the second coding helper"
+
+[recipes.claude_journey_probe]
+kind = "claude"
+provider = "claude"
+args = ["--disallowedTools", "Agent", "--model", "claude-haiku-4-5-20251001", "--dangerously-skip-permissions"]
+plain = "the throwaway journey probe"
