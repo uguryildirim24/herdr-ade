@@ -1753,6 +1753,7 @@ mod tests {
                 .unwrap();
             let before = project.coordinator().unwrap();
             let runner = FakeRunner::new();
+            runner.on("report-metadata", ok(r#"{"result":{}}"#));
             let observations = std::cell::Cell::new(0);
             runner.on_fn(
                 |cmd| cmd.display().contains("pane process-info"),

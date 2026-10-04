@@ -1750,7 +1750,8 @@ mod tests {
                 path: path.display().to_string(),
                 ..Repo::default()
             });
-            let query = format!("-C {} remote get-url origin", path.display());
+            let physical = std::fs::canonicalize(&path).unwrap();
+            let query = format!("-C {} remote get-url origin", physical.display());
             if name == "spawn-error" {
                 world.runner.on_fn(
                     move |cmd| cmd.display().contains(&query),
@@ -1882,6 +1883,7 @@ mod tests {
         let project = world.project("demo", "a.sock");
         let repo = world.home.path().join("repo");
         std::fs::create_dir_all(&repo).unwrap();
+        let repo = std::fs::canonicalize(&repo).unwrap();
         world.add_repo(&project, repo.to_str().unwrap());
         delete(&world.ctx(), "demo", false, true).unwrap();
         world.add_repo(&project, repo.join("new-nested").to_str().unwrap());
