@@ -1740,16 +1740,10 @@ pub(crate) fn restore_unchanged_seal(
         return Ok(());
     }
     let done = event.payload.done.as_ref().expect("latest done");
-    if done.sha.is_empty() || done.artifact.is_empty() || lane.worktree_path.is_empty() {
+    if done.sha.is_empty() || lane.worktree_path.is_empty() {
         return Ok(());
     }
     let folder = &lane.worktree_path;
-    let report = Path::new(&done.report_path);
-    let report = if report.is_absolute() {
-        report.to_path_buf()
-    } else {
-        Path::new(folder).join(report)
-    };
     let unchanged = if lane.is_remote() {
         let profile = crate::remote::machine_profile(
             ctx.runner,
@@ -1761,9 +1755,8 @@ pub(crate) fn restore_unchanged_seal(
         let script = crate::remote::with_path(
             &machine.path,
             &format!(
-                "cd {} && git rev-parse HEAD && git status --porcelain --untracked-files=all && sha256sum -- {}",
-                crate::remote::quote(folder),
-                crate::remote::quote(&report.to_string_lossy())
+                "cd {} && git rev-parse HEAD && git status --porcelain --untracked-files=all",
+                crate::remote::quote(folder)
             ),
         );
         let output = crate::remote::ssh(
@@ -1775,24 +1768,29 @@ pub(crate) fn restore_unchanged_seal(
         )?;
         output.success()
             && output.stdout.lines().next() == Some(done.sha.as_str())
-            && output
-                .stdout
-                .lines()
-                .nth(1)
-                .is_some_and(|line| line.split_whitespace().next() == Some(done.artifact.as_str()))
-            && output.stdout.lines().count() == 2
+            && output.stdout.lines().count() == 1
     } else {
         let git = crate::repo::Git::new(ctx.runner, folder).with_timeout(Duration::from_secs(20));
         git.run(&["rev-parse", "HEAD"])? == done.sha
             && git
                 .stdout(&["status", "--porcelain", "--untracked-files=all"])?
                 .is_empty()
-            && std::fs::read(report).is_ok_and(|bytes| thread::sha256_hex(&bytes) == done.artifact)
     };
     if unchanged {
         thread::update_checked(project, &lane.id, |current| {
-            if current.attempt != lane.attempt {
-                bail!("lane changed during seal check");
+            // A prompt or re-seal arriving during the git check must not
+            // borrow this confirmation. Leave it for a fresh observation.
+            if current.attempt != lane.attempt
+                || current.pane_id != lane.pane_id
+                || current.follow_ups != lane.follow_ups
+                || crate::events::latest_done_event(
+                    &crate::events::for_thread(project, &lane.id),
+                    &lane.id,
+                    lane.attempt.max(1),
+                )
+                .is_none_or(|latest| latest.id != event.id)
+            {
+                return Ok(());
             }
             if current.review_after == event.id {
                 current.review_after.clear();
@@ -1807,6 +1805,13 @@ pub(crate) fn restore_unchanged_seal(
                     follow_up.closed_at = project::now();
                 }
             }
+            current.start_notices.push(steps::Notice {
+                line: format!(
+                    "{} answered the post-seal note without changes; confirmed existing seal {}.",
+                    lane.id, event.id
+                ),
+                submitted: false,
+            });
             Ok(())
         })?;
     }
@@ -2765,7 +2770,7 @@ fn thread_pass_observed(
             }
         } else if !t.prompt_pending
             && (t.kind == thread::Kind::Adopted || t.bootstrap == "acknowledged")
-            && ready
+            && (ready || crate::threads::can_steer(t, &state))
         {
             loop {
                 match crate::threads::send_lane_input(
@@ -2899,9 +2904,9 @@ fn thread_pass_observed(
         }
         // A delivered correction may simply acknowledge the existing seal. Only
         // restore it after the agent has returned to idle and the sealed git
-        // state and report have been checked on the lane's own machine.
+        // state has been checked on the lane's own machine.
         if !delivered
-            && state == "idle"
+            && crate::herdr::ready_state(&state)
             && let Err(error) = restore_unchanged_seal(ctx, project, &after)
         {
             pass.error = pass

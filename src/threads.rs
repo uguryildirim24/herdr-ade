@@ -2031,6 +2031,17 @@ pub(crate) fn follow_up_pending_for_seal(
     })
 }
 
+/// Enter steers pi at its next tool boundary. Other adapters have not proven
+/// that contract, so keep their working-turn input in the durable queue.
+pub(crate) fn can_steer(record: &Thread, state: &str) -> bool {
+    let kind = if record.launch.kind.is_empty() {
+        &record.agent
+    } else {
+        &record.launch.kind
+    };
+    state == "working" && kind == "pi"
+}
+
 fn awaiting_follow_up(record: &Thread) -> bool {
     let attempt = record.attempt.max(1);
     record.follow_ups.iter().any(|follow_up| {
@@ -2288,7 +2299,7 @@ pub(crate) fn send_lane_input(
             return Ok(PromptOutcome::Queued { attempt });
         }
     }
-    if queued {
+    if queued || (state == "working" && !can_steer(&record, &state)) {
         return Ok(PromptOutcome::Queued { attempt });
     }
     let Some((index, follow_up)) = record
@@ -2332,7 +2343,13 @@ pub(crate) fn send_lane_input(
             .herdr
             .on_machine(record.machine_route())
     };
-    let result = if state == "blocked" {
+    let steering = can_steer(&record, &state);
+    let result = if steering {
+        // The API acknowledges only after the paste AND encoded Enter have
+        // been written. Waiting for "working" here would merely observe the
+        // already-active turn, not strengthen that submission receipt.
+        herdr.agent_prompt(&record.pane_id, &follow_up.text)
+    } else if state == "blocked" {
         herdr.pane_submit_text(&record.pane_id, &follow_up.text)
     } else {
         herdr.agent_prompt_wait_started(
@@ -2353,7 +2370,7 @@ pub(crate) fn send_lane_input(
                     saved.state = FollowUpState::Queued;
                 }
             })?;
-        } else {
+        } else if !steering {
             let _ = crate::inbox::write(
                 project,
                 "prompt-uncertain",
@@ -2363,6 +2380,18 @@ pub(crate) fn send_lane_input(
                 ),
                 "",
             );
+        }
+        if steering {
+            let _ = crate::inbox::write(
+                project,
+                "steering-queued",
+                id,
+                &format!(
+                    "{id} attempt {attempt}: steering delivery unconfirmed; the note remains queued ({error})"
+                ),
+                "",
+            );
+            return Ok(PromptOutcome::Queued { attempt });
         }
         return Err(anyhow::anyhow!("{error}"));
     }
@@ -6327,6 +6356,245 @@ mod tests {
             "working"
         );
         assert_eq!(prompt_state(&t, &[agent("idle")], false).unwrap(), "idle");
+    }
+
+    #[test]
+    fn working_pi_notes_are_steering_on_local_and_box_routes() {
+        use crate::runner::fake::ok;
+        use crate::scenarios::{World, agent_json};
+        for machine in ["", "box"] {
+            let world = World::new();
+            let project = world.project("demo", "a.sock");
+            let lane = world.thread(&project, world.home.path(), |t| {
+                t.agent = "pi".into();
+                t.launch.kind = "pi".into();
+                t.machine = machine.into();
+                t.prompt_pending = false;
+                t.bootstrap = "acknowledged".into();
+            });
+            let agents: Vec<Agent> = serde_json::from_str(&format!(
+                "[{}]",
+                agent_json(
+                    "w2",
+                    "w2:t1",
+                    "w2:p1",
+                    &lane.cwd,
+                    &lane.agent_name,
+                    "working"
+                )
+                .replace("\"claude\"", "\"pi\"")
+            ))
+            .unwrap();
+            *world.agents.borrow_mut() = serde_json::to_string(&agents).unwrap();
+            world.runner.on("agent prompt", ok(r#"{"result":{}}"#));
+            let herdr = Herdr::new(world.env.herdr_bin(), "a.sock", &world.runner);
+            let outcome = if machine.is_empty() {
+                prompt(&world.ctx(), "demo", &lane.id, "steer at next boundary").unwrap()
+            } else {
+                send_lane_input(
+                    &world.ctx(),
+                    &project,
+                    &lane.id,
+                    Some("steer at next boundary"),
+                    Some((&herdr, &agents, &lane)),
+                )
+                .unwrap()
+            };
+            assert_eq!(
+                outcome,
+                PromptOutcome::Sent {
+                    attempt: 1,
+                    agent_state: "working".into()
+                }
+            );
+            let saved = thread::load(&project, &lane.id).unwrap();
+            assert_eq!(saved.follow_ups[0].state, FollowUpState::Delivered);
+            let calls = world.runner.calls.borrow();
+            let call = calls
+                .iter()
+                .find(|c| c.display().contains("agent prompt"))
+                .unwrap();
+            assert!(!call.args.iter().any(|a| a == "--wait" || a == "--steer"));
+            assert_eq!(call.args.iter().any(|a| a == "--machine"), machine == "box");
+            assert!(!calls.iter().any(|c| c.display().contains("pane send-text")));
+        }
+    }
+
+    #[test]
+    fn unconfirmed_pi_steering_is_retained_and_reported() {
+        use crate::runner::fake::{fail, timeout};
+        use crate::scenarios::{World, agent_json};
+        for (reply, expected) in [
+            (
+                fail(
+                    1,
+                    r#"{"error":{"code":"agent_blocked","message":"dialog opened"}}"#,
+                ),
+                FollowUpState::Queued,
+            ),
+            (timeout(), FollowUpState::Uncertain),
+        ] {
+            let world = World::new();
+            let project = world.project("demo", "a.sock");
+            let lane = world.thread(&project, world.home.path(), |t| {
+                t.agent = "pi".into();
+                t.launch.kind = "pi".into();
+                t.prompt_pending = false;
+                t.bootstrap = "acknowledged".into();
+            });
+            *world.agents.borrow_mut() = format!(
+                "[{}]",
+                agent_json(
+                    "w2",
+                    "w2:t1",
+                    "w2:p1",
+                    &lane.cwd,
+                    &lane.agent_name,
+                    "working"
+                )
+            );
+            world.runner.on("agent prompt", reply);
+            assert_eq!(
+                prompt(&world.ctx(), "demo", &lane.id, "do not lose me").unwrap(),
+                PromptOutcome::Queued { attempt: 1 }
+            );
+            let saved = thread::load(&project, &lane.id).unwrap();
+            assert_eq!(saved.follow_ups[0].state, expected);
+            assert_eq!(saved.follow_ups[0].text, "do not lose me");
+            assert!(saved.follow_ups[0].delivered_at.is_empty());
+            assert!(
+                crate::inbox::unhandled(&project)
+                    .iter()
+                    .any(|i| i.summary.contains("steering delivery unconfirmed"))
+            );
+            if expected == FollowUpState::Uncertain {
+                assert_eq!(
+                    send_lane_input(&world.ctx(), &project, &lane.id, None, None).unwrap(),
+                    PromptOutcome::Queued { attempt: 1 }
+                );
+                assert_eq!(world.runner.count("agent prompt"), 1);
+            }
+        }
+    }
+
+    #[test]
+    fn working_claude_keeps_the_queue() {
+        use crate::scenarios::{World, agent_json};
+        let world = World::new();
+        let project = world.project("demo", "a.sock");
+        let lane = world.thread(&project, world.home.path(), |t| {
+            t.prompt_pending = false;
+            t.bootstrap = "acknowledged".into();
+        });
+        *world.agents.borrow_mut() = format!(
+            "[{}]",
+            agent_json(
+                "w2",
+                "w2:t1",
+                "w2:p1",
+                &lane.cwd,
+                &lane.agent_name,
+                "working"
+            )
+        );
+        assert_eq!(
+            prompt(&world.ctx(), "demo", &lane.id, "later").unwrap(),
+            PromptOutcome::Queued { attempt: 1 }
+        );
+        assert_eq!(world.runner.count("agent prompt"), 0);
+        assert_eq!(
+            thread::load(&project, &lane.id).unwrap().follow_ups[0].state,
+            FollowUpState::Queued
+        );
+    }
+
+    #[test]
+    fn answered_post_seal_notes_confirm_once_only_with_unchanged_clean_head() {
+        use crate::testkit::{commit_file, fixture};
+        for role in ["worker", "reviewer"] {
+            for change in ["none", "commit", "dirty", "seal", "queued", "recent"] {
+                let fx = fixture();
+                let (id, sha) = fx.lane(1);
+                let seal = fx.seal_done(
+                    &id,
+                    1,
+                    1,
+                    &sha,
+                    if role == "reviewer" {
+                        "MERGE"
+                    } else {
+                        "finished"
+                    },
+                );
+                let lane = thread::update(&fx.project, &id, |t| {
+                    t.role = role.into();
+                    t.review_after = seal.clone();
+                    t.follow_ups.push(FollowUp {
+                        attempt: 1,
+                        text: "already fixed?".into(),
+                        state: FollowUpState::Delivered,
+                        after_seal: seal.clone(),
+                        delivered_at: "2026-09-18T11:00:00Z".into(),
+                        ..Default::default()
+                    });
+                    if change == "queued" {
+                        t.follow_ups[0].state = FollowUpState::Queued;
+                    }
+                    if change == "recent" {
+                        t.follow_ups[0].delivered_at = project::now();
+                    }
+                })
+                .unwrap();
+                let folder = Path::new(&lane.worktree_path);
+                if change == "commit" {
+                    commit_file(folder, "correction.txt", "new", "correction");
+                }
+                if change == "dirty" {
+                    std::fs::write(folder.join("untracked.txt"), "new").unwrap();
+                }
+                if change == "seal" {
+                    fx.seal_done(&id, 1, 2, &sha, "new verdict");
+                }
+                crate::ticker::restore_unchanged_seal(&fx.world.ctx(), &fx.project, &lane).unwrap();
+                let saved = thread::load(&fx.project, &id).unwrap();
+                if change == "none" {
+                    assert_eq!(saved.follow_ups[0].state, FollowUpState::Closed);
+                    assert!(saved.review_after.is_empty());
+                    assert_eq!(saved.start_notices.len(), 1);
+                    assert!(
+                        saved.start_notices[0]
+                            .line
+                            .contains("confirmed existing seal")
+                    );
+                    let events = crate::events::for_thread(&fx.project, &id);
+                    assert!(!follow_up_pending_for_seal(
+                        &saved,
+                        crate::events::latest_done_event(&events, &id, 1)
+                    ));
+                    assert!(crate::review::sealed(&events, &saved).is_some());
+                    crate::ticker::restore_unchanged_seal(&fx.world.ctx(), &fx.project, &saved)
+                        .unwrap();
+                    assert_eq!(
+                        thread::load(&fx.project, &id).unwrap().start_notices.len(),
+                        1
+                    );
+                } else {
+                    assert_ne!(saved.follow_ups[0].state, FollowUpState::Closed, "{change}");
+                    assert_eq!(saved.review_after, seal);
+                    assert!(saved.start_notices.is_empty());
+                    let events = crate::events::for_thread(&fx.project, &id);
+                    let old = events.iter().find(|e| e.id == seal).unwrap();
+                    assert!(follow_up_pending_for_seal(&saved, Some(old)));
+                    if change == "seal" {
+                        assert!(!follow_up_pending_for_seal(
+                            &saved,
+                            crate::events::latest_done_event(&events, &id, 1)
+                        ));
+                        assert!(crate::review::sealed(&events, &saved).is_some());
+                    }
+                }
+            }
+        }
     }
 
     #[test]
