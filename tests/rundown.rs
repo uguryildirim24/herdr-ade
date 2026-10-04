@@ -463,23 +463,24 @@ fn print_is_terminal_free_and_a_failed_project_does_not_hide_others() {
     for project in ["alpha", "broken", "charlie"] {
         ade(home.path(), &["new", project]);
     }
-    write(
-        home.path().join("root/broken/.state/plan.toml"),
-        "broken = [",
-    );
-    let output = Command::new(env!("CARGO_BIN_EXE_herdr-rundown"))
-        .env_clear()
-        .env("HOME", home.path())
-        .env("HERDR_ADE_ROOT", home.path().join("root"))
-        .arg("--print")
-        .output()
-        .unwrap();
-    assert!(!output.status.success());
-    let text = String::from_utf8(output.stdout).unwrap();
-    assert!(text.contains("Alpha") && text.contains("Charlie"), "{text}");
-    assert!(text.contains("Overview unavailable; retrying"));
-    assert_eq!(text.matches("Harness update time unknown").count(), 1);
-    assert!(!text.contains('\u{1b}'));
+    for record in ["", "broken = ["] {
+        write(home.path().join("root/broken/.state/plan.toml"), record);
+        let output = Command::new(env!("CARGO_BIN_EXE_herdr-rundown"))
+            .env_clear()
+            .env("HOME", home.path())
+            .env("HERDR_ADE_ROOT", home.path().join("root"))
+            .arg("--print")
+            .output()
+            .unwrap();
+        assert!(!output.status.success());
+        let text = String::from_utf8(output.stdout).unwrap();
+        assert!(text.contains("Alpha") && text.contains("Charlie"), "{text}");
+        assert!(text.contains("unreadable record"), "{text}");
+        assert!(text.contains("Progress unreadable"), "{text}");
+        assert!(String::from_utf8_lossy(&output.stderr).contains("plan.toml"));
+        assert_eq!(text.matches("Harness update time unknown").count(), 1);
+        assert!(!text.contains('\u{1b}'));
+    }
 }
 
 #[test]
