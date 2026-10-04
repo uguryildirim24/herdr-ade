@@ -22,8 +22,8 @@ wall = ["sudo", str(REPO / "tools/wall/wall"), "--instance", str(args.instance)]
 subprocess.run(wall + ["reset"], check=True)
 code = 2
 try:
-    source = (HERE / "herdr-input-scenarios.py").read_text()
-    command = "python3 -c " + shlex.quote(source) + " " + shlex.quote(args.defect)
+    # wall install stages this readable helper into each instance's tools.
+    command = 'python3 "$HOME/tools/regressions/herdr-input-scenarios.py" ' + shlex.quote(args.defect)
     command += '; result=$?; printf "\\nWALL_SCENARIO_EXIT=%s\\n" "$result"'
     result = subprocess.run(wall + ["enter", command], capture_output=True, text=True)
     print(result.stdout, end="")

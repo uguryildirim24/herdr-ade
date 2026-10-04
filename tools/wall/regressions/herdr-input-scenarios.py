@@ -60,11 +60,11 @@ def large_prompt():
     path = HOME / ".herdr-ade/wall/.state/threads/t-0001.toml"
     for _ in range(200):
         row = tomllib.loads(path.read_text())
-        if not row.get("prompt_pending", True):
+        if not row.get("prompt_pending", True) and row.get("bootstrap") == "acknowledged":
             break
         time.sleep(.1)
     else:
-        raise RuntimeError("fixture brief was not acknowledged")
+        raise RuntimeError("fixture skill/brief receipt did not become acknowledged")
     herdr("pane", "report-agent", row["pane_id"], "--source", "pi", "--agent", "pi",
           "--state", "idle", "--seq", "100000")
     note = HOME / "large-note.txt"
