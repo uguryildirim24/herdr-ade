@@ -9,7 +9,7 @@ use std::{
 
 #[derive(Debug, Serialize, Deserialize)]
 pub(crate) enum Request {
-    Doctor(crate::doctor::ProbePlan),
+    Doctor(Box<crate::doctor::ProbePlan>),
     Courier {
         session: String,
         taken: Vec<(String, String)>,
@@ -165,7 +165,7 @@ pub(crate) fn local<T: DeserializeOwned>(ctx: &Ctx, request: Request) -> Result<
 
 fn execute(ctx: &Ctx, request: Request) -> Result<String> {
     match request {
-        Request::Doctor(plan) => ready(crate::doctor::execute_plan(ctx, &plan)?),
+        Request::Doctor(plan) => ready(crate::doctor::execute_plan(ctx, plan.as_ref())?),
         Request::Courier { session, taken } => {
             ready(crate::steps::box_manifest(ctx, &session, &taken)?)
         }
@@ -363,7 +363,7 @@ pub(crate) mod tests {
     }
     pub(crate) fn doctor_input(input: &str) -> crate::doctor::ProbePlan {
         match serde_json::from_str::<Input>(input).unwrap().request {
-            Request::Doctor(plan) => plan,
+            Request::Doctor(plan) => *plan,
             _ => panic!("not a doctor request"),
         }
     }

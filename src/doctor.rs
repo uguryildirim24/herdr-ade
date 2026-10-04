@@ -495,7 +495,9 @@ fn remote_plan(
         runner,
         &profile.target,
         machine,
-        crate::box_helper::Request::Doctor(serde_json::from_value(serde_json::to_value(plan)?)?),
+        crate::box_helper::Request::Doctor(Box::new(serde_json::from_value(
+            serde_json::to_value(plan)?,
+        )?)),
         timeout,
         None,
     )?;
