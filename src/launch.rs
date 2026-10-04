@@ -592,7 +592,7 @@ pub(crate) fn bind_execution(
     record: &crate::thread::Thread,
     machine: Option<&crate::remote::MachineDeclaration>,
 ) -> Result<ExecutionBinding> {
-    bind_execution_with_evidence(ctx, record, machine, &[])
+    bind_execution_with_evidence(ctx, record, machine, &[], None)
 }
 
 /// Only packet-pinned member reports and this lane's frozen inputs are exposed.
@@ -639,6 +639,7 @@ pub(crate) fn bind_execution_with_evidence(
     record: &crate::thread::Thread,
     machine: Option<&crate::remote::MachineDeclaration>,
     evidence: &[Value],
+    publication: Option<(String, String)>,
 ) -> Result<ExecutionBinding> {
     if record.launch.execution == "advisory" {
         anyhow::ensure!(
@@ -666,8 +667,12 @@ pub(crate) fn bind_execution_with_evidence(
             notice: ExecutionNotice::None,
         });
     }
-    let observation =
-        crate::doctor::lane_execution(ctx, machine, execution_network(&record.launch))?;
+    let observation = crate::doctor::lane_execution(
+        ctx,
+        machine,
+        execution_network(&record.launch),
+        publication,
+    )?;
     if observation.level != crate::pi::doctor::Level::Ok {
         anyhow::ensure!(
             !record
@@ -1083,7 +1088,17 @@ mod tests {
                     .push(format!("HERDR_ADE_EXECUTION={EXECUTION_BACKEND}"));
             })
             .unwrap();
-            let binding = bind_execution(&world.ctx(), &record, None).unwrap();
+            let binding = bind_execution_with_evidence(
+                &world.ctx(),
+                &record,
+                None,
+                &[],
+                Some((
+                    "/fresh/lane-repo".into(),
+                    "https://example.org/lane.git".into(),
+                )),
+            )
+            .unwrap();
             assert!(
                 binding
                     .advisory
@@ -1103,8 +1118,41 @@ mod tests {
                 .sum::<usize>(),
             1
         );
+        assert!(world.runner.calls.borrow().iter().any(|cmd| {
+            cmd.display().contains("--ade-publication-probe")
+                && cmd.stdin.as_ref().is_some_and(|source| {
+                    source.contains("\"cwd\":\"/fresh/lane-repo\"")
+                        && source.contains("\"publication\":\"https://example.org/lane.git\"")
+                })
+        }));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn local_seal_without_publication_does_not_require_a_remote_lane_card() {
+        let world = World::new();
+        world
+            .runner
+            .on("/usr/bin/bwrap", crate::runner::fake::ok(""));
+        let mut output = crate::doctor::pi_execution_fixture();
+        output.stdout = output
+            .stdout
+            .replace("ADE_AUTHORIZED_PUBLICATION=passed\n", "");
+        world.runner.on("ade-boundary-probe.mjs", output);
+        let record = crate::thread::Thread {
+            worktree_path: "/fresh/local-worktree".into(),
+            branch: "local-lane".into(),
+            launch: Launch {
+                env: vec![format!("HERDR_ADE_EXECUTION={EXECUTION_BACKEND}")],
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let binding = bind_execution(&world.ctx(), &record, None).unwrap();
+        assert!(binding.advisory.is_none());
+        assert!(binding.args.iter().any(|arg| arg == "--no-extensions"));
         assert!(
-            world
+            !world
                 .runner
                 .calls
                 .borrow()

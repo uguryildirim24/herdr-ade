@@ -1079,8 +1079,23 @@ fn bind_terminal(ctx: &Ctx, project: &Project, view: &SessionView, record: &Thre
     } else {
         Vec::new()
     };
-    let execution =
-        crate::launch::bind_execution_with_evidence(ctx, record, machine.as_ref(), &evidence)?;
+    let publication = if machine.is_some() && crate::launch::execution_requested(&record.launch) {
+        Some(box_repo_row(
+            &ctx.config_dir,
+            &settings,
+            &record.machine,
+            &record.repo,
+        )?)
+    } else {
+        None
+    };
+    let execution = crate::launch::bind_execution_with_evidence(
+        ctx,
+        record,
+        machine.as_ref(),
+        &evidence,
+        publication,
+    )?;
     let mut spec = crate::contracts::RoleSpec {
         kind: record.launch.kind.clone(),
         args: execution.args.clone(),

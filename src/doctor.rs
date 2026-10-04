@@ -196,6 +196,10 @@ pub(crate) struct ProbePlan {
     pi_ids: BTreeMap<String, Vec<String>>,
     #[serde(default)]
     boundaries: Vec<(String, String, String)>,
+    #[serde(default)]
+    publication_target: Option<(String, String)>,
+    #[serde(default)]
+    execution_tools_only: bool,
     disk: Option<(String, f64)>,
     snapshot: Option<SnapshotInput>,
 }
@@ -230,7 +234,12 @@ impl ProbePlan {
                 .context("pi_args_forbidden: a provider launch names no --provider")?;
             let model = crate::pi::launch::flag_value(&launch.args, "--model")
                 .context("pi_args_forbidden: a provider launch names no --model")?;
-            let mut plan = Self::default();
+            // Publication uses the repository selected at terminal binding,
+            // not another lane's card during provider readiness.
+            let mut plan = Self {
+                execution_tools_only: true,
+                ..Default::default()
+            };
             if !launch.recipe_id.is_empty() {
                 plan.pi_ids.insert(
                     format!("provider {provider}/{model}"),
@@ -354,7 +363,14 @@ pub(crate) fn execute_plan(ctx: &Ctx, plan: &ProbePlan) -> Result<ProbeReport> {
     use crate::pi::doctor::Row;
     let mut report = ProbeReport::default();
     for (id, backend, network) in &plan.boundaries {
-        report.rows.push(execution_row(ctx, id, backend, network));
+        report.rows.push(execution_row_with_publication(
+            ctx,
+            id,
+            backend,
+            network,
+            plan.publication_target.as_ref(),
+            plan.execution_tools_only,
+        ));
     }
     progress("disk", &report.rows);
     if let Some((path, floor)) = &plan.disk {
@@ -553,6 +569,7 @@ pub(crate) fn lane_execution(
     ctx: &Ctx,
     machine: Option<&crate::remote::MachineDeclaration>,
     network: &str,
+    publication_target: Option<(String, String)>,
 ) -> Result<crate::pi::doctor::Row> {
     let plan = ProbePlan {
         boundaries: vec![(
@@ -560,6 +577,10 @@ pub(crate) fn lane_execution(
             crate::launch::EXECUTION_BACKEND.into(),
             network.into(),
         )],
+        // Local seals do not publish. Remote bindings supply their exact
+        // trusted target before the first lane card has been provisioned.
+        execution_tools_only: machine.is_none() && publication_target.is_none(),
+        publication_target,
         ..Default::default()
     };
     let report = if let Some(machine) = machine {
@@ -703,6 +724,17 @@ pub(crate) fn pi_execution_probe_result(output: &Output) -> Result<()> {
 }
 
 fn execution_row(ctx: &Ctx, id: &str, backend: &str, network: &str) -> crate::pi::doctor::Row {
+    execution_row_with_publication(ctx, id, backend, network, None, false)
+}
+
+fn execution_row_with_publication(
+    ctx: &Ctx,
+    id: &str,
+    backend: &str,
+    network: &str,
+    publication: Option<&(String, String)>,
+    tools_only: bool,
+) -> crate::pi::doctor::Row {
     use crate::pi::doctor::Row;
     let label = format!("recipe {id} execution");
     let detail = crate::launch::execution_description(backend, std::env::consts::OS, network);
@@ -712,16 +744,30 @@ fn execution_row(ctx: &Ctx, id: &str, backend: &str, network: &str) -> crate::pi
     let output = ctx.runner.run(&execution_probe_command(network));
     match output {
         Ok(output) if output.success() => {
-            let probe = ctx
-                .runner
-                .run(&pi_authorized_publication_probe_command(&ctx.root))
-                .and_then(|output| pi_authorized_publication_probe_result(&output));
+            let command = if tools_only {
+                pi_probe_command(&ctx.root, false, None)
+            } else if let Some((repo, url)) = publication {
+                pi_publication_probe_for(&ctx.root, repo, url)
+            } else {
+                pi_authorized_publication_probe_command(&ctx.root)
+            };
+            let probe = ctx.runner.run(&command).and_then(|output| {
+                if tools_only {
+                    pi_execution_probe_result(&output)
+                } else {
+                    pi_authorized_publication_probe_result(&output)
+                }
+            });
             match probe {
                 Ok(()) => Row::ok(
                     label,
                     detail.replace(
                         "(availability probed separately)",
-                        "(namespace, bounded Pi CLI tool and authorized publication probes passed)",
+                        if tools_only {
+                            "(namespace and bounded Pi CLI tool probes passed)"
+                        } else {
+                            "(namespace, bounded Pi CLI tool and authorized publication probes passed)"
+                        },
                     ),
                 ),
                 Err(error) => Row::fail(
