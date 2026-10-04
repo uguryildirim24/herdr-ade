@@ -1361,15 +1361,6 @@ fn machine_passes_with_steps(
             entry.last_poll_tick = tick;
             entry.skip_until_tick = 0;
         } else if !memory.machine_is_due(&machine) {
-            // A deferred check is not a successful observation. Reuse only
-            // the failure, never an old successful snapshot for reconciliation.
-            if let Some(entry) = memory.machines.get(&machine)
-                && !entry.outage.last_error.is_empty()
-            {
-                memory
-                    .machine_views
-                    .insert(machine, Err(entry.outage.last_error.clone()));
-            }
             continue;
         }
         let projects: Vec<&Project> = entries.iter().map(|(project, _)| project).collect();
@@ -1395,8 +1386,6 @@ fn machine_passes_with_steps(
         {
             let detail = format!("{error:#}");
             let event = memory.record_machine(&machine, Some(&detail), now);
-            record_failed_observation(&entries, &memory.machine_failure(&machine), log);
-            clear_missing_box_panes(&entries, &machine, log);
             write_machine_outages(&entries, &machine, event.as_ref(), memory, &mut errors);
             memory.machine_views.insert(machine, Err(detail));
             continue;
@@ -3718,11 +3707,7 @@ fn tick_remote_with_steps(
         let view = match view {
             Ok(view) => view,
             Err(error) => {
-                let failure = memory.machine_failure(&machine);
-                errors.push(anyhow::anyhow!(
-                    "{machine}: {}",
-                    if failure.is_empty() { error } else { &failure }
-                ));
+                errors.push(anyhow::anyhow!("{machine}: unreachable this tick: {error}"));
                 continue;
             }
         };
@@ -5590,137 +5575,6 @@ mod tests {
         assert_eq!(project.status(), Status::Paused);
         assert_eq!(world.runner.count("agent start"), 0);
         assert_eq!(world.runner.count("agent prompt"), 0);
-    }
-
-    #[test]
-    fn ssh_failure_survives_skipped_ticks_until_successful_observation() {
-        use crate::scenarios::{World, agent_json, pane_json};
-        let world = World::new();
-        let project = world.project("demo", "a.sock");
-        let lane = world.thread(&project, &world.home.path().join("lane"), |t| {
-            t.machine = "box".into();
-            t.machine_id = "box".into();
-            t.launch_attempts = 1;
-            t.bootstrap = "acknowledged".into();
-            t.identity.process = Some(crate::contracts::ProcessIdentity {
-                pid: 42,
-                argv0: "claude".into(),
-            });
-        });
-        let agent = agent_json(
-            &lane.workspace_id,
-            &lane.tab_id,
-            &lane.pane_id,
-            &lane.cwd,
-            &lane.agent_name,
-            "working",
-        );
-        let pane = pane_json(&lane.workspace_id, &lane.tab_id, &lane.pane_id, &lane.cwd);
-        let manifest = crate::box_helper::tests::ready(steps::CourierManifest {
-            agents: Some(serde_json::from_str(&format!("[{agent}]")).unwrap()),
-            panes: Some(serde_json::from_str(&format!("[{pane}]")).unwrap()),
-            ..Default::default()
-        });
-        let down = std::rc::Rc::new(std::cell::Cell::new(false));
-        let flag = down.clone();
-        world.runner.on_fn(
-            |cmd| cmd.program == "ssh",
-            move |_| {
-                Ok(if flag.get() {
-                    fail(255, "ssh: connect to host box: Operation timed out")
-                } else {
-                    ok(&manifest)
-                })
-            },
-        );
-        world.runner.on(
-            "machine list --json",
-            ok(r#"[{"id":"box","label":"box","target":"box","session":"default","enabled":true}]"#),
-        );
-        let ctx = world.ctx();
-        let mut memory = Memory::new(&ctx);
-        let log = Log {
-            path: world.home.path().join("ticker.log"),
-        };
-        let pass = |memory: &mut Memory| {
-            memory.machine_views.clear(); // The real tick discards per-tick snapshots.
-            assert!(machine_passes(&ctx, &[&project], memory, &log).is_empty());
-            let mut errors = Vec::new();
-            let herdr = Herdr::new(ctx.env.herdr_bin(), "", ctx.runner);
-            assert!(tick_remote_with_steps(
-                &ctx,
-                &project,
-                &herdr,
-                memory,
-                &mut false,
-                &mut errors,
-                &mut |_| true,
-            ));
-            let mut health = Health::begin(&ctx.root, 1);
-            for error in errors {
-                health.failure(&ctx.root, &log, format!("{error:#}"));
-            }
-            health.publish(&ctx.root, &log);
-        };
-        memory.tick = 1;
-        pass(&mut memory);
-        let observed = thread::load(&project, &lane.id).unwrap();
-        assert_eq!(observed.last_state, "working");
-        assert!(!observed.last_observed.is_empty());
-        down.set(true);
-        memory.tick = 2;
-        pass(&mut memory);
-        let failed = thread::load(&project, &lane.id).unwrap();
-        assert!(failed.observation_error.contains("box unreachable since"));
-        assert_eq!(failed.last_observed, observed.last_observed);
-        assert!(!failed.observation_attempted.is_empty());
-        let failure = memory.machine_failure("box");
-        for tick in 3..=10 {
-            memory.tick = tick;
-            pass(&mut memory);
-            let held = thread::load(&project, &lane.id).unwrap();
-            assert_eq!(held.observation_error, failed.observation_error);
-            assert_eq!(held.observation_attempted, failed.observation_attempted);
-            assert_eq!(held.last_observed, observed.last_observed);
-            assert_eq!(held.attempt, lane.attempt);
-            assert_eq!(held.identity.process, lane.identity.process);
-            assert_eq!(held.status, thread::Status::Open);
-            assert_eq!(memory.machine_failure("box"), failure);
-            let health: serde_json::Value =
-                serde_json::from_slice(&std::fs::read(ctx.root.join(".ticker.health")).unwrap())
-                    .unwrap();
-            assert!(
-                health["failures"]
-                    .to_string()
-                    .contains("box unreachable since")
-            );
-            let rows = threads::rows(&ctx, &project);
-            assert!(rows[0].note.contains("box unreachable since"));
-            assert!(rows[0].note.contains("retrying"));
-        }
-        down.set(false);
-        memory.tick = 11;
-        pass(&mut memory);
-        let recovered = thread::load(&project, &lane.id).unwrap();
-        assert!(recovered.observation_error.is_empty());
-        assert!(memory.machine_failure("box").is_empty());
-        assert_eq!(recovered.attempt, lane.attempt);
-        assert_eq!(recovered.identity.process, lane.identity.process);
-        let health: serde_json::Value =
-            serde_json::from_slice(&std::fs::read(ctx.root.join(".ticker.health")).unwrap())
-                .unwrap();
-        assert!(!health["failures"].to_string().contains("unreachable"));
-        assert_eq!(
-            world
-                .runner
-                .calls
-                .borrow()
-                .iter()
-                .filter(|c| c.program == "ssh")
-                .count(),
-            3
-        );
-        assert_eq!(world.runner.count("agent start"), 0);
     }
 
     #[test]

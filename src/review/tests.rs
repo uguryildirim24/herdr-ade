@@ -503,7 +503,9 @@ fn offline_box_does_not_hold_local_task_or_local_pile_in_the_same_project() {
             ))
         },
     );
-    let before = thread::load(&fx.project, &remote.id).unwrap();
+    let before =
+        std::fs::read(thread::threads_dir(&fx.project).join(format!("{}.toml", remote.id)))
+            .unwrap();
     let ctx = fx.world.ctx();
     crate::ticker::tick_for_test(&ctx, &mut crate::steps::Memory::new(&ctx));
     assert!(
@@ -512,9 +514,10 @@ fn offline_box_does_not_hold_local_task_or_local_pile_in_the_same_project() {
             .provider_wait_started
             .is_empty()
     );
-    crate::testkit::assert_failed_observation_only(
-        &before,
-        &thread::load(&fx.project, &remote.id).unwrap(),
+    assert_eq!(
+        std::fs::read(thread::threads_dir(&fx.project).join(format!("{}.toml", remote.id)))
+            .unwrap(),
+        before
     );
     assert!(load(&fx.project, &review.id).unwrap().fast_forward);
     assert_eq!(git(&fx.repo, &["rev-parse", "main"]), candidate);

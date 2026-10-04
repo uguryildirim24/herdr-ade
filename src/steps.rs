@@ -912,26 +912,6 @@ impl Memory {
         }
     }
 
-    /// Last failed check stays visible until a successful courier replaces it.
-    pub(crate) fn machine_failure(&self, machine: &str) -> String {
-        let Some(outage) = self.machines.get(machine).map(|entry| &entry.outage) else {
-            return String::new();
-        };
-        let Some(since) = outage.failing_since else {
-            return String::new();
-        };
-        let state = if crate::remote::is_unreachable(&outage.last_error) {
-            "unreachable"
-        } else {
-            "check failed"
-        };
-        format!(
-            "box {state} since {}, retrying: {}",
-            since.strftime("%H:%MZ"),
-            short_error(&outage.last_error)
-        )
-    }
-
     /// Poll each machine on every 15-second tick; a fresh reviewer seal
     /// should not sit through a minute of courier cadence. Failures back off.
     pub(crate) fn machine_is_due(&mut self, machine: &str) -> bool {

@@ -1,4 +1,4 @@
-"""Instance-scoped live repro utilities. Never addresses ubuntu's ADE root."""
+"""Default-wall-only live repro utilities. Never addresses ubuntu's ADE root."""
 import json
 from pathlib import Path
 import shlex
@@ -7,21 +7,10 @@ import time
 
 REPO = Path(__file__).resolve().parents[4]
 WALL = REPO / 'tools/wall/wall'
-INSTANCE = None
-
-
-def set_instance(number):
-    global INSTANCE
-    INSTANCE = number
-
-
-def wall_command(*args):
-    return ['sudo', str(WALL), *(['--instance', str(INSTANCE)] if INSTANCE else []),
-            *map(str, args)]
 
 
 def wall(*args, check=True, timeout=180):
-    command = wall_command(*args)
+    command = ['sudo', str(WALL), *map(str, args)]
     print('+', shlex.join(command), flush=True)
     result = subprocess.run(command, text=True, stdout=subprocess.PIPE,
                             stderr=subprocess.STDOUT, timeout=timeout)
@@ -41,8 +30,8 @@ def py(code, box=False, check=True):
 
 
 def quiet_py(code, box=False):
-    command = wall_command('enter', *(['--box'] if box else []),
-                           'python3 -c ' + shlex.quote(code))
+    command = ['sudo', str(WALL), 'enter', *(['--box'] if box else []),
+               'python3 -c ' + shlex.quote(code)]
     result = subprocess.run(command, text=True, capture_output=True, timeout=45)
     if result.returncode:
         raise RuntimeError(result.stdout + result.stderr)
@@ -120,7 +109,7 @@ def snapshot():
         enter('ha overview wall; python3 "$HOME/tools/guest.py" records; '
               'herdr pane list; herdr agent list; ha ticker status; '
               'git -C "$HOME/repo" worktree list --porcelain; '
-              'git --git-dir="${HOME%/box}/remote.git" for-each-ref', box, check=False)
+              'git --git-dir=/home/wall/remote.git for-each-ref', box, check=False)
         py('import pathlib,os; p=pathlib.Path(os.environ["HOME"])/".herdr-ade/wall/.state"; '
            '[(print(str(f)),print(f.read_text())) for k in ("ops","reviews","events") '
            'for f in sorted((p/k).glob("*.toml"))]', box)
