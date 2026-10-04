@@ -1049,6 +1049,7 @@ mod tests {
                     verdict: reviewer.then(|| crate::review::Verdict {
                         verdict: "approve".into(),
                         evidence_only: false,
+                        withdrawn_only: false,
                         review: "review-1".into(),
                         candidate: seal.clone(),
                         without: Default::default(),
