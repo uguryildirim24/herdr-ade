@@ -7698,6 +7698,8 @@ mod tests {
             push_remote: None,
             install_required: false,
             fast_forward: false,
+            merged_at: String::new(),
+            installed_at: String::new(),
             push: false,
             install: false,
             install_result: String::new(),
