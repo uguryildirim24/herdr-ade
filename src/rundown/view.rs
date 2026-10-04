@@ -83,6 +83,7 @@ pub(crate) struct Card {
     /// Authored outcome, cut only to fit the panel.
     pub(crate) about: String,
     pub(crate) steps: Vec<Step>,
+    pub(crate) read_error: String,
     pub(crate) activity: Activity,
     pub(crate) needs_you_items: Vec<String>,
     pub(crate) harness: Harness,
@@ -114,6 +115,8 @@ pub(crate) struct Harness {
 struct ProjectView {
     plan: PlanView,
     #[serde(default)]
+    read_error: String,
+    #[serde(default)]
     title: String,
     #[serde(default)]
     activity: Activity,
@@ -143,14 +146,11 @@ impl Card {
                         .find(|text| !text.is_empty())
                         .unwrap_or_default(),
                     steps: readable_steps(&plan["steps"]),
-                    work: format!("Rundown read failed: {error}"),
-                    needs_you: reply["needs_you"].as_str().unwrap_or_default().into(),
-                    actions: reply["actions"]
-                        .as_array()
-                        .into_iter()
-                        .flatten()
-                        .filter_map(|value| value.as_str().map(str::to_string))
-                        .collect(),
+                    read_error: format!("Rundown read failed: {error}"),
+                    activity: serde_json::from_value(reply["activity"].clone()).unwrap_or_default(),
+                    needs_you_items: serde_json::from_value(reply["needs_you_items"].clone())
+                        .unwrap_or_default(),
+                    harness: serde_json::from_value(reply["harness"].clone()).unwrap_or_default(),
                 });
             }
         };
@@ -167,6 +167,7 @@ impl Card {
             },
             about,
             steps: plan.steps,
+            read_error: view.read_error,
             activity: view.activity,
             needs_you_items: view.needs_you_items,
             harness: view.harness,
@@ -251,6 +252,11 @@ pub(crate) fn render_at(
         &card.title
     };
     let mut content = vec![shine(&cut(title, inner))];
+    let note = if note.is_empty() {
+        &card.read_error
+    } else {
+        note
+    };
     if !note.is_empty() {
         content.push(format!("{}{}{RESET}", AMBER.fg(), cut(note, inner)));
     }
@@ -655,6 +661,7 @@ mod tests {
             title: "Demo".into(),
             about: String::new(),
             steps: vec![],
+            read_error: String::new(),
             activity: Activity::default(),
             needs_you_items: vec![],
             harness: Harness::default(),

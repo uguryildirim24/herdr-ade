@@ -285,11 +285,12 @@ pub(crate) struct View {
 impl View {
     pub(crate) fn load(ctx: &Ctx, project: &Project, history: Option<usize>) -> Result<Self> {
         let (settings, _) = project.read_project_md()?;
-        let mut view = Self::capture(
+        let mut view = Self::capture_with_runner(
             project,
             &settings,
             Some(crate::threads::rows(ctx, project)),
             history,
+            Some(ctx.runner),
         );
         if !settings.repos.is_empty() {
             view.sections.push(Section::new(
@@ -326,6 +327,18 @@ impl View {
         settings: &Settings,
         observed: Option<Vec<Row>>,
         history: Option<usize>,
+    ) -> Self {
+        Self::capture_with_runner(project, settings, observed, history, None)
+    }
+
+    // Record-only page generation needs no subprocesses. Interactive reads can
+    // also recover historical landing dates from the repository's reflog.
+    fn capture_with_runner(
+        project: &Project,
+        settings: &Settings,
+        observed: Option<Vec<Row>>,
+        history: Option<usize>,
+        runner: Option<&dyn crate::runner::Runner>,
     ) -> Self {
         let evidence = crate::task::EvidenceSnapshot::load(project);
         let events = evidence.events();
@@ -364,7 +377,7 @@ impl View {
         let mut plan = match crate::plan::load(project) {
             Ok(Some(mut plan)) => {
                 let holds = crate::plan::failed_check_holds(project, &mut plan, &evidence);
-                activity = activity::activity(&plan, &evidence, &reviews, &lanes);
+                activity = activity::activity(&plan, &evidence, &reviews, &lanes, runner);
                 let mut value = serde_json::to_value(&plan).expect("serializable plan");
                 for step in value
                     .get_mut("steps")
@@ -920,6 +933,7 @@ impl View {
 
     pub(crate) fn rundown(&self) -> Value {
         json!({"title":self.title, "plan":self.plan, "work":self.work_summary(), "needs_you":self.needs_you.join("; "),
+            "read_error":if self.unreadable_lanes > 0 { "Some work records could not be read" } else { "" },
             "needs_you_items":self.needs_you_items, "activity":self.activity, "harness":self.harness,
             "actions":self.sections.iter().filter(|s| matches!(s.name.as_str(), "Current work" | "Pile reviews" | "Open tasks")).flat_map(|s| &s.rows).map(|r| format!("{}: {}", r.id, r.text.lines().next().unwrap_or(""))).collect::<Vec<_>>()})
     }

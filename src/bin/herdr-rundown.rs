@@ -245,6 +245,7 @@ fn empty_card(title: String) -> view::Card {
         title,
         about: String::new(),
         steps: vec![],
+        read_error: String::new(),
         activity: Default::default(),
         needs_you_items: vec![],
         harness: Default::default(),
@@ -270,10 +271,12 @@ impl Panel {
         }
         match self.source.card(&self.title) {
             Ok(card) => {
+                self.note = card.read_error.clone();
                 self.card = card;
-                self.note.clear();
-                self.seen = Some(fingerprint);
-                self.fetched = Some(Instant::now());
+                if self.note.is_empty() {
+                    self.seen = Some(fingerprint);
+                    self.fetched = Some(Instant::now());
+                }
             }
             Err(error) => {
                 self.note = "Overview unavailable; retrying".into();
