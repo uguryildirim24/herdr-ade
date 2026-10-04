@@ -6,7 +6,7 @@ from pathlib import Path
 import sys
 import time
 
-from support import (enter, evidence, fault, phase, record, records, reset,
+from support import (control, enter, evidence, fault, phase, record, records, reset,
                      set_instance, snapshot, start, until)
 
 parser = argparse.ArgumentParser(description=__doc__)
@@ -42,6 +42,26 @@ try:
                       'correct_advice': 'agent gone, waiting seal kept' in view,
                       'status': lane['status'], 'attempt': lane['attempt'],
                       'seal_unchanged': records(kind='events') == seals})
+    if passed:
+        # Only a deliberate continuation may replace the dead waiting agent.
+        # Use the advertised command and keep the old seal as durable evidence.
+        control({'hold': ['working']})
+        enter(f'ha thread retry wall {thread} --reason "input is ready; continue preserved work"')
+        until(lambda: record(thread)['attempt'] == before['attempt'] + 1,
+              'deliberate retry selected replacement attempt')
+        replacement = until(lambda: (r if (r := record(thread))['identity'].get('process')
+                                     and r['identity']['process'] != before['identity']['process']
+                                     else None), 'replacement agent bound')
+        live = json.loads(enter('herdr pane process-info --pane ' + replacement['pane_id']).stdout)
+        info = live['result']['process_info']
+        passed = (replacement['worktree_path'] == before['worktree_path']
+                  and records(kind='events') == seals and replacement['status'] == 'open'
+                  and info['pane_id'] == replacement['pane_id']
+                  and any(p['pid'] == replacement['identity']['process']['pid']
+                          for p in info['foreground_processes']))
+        print('RETRY:', {'replacement_agent': replacement['identity']['process'],
+                         'same_worktree': replacement['worktree_path'] == before['worktree_path'],
+                         'waiting_seal_kept': records(kind='events') == seals})
     print('R02 PASS' if passed else 'R02 FAIL', flush=True)
 finally:
     evidence(args.evidence)
