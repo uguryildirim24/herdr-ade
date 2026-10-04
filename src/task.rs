@@ -1256,11 +1256,7 @@ pub(crate) fn view_with_evidence(
     }
     if lane.status == crate::thread::Status::Resolved {
         view.state = State::Open;
-        view.next = if lane.cancellation_reason.is_empty() {
-            "lane ended without done; retry or attest its stored report".into()
-        } else {
-            "cancelled".into()
-        };
+        view.next = "lane ended without done; retry or attest its stored report".into();
     }
     view
 }
