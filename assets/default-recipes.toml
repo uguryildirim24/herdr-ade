@@ -1,4 +1,7 @@
 # Shipped recipe data. Model and provider choices live here, not in the engine.
+# Execution is declared by the adapter: new Pi lanes get Linux bubblewrap
+# tool isolation; Mac Pi and native Claude/agy remain advisory. Permission
+# bypass below is not a host/credential/network boundary. Doctor reports mode.
 [recipes.agy_gemini_flash]
 kind = "agy"
 provider = "agy"

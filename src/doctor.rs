@@ -194,6 +194,8 @@ pub(crate) struct ProbePlan {
     natives: Vec<(String, NativeProbe, u64)>,
     models: Vec<(String, String)>,
     pi_ids: BTreeMap<String, Vec<String>>,
+    #[serde(default)]
+    boundaries: Vec<(String, String)>,
     disk: Option<(String, f64)>,
     snapshot: Option<SnapshotInput>,
 }
@@ -236,6 +238,12 @@ impl ProbePlan {
                 );
             }
             plan.models.push((provider, model));
+            if crate::launch::execution_requested(launch) {
+                plan.boundaries.push((
+                    launch.recipe_id.clone(),
+                    crate::launch::EXECUTION_BACKEND.into(),
+                ));
+            }
             return Ok(plan);
         }
         let recipe = crate::contracts::Recipe {
@@ -269,6 +277,16 @@ fn selected_plan(
     machine: Option<&crate::remote::MachineDeclaration>,
 ) -> Result<ProbePlan> {
     let mut plan = ProbePlan::default();
+    for (id, recipe) in &config.recipes {
+        if recipe.enabled && machine.is_none_or(|m| m.runs_kind(&recipe.kind)) {
+            let adapter = config
+                .adapters
+                .get(&recipe.kind)
+                .with_context(|| format!("no adapter exists for agent kind `{}`", recipe.kind))?;
+            plan.boundaries
+                .push((id.clone(), adapter.execution.clone()));
+        }
+    }
     for id in config.routing.recipe_ids() {
         let recipe = config
             .recipes
@@ -331,6 +349,9 @@ fn progress(phase: &str, rows: &[crate::pi::doctor::Row]) {
 pub(crate) fn execute_plan(ctx: &Ctx, plan: &ProbePlan) -> Result<ProbeReport> {
     use crate::pi::doctor::Row;
     let mut report = ProbeReport::default();
+    for (id, backend) in &plan.boundaries {
+        report.rows.push(execution_row(ctx, id, backend));
+    }
     progress("disk", &report.rows);
     if let Some((path, floor)) = &plan.disk {
         report.rows.push(disk_row(ctx.runner, path, *floor));
@@ -471,6 +492,11 @@ fn remote_plan(
     if plan.disk.is_some() {
         expected.push("disk".into());
     }
+    expected.extend(
+        plan.boundaries
+            .iter()
+            .map(|(id, _)| format!("recipe {id} execution")),
+    );
     for label in expected {
         anyhow::ensure!(
             report.rows.iter().filter(|row| row.label == label).count() == 1,
@@ -478,6 +504,79 @@ fn remote_plan(
         );
     }
     Ok(report)
+}
+
+/// Probe namespaces on the execution machine, never infer enforcement from
+/// an installed binary or a permission flag. No silent host fallback.
+fn execution_row(ctx: &Ctx, id: &str, backend: &str) -> crate::pi::doctor::Row {
+    use crate::pi::doctor::Row;
+    let label = format!("recipe {id} execution");
+    let detail = crate::launch::execution_description(backend, std::env::consts::OS);
+    if backend != crate::launch::EXECUTION_BACKEND || !cfg!(target_os = "linux") {
+        return Row::warn(label, detail);
+    }
+    let output = ctx
+        .runner
+        .run(&Cmd::new("/usr/bin/bwrap", TOOL_TIMEOUT).args([
+            "--unshare-all",
+            "--die-with-parent",
+            "--new-session",
+            "--cap-drop",
+            "ALL",
+            "--clearenv",
+            "--ro-bind",
+            "/usr",
+            "/usr",
+            "--ro-bind",
+            "/lib",
+            "/lib",
+            "--ro-bind-try",
+            "/lib64",
+            "/lib64",
+            "/usr/bin/true",
+        ]));
+    match output {
+        Ok(output) if output.success() => Row::ok(
+            label,
+            detail.replace(
+                "(availability probed separately)",
+                "(namespace probe passed)",
+            ),
+        ),
+        Ok(output) => Row::fail(
+            label,
+            format!(
+                "execution_boundary_unavailable: {}; tools fail closed; no host fallback",
+                output.error_text()
+            ),
+        ),
+        Err(error) => Row::fail(
+            label,
+            format!(
+                "execution_boundary_unavailable: {error:#}; install bubblewrap and enable its user namespaces; no host fallback"
+            ),
+        ),
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn boundary_diagnostic_output(cmd: &Cmd, free_kb: u64, refusal: Option<&str>) -> Output {
+    let mut output = crate::testkit::diagnostic_output(cmd, free_kb, refusal);
+    let input: serde_json::Value = serde_json::from_str(cmd.stdin.as_deref().unwrap()).unwrap();
+    let mut reply: serde_json::Value = serde_json::from_str(&output.stdout).unwrap();
+    if let Some(boundaries) = input["request"]["Doctor"]["boundaries"].as_array() {
+        for boundary in boundaries {
+            reply["result"]["rows"].as_array_mut().unwrap().push(
+                serde_json::to_value(crate::pi::doctor::Row::ok(
+                    format!("recipe {} execution", boundary[0].as_str().unwrap()),
+                    "fixture namespace probe passed",
+                ))
+                .unwrap(),
+            );
+        }
+    }
+    output.stdout = serde_json::to_string(&reply).unwrap();
+    output
 }
 
 fn require_ready(report: &ProbeReport) -> Result<()> {
@@ -1228,6 +1327,23 @@ fn report_with_checks(
     }
 
     if worker {
+        if let Ok(config) = &config {
+            let ctx = Ctx {
+                env,
+                root: root.to_path_buf(),
+                config_dir: config_dir.to_path_buf(),
+                runner,
+                detached_ticker: false,
+            };
+            for (id, recipe) in &config.recipes {
+                if recipe.enabled
+                    && let Some(adapter) = config.adapters.get(&recipe.kind)
+                {
+                    let row = execution_row(&ctx, id, &adapter.execution);
+                    check(&mut out, row_status(row.level), &row.label, row.detail);
+                }
+            }
+        }
         check(
             &mut out,
             Some(true),
@@ -2000,7 +2116,7 @@ recipe = "claude_fable_xhigh"
                 |cmd| cmd.program == "ssh",
                 move |cmd| {
                     let value: serde_json::Value = serde_json::from_str(
-                        &crate::testkit::diagnostic_output(cmd, 99_999_999, None).stdout,
+                        &crate::doctor::boundary_diagnostic_output(cmd, 99_999_999, None).stdout,
                     )
                     .unwrap();
                     let mut report: ProbeReport =
@@ -2784,6 +2900,7 @@ recipe = "claude_fable_xhigh"
         )
         .unwrap();
         let runner = runner_with_herdr("herdr 0.9.1\n");
+        runner.on("/usr/bin/bwrap", ok(""));
 
         let ctx = Ctx {
             env: &env,
@@ -3007,6 +3124,7 @@ recipe = "claude_fable_xhigh"
         runner.on("session list --json", ok(r#"{"sessions":[]}"#));
         runner.on("git --version", ok("git version 2.50.0\n"));
         runner.on("df -Pk", fail(1, "df failed"));
+        runner.on("/usr/bin/bwrap", ok(""));
 
         let (text, healthy, checks) = report_with_checks(
             &env,
@@ -3273,6 +3391,10 @@ recipe = "claude_fable_xhigh"
                 format!("recipe {id}")
             };
             rows.push(Row::ok(label, "selected model ready"));
+            rows.push(Row::ok(
+                format!("recipe {id} execution"),
+                "fixture namespace probe passed",
+            ));
         }
         ProbeReport {
             rows,
@@ -3336,6 +3458,32 @@ recipe = "claude_fable_xhigh"
                 .2
                 .contains("unknown")
         );
+    }
+
+    #[test]
+    fn namespace_readiness_never_falls_back_or_claims_an_advisory_runtime_is_secure() {
+        let world = crate::scenarios::World::new();
+        let backend = crate::launch::EXECUTION_BACKEND;
+        let advisory = execution_row(&world.ctx(), "claude", "");
+        assert_eq!(advisory.level, crate::pi::doctor::Level::Warn);
+        assert!(advisory.detail.starts_with("advisory:"));
+        if cfg!(target_os = "linux") {
+            world.runner.on(
+                "/usr/bin/bwrap",
+                crate::runner::fake::fail(1, "namespaces disabled"),
+            );
+            let denied = execution_row(&world.ctx(), "pi", backend);
+            assert_eq!(denied.level, crate::pi::doctor::Level::Fail);
+            assert!(denied.detail.contains("execution_boundary_unavailable:"));
+            assert!(denied.detail.contains("no host fallback"));
+            let ready_world = crate::scenarios::World::new();
+            ready_world
+                .runner
+                .on("/usr/bin/bwrap", crate::runner::fake::ok(""));
+            let ready = execution_row(&ready_world.ctx(), "pi", backend);
+            assert_eq!(ready.level, crate::pi::doctor::Level::Ok);
+            assert!(ready.detail.contains("namespace probe passed"));
+        }
     }
 
     #[test]

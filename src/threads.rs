@@ -1055,12 +1055,20 @@ fn bind_terminal(ctx: &Ctx, project: &Project, view: &SessionView, record: &Thre
         None
     };
     let herdr = view.herdr.on_machine(record.machine_route());
-    let spec = crate::contracts::RoleSpec {
+    let execution_args = crate::launch::bind_execution(ctx, record, machine.as_ref())?;
+    let mut spec = crate::contracts::RoleSpec {
         kind: record.launch.kind.clone(),
-        args: record.launch.args.clone(),
+        args: execution_args.clone(),
         env: record.launch.env.clone(),
         ready_timeout_ms: record.launch.ready_timeout_ms,
     };
+    if crate::launch::execution_requested(&record.launch)
+        && !execution_args.iter().any(|arg| arg == "--no-extensions")
+    {
+        spec.env
+            .retain(|value| !value.starts_with("HERDR_ADE_EXECUTION="));
+        spec.env.push("HERDR_ADE_EXECUTION=advisory".into());
+    }
     let attempt = record.attempt.max(1);
     let env = project::tab_env(
         &project.slug,
@@ -1120,6 +1128,8 @@ fn bind_terminal(ctx: &Ctx, project: &Project, view: &SessionView, record: &Thre
     // can now close this exact workspace instead of leaking an unrecorded one.
     thread::update(project, &record.id, |t| {
         t.cwd = cwd.clone();
+        t.launch.args = execution_args.clone();
+        t.launch.env = spec.env.clone();
         t.workspace_id = created.workspace_id.clone();
         t.tab_id = created.tab_id.clone();
         t.pane_id = created.pane_id.clone();
@@ -7173,7 +7183,12 @@ mod tests {
             |cmd| {
                 let script = cmd.args.last().cloned().unwrap_or_default();
                 if crate::box_helper::tests::is_doctor(cmd) {
-                    return Ok(crate::testkit::diagnostic_output(cmd, 99_999_999, None));
+                    return Ok(crate::doctor::boundary_diagnostic_output(
+                        cmd, 99_999_999, None,
+                    ));
+                }
+                if script.contains("uname -s") {
+                    return Ok(ok("Linux\n"));
                 }
                 if script.contains("getconf _NPROCESSORS_ONLN") {
                     return Ok(ok("1.0 16\n"));
@@ -7594,7 +7609,7 @@ mod tests {
         fx.world.runner.on_fn(
             |cmd| cmd.program == "ssh" && crate::box_helper::tests::is_doctor(cmd),
             move |cmd| {
-                Ok(crate::testkit::diagnostic_output(
+                Ok(crate::doctor::boundary_diagnostic_output(
                     cmd,
                     current.get() * 1_000_000,
                     None,
@@ -7888,7 +7903,7 @@ mod tests {
         fx.world.runner.on_fn(
             |cmd| cmd.program == "ssh" && crate::box_helper::tests::is_doctor(cmd),
             move |cmd| {
-                Ok(crate::testkit::diagnostic_output(
+                Ok(crate::doctor::boundary_diagnostic_output(
                     cmd,
                     99_999_999,
                     (!state.get()).then_some("provider readiness probe timed out"),
@@ -8768,7 +8783,7 @@ mod tests {
                         .is_some_and(|input| input.contains("\"kind\":\"claude\""))
             },
             |cmd| {
-                Ok(crate::testkit::diagnostic_output(
+                Ok(crate::doctor::boundary_diagnostic_output(
                     cmd,
                     99_999_999,
                     Some("Usage limit reached"),
@@ -8810,7 +8825,7 @@ mod tests {
                 |cmd| cmd.program == "ssh" && crate::box_helper::tests::is_doctor(cmd),
                 move |cmd| {
                     Ok(if installed.get() {
-                        crate::testkit::diagnostic_output(cmd, 99_999_999, None)
+                        crate::doctor::boundary_diagnostic_output(cmd, 99_999_999, None)
                     } else {
                         crate::runner::fake::ok(r#"{"status":"Skew","build":"0.1.0+old.1"}"#)
                     })

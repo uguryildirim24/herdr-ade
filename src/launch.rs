@@ -440,7 +440,22 @@ fn resolve(ctx: &Ctx, project: &Project, input: &ResolveInput) -> Result<Launch>
                 recipe,
             )
         },
-        env: recipe.env.clone(),
+        env: {
+            let mut env: Vec<_> = recipe
+                .env
+                .iter()
+                .filter(|value| !value.starts_with("HERDR_ADE_EXECUTION="))
+                .cloned()
+                .collect();
+            // Pin new lane launches only. Recovery preserves the stored env;
+            // installing this build does not retrofit a running process.
+            if input.workflow != "coordinator"
+                && config.adapters[&recipe.kind].execution == EXECUTION_BACKEND
+            {
+                env.push(format!("HERDR_ADE_EXECUTION={EXECUTION_BACKEND}"));
+            }
+            env
+        },
         ready_timeout_ms: if recipe.ready_timeout_ms == 0 {
             config.adapters[&recipe.kind].ready_timeout_ms
         } else {
@@ -461,6 +476,128 @@ fn resolve(ctx: &Ctx, project: &Project, input: &ResolveInput) -> Result<Launch>
         machine: config.dispatch.machine,
         ..Launch::default()
     })
+}
+
+pub(crate) const EXECUTION_BACKEND: &str = "linux-bwrap-tools-v1";
+
+pub(crate) fn execution_requested(launch: &Launch) -> bool {
+    launch
+        .env
+        .iter()
+        .any(|value| value == &format!("HERDR_ADE_EXECUTION={EXECUTION_BACKEND}"))
+}
+
+pub(crate) fn execution_description(backend: &str, os: &str) -> String {
+    if backend == EXECUTION_BACKEND && os == "linux" {
+        "Linux bubblewrap tool boundary (availability probed separately): worktree/private Git/build writable; tool network denied; provider and authorized seal/publication outside. Trusted Pi and installed extensions are not contained.".into()
+    } else {
+        "advisory: no ADE filesystem/network/credential boundary; permission bypass, hooks and worktrees do not protect the host".into()
+    }
+}
+
+/// Freeze the backend outside writable work. Remote writes use the same
+/// hash-verified runtime-file transport as briefs, not a credential transfer.
+/// Arguments are stored on the launch, so retries retain their chosen mode.
+pub(crate) fn bind_execution(
+    ctx: &Ctx,
+    record: &crate::thread::Thread,
+    machine: Option<&crate::remote::MachineDeclaration>,
+) -> Result<Vec<String>> {
+    if !execution_requested(&record.launch) {
+        return Ok(record.launch.args.clone());
+    }
+    let linux = if let Some(machine) = machine {
+        let output = crate::remote::ssh(
+            ctx.runner,
+            &machine.target,
+            &crate::remote::with_path(&machine.path, "uname -s"),
+            None,
+            HELP_TIMEOUT,
+        )?;
+        anyhow::ensure!(
+            output.success(),
+            "execution_boundary_unavailable: execution OS is unknown: {}",
+            output.error_text()
+        );
+        output.stdout.trim() == "Linux"
+    } else {
+        cfg!(target_os = "linux")
+    };
+    if !linux {
+        anyhow::ensure!(
+            !record
+                .launch
+                .args
+                .iter()
+                .any(|arg| arg == "--no-extensions"),
+            "execution_boundary_unavailable: a stored bounded launch cannot downgrade to an advisory host"
+        );
+        return Ok(record.launch.args.clone());
+    }
+    let root = machine.map_or_else(
+        || std::path::absolute(&ctx.root).map(|root| root.display().to_string()),
+        |m| Ok(m.root.clone()),
+    )?;
+    let ade = machine.map_or_else(
+        || std::env::current_exe().map(|p| p.display().to_string()),
+        |m| Ok(m.ade_bin.clone()),
+    )?;
+    let identity = crate::thread::sha256_hex(
+        format!(
+            "{}\0{}\0{}\0{}",
+            root,
+            record.id,
+            record.attempt.max(1),
+            record.worktree_path
+        )
+        .as_bytes(),
+    );
+    let state = format!("{root}/.execution/{identity}");
+    anyhow::ensure!(
+        !Path::new(&state).starts_with(&record.worktree_path),
+        "execution_root_exposed: runtime state must be outside the writable worktree"
+    );
+    let policy = json!({"root": root, "ade": ade, "cwd": record.worktree_path, "branch": record.branch, "role": record.role, "state": state});
+    let source = include_str!("../assets/pi-execution-boundary.mjs")
+        .replace("__ADE_EXECUTION_POLICY__", &serde_json::to_string(&policy)?);
+    let hash = crate::thread::sha256_hex(source.as_bytes());
+    let path = format!("{state}/{hash}.mjs");
+    if let Some(machine) = machine {
+        crate::remote::write_runtime_file(
+            ctx.runner,
+            &machine.target,
+            &path,
+            source.as_bytes(),
+            &hash,
+        )?;
+    } else {
+        std::fs::create_dir_all(&state)?;
+        std::fs::write(&path, source)?;
+    }
+    // These flags cannot originate in a Pi recipe. A retry replaces only the
+    // prior backend suffix with this attempt's immutable backend and state.
+    let mut args = record.launch.args.clone();
+    if let Some(index) = args.iter().position(|arg| arg == "--no-extensions") {
+        args.truncate(index);
+    }
+    args.extend([
+        "--no-extensions".into(),
+        "--no-tools".into(),
+        "--no-approve".into(),
+        "--no-prompt-templates".into(),
+        "--no-themes".into(),
+        "--session-dir".into(),
+        format!("{state}/sessions"),
+        "--extension".into(),
+        path,
+    ]);
+    for extension in ["herdr-agent-state.ts", "herdr-pi-guard.ts"] {
+        args.extend([
+            "--extension".into(),
+            format!("{root}/pi/agent/extensions/{extension}"),
+        ]);
+    }
+    Ok(args)
 }
 
 /// Append-only dispatch journal. No network call is made while holding its lock.
@@ -568,6 +705,232 @@ mod tests {
     use super::*;
     use crate::contracts::FailureClass;
     use crate::scenarios::World;
+
+    #[test]
+    fn boundary_launch_is_pinned_outside_work_and_old_launches_stay_unchanged() {
+        let world = World::new();
+        let mut record = crate::thread::Thread {
+            id: "t-1".into(),
+            attempt: 1,
+            worktree_path: world.home.path().join("work").display().to_string(),
+            branch: "lane/one".into(),
+            role: "reviewer".into(),
+            launch: Launch {
+                kind: "pi".into(),
+                args: vec!["--provider".into(), "same".into()],
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let before = record.launch.clone();
+        assert_eq!(
+            bind_execution(&world.ctx(), &record, None).unwrap(),
+            before.args
+        );
+        assert_eq!(record.launch, before);
+        record
+            .launch
+            .env
+            .push(format!("HERDR_ADE_EXECUTION={EXECUTION_BACKEND}"));
+        if cfg!(target_os = "linux") {
+            let args = bind_execution(&world.ctx(), &record, None).unwrap();
+            assert!(args.contains(&"--no-tools".into()));
+            assert!(!args.contains(&"--tools".into()));
+            assert!(args.contains(&"--no-extensions".into()));
+            assert!(args.contains(&"--no-approve".into()));
+            let index = args.iter().position(|arg| arg == "--extension").unwrap();
+            let path = Path::new(&args[index + 1]);
+            assert!(!path.starts_with(&record.worktree_path));
+            let source = std::fs::read_to_string(path).unwrap();
+            assert!(!source.contains("__ADE_EXECUTION_POLICY__"));
+            assert!(source.contains("\"role\":\"reviewer\""));
+            record.launch.args = args.clone();
+            assert_eq!(bind_execution(&world.ctx(), &record, None).unwrap(), args);
+            record.attempt += 1;
+            let retry = bind_execution(&world.ctx(), &record, None).unwrap();
+            assert_ne!(retry[index + 1], args[index + 1]);
+            assert_eq!(
+                retry.iter().filter(|arg| *arg == "--no-extensions").count(),
+                1
+            );
+            assert_eq!(std::fs::read_to_string(path).unwrap(), source);
+        }
+        assert!(execution_description(EXECUTION_BACKEND, "macos").starts_with("advisory:"));
+        assert!(execution_description("", "linux").starts_with("advisory:"));
+    }
+
+    #[test]
+    fn unsupported_remote_is_advisory_but_a_stored_boundary_cannot_downgrade() {
+        let world = World::new();
+        world
+            .runner
+            .on("uname -s", crate::runner::fake::ok("Darwin\n"));
+        let machine = crate::remote::MachineDeclaration {
+            target: "scratch-mac".into(),
+            path: "/usr/bin:/bin".into(),
+            ..Default::default()
+        };
+        let mut record = crate::thread::Thread {
+            launch: Launch {
+                env: vec![format!("HERDR_ADE_EXECUTION={EXECUTION_BACKEND}")],
+                args: vec!["--provider".into(), "same".into()],
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        assert_eq!(
+            bind_execution(&world.ctx(), &record, Some(&machine)).unwrap(),
+            record.launch.args
+        );
+        record.launch.args.push("--no-extensions".into());
+        assert!(
+            bind_execution(&world.ctx(), &record, Some(&machine))
+                .unwrap_err()
+                .to_string()
+                .contains("cannot downgrade")
+        );
+        assert_eq!(world.runner.count("python3"), 0);
+    }
+
+    // These run without root when Linux permits unprivileged namespaces. The
+    // doctor failure regression covers machines that cannot run this backend;
+    // the authorized oci transcript supplies the positive enforcement witness.
+    #[cfg(target_os = "linux")]
+    fn isolated_trial(code: &str) {
+        use std::process::Command;
+        let probe = Command::new("/usr/bin/bwrap")
+            .args(["--unshare-all", "--ro-bind", "/", "/", "/usr/bin/true"])
+            .output();
+        if !probe.is_ok_and(|out| out.status.success())
+            || Command::new("node").arg("--version").output().is_err()
+        {
+            eprintln!("namespace enforcement unavailable here; oci trial required");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().join("repo");
+        let work = dir.path().join("work");
+        std::fs::create_dir(&repo).unwrap();
+        crate::testkit::git(&repo, &["init", "-q", "-b", "main"]);
+        crate::testkit::git(&repo, &["config", "user.name", "Trial"]);
+        crate::testkit::git(&repo, &["config", "user.email", "trial@localhost"]);
+        crate::testkit::commit_file(&repo, "source.c", "int main(void) { return 0; }\n", "base");
+        crate::testkit::git(
+            &repo,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "-b",
+                "lane/trial",
+                work.to_str().unwrap(),
+            ],
+        );
+        std::fs::write(repo.join(".git/info/exclude"), ".herdr-project/\n").unwrap();
+        let root = dir.path().join("control");
+        std::fs::create_dir(&root).unwrap();
+        std::fs::write(root.join("records"), "protected").unwrap();
+        std::fs::write(dir.path().join("credential"), "synthetic-secret").unwrap();
+        let ade = dir.path().join("trusted-ade");
+        std::fs::write(
+            &ade,
+            format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$@\" > '{}'\n",
+                dir.path().join("authorized-call").display()
+            ),
+        )
+        .unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&ade, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let policy = json!({"root": root, "ade": ade, "cwd": work, "branch": "lane/trial", "state": root.join("backend")});
+        let source = include_str!("../assets/pi-execution-boundary.mjs")
+            .replace("__ADE_EXECUTION_POLICY__", &policy.to_string())
+            .replace("import { Type } from '@sinclair/typebox';", "");
+        let backend = dir.path().join("backend.mjs");
+        std::fs::write(&backend, source).unwrap();
+        let script = dir.path().join("trial.mjs");
+        std::fs::write(&script, format!("import assert from 'node:assert/strict';\nimport fs from 'node:fs';\nimport {{runSandbox, seal, policy}} from './backend.mjs';\nconst run = command => runSandbox(['/bin/bash', '--noprofile', '--norc', '-c', command]);\n{code}")).unwrap();
+        let output = Command::new("node")
+            .arg(&script)
+            .env("ADE_TRIAL_ROOT", dir.path())
+            .env("FAKE_PROVIDER_TOKEN", "must-not-inherit")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            std::fs::read_to_string(root.join("records")).unwrap(),
+            "protected"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn namespace_denies_control_and_unrelated_writes_including_subprocesses() {
+        isolated_trial(
+            r#"
+await run('cc source.c -o /build/trial && /build/trial && mkdir -p .herdr-project/library && echo artifact > .herdr-project/library/result');
+for (const target of [policy.root + '/records', process.env.ADE_TRIAL_ROOT + '/unrelated/records']) {
+  await assert.rejects(run(`bash -c 'echo hostile > "${target}"'`));
+  await assert.rejects(run(`ln -sf '${target}' escape; echo hostile > escape`));
+}
+await assert.rejects(run('kill -0 ' + process.pid));
+assert.equal(await run('cat .herdr-project/library/result'), 'artifact\n');
+"#,
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn malformed_binding_cannot_resolve_host_git_from_the_callers_directory() {
+        isolated_trial(
+            r#"
+const broken = fs.readFileSync(new URL('./backend.mjs', import.meta.url), 'utf8')
+  .replace('"cwd":' + JSON.stringify(policy.cwd), '"cwd":""');
+const backend = await import('data:text/javascript;base64,' + Buffer.from(broken).toString('base64'));
+await assert.rejects(backend.runSandbox(['/usr/bin/true']), /execution_policy_invalid/);
+"#,
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn namespace_denies_credentials_and_network_including_children() {
+        isolated_trial(
+            r#"
+await assert.rejects(run(`bash -c 'cat "${process.env.ADE_TRIAL_ROOT}/credential"'`));
+assert.equal(await run('printf "%s" "${FAKE_PROVIDER_TOKEN-unset}"'), 'unset');
+const net = await import('node:net');
+const host = net.createServer(socket => socket.end('host-only'));
+await new Promise(resolve => host.listen(0, '127.0.0.1', resolve));
+try { await assert.rejects(run(`bash -c 'echo send >/dev/tcp/127.0.0.1/${host.address().port}'`)); }
+finally { await new Promise(resolve => host.close(resolve)); }
+await assert.rejects(run("bash -c 'echo send >/dev/tcp/1.1.1.1/443'"));
+"#,
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn private_git_denies_push_and_shared_metadata_but_authorized_import_works() {
+        isolated_trial(
+            r#"
+await assert.rejects(run(`git push '${process.env.ADE_TRIAL_ROOT}/repo' HEAD:main`));
+await assert.rejects(run(`echo hostile > '${process.env.ADE_TRIAL_ROOT}/repo/.git/config'`));
+await run('echo changed > change; git add change; git commit -qm change');
+await assert.rejects(seal('push', 'not authorized'));
+await run('echo untracked > escape');
+await assert.rejects(seal('done')); // untracked artifacts must not be silently lost
+await run('rm -f escape');
+await seal('done');
+assert.equal(fs.readFileSync(process.env.ADE_TRIAL_ROOT + '/authorized-call', 'utf8'), '--root\n' + policy.root + '\ndone\n');
+"#,
+        );
+    }
 
     #[test]
     fn recovery_keeps_the_entire_stored_launch_without_initial_validation() {
