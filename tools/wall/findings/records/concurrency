@@ -1,0 +1,73 @@
+#!/usr/bin/env python3
+"""Bounded concurrent command observations on real sandbox records."""
+from support import Sandbox, SETUP
+
+box = Sandbox()
+box.reset()
+box.guest(SETUP)
+box.guest(r'''
+import concurrent.futures, json, subprocess, sys, time, tomllib
+sys.path.insert(0, str(home/'tools'))
+import guest
+
+def run(command, **options):
+    p = subprocess.run(command, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=90, **options)
+    print('COMMAND',command,'EXIT',p.returncode,p.stdout,flush=True)
+    return p
+
+request = (home/'request').read_text().strip()
+commands = [['ha','plan','step','add','wall',f'Concurrent step {n}'] for n in range(8)]
+commands += [['ha','task','add','wall','--title',f'Concurrent task {n}','--request',request,'--acceptance','Recorded once'] for n in range(4)]
+commands += [['ha','note','add','wall',f'Concurrent note {n}','--kind','memory','--request',request] for n in range(4)]
+with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
+    outcomes = list(pool.map(run, commands))
+assert all(p.returncode == 0 for p in outcomes)
+plan = tomllib.loads((state/'plan.toml').read_text())
+assert len(plan['steps']) == 9 and len(list((state/'tasks').glob('*.toml'))) == 5
+assert len(list((state/'notes').glob('*.json'))) == 5
+print('EXPECTED: no lost updates; ACTUAL: 8/8 steps, 4/4 tasks and 4/4 notes retained')
+
+# Observe a real start and cancel overlap; no invented lane id is used.
+(home/'control.json').write_text(json.dumps({'hold':['working']}))
+guest.run('ha','ticker','start')
+task = home/'concurrent-task.md'; task.write_text('Read the frozen brief and seal the scratch change.\n')
+command = ['ha','thread','start','wall','--task-file',str(task),'--title','Concurrent start',
+           '--repo',str(home/'repo'),'--recipe','wall_lane','--request',request,'--acceptance','Scripted fault plumbing observed']
+old = {p.name for p in (state/'threads').glob('*.toml')}
+p = subprocess.Popen(command, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+def new_record():
+    return [f for f in (state/'threads').glob('*.toml') if f.name not in old]
+guest.poll('new start record',new_record)
+record = new_record()[0]
+overlap = p.poll() is None
+cancel = run(['ha','thread','cancel','wall',record.stem,'--reason','Concurrent start/cancel check'])
+output = p.communicate(timeout=90)[0]
+print('START exit',p.returncode,output,'overlap observed',overlap,flush=True)
+print('POST START/CANCEL',record.read_text(),flush=True)
+
+# Delay only real git calls inside the sealing command to observe overlap.
+(home/'control.json').write_text(json.dumps({'hold':['before-seal']}))
+(home/'release/before-seal').unlink(missing_ok=True)
+lane = guest.lane()
+guest.wait(lane['id'],'before-seal')
+follow = home/'follow-up.txt'; follow.write_text('Record this follow-up without changing the scratch work.\n')
+env = dict(os.environ,HERDR_PANE_ID=lane['pane_id'],WALL_GIT_DELAY_SECONDS='1')
+p = subprocess.Popen(['ha','done'],cwd=lane['cwd'],env=env,text=True,stdout=subprocess.PIPE,stderr=subprocess.STDOUT)
+time.sleep(0.2)
+overlap = p.poll() is None
+follow_result = run(['ha','thread','prompt','wall',lane['id'],'--text-file',str(follow)])
+output = p.communicate(timeout=90)[0]
+print('DONE exit',p.returncode,output,'overlap observed',overlap,flush=True)
+print('POST DONE/PROMPT',(state/'threads'/f"{lane['id']}.toml").read_text(),flush=True)
+
+# D52 is already known. Observe this pair without claiming a new finding.
+with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+    futures = [pool.submit(run,c) for c in [
+        ['ha','review','wall'],
+        ['ha','task','drop','wall','job-0001','--reason','Concurrent review/drop check']]]
+    for f in futures: f.result()
+guest.run('ha','ticker','stop')
+print('EXPECTED: bounded completion; ACTUAL: all command pairs returned within the recorded timeouts')
+print('Review was already active: review-creation versus drop overlap is NOT ESTABLISHED.')
+''')
+box.evidence()

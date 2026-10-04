@@ -1,0 +1,53 @@
+#!/usr/bin/env python3
+"""Exercise real writers with the sandbox tmpfs full; report actual failing paths."""
+from support import Sandbox, SETUP
+
+box = Sandbox()
+box.reset()
+box.guest(SETUP)
+box.guest(r'''
+import hashlib, json, subprocess, sys, tomllib
+sys.path.insert(0, str(home/'tools'))
+import guest
+(home/'control.json').write_text(json.dumps({'hold':['working']}))
+guest.run('ha','ticker','start')
+fresh = guest.lane()
+guest.wait(fresh['id'],'working')
+guest.run('ha','ticker','stop')
+before = {str(p.relative_to(state)): p.read_bytes() for p in state.rglob('*') if p.is_file()}
+request = (home/'request').read_text().strip()
+lane = tomllib.loads((state/'threads/t-0002.toml').read_text())
+commands = [
+ ('plan', ['ha','plan','set','wall','--does','Full storage outcome'], {}),
+ ('note', ['ha','note','add','wall','Full storage note','--kind','memory','--request',request], {}),
+ ('task', ['ha','task','add','wall','--title','Full storage task','--request',request,'--acceptance','Durable task'], {}),
+ ('thread', ['ha','thread','cancel','wall',fresh['id'],'--reason','Full storage check'], {}),
+ ('review', ['ha','review','cancel','wall'], {}),
+ ('event', ['ha','failed','Full storage check'], {'cwd':lane['cwd'],'env':dict(os.environ,HERDR_PANE_ID=lane['pane_id'])}),
+ ('coordinator', ['ha','open','wall'], {}),
+ ('inbox-receipt', ['ha','context','wall'], {}),
+]
+try:
+    for kind, command, options in commands:
+        guest.fault('fill', [])
+        print('WRITE',kind,command,flush=True)
+        result = subprocess.run(command, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=45, **options)
+        print('EXIT',result.returncode,result.stdout,flush=True)
+    guest.fault('fill', [])
+    full = home/'disk-full'
+    os.truncate(full, full.stat().st_size - 4096)
+    print('PARTIAL WRITE: 4096 bytes free for a 24 KiB note',flush=True)
+    result = subprocess.run(['ha','note','add','wall','N'*24576,'--kind','memory','--request',request],
+                            text=True,stdout=subprocess.PIPE,stderr=subprocess.STDOUT,timeout=45)
+    print('EXIT',result.returncode,result.stdout,flush=True)
+    after = {str(p.relative_to(state)): p.read_bytes() for p in state.rglob('*') if p.is_file()}
+    print('EXPECTED: published records are absent or complete; failed writes preserve old bytes')
+    print('ACTUAL changed existing:',[p for p in before if p in after and before[p] != after[p]])
+    print('ACTUAL missing existing:',sorted(before.keys()-after.keys()))
+    print('ACTUAL added:',{p:len(after[p]) for p in after.keys()-before.keys()})
+finally:
+    (home/'disk-full').unlink(missing_ok=True)
+# A successful post-full write establishes that releasing space permits progress.
+guest.run('ha','plan','set','wall','--does','Recovered after storage full')
+''')
+box.evidence()

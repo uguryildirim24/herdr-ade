@@ -1,0 +1,30 @@
+#!/usr/bin/env python3
+# Only touches the named sandbox instance's own .herdr-ade state.
+import argparse
+from pathlib import Path
+import shlex
+import subprocess
+import sys
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from instance import Instance
+
+parser = argparse.ArgumentParser(description='Simulate an interrupted state-file write')
+parser.add_argument('--instance', type=int, choices=range(9), default=0)
+parser.add_argument('--box', action='store_true')
+parser.add_argument('record', help='Path relative to wall/.state')
+parser.add_argument('condition', choices=['empty', 'truncated', 'unreadable'])
+args = parser.parse_args()
+instance = Instance(args.instance)
+home = instance.home / 'box' if args.box else instance.home
+wall = Path(__file__).resolve().parents[1] / 'wall'
+command = ['sudo', '-n', str(wall)]
+if args.instance:
+    command += ['--instance', str(args.instance)]
+command += ['enter', *(['--box'] if args.box else [])]
+script = Path(__file__).with_name('interrupted-write-guest.py')
+with script.open() as source:
+    subprocess.run(command + ['tee "$HOME/tools/interrupted-write-guest.py" >/dev/null'],
+                   stdin=source, check=True)
+subprocess.run(command + [shlex.join(['python3', str(home/'tools/interrupted-write-guest.py'),
+                                    str(home), args.record, args.condition])], check=True)
