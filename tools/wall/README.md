@@ -9,7 +9,17 @@ The omitted flag preserves the original default: `wall`/`wallbox`, `/home/wall`,
 ports 22285/22286, units `herdr-wall-PORT`, and saved machine `wall-box`.
 **Do not reset/install/fault the default while another lane uses it.**
 
-Every command accepts `--instance N` before its verb, N = 1..8. Instance N uses
+Every command accepts `--instance N` before its verb, N = 1..8.
+
+- **1–4:** manually assigned wall-lane slots; use only your assigned instance.
+- **5–8:** reserved together for `tools/wall/gate` on every herdr-ade review.
+  Instance 5 runs prove and the final fixture journey; independent regression
+  workers use 6, 7 and 8 concurrently. The gate holds one nonblocking lock per
+  slot (`/home/ubuntu/.cache/herdr-wall-gate/instance-N.lock`). Any occupied lock
+  yields the same retryable `gate instance busy` exit 75 before build/install.
+  Never use a reserved slot manually without holding its corresponding lock.
+
+Instance N uses
 `wallN`/`wallboxN`, `/home/wall-N` (box beneath it), ports `22285+2*N` and
 `22286+2*N`, units `herdr-wall-N-PORT`, and saved machine `wall-box-N`. Each has
 its own root/socket, remote, mounts, private tmp, cgroups, controls and releases.

@@ -2,9 +2,11 @@
 """Trusted host gate for oci. Never invoke this inside a lane boundary.
 
 Exit 75 means contention: retry the same sealed candidate, not a code failure.
-All transcripts/captures are outside the candidate and the disposable instance.
+All transcripts/captures are outside the candidate and the disposable instances.
 """
 import argparse
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from contextlib import ExitStack
 import fcntl
 import hashlib
 import json
@@ -15,16 +17,25 @@ import signal
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 
 TOOLS = Path(__file__).resolve().parent
 FAULTS = 'kill-pane kill-process ticker disconnect reboot fill corrupt clock install'
-BUDGET = 900
+INSTANCES = (5, 6, 7, 8)
+REGRESSION_INSTANCES = INSTANCES[1:]
+BUDGET = 1500
 CLEANUP = 90
 
 
 class Incomplete(Exception):
     pass
+
+
+class RoundFailure(Exception):
+    def __init__(self, round_name, detail):
+        super().__init__(detail)
+        self.round = round_name
 
 
 def findings(path, clock=False):
@@ -41,38 +52,142 @@ class Gate:
         self.started = time.monotonic()
         self.deadline = self.started + BUDGET - CLEANUP
         self.round = 'build'
-        self.wall = ['sudo', '-n', str(TOOLS / 'wall'), '--instance', '5']
+        self.wall = self.wall_command(5)
+        self.touched = set()
+        self.processes = set()
+        self.mutex = threading.Lock()
+        self.aborting = False
 
-    def command(self, args, name, env=None, timeout=None):
-        remaining = self.deadline - time.monotonic()
+    @staticmethod
+    def wall_command(instance):
+        return ['sudo', '-n', str(TOOLS / 'wall'), '--instance', str(instance)]
+
+    def timing(self, filename, name, round_name, started, outcome):
+        row = dict(name=name, round=round_name, started=started - self.started,
+                   duration=time.monotonic() - started, outcome=outcome)
+        with self.mutex, (self.evidence / filename).open('a') as log:
+            log.write(json.dumps(row) + '\n')
+
+    @staticmethod
+    def kill(process):
+        # Privileged controllers and their children must die before capture/reset.
+        subprocess.run(['sudo', '-n', '/bin/kill', '-KILL', '--', f'-{process.pid}'],
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=5)
+
+    def abort(self):
+        with self.mutex:
+            self.aborting = True
+            processes = list(self.processes)
+        for process in processes:
+            self.kill(process)
+
+    def command(self, args, name, env=None, timeout=None, round_name=None):
+        round_name = round_name or self.round
+        started = time.monotonic()
+        remaining = self.deadline - started
         if timeout is not None:
             remaining = min(remaining, timeout)
         if remaining <= 0:
-            raise TimeoutError(f'timed out at {self.round}')
-        with (self.evidence / 'commands.log').open('a') as log:
-            log.write(f'{time.monotonic() - self.started:.3f}s {self.round}: {shlex.join(map(str, args))}\n')
+            raise TimeoutError(f'timed out at {round_name}')
+        with self.mutex, (self.evidence / 'commands.log').open('a') as log:
+            log.write(f'{started - self.started:.3f}s {round_name}: {shlex.join(map(str, args))}\n')
+        outcome = 'interrupted'
         with (self.evidence / f'{name}.log').open('ab') as output:
-            process = subprocess.Popen(list(map(str, args)), cwd=self.candidate, env=env,
-                                       stdout=output, stderr=subprocess.STDOUT, start_new_session=True)
+            with self.mutex:
+                if self.aborting:
+                    raise RuntimeError('parallel campaign cancelled')
+                process = subprocess.Popen(list(map(str, args)), cwd=self.candidate, env=env,
+                                           stdout=output, stderr=subprocess.STDOUT, start_new_session=True)
+                self.processes.add(process)
             try:
                 code = process.wait(timeout=remaining)
-            except BaseException:
-                # sudo-owned controllers must also die before capture/reset.
-                subprocess.run(['sudo', '-n', '/bin/kill', '-KILL', '--', f'-{process.pid}'],
-                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=5)
+                outcome = f'exit {code}'
+            except BaseException as error:
+                outcome = 'timeout' if isinstance(error, (TimeoutError, subprocess.TimeoutExpired)) else 'interrupted'
+                self.kill(process)
                 process.wait(timeout=5)
                 raise
+            finally:
+                with self.mutex:
+                    self.processes.discard(process)
+                self.timing('command-durations.jsonl', name, round_name, started, outcome)
         if code:
             raise RuntimeError(f'exit {code}; see {name}.log')
-        # Historical guest helpers explicitly disclose assisted-open/provider
-        # workarounds. They are evidence for exploration, not a passing gate.
         findings(self.evidence / f'{name}.log')
+
+    def round_job(self, round_name, action):
+        started = time.monotonic()
+        outcome = 'failed'
+        try:
+            action()
+            outcome = 'pass'
+        except Incomplete:
+            outcome = 'incomplete'
+            raise
+        except Exception as error:
+            active = self.active_round(round_name)
+            detail = (f'timed out at {active}' if isinstance(error, (TimeoutError, subprocess.TimeoutExpired))
+                      else str(error))
+            raise RoundFailure(active, detail) from error
+        finally:
+            self.timing('round-durations.jsonl', round_name, round_name, started, outcome)
 
     def snapshot(self, name):
         self.command(['sh', '-c', 'date -u; id ubuntu; '
                       'ls -ld /home/ubuntu/.herdr-ade /home/ubuntu/.config/herdr '
                       '/home/ubuntu/.config/herdr/herdr.sock; '
-                      'ps -u ubuntu -o pid,lstart,comm'], name)
+                      'ps -u ubuntu -o pid,lstart,comm'], name, timeout=5)
+
+    def regressions(self, instance, repros):
+        wall = self.wall_command(instance)
+        for repro in repros:
+            round_name = f'regression {repro.parent.name}'
+
+            def run_repro():
+                self.command([repro, '--instance', str(instance)], f'regression-{repro.parent.name}',
+                             round_name=round_name)
+                self.command([*wall, 'evidence', self.evidence / f'{repro.parent.name}-capture'],
+                             f'{repro.parent.name}-evidence', round_name=round_name)
+
+            self.round_job(round_name, run_repro)
+
+    def prove(self):
+        env = dict(os.environ)
+        env.pop('WALL_PROVE_FAULTS', None)
+        self.command([*self.wall, 'prove', self.evidence / 'prove', self.alternate], 'prove', env,
+                     round_name='prove')
+        for fault in FAULTS.split():
+            if not all((self.evidence / 'prove' / fault / 'capture' / name).is_file()
+                       for name in ['local.tar', 'box.tar']):
+                raise Incomplete(f'prove {fault}: capture missing')
+            findings(self.evidence / 'prove' / fault / 'commands.log', clock=(fault == 'clock'))
+        install_log = (self.evidence / 'prove/install/commands.log').read_text()
+        hashes = {parts[0] for line in install_log.splitlines()
+                  if len(parts := line.split()) == 2 and len(parts[0]) == 64
+                  and parts[1].endswith('/bin/herdr-ade')}
+        if len(hashes) < 2:
+            raise Incomplete('prove install: sandbox image did not change')
+
+    def campaign(self, repros):
+        # Three slot-owning workers; queued repros reuse a slot only after its
+        # previous capture. Prove exclusively owns 5 throughout the campaign.
+        assignments = {instance: repros[index::len(REGRESSION_INSTANCES)]
+                       for index, instance in enumerate(REGRESSION_INSTANCES)}
+        (self.evidence / 'regression-instances.json').write_text(json.dumps(
+            {repro.parent.name: instance for instance, batch in assignments.items() for repro in batch},
+            indent=2) + '\n')
+        with ThreadPoolExecutor(max_workers=len(INSTANCES)) as executor:
+            futures = [executor.submit(self.round_job, 'prove', self.prove)]
+            futures += [executor.submit(self.regressions, instance, batch)
+                        for instance, batch in assignments.items()]
+            try:
+                for future in as_completed(futures):
+                    future.result()
+            except BaseException:
+                self.abort()
+                for future in futures:
+                    future.cancel()
+                raise
 
     def run(self):
         self.snapshot('ubuntu-before')
@@ -80,10 +195,10 @@ class Gate:
         self.command(['git', 'status', '--porcelain'], 'candidate-status')
         tools = [TOOLS / name for name in ['gate', 'wall', 'guest.py', 'prove', 'scripted-agent.js']]
         tools += sorted((TOOLS / 'regressions').glob('*/repro'))
+        tools += sorted((TOOLS / 'regressions').glob('*.py'))
         (self.evidence / 'tools.json').write_text(json.dumps(
             {str(p): hashlib.sha256(p.read_bytes()).hexdigest() for p in tools}, indent=2) + '\n')
         self.command(['cargo', 'build', '--bins'], 'build')
-        # cargo metadata honors this worktree's config and CARGO_TARGET_DIR.
         self.command(['cargo', 'metadata', '--no-deps', '--format-version', '1'], 'metadata')
         metadata = json.loads((self.evidence / 'metadata.log').read_text())
         build = Path(metadata['target_directory']) / 'debug'
@@ -93,67 +208,65 @@ class Gate:
             if hashlib.file_digest(candidate, 'sha256').digest() == hashlib.file_digest(alternate, 'sha256').digest():
                 raise Incomplete('prove install: alternate build is identical to candidate')
         self.round = 'install'
-        self.command([*self.wall, 'install', '--build', build], 'install')
-        self.command([*self.wall, 'enter', 'set -e; ha --version; id; '
-                      'sha256sum "$HOME/bin/herdr-ade" "$HOME/bin/herdr-pi" "$HOME/bin/herdr-rundown"'],
-                     'installed-build')
-        # Repros run first so a known defect is named rather than masked by a
-        # later general journey failure. Each repro owns its initial reset.
+        # The first install creates the hash-addressed stage once. Subsequent
+        # installs attach that same stage, with private writable guest copies.
+        for instance in INSTANCES:
+            self.touched.add(instance)
+            wall = self.wall_command(instance)
+            self.command([*wall, 'install', '--build', build], f'install-{instance}')
+            self.command([*wall, 'enter', 'set -e; ha --version; id; '
+                          'sha256sum "$HOME/bin/herdr-ade" "$HOME/bin/herdr-pi" "$HOME/bin/herdr-rundown"'],
+                         f'installed-build-{instance}')
+            self.command(['sudo', '-n', 'readlink', '-f', f'/var/lib/herdr-wall-{instance}/bin'],
+                         f'stage-{instance}')
         repros = sorted((TOOLS / 'regressions').glob('*/repro'))
         if not repros:
             raise Incomplete('no live regression repros found')
-        for repro in repros:
-            self.round = f'regression {repro.parent.name}'
-            self.command([repro, '--instance', '5'], f'regression-{repro.parent.name}')
-            self.command([*self.wall, 'evidence', self.evidence / f'{repro.parent.name}-capture'],
-                         f'{repro.parent.name}-evidence')
-        self.round = 'prove'
-        # Ignore inherited selection overrides: a gate always runs every round.
-        env = dict(os.environ)
-        env.pop('WALL_PROVE_FAULTS', None)
-        self.command([*self.wall, 'prove', self.evidence / 'prove', self.alternate], 'prove', env)
-        for fault in FAULTS.split():
-            self.round = f'prove/{fault}'
-            if not all((self.evidence / 'prove' / fault / 'capture' / name).is_file()
-                       for name in ['local.tar', 'box.tar']):
-                raise Incomplete(f'prove {fault}: capture missing')
-            findings(self.evidence / 'prove' / fault / 'commands.log', clock=(fault == 'clock'))
-        # Staging strips the candidate, while install faults stream the alternate
-        # unchanged. Compare the actual sandbox images, not debug-file sizes.
-        install_log = (self.evidence / 'prove/install/commands.log').read_text()
-        hashes = {parts[0] for line in install_log.splitlines()
-                  if len(parts := line.split()) == 2 and len(parts[0]) == 64
-                  and parts[1].endswith('/bin/herdr-ade')}
-        if len(hashes) < 2:
-            raise Incomplete('prove install: sandbox image did not change')
+        self.round = 'parallel campaign'
+        self.campaign(repros)
         self.round = 'loop'
-        # The mixed-build install fault leaves the alternate executable in the
-        # sandbox. Install restores the candidate AND resets both accounts.
-        self.command([*self.wall, 'install', '--build', build], 'loop-install')
-        self.command([*self.wall, 'enter', 'set -e; ha --version; '
-                      'sha256sum "$HOME/bin/herdr-ade"'], 'loop-build')
-        self.command([*self.wall, 'enter', 'python3 "$HOME/tools/guest.py" gate-loop'], 'loop')
-        self.command([*self.wall, 'evidence', self.evidence / 'loop-capture'], 'loop-evidence')
 
-    def active_round(self):
-        if self.round == 'prove':
+        def loop():
+            # Prove's install fault leaves the alternate executable. Restore
+            # the candidate AND reset both accounts before the final journey.
+            self.command([*self.wall, 'install', '--build', build], 'loop-install')
+            self.command([*self.wall, 'enter', 'set -e; ha --version; '
+                          'sha256sum "$HOME/bin/herdr-ade"'], 'loop-build')
+            self.command([*self.wall, 'enter', 'python3 "$HOME/tools/guest.py" gate-loop'], 'loop')
+            self.command([*self.wall, 'evidence', self.evidence / 'loop-capture'], 'loop-evidence')
+
+        self.round_job('loop', loop)
+
+    def active_round(self, round_name=None):
+        round_name = round_name or self.round
+        if round_name == 'prove':
             rounds = [p for p in (self.evidence / 'prove').glob('*') if p.is_dir()]
             if rounds:
                 return 'prove/' + max(rounds, key=lambda p: p.stat().st_mtime).name
-        return self.round
+        return round_name
 
     def finish(self):
-        # Reserve cleanup time inside the total 15-minute budget, not after it.
+        # Leave 15 seconds for process-group termination and result publication
+        # even if a cleanup command itself reaches the deadline.
         self.deadline = self.started + BUDGET - 15
-        errors = []
-        for verb, args in [('evidence', [self.evidence / 'final-capture']), ('reset', [])]:
-            try:
-                self.command([*self.wall, verb, *args], f'final-{verb}',
-                             timeout=25 if verb == 'evidence' else 55)
-            except (TimeoutError, subprocess.TimeoutExpired):
-                errors.append(f'timed out at cleanup/{verb}')
-            except Exception as error:
-                errors.append(f'{verb}: {error}')
+        self.aborting = False  # Campaign workers have joined; cleanup may launch.
+
+        def clean(instance):
+            errors = []
+            wall = self.wall_command(instance)
+            for verb, args in [('evidence', [self.evidence / f'final-capture-{instance}']), ('reset', [])]:
+                try:
+                    self.command([*wall, verb, *args], f'final-{instance}-{verb}',
+                                 timeout=25 if verb == 'evidence' else 55, round_name=f'cleanup/{instance}')
+                except (TimeoutError, subprocess.TimeoutExpired):
+                    errors.append(f'timed out at cleanup/{instance}/{verb}')
+                except Exception as error:
+                    errors.append(f'{instance}/{verb}: {error}')
+            return errors
+
+        # Four serial 55-second resets cannot fit the cleanup reservation.
+        with ThreadPoolExecutor(max_workers=len(INSTANCES)) as executor:
+            errors = [error for batch in executor.map(clean, sorted(self.touched)) for error in batch]
         try:
             self.snapshot('ubuntu-after')
         except Exception as error:
@@ -169,12 +282,14 @@ def main():
     args = parser.parse_args()
     lock_dir = Path('/home/ubuntu/.cache/herdr-wall-gate')
     lock_dir.mkdir(parents=True, exist_ok=True)
-    with (lock_dir / 'instance-5.lock').open('a') as lock:
-        try:
-            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except BlockingIOError:
-            print('WALL GATE INCOMPLETE: gate instance busy (retryable; exit 75)')
-            return 75
+    with ExitStack() as locks:
+        for instance in INSTANCES:
+            lock = locks.enter_context((lock_dir / f'instance-{instance}.lock').open('a'))
+            try:
+                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                print('WALL GATE INCOMPLETE: gate instance busy (retryable; exit 75)')
+                return 75
         evidence = Path(tempfile.mkdtemp(prefix='wall-gate-', dir=lock_dir))
         gate = Gate(evidence, args.candidate.resolve(), args.alternate_build.resolve())
         result, code = 'WALL GATE PASS', 0
@@ -188,12 +303,13 @@ def main():
             gate.run()
         except Incomplete as error:
             result, code = f'WALL GATE INCOMPLETE: {error}', 1
+        except RoundFailure as error:
+            result, code = f'WALL GATE FAIL: {error.round}: {error}', 1
         except (TimeoutError, subprocess.TimeoutExpired):
             result, code = f'WALL GATE FAIL: {gate.active_round()}: timed out at {gate.active_round()}', 1
         except Exception as error:
             result, code = f'WALL GATE FAIL: {gate.active_round()}: {error}', 1
         finally:
-            # A second signal must not interrupt the bounded cleanup.
             signal.signal(signal.SIGTERM, signal.SIG_IGN)
             signal.signal(signal.SIGINT, signal.SIG_IGN)
             errors = gate.finish()

@@ -1,20 +1,16 @@
 #!/usr/bin/env python3
 """D38/R03: a proven SSH outage stays visible during poll backoff."""
-import argparse
 from pathlib import Path
 import shlex
 import subprocess
 import sys
 import time
 
-from support import (enter, evidence, phase, quiet_py, record, reset, set_instance,
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from support import (enter, evidence, phase, quiet_py, record, repro_args, reset,
                      start, until, wall_command)
 
-parser = argparse.ArgumentParser(description=__doc__)
-parser.add_argument('--instance', type=int, choices=range(1, 9))
-parser.add_argument('--evidence', type=Path, required=True, help='new host evidence directory')
-args = parser.parse_args()
-set_instance(args.instance)
+args = repro_args(__doc__)
 reset({'hold': ['working']}, box=True)
 transport = None
 try:
@@ -23,9 +19,7 @@ try:
     until(lambda: record()['last_state'] == 'working', 'working courier observation')
     before = record()
     # The numbered wall dispatcher confines disconnect to this instance.
-    command = wall_command('fault', 'disconnect', '95') if args.instance else [
-        'sudo', str(Path(__file__).resolve().parents[2] / 'faults/pause-transport'),
-        '--instance', 'default', '95']
+    command = wall_command('fault', 'disconnect', '95')
     print('+', shlex.join(command), flush=True)
     transport = subprocess.Popen(command)
 
@@ -35,7 +29,7 @@ try:
                         'print(p.read_text())')
 
     until(lambda: [e for e in health()['failures'] if 'unreachable' in e],
-          'courier proved connection failure', seconds=65)
+          'courier proved connection failure', seconds=65, wake=False)
     failed = record()
     enter('ha overview wall; ha ticker status')
     time.sleep(20)  # One 15-second tick, still inside the 95-second outage.
@@ -73,7 +67,7 @@ try:
                         'same_attempt': recovered['attempt'] == before['attempt'],
                         'same_process': recovered['identity']['process'] == before['identity']['process'],
                         'health_failures': health()['failures']})
-    print('R03 PASS' if passed else 'R03 FAIL', flush=True)
+    print('D38 PASS' if passed else 'D38 FAIL', flush=True)
 finally:
     try:
         if transport is not None:
