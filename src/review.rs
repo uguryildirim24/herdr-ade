@@ -82,6 +82,10 @@ pub(crate) struct Review {
     pub gates_note: String,
     pub selected_gates: Vec<project::Gate>,
     pub reviewer: Option<String>,
+    /// Requested placement while preparing; actual placement once bound.
+    /// Historical records have no machine evidence.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub review_machine: Option<String>,
     pub phase: Phase,
     pub verdict: Option<Verdict>,
     pub verdict_event: String,
@@ -886,6 +890,7 @@ fn start_locked(
         gates,
         gates_note,
         reviewer: None,
+        review_machine: row.review_machine,
         phase: Phase::Preparing,
         verdict: None,
         verdict_event: String::new(),
@@ -920,6 +925,9 @@ fn task(project: &Project, review: &Review) -> String {
         "Run `ha skill reviewer`. Review the whole repository pile {}. Your checkout owns the candidate, starting at frozen integration base `{}`. Merge every included SHA below (preserve any merges/fixes already in a recovered checkout); resolve conflicts, fix small issues, and judge each original required acceptance criterion not withdrawn. ADE runs the path-selected gates on your sealed candidate, on your machine, before landing. Do not push or install.\n\n",
         review.id, review.base
     );
+    if let Some(machine) = &review.review_machine {
+        out.push_str(&format!("Reviewer machine: `{machine}`. Gates run here too; member runtime evidence on other machines is not local.\n\n"));
+    }
     for member in &review.members {
         out.push_str(&format!(
             "- {}: `{}`, report `{}`\n",
@@ -1103,7 +1111,7 @@ fn prepare(ctx: &Ctx, project: &Project, review: &mut Review) -> Result<()> {
                 crate::threads::StartArgs {
                     title: format!("Review pile {}", review.id),
                     repo: Some(review.repo.clone()),
-                    machine: None,
+                    machine: review.review_machine.clone(),
                     // An in-flight historical review keeps its starting
                     // candidate and fixes; new reviews start at the frozen base.
                     base: Some(if review.candidate_branch.is_empty() {
@@ -1123,6 +1131,11 @@ fn prepare(ctx: &Ctx, project: &Project, review: &mut Review) -> Result<()> {
                 pile_attachments(project, review),
             )?
         };
+        review.review_machine = Some(if reviewer.machine.is_empty() {
+            crate::contracts::MACHINE_LOCAL.to_string()
+        } else {
+            reviewer.machine.clone()
+        });
         review.reviewer = Some(reviewer.id);
     }
     review.phase = Phase::Reviewing;

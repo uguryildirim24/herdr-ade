@@ -297,20 +297,32 @@ impl View {
             Some(ctx.runner),
         );
         if !settings.repos.is_empty() {
+            let default_review_machine = crate::launch::parse_launch_config(&ctx.config_dir)
+                .map(|config| config.dispatch.machine)
+                .unwrap_or_default();
             view.sections.push(Section::new(
                 "Repositories",
                 settings
                     .repos
                     .iter()
                     .map(|repo| {
-                        entry(
-                            "",
-                            if let Some(machine) = &repo.machine {
-                                format!("{} on {machine} (local git status not queried)", repo.path)
-                            } else {
-                                crate::coordinator::repo_snapshot(ctx.runner, &repo.path)
-                            },
-                        )
+                        let snapshot = if let Some(machine) = &repo.machine {
+                            format!("{} on {machine} (local git status not queried)", repo.path)
+                        } else {
+                            crate::coordinator::repo_snapshot(ctx.runner, &repo.path)
+                        };
+                        let review_machine = match &repo.review_machine {
+                            Some(machine) => format!("{machine} (explicit; no fallback)"),
+                            None if default_review_machine.is_empty()
+                                || default_review_machine == crate::contracts::MACHINE_LOCAL =>
+                            {
+                                "local (default)".into()
+                            }
+                            None => format!(
+                                "{default_review_machine} first, local if unavailable (default)"
+                            ),
+                        };
+                        entry("", format!("{snapshot}; review machine: {review_machine}"))
                     })
                     .collect(),
             ));

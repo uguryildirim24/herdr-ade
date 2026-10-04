@@ -1394,6 +1394,24 @@ fn report_with_checks(
         let label = format!("project {slug}");
         if let Ok((settings, _)) = project.read_project_md() {
             for repo in &settings.repos {
+                if let Some(machine) = &repo.review_machine {
+                    let result = if machine == crate::contracts::MACHINE_LOCAL {
+                        Ok(())
+                    } else {
+                        crate::remote::machine_declaration(config_dir, machine).map(|_| ())
+                    };
+                    check(
+                        &mut out,
+                        Some(result.is_ok()),
+                        &format!("{label} repo {} review_machine", repo.path),
+                        match result {
+                            Ok(()) => format!("explicit review machine `{machine}`"),
+                            Err(error) => {
+                                format!("unknown or invalid review_machine `{machine}`: {error:#}")
+                            }
+                        },
+                    );
+                }
                 if repo.machine.is_none()
                     && repo
                         .push_remote
@@ -2160,6 +2178,11 @@ fn machines_to_check(
             if let Some(machine) = repo.machine.as_ref().filter(|machine| !machine.is_empty()) {
                 machines.insert(machine.clone());
             }
+            if let Some(machine) = &repo.review_machine
+                && machine != crate::contracts::MACHINE_LOCAL
+            {
+                machines.insert(machine.clone());
+            }
             // A box_path is what makes the dispatch default eligible for this
             // repository. Keep that relationship explicit even though the
             // dispatch row itself is also checked when no project is open.
@@ -2472,6 +2495,38 @@ recipe = "claude_fable_xhigh"
             ..world.ctx()
         };
         assert!(check_start_disk(&ctx, None, Some("/missing-fixture")).is_err());
+    }
+
+    #[test]
+    fn doctor_refuses_unknown_review_machine() {
+        let world = crate::scenarios::World::new();
+        let project = world.project("demo", "a.sock");
+        world.add_repo(&project, "/code/demo");
+        let (mut settings, body) = project.read_project_md().unwrap();
+        settings.repos[0].review_machine = Some("missing-box".into());
+        std::fs::write(
+            project.project_md(),
+            format!("+++\n{}+++\n{body}", toml::to_string(&settings).unwrap()),
+        )
+        .unwrap();
+        let (_, _, checks) = report_with_checks(
+            &world.env,
+            &world.root,
+            &world.ctx().config_dir,
+            &SessionFlags::default(),
+            &world.runner,
+            None,
+        );
+        let check = checks
+            .iter()
+            .find(|c| c.label == "project demo repo /code/demo review_machine")
+            .unwrap();
+        assert_eq!(check.status, "failed");
+        assert!(
+            check
+                .detail
+                .contains("unknown or invalid review_machine `missing-box`")
+        );
     }
 
     #[test]

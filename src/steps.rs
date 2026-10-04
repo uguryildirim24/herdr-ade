@@ -2641,6 +2641,7 @@ mod tests {
             gates_note: String::new(),
             selected_gates: vec![],
             reviewer: Some(reviewer.id.clone()),
+            review_machine: None,
             phase: crate::review::Phase::Complete,
             verdict: None,
             verdict_event: String::new(),
