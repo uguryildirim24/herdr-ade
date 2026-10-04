@@ -2,6 +2,7 @@
 """D69/D70: rebased Mac member publication and executable box-review recovery."""
 import json
 from pathlib import Path
+import shlex
 import sys
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -46,22 +47,26 @@ try:
        'cfg=Path.home()/".config/herdr-ade/config.toml"; '
        'cfg.write_text(cfg.read_text()+"\\n[dispatch]\\nmachine = "+'
        f'{json.dumps("wall-box-"+str(args.instance))!r}'+ '+"\\n")')
-    enter('ha review wall')
+    enter('ha review wall --repo "$HOME/repo"')
     review = until(lambda: next((r for r in records(kind='reviews') if r.get('reviewer')), None), 'reviewer bound')
+    review_repo = shlex.quote(review['repo'])
     reviewer = review['reviewer']
     phase(reviewer, 'mid-review', box=True)
     observed['rebased_refs'] = quiet_py('import subprocess,json; '
         f'refs={ [lane["branch"], "seals/"+lane["branch"]+"/"+old]!r}; '
         'print(json.dumps([subprocess.check_output(["git","--git-dir",str(__import__("pathlib").Path.home()/"remote.git"),"rev-parse","refs/heads/"+r],text=True).strip() for r in refs]))')
     assert observed['rebased_refs'] == [new, old], observed
-    enter('ha review cancel wall')
-    until(lambda: all(r['phase'] in ('cancelled', 'complete', 'rejected') for r in records(kind='reviews')), 'review cancelled')
+    # Inject unknown work while this reviewer is held, before cancellation
+    # lets automatic reviews publish the member again.
     rogue = quiet_py('import subprocess,json; from pathlib import Path; '
         'repo=str(Path.home()/"repo"); '
         'sha=subprocess.check_output(["git","-C",repo,"commit-tree","main^{tree}","-m","D69 unknown work"],text=True).strip(); '
         f'subprocess.run(["git","-C",repo,"push","--force",str(Path.home()/"remote.git"),sha+":refs/heads/"+{lane["branch"]!r}],check=True,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL); '
         'print(json.dumps(sha))')
-    enter('ha review wall')
+    enter(f'ha review cancel wall --repo {review_repo}')
+    until(lambda: next(r for r in records(kind='reviews') if r['id'] == review['id'])['phase']
+          in ('cancelled', 'complete', 'rejected'), 'review cancelled')
+    enter(f'ha review wall --repo {review_repo}')
     failed = until(lambda: next((t for t in records() if t.get('role') == 'reviewer'
                    and t['id'] != reviewer and t['status'] == 'failed'
                    and not t.get('recovery_pending') and t.get('start_notices')), None), 'bounded reviewer startup failure')
