@@ -601,6 +601,10 @@ pub(crate) fn first_line(output: &Output) -> String {
 }
 
 #[cfg(test)]
+#[path = "runner/fake_herdr.rs"]
+mod fake_herdr;
+
+#[cfg(test)]
 pub(crate) mod fake {
     use super::*;
     use std::cell::RefCell;
@@ -677,6 +681,11 @@ pub(crate) mod fake {
     impl Runner for FakeRunner {
         fn run(&self, cmd: &Cmd) -> Result<Output> {
             self.calls.borrow_mut().push(cmd.clone());
+            // Fail even if the caller would swallow a herdr error. Scripted
+            // successes and failures must both use arguments the fork accepts.
+            if let Err(error) = super::fake_herdr::validate(cmd) {
+                panic!("fake herdr rejected `{}`: {error}", cmd.display());
+            }
             for (matcher, answer) in self.rules.borrow().iter() {
                 if matcher(cmd) {
                     return answer(cmd);
