@@ -449,6 +449,17 @@ fn stop_session(ctx: &Ctx, owned: &OwnedSession) -> Result<()> {
     Ok(())
 }
 
+// Herdr can drop the launch name while Pi's session hook still identifies the
+// same agent. Do not mistake that unnamed occupant for a foreign replacement.
+fn owned_coordinator(slug: &str, c: &project::Coordinator, a: &crate::herdr::Agent) -> bool {
+    crate::coordinator::agent_matches(c, a)
+        || (a.name.is_empty()
+            && crate::coordinator::agent_on_pane(c, a)
+            && a.agent == c.launch.kind
+            && a.tokens.get("project").is_some_and(|p| p == slug)
+            && a.tokens.get("thread").is_some_and(|t| t == "coordinator"))
+}
+
 fn cleanup_effect(errors: &mut Vec<String>, name: &str, action: impl FnOnce() -> Result<()>) {
     if let Err(error) = action() {
         errors.push(format!("{name}: {error:#}"));
@@ -576,7 +587,7 @@ fn shutdown_failed_run(
                 let agents = herdr.agent_list()?;
                 if agents
                     .iter()
-                    .any(|a| a.pane_id == c.pane_id && !crate::coordinator::agent_matches(c, a))
+                    .any(|a| a.pane_id == c.pane_id && !owned_coordinator(&report.project, c, a))
                 {
                     bail!("coordinator occupant changed; nothing stopped");
                 }
@@ -638,7 +649,7 @@ fn shutdown_failed_run(
                         .any(|l| crate::thread::agent_matches(l, a))
                         && !coordinator
                             .as_ref()
-                            .is_some_and(|c| crate::coordinator::agent_matches(c, a))
+                            .is_some_and(|c| owned_coordinator(&report.project, c, a))
                 }) {
                     bail!("unowned agent in isolated session; session not stopped");
                 }
@@ -646,7 +657,12 @@ fn shutdown_failed_run(
                 // panes allocated just before a command wrapper timed out.
                 // Stop that exact incarnation, not merely the observed agents.
             }
-            stop_session(&ctx, session)
+            stop_session(&ctx, session)?;
+            command(
+                &ctx,
+                Cmd::new(ctx.env.herdr_bin(), COMMAND).args(["session", "delete", &session.name]),
+            )?;
+            Ok(())
         });
     }
     if let Some(server) = resources.server.as_mut() {
@@ -662,20 +678,30 @@ fn shutdown_failed_run(
     if !errors.is_empty() {
         bail!("shutdown not fully verified: {}", errors.join("; "));
     }
-    Ok("owned agents/panes stopped; isolated session stopped; project, checkouts, refs and evidence retained".into())
+    Ok("owned agents/panes stopped; isolated session stopped and deleted; project, checkouts, refs and evidence retained".into())
 }
 
 struct Process(Child);
 impl Drop for Process {
     fn drop(&mut self) {
+        // `git daemon` may be a wrapper with a git-daemon child. Killing only
+        // the wrapper leaves its listener alive. The group was created here.
+        unsafe {
+            unsafe extern "C" {
+                fn kill(pid: i32, sig: i32) -> i32;
+            }
+            let _ = kill(-(self.0.id() as i32), 9);
+        }
         let _ = self.0.kill();
         let _ = self.0.wait();
     }
 }
 
 fn spawn(mut cmd: Command) -> Result<Process> {
+    use std::os::unix::process::CommandExt;
     Ok(Process(
-        cmd.stdin(Stdio::null())
+        cmd.process_group(0)
+            .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .spawn()?,
@@ -984,8 +1010,24 @@ fn run_steps(
         resources.session = Some(observe_session(ctx, &session)?);
         ha(ctx, &["open", &slug, "--session", &session, "--recipe", small, "--basis", &request])?;
         bounded_poll(deadline, "coordinator bootstrap", Duration::from_secs(90), || {
+            // Exercise the shared production prime path in this image, even
+            // when a hand-run is testing a fix before the installed ticker has
+            // it. The lifecycle/writer locks and prime_sent receipt prevent a
+            // duplicate submission by the ticker on the same root.
+            let _binding = project.coordinator_lock()?;
             let c = project.coordinator().context("coordinator binding absent")?;
-            let registered = crate::herdr::Herdr::new(ctx.env.herdr_bin(), &c.socket, ctx.runner).agent_list()?.iter().any(|a| crate::coordinator::agent_matches(&c, a));
+            let herdr = crate::herdr::Herdr::new(ctx.env.herdr_bin(), &c.socket, ctx.runner);
+            let agents = herdr.agent_list()?;
+            let agent = crate::coordinator::restore_agent_name(&project, &herdr, &c, &agents)?;
+            if let Some(agent) = &agent {
+                crate::coordinator::deliver_or_defer(
+                    &project, &herdr, &c, agent,
+                    &crate::coordinator::priming_prompt(&crate::coordinator::current_prefix(&ctx.root)?, &slug),
+                    false,
+                )?;
+            }
+            let c = project.coordinator().context("coordinator binding absent")?;
+            let registered = agent.is_some();
             Ok(((registered && c.bootstrap == "acknowledged" && !c.prime_pending).then_some(()), format!("registered={registered}, bootstrap={}, prime_pending={}", c.bootstrap, c.prime_pending)))
         })?;
         let c = project.coordinator().context("coordinator absent")?;

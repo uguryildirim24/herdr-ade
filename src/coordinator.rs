@@ -1891,6 +1891,58 @@ mod tests {
     }
 
     #[test]
+    fn idle_pi_footer_primes_on_the_recorded_isolated_socket_without_overwriting_a_draft() {
+        use crate::runner::fake::{FakeRunner, ok};
+        let world = crate::scenarios::World::new();
+        let project = world.project("journey-prime", "isolated.sock");
+        project
+            .update_coordinator(|c| {
+                c.prime_pending = true;
+                c.launch.kind = "pi".into();
+            })
+            .unwrap();
+        let record = project.coordinator().unwrap();
+        let agent = Agent {
+            pane_id: record.pane_id.clone(),
+            tab_id: record.tab_id.clone(),
+            workspace_id: record.workspace_id.clone(),
+            cwd: record.cwd.clone(),
+            agent: "pi".into(),
+            agent_status: "idle".into(),
+            ..Agent::default()
+        };
+        let screen = "────────────────\n\x1b[7m \x1b[0m\n────────────────\n~/.herdr-ade/journey\n0.0%/388k (auto) (opencode-go) deepseek-v4.1-flash • high\n";
+        let runner = FakeRunner::new();
+        let live = std::rc::Rc::new(std::cell::RefCell::new(
+            screen.replace("\x1b[7m ", "Rolf's draft\x1b[7m "),
+        ));
+        let read = live.clone();
+        runner.on_fn(
+            |cmd| cmd.display().contains("pane read"),
+            move |_| Ok(ok(&read.borrow())),
+        );
+        runner.on("agent prompt", ok(r#"{"result":{}}"#));
+        let herdr = Herdr::new("herdr", &record.socket, &runner);
+        let _binding = project.coordinator_lock().unwrap();
+        deliver_or_defer(&project, &herdr, &record, &agent, "prime", false).unwrap();
+        assert_eq!(runner.count("agent prompt"), 0);
+        *live.borrow_mut() = screen.into();
+        deliver_or_defer(&project, &herdr, &record, &agent, "prime", false).unwrap();
+        assert_eq!(runner.count("agent prompt"), 1);
+        let current = project.coordinator().unwrap();
+        assert!(current.prime_sent && current.prime_pending);
+        assert!(
+            current.bootstrap.is_empty(),
+            "transport is not the context receipt"
+        );
+        assert!(runner.calls.borrow().iter().all(|cmd| {
+            cmd.env
+                .iter()
+                .any(|(key, value)| key == "HERDR_SOCKET_PATH" && value == &record.socket)
+        }));
+    }
+
+    #[test]
     fn priming_rechecks_receipt_and_incarnation() {
         use crate::runner::fake::FakeRunner;
         let world = crate::scenarios::World::new();
