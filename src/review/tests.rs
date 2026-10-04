@@ -2076,12 +2076,12 @@ fn gates_are_observed_from_pile_and_reviewer_fix_paths_not_declared_exits() {
         gates.clone(),
         2,
     );
-    assert!(
-        advance(&fx.world.ctx(), &fx.project, &mut review)
-            .unwrap_err()
-            .to_string()
-            .contains("not established")
-    );
+    let error = advance(&fx.world.ctx(), &fx.project, &mut review)
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("gate failed:"), "{error}");
+    assert!(error.contains("reviewer verdict MERGE disagrees"));
+    assert!(error.contains("checker broke"));
     passing.set(true);
     // No declarations at all: the two real ADE observations suffice.
     seal_verdict(
@@ -2588,6 +2588,80 @@ fn gate_free_and_allowlist_exclusions_are_visible_not_silently_broadened() {
             .contains("no gates declared")
     );
     assert_eq!(fx.world.runner.count("sh -c"), 0);
+}
+
+#[test]
+fn complete_nonzero_gate_is_failed_and_notice_keeps_failing_lines_and_disagreement() {
+    let fx = configured();
+    lane(&fx, 1);
+    let mut review = prepared(&fx);
+    review.gates = vec![project::Gate {
+        command: "printf 'failures:\n    review::tests::holds::lock_and_start_errors_are_durable_holds\ntest result: FAILED\n'; exit 101".into(),
+        ..Default::default()
+    }];
+    let candidate = candidate(&fx, &review);
+    landing_verdict(&mut review, &candidate);
+    let mut ctx = fx.world.ctx();
+    ctx.runner = &crate::runner::RealRunner;
+    let git = Git::new(ctx.runner, &review.repo);
+    let error = observed_gates(&ctx, &fx.project, &review, &candidate, &git)
+        .unwrap_err()
+        .to_string();
+    assert!(error.starts_with("gate failed:"), "{error}");
+    assert!(error.contains("exit 101"));
+    assert!(error.contains("reviewer verdict MERGE disagrees"));
+    assert!(error.contains("stdout last lines: failures:"));
+    assert!(!error.contains("not established"));
+    needs_coordinator(&fx.project, &mut review, &error).unwrap();
+    let notice = &review.notices.last().unwrap().line;
+    assert!(notice.contains("gate failed:"));
+    assert!(notice.contains("lock_and_start_errors_are_durable_holds"));
+    assert!(notice.contains("reviewer verdict MERGE disagrees"));
+    let receipt = receipts(&fx.project, &review).pop().unwrap();
+    assert_eq!(receipt.exit, Some(101));
+    assert!(receipt.complete && receipt.error.is_empty());
+    assert!(!review.fast_forward);
+    // A gate's own 125 is failure too; only ADE's checker marker is unknown.
+    review.gates[0].command = "exit 125".into();
+    let error = observed_gates(&ctx, &fx.project, &review, &candidate, &git)
+        .unwrap_err()
+        .to_string();
+    assert!(error.starts_with("gate failed:"), "{error}");
+    assert!(error.contains("exit 125"));
+}
+
+#[test]
+fn gate_transport_error_is_not_established() {
+    struct Transport;
+    impl crate::runner::Runner for Transport {
+        fn run(&self, cmd: &crate::runner::Cmd) -> Result<crate::runner::Output> {
+            crate::runner::Runner::run(&crate::runner::RealRunner, cmd)
+        }
+        fn capture(
+            &self,
+            _: &crate::runner::Cmd,
+            _: Option<&crate::runner::OutputLogs>,
+        ) -> Result<crate::runner::Capture> {
+            bail!("SSH transport: connection reset by peer")
+        }
+    }
+    let fx = configured();
+    lane(&fx, 1);
+    let mut review = prepared(&fx);
+    review.gates = vec![project::Gate {
+        command: "checker".into(),
+        ..Default::default()
+    }];
+    let candidate = candidate(&fx, &review);
+    let mut ctx = fx.world.ctx();
+    ctx.runner = &Transport;
+    let git = Git::new(ctx.runner, &review.repo);
+    let error = observed_gates(&ctx, &fx.project, &review, &candidate, &git)
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("not established"), "{error}");
+    assert!(error.contains("connection reset by peer"));
+    assert!(!error.contains("gate failed:"));
 }
 
 #[test]

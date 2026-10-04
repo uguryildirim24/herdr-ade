@@ -164,6 +164,9 @@ fn lock_and_start_errors_are_durable_holds() {
             .line
             .contains("operation lock")
     );
+    // A forked child can retain the same open file description until exec.
+    // Keep a duplicate alive to reproduce that interval without scheduler luck.
+    let inherited = lock.0.try_clone().unwrap();
     drop(lock);
     // A configured integration branch that does not exist fails before review allocation.
     let (mut settings, body) = fx.project.read_project_md().unwrap();
@@ -179,6 +182,7 @@ fn lock_and_start_errors_are_durable_holds() {
     let notices = hold_notices(&fx.project).unwrap();
     assert_eq!(notices.len(), 2);
     assert!(notices[1].line.contains("integration branch is missing"));
+    drop(inherited);
 }
 
 #[test]

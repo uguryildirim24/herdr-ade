@@ -322,7 +322,11 @@ fn queue_notice(review: &mut Review, line: String) {
 }
 
 fn needs_coordinator(project: &Project, review: &mut Review, reason: &str) -> Result<()> {
-    let attention = crate::steps::short_error(reason);
+    let attention = if reason.starts_with("gate failed:") {
+        reason.chars().take(4096).collect::<String>()
+    } else {
+        crate::steps::short_error(reason)
+    };
     review.attention = reason.into();
     queue_notice(
         review,
@@ -443,15 +447,25 @@ fn watch_no_verdict_state(
     Ok(())
 }
 
-fn operation_lock(ctx: &Ctx, repo: &str) -> Result<std::fs::File> {
+pub(crate) struct OperationLock(std::fs::File);
+
+impl Drop for OperationLock {
+    fn drop(&mut self) {
+        // Closing alone can leave flock held by a concurrently forked child
+        // until exec. Unlock the shared open file description before closing.
+        let _ = self.0.unlock();
+    }
+}
+
+fn operation_lock(ctx: &Ctx, repo: &str) -> Result<OperationLock> {
     let file = lock_file(ctx, repo)?;
     file.lock()?;
-    Ok(file)
+    Ok(OperationLock(file))
 }
-pub(crate) fn try_operation_lock(ctx: &Ctx, repo: &str) -> Result<Option<std::fs::File>> {
+pub(crate) fn try_operation_lock(ctx: &Ctx, repo: &str) -> Result<Option<OperationLock>> {
     let file = lock_file(ctx, repo)?;
     match file.try_lock() {
-        Ok(()) => Ok(Some(file)),
+        Ok(()) => Ok(Some(OperationLock(file))),
         Err(std::fs::TryLockError::WouldBlock) => Ok(None),
         Err(std::fs::TryLockError::Error(error)) => Err(error.into()),
     }
@@ -1148,12 +1162,13 @@ fn verdict(
     // reviewer; mechanical proof comes only from the existing execution path.
     let mut execution = review.clone();
     execution.verdict_event = event.id.clone();
+    execution.verdict = Some(verdict.clone());
     verdict.gates = observed_gates(ctx, project, &execution, &verdict.candidate, git)?;
     Ok(verdict)
 }
 /// ADE-owned execution evidence, separate from the reviewer-authored report.
-/// A nonzero checker, lost transport, timeout or incomplete log establishes no
-/// acceptance result; none is classified as a failed implementation.
+/// A complete nonzero gate establishes failure, not an infrastructure fault.
+/// Lost transport, timeout, checker guards and incomplete logs remain unknown.
 #[derive(Debug, Serialize, Deserialize)]
 struct GateReceipt {
     review: String,
@@ -1206,7 +1221,7 @@ fn log_hash(path: &std::path::Path) -> Result<String> {
 
 fn candidate_guard(candidate: &str) -> String {
     format!(
-        "ade_candidate() {{ head=$(git rev-parse HEAD) && status=$(git status --porcelain) && [ \"$head\" = {} ] && [ -z \"$status\" ]; }}\nade_candidate || {{ echo 'candidate changed or dirty; result not established' >&2; exit 125; }}\n",
+        "ade_candidate() {{ head=$(git rev-parse HEAD) && status=$(git status --porcelain) && [ \"$head\" = {} ] && [ -z \"$status\" ]; }}\nade_candidate || {{ echo 'ADE_GATE_CHECKER_ERROR: candidate changed or dirty; result not established' >&2; exit 125; }}\n",
         crate::remote::quote(candidate)
     )
 }
@@ -1221,7 +1236,7 @@ fn gate_command(
     use crate::runner::Cmd;
     let guard = candidate_guard(candidate);
     let script = format!(
-        "cd {} || exit 125\n{guard}sh -c {}\nresult=$?\nade_candidate || {{ echo 'gate changed candidate; result not established' >&2; exit 125; }}\nexit \"$result\"",
+        "cd {} || {{ echo 'ADE_GATE_CHECKER_ERROR: reviewer checkout unavailable' >&2; exit 125; }}\n{guard}sh -c {}\nresult=$?\nade_candidate || {{ echo 'ADE_GATE_CHECKER_ERROR: gate changed candidate; result not established' >&2; exit 125; }}\nexit \"$result\"",
         crate::remote::quote(cwd),
         crate::remote::quote(&gate.command)
     );
@@ -1402,6 +1417,34 @@ fn observed_gates(
         receipt.complete &= !receipt.stdout_hash.is_empty() && !receipt.stderr_hash.is_empty();
         let path = run_dir.join("receipt.toml");
         project::write_atomic(&path, toml::to_string(&receipt)?.as_bytes())?;
+        let checker_error = receipt.exit == Some(125)
+            && gate_log_tail(&logs.stderr)
+                .is_ok_and(|tail| tail.contains("ADE_GATE_CHECKER_ERROR:"));
+        // SSH reserves 255 for a transport failure; it is not a gate verdict.
+        let transport_error = receipt.target.is_some() && receipt.exit == Some(255);
+        if receipt.exit.is_some_and(|exit| exit != 0)
+            && !checker_error
+            && !transport_error
+            && receipt.establishes(project, review, candidate, &cmd, &machine)
+        {
+            let disagreement = if review
+                .verdict
+                .as_ref()
+                .is_some_and(|verdict| verdict.verdict == "MERGE")
+            {
+                "; reviewer verdict MERGE disagrees"
+            } else {
+                ""
+            };
+            bail!(
+                "gate failed: {}; exit {}{disagreement}; stdout last lines: {}; stderr last lines: {}; receipt {}",
+                receipt.gate.command,
+                receipt.exit.unwrap(),
+                gate_log_tail(&logs.stdout)?,
+                gate_log_tail(&logs.stderr)?,
+                path.display()
+            );
+        }
         if !receipt.matches(project, review, candidate, &cmd, &machine) {
             bail!(
                 "gate result not established (checker/transport/output error): {}; exit {:?}, timed_out {}, complete {}, error {}; receipt {}",
@@ -1421,8 +1464,31 @@ fn observed_gates(
     Ok(runs)
 }
 
+fn gate_log_tail(path: &std::path::Path) -> Result<String> {
+    use std::io::{Read, Seek, SeekFrom};
+    let mut file = std::fs::File::open(path)?;
+    let length = file.metadata()?.len();
+    file.seek(SeekFrom::Start(length.saturating_sub(2048)))?;
+    let mut bytes = Vec::new();
+    file.take(2048).read_to_end(&mut bytes)?;
+    let text = String::from_utf8_lossy(&bytes);
+    let lines: Vec<_> = text.lines().rev().take(12).collect();
+    Ok(lines.into_iter().rev().collect::<Vec<_>>().join(" | "))
+}
+
 impl GateReceipt {
     fn matches(
+        &self,
+        project: &Project,
+        review: &Review,
+        candidate: &str,
+        command: &crate::runner::Cmd,
+        machine: &str,
+    ) -> bool {
+        self.exit == Some(0) && self.establishes(project, review, candidate, command, machine)
+    }
+
+    fn establishes(
         &self,
         project: &Project,
         review: &Review,
@@ -1436,7 +1502,7 @@ impl GateReceipt {
             && self.candidate == candidate
             && self.machine == machine
             && review.gates.contains(&self.gate)
-            && self.exit == Some(0)
+            && self.exit.is_some()
             && !self.timed_out
             && self.complete
             && self.error.is_empty()
