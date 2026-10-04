@@ -2820,7 +2820,11 @@ fn retire(
         }
         let removable = removable_folder(project, &record);
         let already_removed = removable && !worktree_exists(ctx, project, &record)?;
-        if removable && !already_removed && !managed_git_folder(project, &record) {
+        if removable
+            && !already_removed
+            && !request.keep_checkout
+            && !managed_git_folder(project, &record)
+        {
             repair_worktree_for_cleanup(ctx, project, &record)?;
         }
 

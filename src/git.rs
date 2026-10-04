@@ -232,9 +232,7 @@ pub(crate) fn forget_worktree(runner: &dyn Runner, repo: &str, path: &str) -> Re
     Ok(())
 }
 
-/// Rebuild lost administration from a sealed branch without changing checkout
-/// files. The reconstructed index is only a comparison baseline; dirty files
-/// and unique commits still face the normal removal safety checks.
+/// Receipt identifying an index reconstructed from a retained seal.
 fn recovered_index(admin: &Path) -> Result<Option<String>> {
     match std::fs::read_to_string(admin.join(RECOVERED_INDEX)) {
         Ok(sha) => Ok(Some(sha.trim_end_matches('\n').into())),
@@ -243,6 +241,9 @@ fn recovered_index(admin: &Path) -> Result<Option<String>> {
     }
 }
 
+/// Rebuild lost administration, not checkout contents, from a retained seal.
+/// True means the index is a reconstruction; missing tracked files carry no
+/// unique bytes, but staged changes, edits and unmerged commits still stay.
 pub(crate) fn repair_worktree(
     runner: &dyn Runner,
     repo: &str,

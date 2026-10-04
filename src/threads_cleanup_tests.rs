@@ -130,6 +130,8 @@ fn d67_resolved_cache_is_removed_after_worktree_inspection_errors() {
         t.cleanup_pending = true;
     })
     .unwrap();
+    let sealed = git(&fx.repo, &["rev-parse", "HEAD"]);
+    fx.seal_done(&record.id, 1, 1, &sealed, "retained report\n");
     let outcome = resolve_automatically(&fx.world.ctx(), &fx.project, &record.id, "merged");
     assert_eq!(outcome.state, "cleanup_pending");
     let saved = thread::load(&fx.project, &record.id).unwrap();
