@@ -986,7 +986,7 @@ mod tests {
             crate::runner::fake::ok(&crate::box_helper::tests::ready(
                 serde_json::json!({"rows": [
                 crate::pi::doctor::Row::warn("recipe lane execution", "advisory: unsupported OS")
-            ], "snapshot": {}}),
+            ], "snapshot": {"build_sizes": {}}}),
             )),
         );
         let machine = crate::remote::MachineDeclaration {

@@ -518,6 +518,18 @@ fn cancel_keeps_non_disposable_ignored_data() {
     );
 }
 
+fn register_scripted_checkout(world: &World, thread: &Thread) {
+    let common = world.home.path().join("scripted-git");
+    let admin = common.join("worktrees").join(&thread.id);
+    std::fs::create_dir_all(&admin).unwrap();
+    let pointer = Path::new(&thread.worktree_path).join(".git");
+    std::fs::write(&pointer, format!("gitdir: {}\n", admin.display())).unwrap();
+    std::fs::write(admin.join("gitdir"), format!("{}\n", pointer.display())).unwrap();
+    world
+        .runner
+        .on("rev-parse --git-common-dir", ok(&common.to_string_lossy()));
+}
+
 #[test]
 fn cancel_uses_the_repository_specific_disposable_list() {
     let world = World::new();
@@ -538,12 +550,12 @@ fn cancel_uses_the_repository_specific_disposable_list() {
         "status --porcelain --ignored --untracked-files=all",
         ok("!! runs/pytest-cancel/cache\0"),
     );
-    world.runner.on("worktree remove", ok(""));
+    register_scripted_checkout(&world, &t);
 
     let outcome = threads::cancel(&world.ctx(), "demo", &t.id, "stop this run").unwrap();
 
     assert_eq!(outcome.worktree, "removed");
-    assert_eq!(world.runner.count("worktree remove"), 1);
+    assert!(!worktree.exists());
 }
 
 #[test]
@@ -907,12 +919,12 @@ fn resolving_disposable_ignored_output_removes_the_worktree() {
         "status --porcelain --ignored --untracked-files=all",
         ok("!! target/debug/cache\0"),
     );
-    world.runner.on("worktree remove", ok(""));
+    register_scripted_checkout(&world, &t);
 
     let outcome = threads::resolve(&world.ctx(), "demo", &t.id, &ResolveArgs::default()).unwrap();
 
     assert_eq!(outcome.worktree, "removed");
-    assert_eq!(world.runner.count("worktree remove"), 1);
+    assert!(!worktree.exists());
 }
 
 #[test]
@@ -932,12 +944,12 @@ fn resolving_a_lane_with_only_its_stored_report_removes_the_worktree() {
         "status --porcelain --ignored --untracked-files=all",
         ok("!! .reports/t-0001.md\0"),
     );
-    world.runner.on("worktree remove", ok(""));
+    register_scripted_checkout(&world, &t);
 
     let outcome = threads::resolve(&world.ctx(), "demo", &t.id, &ResolveArgs::default()).unwrap();
 
     assert_eq!(outcome.worktree, "removed");
-    assert_eq!(world.runner.count("worktree remove"), 1);
+    assert!(!worktree.exists());
 }
 
 #[test]
@@ -961,12 +973,12 @@ fn resolve_uses_the_repository_specific_disposable_list() {
         "status --porcelain --ignored --untracked-files=all",
         ok("!! runs/pytest-resolve/cache\0"),
     );
-    world.runner.on("worktree remove", ok(""));
+    register_scripted_checkout(&world, &t);
 
     let outcome = threads::resolve(&world.ctx(), "demo", &t.id, &ResolveArgs::default()).unwrap();
 
     assert_eq!(outcome.worktree, "removed");
-    assert_eq!(world.runner.count("worktree remove"), 1);
+    assert!(!worktree.exists());
 }
 
 #[test]
@@ -1053,8 +1065,10 @@ fn resolving_a_merged_box_lane_uses_the_box_clone_path() {
                 Ok(ok(&crate::box_helper::tests::ready(
                     if input["request"].get("Missing").is_some() {
                         serde_json::json!(true)
-                    } else {
+                    } else if input["request"].get("Inspect").is_some() {
                         serde_json::to_value(crate::worktrees::Inspection::default())?
+                    } else {
+                        serde_json::Value::Null
                     },
                 )))
             } else {
@@ -1077,16 +1091,23 @@ fn resolving_a_merged_box_lane_uses_the_box_clone_path() {
     let calls = world.runner.calls.borrow();
     let removal = calls
         .iter()
-        .find(|call| call.program == "ssh" && call.display().contains("git worktree remove"))
+        .find(|call| {
+            call.program == "ssh"
+                && call
+                    .stdin
+                    .as_deref()
+                    .is_some_and(|input| input.contains("RemoveWorktree"))
+        })
         .expect("box removal ssh call");
     let command = removal.display();
     assert!(
         command.contains("PATH=/home/agent/.local/bin:/home/agent/.cargo/bin:/usr/local/bin:/usr/bin:/bin; export PATH"),
         "{command}"
     );
-    assert!(
-        command.contains("cd /home/agent/projects/herdr-ade"),
-        "{command}"
+    let input: serde_json::Value = serde_json::from_str(removal.stdin.as_deref().unwrap()).unwrap();
+    assert_eq!(
+        input["request"]["RemoveWorktree"]["repo"],
+        "/home/agent/projects/herdr-ade"
     );
     assert!(!command.contains("cd /Users/agent"), "{command}");
     assert!(!command.contains("rm -rf --"), "{command}");

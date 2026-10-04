@@ -219,6 +219,8 @@ struct SnapshotObservation {
     panes: Option<Vec<herdr::Pane>>,
     agents: Option<Vec<herdr::Agent>>,
     builds: Option<Vec<String>>,
+    build_sizes: BTreeMap<String, u64>,
+    private_builds: Option<(String, BTreeMap<String, u64>)>,
     build_error: Option<String>,
 }
 
@@ -418,8 +420,28 @@ pub(crate) fn execute_plan(ctx: &Ctx, plan: &ProbePlan) -> Result<ProbeReport> {
         report.snapshot.agents =
             observe_list(ctx.runner, &bin, "agent", "agents", &input.session).ok();
         progress("builds", &report.rows);
+        let execution = ctx.root.join(".execution");
+        if let Ok(states) = build_folders(&execution.to_string_lossy()) {
+            let mut sizes = BTreeMap::new();
+            for state in states {
+                let cache = Path::new(&state).join("build");
+                if cache.is_dir()
+                    && let Ok(bytes) = build_disk_bytes(ctx.runner, &cache.to_string_lossy())
+                {
+                    sizes.insert(cache.display().to_string(), bytes);
+                }
+            }
+            report.snapshot.private_builds = Some((ctx.root.display().to_string(), sizes));
+        }
         match build_folders(&input.build) {
-            Ok(builds) => report.snapshot.builds = Some(builds),
+            Ok(builds) => {
+                for path in &builds {
+                    if let Ok(bytes) = build_disk_bytes(ctx.runner, path) {
+                        report.snapshot.build_sizes.insert(path.clone(), bytes);
+                    }
+                }
+                report.snapshot.builds = Some(builds);
+            }
             Err(error) => {
                 report.snapshot.build_error = Some(format!(
                     "could not list build folders under {}: {error:#}",
@@ -447,6 +469,52 @@ pub(crate) fn observe_list<T: serde::de::DeserializeOwned>(
     anyhow::ensure!(out.success(), "{}", out.error_text());
     let value: serde_json::Value = serde_json::from_str(&out.stdout)?;
     Ok(serde_json::from_value(value["result"][field].clone())?)
+}
+
+fn build_disk_bytes(runner: &dyn Runner, path: &str) -> Result<u64> {
+    let out = runner.run(&Cmd::new("du", TOOL_TIMEOUT).args(["-sk", "--", path]))?;
+    anyhow::ensure!(out.success(), "{}", out.error_text());
+    let blocks: u64 = out
+        .stdout
+        .split_whitespace()
+        .next()
+        .context("cache size missing")?
+        .parse()?;
+    Ok(blocks.saturating_mul(1024))
+}
+
+fn reclaimable_cache_detail(
+    paths: &[String],
+    sizes: &BTreeMap<String, u64>,
+    labels: &BTreeMap<String, String>,
+) -> String {
+    let total: u64 = paths
+        .iter()
+        .filter_map(|path| sizes.get(path))
+        .copied()
+        .sum();
+    let lanes = paths
+        .iter()
+        .map(|path| {
+            let lane = labels.get(path).cloned().unwrap_or_else(|| {
+                Path::new(path)
+                    .file_name()
+                    .unwrap_or_default()
+                    .to_string_lossy()
+                    .into_owned()
+            });
+            match sizes.get(path) {
+                Some(bytes) => format!("{lane}: {}", crate::worktrees::human_size(*bytes)),
+                None => format!("{lane}: size unavailable"),
+            }
+        })
+        .collect::<Vec<_>>();
+    format!(
+        "reclaimable harness cache: {}{}{}",
+        crate::worktrees::human_size(total),
+        if lanes.is_empty() { "" } else { "; lanes " },
+        lanes.join(", ")
+    )
 }
 
 fn build_folders(root: &str) -> Result<Vec<String>> {
@@ -1610,13 +1678,26 @@ fn report_with_checks(
                                 (&bin, runner),
                                 Some(&box_snapshot),
                             );
-                            let (builds, errors) =
+                            let (mut builds, errors) =
                                 finished_build_folders_impl(&profile, &box_snapshot, &projects);
+                            let private =
+                                finished_private_builds(&profile, &box_snapshot, &projects);
+                            let mut sizes = box_snapshot.build_sizes.clone();
+                            let mut labels = BTreeMap::new();
+                            for (path, lane, bytes) in private {
+                                sizes.insert(path.clone(), bytes);
+                                labels.insert(path.clone(), lane);
+                                builds.push(path);
+                            }
                             check(
                                 &mut out,
                                 worktree_check_status(&builds, &errors),
                                 &format!("finished build folders {}", profile.label),
-                                worktree_check_detail(&builds, &errors),
+                                format!(
+                                    "{}; {}",
+                                    worktree_check_detail(&builds, &errors),
+                                    reclaimable_cache_detail(&builds, &sizes, &labels)
+                                ),
                             );
                         }
                         Err(error) => check(
@@ -1785,6 +1866,48 @@ fn finished_build_folders(
         }
         Err(error) => (Vec::new(), vec![format!("{error:#}")]),
     }
+}
+
+fn finished_private_builds(
+    profile: &crate::contracts::MachineProfile,
+    snapshot: &SnapshotObservation,
+    projects: &Projects,
+) -> Vec<(String, String, u64)> {
+    let Some((root, sizes)) = &snapshot.private_builds else {
+        return Vec::new();
+    };
+    let mut caches = Vec::new();
+    for (slug, project) in projects {
+        let Ok(project) = project else {
+            continue;
+        };
+        for record in crate::thread::list_with_errors(project).0 {
+            if record.status != crate::thread::Status::Resolved
+                || !thread_is_on_machine(&record, profile)
+            {
+                continue;
+            }
+            let checkout = if record.worktree_path.is_empty() {
+                &record.cwd
+            } else {
+                &record.worktree_path
+            };
+            for attempt in 1..=record.attempt.max(1) {
+                let identity = crate::thread::sha256_hex(
+                    format!("{root}\0{}\0{attempt}\0{checkout}", record.id).as_bytes(),
+                );
+                let path = format!("{root}/.execution/{identity}/build");
+                if let Some(bytes) = sizes.get(&path) {
+                    caches.push((
+                        path,
+                        format!("{slug}-{} (private attempt {attempt})", record.id),
+                        *bytes,
+                    ));
+                }
+            }
+        }
+    }
+    caches
 }
 
 fn finished_build_folders_impl(
@@ -3186,6 +3309,55 @@ recipe = "claude_fable_xhigh"
     }
 
     #[test]
+    fn d67_doctor_reports_reclaimable_cache_bytes_and_lanes_near_disk_low() {
+        let fx = crate::testkit::fixture();
+        let record = crate::thread::allocate(&fx.project, |t| {
+            t.status = crate::thread::Status::Resolved;
+            t.machine = "buildbox".into();
+            t.machine_id = "abc".into();
+            t.cwd = "/box/repo/.worktrees/t-0001".into();
+        })
+        .unwrap();
+        let root = "/box/root";
+        let identity = crate::thread::sha256_hex(
+            format!("{root}\0{}\01\0{}", record.id, record.cwd).as_bytes(),
+        );
+        let private = format!("{root}/.execution/{identity}/build");
+        let primary = format!("/box/build/demo-{}", record.id);
+        let snapshot = SnapshotObservation {
+            builds: Some(vec![primary.clone()]),
+            build_sizes: BTreeMap::from([(primary.clone(), 2 * 1024 * 1024 * 1024)]),
+            private_builds: Some((
+                root.into(),
+                BTreeMap::from([(private.clone(), 1024 * 1024 * 1024)]),
+            )),
+            ..Default::default()
+        };
+        let projects = load_projects(&fx.world.root);
+        let (mut paths, errors) = finished_build_folders_impl(&box_profile(), &snapshot, &projects);
+        assert!(errors.is_empty());
+        let caches = finished_private_builds(&box_profile(), &snapshot, &projects);
+        assert_eq!(caches.len(), 1);
+        let mut sizes = snapshot.build_sizes;
+        let mut labels = BTreeMap::new();
+        for (path, label, bytes) in caches {
+            paths.push(path.clone());
+            sizes.insert(path.clone(), bytes);
+            labels.insert(path, label);
+        }
+        let detail = reclaimable_cache_detail(&paths, &sizes, &labels);
+        assert!(detail.contains("3.0 GiB"), "{detail}");
+        assert!(detail.contains("demo-t-0001: 2.0 GiB"), "{detail}");
+        assert!(
+            detail.contains("demo-t-0001 (private attempt 1): 1.0 GiB"),
+            "{detail}"
+        );
+        let runner = FakeRunner::new();
+        runner.on("df -Pk", ok("Filesystem 1024-blocks Used Available Capacity Mounted on\n/dev/disk 200000000 190000000 11000000 95% /\n"));
+        assert!(disk_row(&runner, "/box", 12.0).detail.contains("disk_low:"));
+    }
+
+    #[test]
     fn open_box_threads_keep_their_build_folders_out_of_orphan_results() {
         let home = tempfile::tempdir().unwrap();
         write_machine_config(&home.path().join("cfg"));
@@ -3558,6 +3730,8 @@ recipe = "claude_fable_xhigh"
                 panes: Some(Vec::new()),
                 agents: Some(Vec::new()),
                 builds: Some(Vec::new()),
+                build_sizes: BTreeMap::new(),
+                private_builds: None,
                 build_error: None,
             },
         }

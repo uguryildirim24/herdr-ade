@@ -68,7 +68,7 @@ pub fn diagnostic_output(
         };
     }
     ok(&crate::box_helper::tests::ready(
-        serde_json::json!({"rows": rows, "snapshot": {"panes": null, "agents": null, "builds": null, "build_error": null}}),
+        serde_json::json!({"rows": rows, "snapshot": {"panes": null, "agents": null, "builds": null, "build_sizes": {}, "build_error": null}}),
     ))
 }
 

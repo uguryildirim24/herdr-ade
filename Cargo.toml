@@ -17,6 +17,7 @@ serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["raw_value"] }
 sha2 = "0.10"
 toml = "0.9"
+tempfile = "3"
 
 # Setup, login instructions, doctor and readiness share the library with ADE.
 [[bin]]
@@ -30,4 +31,3 @@ path = "src/bin/herdr-rundown.rs"
 
 [dev-dependencies]
 regex = "1"
-tempfile = "3"

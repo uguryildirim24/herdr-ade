@@ -1,0 +1,50 @@
+#!/bin/bash
+# D67: actual Git metadata loss and >1 MiB ignored status in a reset wall.
+set -euo pipefail
+[[ ${1:-} == --instance && ${2:-} =~ ^[1-8]$ && $# == 2 ]] || { echo 'usage: repro --instance N (1..8)' >&2; exit 2; }
+wall=$(dirname "$(readlink -f "$0")")/../../wall
+sudo -n "$wall" --instance "$2" reset
+sudo -n "$wall" --instance "$2" enter "$(/usr/bin/python3 - <<'HOST'
+import shlex
+script = r'''
+import json, os, pathlib, shutil, subprocess, sys
+home = pathlib.Path.home()
+repo = home / 'd67-repo'
+repo.mkdir()
+def git(*args, cwd=repo):
+    return subprocess.check_output(['/usr/bin/git', '-C', str(cwd), *args], stderr=subprocess.STDOUT).decode().strip()
+git('init', '-q', '-b', 'main')
+git('config', 'user.name', 'D67')
+git('config', 'user.email', 'd67@localhost')
+(repo/'README').write_text('retained work\n')
+(repo/'.gitignore').write_text('cache/\n')
+git('add', '.'); git('commit', '-qm', 'seed')
+checkout = repo / '.worktrees/lane'
+git('worktree', 'add', '-qb', 'lane', str(checkout))
+sha = git('rev-parse', 'lane')
+admin = pathlib.Path((checkout/'.git').read_text().strip().removeprefix('gitdir: '))
+shutil.rmtree(admin)
+version = subprocess.check_output(['ha', '--version'], text=True).strip().split(' ', 1)[1]
+def inspect():
+    request = {'Inspect': {'path': str(checkout), 'repair': [str(repo), 'lane', sha], 'disposable': ['cache'], 'report_stored': True}}
+    out = subprocess.run(['ha', 'doctor'], input=json.dumps({'build': version, 'request': request}), text=True, capture_output=True, env=dict(os.environ, HERDR_ADE_BOX_INPUT='1'))
+    try: return json.loads(out.stdout.splitlines()[-1])
+    except Exception: return {'status': 'Failed', 'detail': out.stderr or out.stdout}
+result = inspect()
+print('EXPECTED missing-admin inspection: Ready, clean, unique branch preserved')
+print('ACTUAL', json.dumps(result))
+passed = result.get('status') == 'Ready' and not result['result']['dirty'] and git('rev-parse', 'lane') == sha
+if passed:
+    cache = checkout/'cache'; cache.mkdir()
+    for n in range(12000): (cache/(f'{n:05}-'+'x'*90)).write_text('')
+    raw = subprocess.check_output(['/usr/bin/git', '-C', str(checkout), 'status', '--porcelain', '--ignored', '--untracked-files=all', '-z'])
+    assert len(raw) > 1048576
+    result = inspect()
+    print('EXPECTED large ignored status: Ready, no kept data; status bytes', len(raw))
+    print('ACTUAL', json.dumps(result))
+    passed = result.get('status') == 'Ready' and result['result'] == {'dirty': [], 'ignored_data': []}
+sys.exit(0 if passed else 1)
+'''
+print('python3 -c ' + shlex.quote(script))
+HOST
+)"

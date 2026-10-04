@@ -27,8 +27,17 @@ pub(crate) enum Request {
         root: PathBuf,
         relative: PathBuf,
     },
+    ForgetWorktree {
+        repo: String,
+        path: String,
+    },
+    RemoveWorktree {
+        repo: String,
+        path: String,
+    },
     Inspect {
         path: String,
+        repair: Option<(String, String, String)>,
         disposable: Vec<String>,
         report_stored: bool,
     },
@@ -206,17 +215,40 @@ fn execute(ctx: &Ctx, request: Request) -> Result<String> {
         Request::RepoLink { root, relative } => ready(crate::threads::repo_link_hash(
             ctx.runner, &root, &relative,
         )?),
+        Request::ForgetWorktree { repo, path } => {
+            crate::git::forget_worktree(ctx.runner, &repo, &path)?;
+            ready(())
+        }
+        Request::RemoveWorktree { repo, path } => {
+            if Path::new(&path).exists() {
+                crate::git::worktree_remove(ctx.runner, &repo, &path)?;
+            }
+            crate::git::forget_worktree(ctx.runner, &repo, &path)?;
+            ready(())
+        }
         Request::Inspect {
             path,
+            repair,
             disposable,
             report_stored,
-        } => ready(crate::worktrees::inspect_local(
-            ctx.runner,
-            &path,
-            &path,
-            &disposable,
-            report_stored,
-        )?),
+        } => {
+            if let Some((repo, branch, sealed)) = repair {
+                crate::git::repair_worktree(
+                    ctx.runner,
+                    &repo,
+                    &path,
+                    &branch,
+                    if report_stored { &sealed } else { "" },
+                )?;
+            }
+            ready(crate::worktrees::inspect_local(
+                ctx.runner,
+                &path,
+                &path,
+                &disposable,
+                report_stored,
+            )?)
+        }
     }
 }
 pub(crate) const CHUNK: usize = 8 * 1024 * 1024;

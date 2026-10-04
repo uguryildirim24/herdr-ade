@@ -121,6 +121,7 @@ pub(crate) fn disposable_for_rows(
     validate_disposable(paths)
 }
 
+#[cfg(test)]
 fn parse_status(text: &str) -> (Vec<String>, Vec<String>) {
     let mut dirty = Vec::new();
     let mut ignored = Vec::new();
@@ -235,7 +236,7 @@ fn nested_worktrees(root: &Path) -> Result<Vec<String>> {
     Ok(found)
 }
 
-fn path_size(path: &Path) -> Result<u64> {
+pub(crate) fn path_size(path: &Path) -> Result<u64> {
     let metadata = std::fs::symlink_metadata(path)
         .with_context(|| format!("could not measure {}", path.display()))?;
     if !metadata.is_dir() || metadata.file_type().is_symlink() {
@@ -285,21 +286,57 @@ pub(crate) fn inspect_local(
     disposable: &[String],
     report_artifact_stored: bool,
 ) -> Result<Inspection> {
-    let text = crate::git::worktree_status_with_ignored(runner, repo, path)?;
-    inspect_local_status(&text, path, disposable, report_artifact_stored)
+    crate::git::with_worktree_status(runner, repo, path, |stream| {
+        inspect_status_stream(stream, path, disposable, report_artifact_stored)
+    })
 }
 
-/// Decode a status captured in doctor's parallel git batch. The same
-/// classification and kept-data walk is used by explicit removal.
-pub(crate) fn inspect_local_status(
-    text: &str,
+fn inspect_status_stream(
+    stream: &mut dyn std::io::BufRead,
     path: &str,
     disposable: &[String],
     report_artifact_stored: bool,
 ) -> Result<Inspection> {
-    let (dirty, ignored) = parse_status(text);
-    let nested = nested_worktrees(Path::new(path))?;
-    let ignored_data = roots(ignored, nested, disposable, report_artifact_stored)
+    let mut dirty = Vec::new();
+    let mut kept = BTreeSet::new();
+    let mut row = Vec::new();
+    let mut original = false;
+    loop {
+        row.clear();
+        if stream.read_until(0, &mut row)? == 0 {
+            break;
+        }
+        anyhow::ensure!(row.last() == Some(&0), "incomplete Git status record");
+        row.pop();
+        if original {
+            original = false;
+            continue;
+        }
+        if row.len() <= 3 {
+            continue;
+        }
+        original = row[..2].iter().any(|b| matches!(b, b'R' | b'C'));
+        let relative = String::from_utf8_lossy(&row[3..]).into_owned();
+        if &row[..2] == b"!!" {
+            kept.extend(roots(
+                vec![relative],
+                Vec::new(),
+                disposable,
+                report_artifact_stored,
+            ));
+        } else if dirty.len() < 32 {
+            // Only diagnostics are bounded. Any dirty row still refuses removal.
+            dirty.push(relative);
+        }
+    }
+    anyhow::ensure!(!original, "incomplete Git rename record");
+    kept = roots(
+        kept.into_iter().collect(),
+        nested_worktrees(Path::new(path))?,
+        &[],
+        false,
+    );
+    let ignored_data = kept
         .into_iter()
         .map(|relative| {
             let bytes = path_size(&Path::new(path).join(&relative))?;
@@ -319,6 +356,58 @@ pub(crate) fn inspect_local_status(
 mod tests {
     use super::*;
 
+    #[test]
+    fn d67_cleanup_classifies_status_larger_than_one_mib_without_capture_failure() {
+        use crate::runner::RealRunner;
+        use crate::testkit::{fixture, git};
+        let fx = fixture();
+        let (id, _) = fx.lane(1);
+        let record = crate::thread::load(&fx.project, &id).unwrap();
+        let checkout = Path::new(&record.worktree_path);
+        std::fs::write(checkout.join(".gitignore"), "cache/\n").unwrap();
+        git(checkout, &["add", ".gitignore"]);
+        git(checkout, &["commit", "-qm", "ignore build output"]);
+        let cache = checkout.join("cache");
+        std::fs::create_dir(&cache).unwrap();
+        for n in 0..12_000 {
+            std::fs::write(cache.join(format!("{n:05}-{}", "x".repeat(90))), "").unwrap();
+        }
+        // Prove the fixture really crosses the production Runner's limit.
+        let raw = std::process::Command::new("git")
+            .arg("-C")
+            .arg(checkout)
+            .args([
+                "status",
+                "--porcelain",
+                "--ignored",
+                "--untracked-files=all",
+                "-z",
+            ])
+            .output()
+            .unwrap();
+        assert!(raw.status.success());
+        assert!(raw.stdout.len() > 1_048_576, "{}", raw.stdout.len());
+        let inspection = inspect_local(
+            &RealRunner,
+            fx.repo.to_str().unwrap(),
+            &record.worktree_path,
+            &["cache".into()],
+            false,
+        )
+        .unwrap();
+        assert_eq!(inspection, Inspection::default());
+        let kept = inspect_local(
+            &RealRunner,
+            fx.repo.to_str().unwrap(),
+            &record.worktree_path,
+            &[],
+            false,
+        )
+        .unwrap();
+        assert_eq!(kept.ignored_data.len(), 1);
+        assert_eq!(kept.ignored_data[0].path, "cache");
+    }
+
     fn inspect_box(runner: &dyn Runner, path: &str) -> Result<Inspection> {
         crate::box_helper::call(
             runner,
@@ -326,6 +415,7 @@ mod tests {
             &crate::remote::MachineDeclaration::default(),
             crate::box_helper::Request::Inspect {
                 path: path.into(),
+                repair: None,
                 disposable: Vec::new(),
                 report_stored: false,
             },

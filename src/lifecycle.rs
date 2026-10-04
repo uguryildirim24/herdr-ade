@@ -493,15 +493,10 @@ fn machines_for_repo(
     Ok(machines)
 }
 
-fn prune_local_worktrees(ctx: &Ctx, repo: &str) -> Result<()> {
-    if !Path::new(repo).is_dir() {
-        return Ok(());
+fn prune_local_worktrees(ctx: &Ctx, repo: &str, path: &str) -> Result<()> {
+    if Path::new(repo).is_dir() {
+        crate::git::forget_worktree(ctx.runner, repo, path)?;
     }
-    crate::repo::Git::new(ctx.runner, repo)
-        .with_timeout(Duration::from_secs(30))
-        .run(&["worktree", "prune"])
-        .with_context(|| format!("could not reconcile worktrees in {repo}"))?;
-    println!("reconciled worktrees in kept repo: {repo}");
     Ok(())
 }
 
@@ -531,28 +526,24 @@ fn remote_remove(ctx: &Ctx, tool: Trash, machine: &str, path: &str, what: &str) 
     Ok(())
 }
 
-fn prune_remote_worktrees(ctx: &Ctx, machine: &str, repo: &str) -> Result<()> {
+fn prune_remote_worktrees(ctx: &Ctx, machine: &str, repo: &str, path: &str) -> Result<()> {
     if !Path::new(repo).is_absolute() || repo == "/" {
         bail!("refusing unsafe box repo path `{repo}`");
     }
     let profile =
         remote::machine_profile(ctx.runner, &ctx.env.herdr_bin(), &ctx.config_dir, machine)?;
-    let script = format!("git -C {} worktree prune", remote::quote(repo));
-    let out = remote::ssh(
+    let declaration = remote::machine_declaration(&ctx.config_dir, &profile.label)?;
+    crate::box_helper::call::<()>(
         ctx.runner,
         &profile.target,
-        &script,
-        None,
+        &declaration,
+        crate::box_helper::Request::ForgetWorktree {
+            repo: repo.into(),
+            path: path.into(),
+        },
         Duration::from_secs(30),
-    )?;
-    if !out.success() {
-        bail!(
-            "could not reconcile worktrees in {repo} on {machine}: {}",
-            out.error_text()
-        );
-    }
-    println!("reconciled worktrees in kept repo on {machine}: {repo}");
-    Ok(())
+        None,
+    )
 }
 
 fn pi_session_name(path: &Path) -> String {
@@ -1319,10 +1310,26 @@ pub(crate) fn delete(ctx: &Ctx, slug: &str, delete_github: bool, preview: bool) 
             }
             DeleteStep::Prune { repo, machine, .. } => {
                 if file_identity(ctx, machine, repo)?.is_some() {
+                    // Persisted plans pair this step with the immediately prior
+                    // owned worktree trash step. Never scan unrelated entries.
+                    let steps = plan.steps.as_ref().expect("checked");
+                    let Some(DeleteStep::Trash {
+                        path,
+                        machine: owned_machine,
+                        what,
+                        ..
+                    }) = i.checked_sub(1).and_then(|at| steps.get(at))
+                    else {
+                        bail!("worktree cleanup has no owned path");
+                    };
+                    anyhow::ensure!(
+                        owned_machine == machine && what == "project worktree",
+                        "worktree cleanup has no owned path"
+                    );
                     if machine.is_empty() {
-                        prune_local_worktrees(ctx, repo)?;
+                        prune_local_worktrees(ctx, repo, path)?;
                     } else {
-                        prune_remote_worktrees(ctx, machine, repo)?;
+                        prune_remote_worktrees(ctx, machine, repo, path)?;
                     }
                 }
             }
@@ -1447,6 +1454,8 @@ mod tests {
                 move |cmd| {
                     if cmd.display().contains("stat -c") {
                         Ok(ok("1:42"))
+                    } else if cmd.stdin.is_some() {
+                        Ok(ok("{\"status\":\"Ready\",\"result\":null}"))
                     } else if cmd.display().contains("uname -s") {
                         Ok(if available {
                             ok("gio")

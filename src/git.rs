@@ -127,34 +127,181 @@ pub(crate) fn lock(runner: &dyn Runner, repo: &str) -> Result<RepoLock> {
     })
 }
 
-/// `git worktree remove` without `--force`. Callers run ADE's stricter status
-/// inspection first because Git itself permits deletion of ignored files.
+/// Callers first apply ADE's stricter ignored-data/preservation checks. Keep
+/// administration until checkout deletion succeeds: Git's `worktree remove`
+/// deletes it even when a permission error leaves checkout files behind.
 pub(crate) fn worktree_remove(runner: &dyn Runner, repo: &str, path: &str) -> Result<()> {
-    Git::new(runner, repo)
-        .with_timeout(GIT_TIMEOUT)
-        .run(&["worktree", "remove", path])?;
+    let lock = lock(runner, repo)?;
+    let pointer = Path::new(path).join(".git");
+    let text = std::fs::read_to_string(&pointer)?;
+    let raw = text
+        .trim_end_matches('\n')
+        .strip_prefix("gitdir: ")
+        .context("worktree Git pointer missing")?;
+    let admin = Path::new(raw);
+    let common = std::fs::canonicalize(&lock.common_dir)?;
+    anyhow::ensure!(
+        admin.parent() == Some(common.join("worktrees").as_path()),
+        "worktree is not registered in {repo}: {path}"
+    );
+    anyhow::ensure!(
+        Path::new(std::fs::read_to_string(admin.join("gitdir"))?.trim_end_matches('\n')) == pointer,
+        "worktree backlink mismatch: {path}"
+    );
+    anyhow::ensure!(!admin.join("locked").exists(), "worktree is locked: {path}");
+    with_worktree_status(runner, repo, path, |stream| {
+        let mut row = Vec::new();
+        loop {
+            row.clear();
+            if stream.read_until(0, &mut row)? == 0 {
+                break;
+            }
+            anyhow::ensure!(row.last() == Some(&0), "incomplete Git status record");
+            anyhow::ensure!(row.starts_with(b"!! "), "not a clean worktree: {path}");
+        }
+        Ok(())
+    })?;
+    // Detect unwritable wall evidence before deleting tracked files. Retain
+    // both checkout and index on permission refusal, not a half-removed lane.
+    let mut pending = vec![PathBuf::from(path)];
+    while let Some(dir) = pending.pop() {
+        let _probe = tempfile::tempfile_in(&dir)?;
+        for entry in std::fs::read_dir(dir)? {
+            let entry = entry?;
+            if entry.file_name() != ".git" && entry.file_type()?.is_dir() {
+                pending.push(entry.path());
+            }
+        }
+    }
+    for entry in std::fs::read_dir(path)? {
+        let entry = entry?;
+        if entry.file_name() == ".git" {
+            continue;
+        }
+        if entry.file_type()?.is_dir() {
+            std::fs::remove_dir_all(entry.path())?;
+        } else {
+            std::fs::remove_file(entry.path())?;
+        }
+    }
+    std::fs::remove_file(pointer)?;
+    std::fs::remove_dir(path)?;
+    std::fs::remove_dir_all(admin)?;
     Ok(())
 }
 
-/// Drops registrations whose checkout directory is already gone. Expiring
-/// immediately makes manual removal idempotent instead of retaining Git's
-/// default grace-period entry.
-pub(crate) fn worktree_prune(runner: &dyn Runner, repo: &str) -> Result<()> {
-    Git::new(runner, repo)
-        .with_timeout(GIT_TIMEOUT)
-        .run(&["worktree", "prune", "--expire=now"])?;
+/// Forget only the caller's absent checkout. A global prune cannot distinguish
+/// a deleted checkout from another lane hidden by a mount namespace.
+pub(crate) fn forget_worktree(runner: &dyn Runner, repo: &str, path: &str) -> Result<()> {
+    anyhow::ensure!(
+        std::fs::symlink_metadata(path).is_err_and(|e| e.kind() == std::io::ErrorKind::NotFound),
+        "worktree still exists: {path}"
+    );
+    let lock = lock(runner, repo)?;
+    let entries = match std::fs::read_dir(lock.common_dir.join("worktrees")) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(e.into()),
+    };
+    let pointer = Path::new(path).join(".git");
+    for entry in entries {
+        let entry = entry?;
+        if !entry.file_type()?.is_dir() {
+            continue;
+        }
+        let gitdir = std::fs::read_to_string(entry.path().join("gitdir"))?;
+        if Path::new(gitdir.trim_end_matches('\n')) == pointer {
+            anyhow::ensure!(
+                !entry.path().join("locked").exists(),
+                "worktree is locked: {path}"
+            );
+            std::fs::remove_dir_all(entry.path())?;
+        }
+    }
+    Ok(())
+}
+
+/// Rebuild lost administration from a sealed branch without changing checkout
+/// files. The reconstructed index is only a comparison baseline; dirty files
+/// and unique commits still face the normal removal safety checks.
+pub(crate) fn repair_worktree(
+    runner: &dyn Runner,
+    repo: &str,
+    path: &str,
+    branch: &str,
+    sealed: &str,
+) -> Result<()> {
+    let pointer = Path::new(path).join(".git");
+    if pointer.is_dir() {
+        return Ok(());
+    }
+    let raw = match std::fs::read_to_string(&pointer) {
+        Ok(text) => Some(PathBuf::from(
+            text.trim_end_matches('\n')
+                .strip_prefix("gitdir: ")
+                .context("worktree_metadata_invalid: Git pointer")?,
+        )),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+        Err(e) => return Err(e.into()),
+    };
+    if raw.as_ref().is_some_and(|dir| dir.is_dir()) {
+        return Ok(());
+    }
+    if raw.is_none()
+        && Path::new(path).parent() != Some(Path::new(repo).join(".worktrees").as_path())
+    {
+        // Do not infer administration for an arbitrary unregistered folder.
+        // Its ordinary status check remains authoritative.
+        return Ok(());
+    }
+    anyhow::ensure!(
+        !sealed.is_empty() && !branch.is_empty(),
+        "worktree_metadata_missing: no sealed branch; checkout kept for a decision"
+    );
+    let lock = lock(runner, repo)?;
+    let common = std::fs::canonicalize(&lock.common_dir)?;
+    let missing_pointer = raw.is_none();
+    let dir = raw.unwrap_or_else(|| {
+        common
+            .join("worktrees")
+            .join(Path::new(path).file_name().expect("checkout name"))
+    });
+    anyhow::ensure!(
+        dir.parent() == Some(common.join("worktrees").as_path()),
+        "worktree_metadata_invalid: {} is not owned by {repo}",
+        dir.display()
+    );
+    anyhow::ensure!(
+        Git::new(runner, repo).branch_head(branch)?.as_deref() == Some(sealed),
+        "worktree_metadata_missing: branch moved beyond seal {sealed}; checkout kept for a decision"
+    );
+    let temporary = tempfile::tempdir_in(common.join("worktrees"))?;
+    let admin = temporary.path();
+    std::fs::write(admin.join("commondir"), "../..\n")?;
+    std::fs::write(admin.join("HEAD"), format!("ref: refs/heads/{branch}\n"))?;
+    std::fs::write(admin.join("gitdir"), format!("{}\n", pointer.display()))?;
+    Git::new(runner, repo).run(&[
+        &format!("--git-dir={}", admin.display()),
+        "read-tree",
+        sealed,
+    ])?;
+    std::fs::rename(admin, &dir)?;
+    if missing_pointer {
+        std::fs::write(pointer, format!("gitdir: {}\n", dir.display()))?;
+    }
     Ok(())
 }
 
 /// Full removal status, including ignored files. This is only for worktree
 /// deletion safety: callers must classify `!!` rows against the editable
 /// disposable-path list before removing anything.
-pub(crate) fn worktree_status_with_ignored(
+pub(crate) fn with_worktree_status<T>(
     runner: &dyn Runner,
     repo: &str,
     path: &str,
-) -> Result<String> {
-    Git::new(runner, repo).with_timeout(GIT_TIMEOUT).stdout(&[
+    classify: impl FnOnce(&mut dyn std::io::BufRead) -> Result<T>,
+) -> Result<T> {
+    let args = [
         "-C",
         path,
         "status",
@@ -162,7 +309,31 @@ pub(crate) fn worktree_status_with_ignored(
         "--ignored",
         "--untracked-files=all",
         "-z",
-    ])
+    ];
+    if !runner.is_real() {
+        let text = Git::new(runner, repo)
+            .with_timeout(GIT_TIMEOUT)
+            .stdout(&args)?;
+        return classify(&mut std::io::Cursor::new(text));
+    }
+    let temporary = tempfile::tempdir()?;
+    let logs = crate::runner::OutputLogs {
+        stdout: temporary.path().join("status"),
+        stderr: temporary.path().join("stderr"),
+    };
+    let capture = runner.capture(
+        &crate::runner::Cmd::new("git", GIT_TIMEOUT)
+            .env("LC_ALL", "C")
+            .args(["-C", repo])
+            .args(args),
+        Some(&logs),
+    )?;
+    anyhow::ensure!(
+        capture.complete() && capture.output.success(),
+        "worktree status failed: {}",
+        capture.output.error_text()
+    );
+    classify(&mut std::io::BufReader::new(File::open(logs.stdout)?))
 }
 
 /// The branch checked out in the repository's main checkout.
@@ -314,14 +485,112 @@ mod tests {
         (dir, repo)
     }
 
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn d67_forget_does_not_prune_a_checkout_hidden_by_a_namespace() {
+        if let Ok(repo) = std::env::var("D67_TEST_REPO") {
+            forget_worktree(&RealRunner, &repo, &std::env::var("D67_TEST_GONE").unwrap()).unwrap();
+            return;
+        }
+        let (dir, repo) = repo_with_commit();
+        let hidden_root = dir.path().join("hidden");
+        std::fs::create_dir(&hidden_root).unwrap();
+        let hidden = hidden_root.join("lane");
+        let gone = dir.path().join("gone");
+        for (path, branch) in [(&hidden, "hidden"), (&gone, "gone")] {
+            Git::new(&RealRunner, &repo)
+                .run(&["worktree", "add", "-b", branch, path.to_str().unwrap()])
+                .unwrap();
+        }
+        std::fs::remove_dir_all(&gone).unwrap();
+        let admin = std::fs::read_to_string(hidden.join(".git")).unwrap();
+        let admin = Path::new(admin.trim().strip_prefix("gitdir: ").unwrap());
+        let result = std::process::Command::new("/usr/bin/bwrap")
+            .args([
+                "--ro-bind",
+                "/",
+                "/",
+                "--bind",
+                repo.to_str().unwrap(),
+                repo.to_str().unwrap(),
+                "--tmpfs",
+                hidden_root.to_str().unwrap(),
+                "--dev",
+                "/dev",
+            ])
+            .args([
+                "--setenv",
+                "D67_TEST_REPO",
+                repo.to_str().unwrap(),
+                "--setenv",
+                "D67_TEST_GONE",
+                gone.to_str().unwrap(),
+            ])
+            .arg(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "git::tests::d67_forget_does_not_prune_a_checkout_hidden_by_a_namespace",
+                "--nocapture",
+            ])
+            .output()
+            .unwrap();
+        assert!(
+            result.status.success(),
+            "{}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        assert!(hidden.exists());
+        assert!(admin.exists(), "hidden registration was pruned");
+        assert!(
+            Git::new(&RealRunner, &repo)
+                .run(&["worktree", "list", "--porcelain"])
+                .unwrap()
+                .contains(hidden.to_str().unwrap())
+        );
+    }
+
     #[test]
     fn dirty_remove_is_refused() {
-        let runner = FakeRunner::new();
-        runner.on("worktree remove", fail(1, "not a clean worktree"));
-        let err = worktree_remove(&runner, "/repo", "/wt")
+        let (_dir, repo) = repo_with_commit();
+        let wt = repo.join("lane");
+        Git::new(&RealRunner, &repo)
+            .run(&["worktree", "add", "-b", "lane", wt.to_str().unwrap()])
+            .unwrap();
+        std::fs::write(wt.join("README"), "unique edit").unwrap();
+        let err = worktree_remove(&RealRunner, repo.to_str().unwrap(), wt.to_str().unwrap())
             .unwrap_err()
             .to_string();
-        assert!(!err.is_empty());
+        assert!(err.contains("not a clean worktree"), "{err}");
+        assert_eq!(
+            std::fs::read_to_string(wt.join("README")).unwrap(),
+            "unique edit"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn d67_permission_refusal_keeps_administration_until_files_are_removed() {
+        use std::os::unix::fs::PermissionsExt;
+        let (_dir, repo) = repo_with_commit();
+        let wt = repo.join("lane");
+        Git::new(&RealRunner, &repo)
+            .run(&["worktree", "add", "-b", "lane", wt.to_str().unwrap()])
+            .unwrap();
+        let cache = wt.join("cache");
+        std::fs::create_dir(&cache).unwrap();
+        std::fs::write(cache.join("output"), "x").unwrap();
+        std::fs::write(repo.join(".git/info/exclude"), "cache/\n").unwrap();
+        std::fs::set_permissions(&cache, std::fs::Permissions::from_mode(0o500)).unwrap();
+        let refused = worktree_remove(&RealRunner, repo.to_str().unwrap(), wt.to_str().unwrap());
+        std::fs::set_permissions(&cache, std::fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(refused.is_err());
+        let raw = std::fs::read_to_string(wt.join(".git")).unwrap();
+        assert!(Path::new(raw.trim().strip_prefix("gitdir: ").unwrap()).exists());
+        assert!(
+            Git::new(&RealRunner, &wt)
+                .run(&["rev-parse", "HEAD"])
+                .is_ok()
+        );
     }
 
     #[test]
