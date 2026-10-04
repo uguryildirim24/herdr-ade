@@ -155,6 +155,18 @@ impl std::fmt::Display for HerdrError {
 impl std::error::Error for HerdrError {}
 
 pub(crate) const AGENT_START_TIMEOUT: Duration = Duration::from_secs(20);
+/// Keep short names readable; long project slugs otherwise exceed the fork's
+/// 32-byte agent-name limit. Preserve the role suffix and distinguish slugs.
+pub(crate) fn project_agent_name(slug: &str, role: &str) -> String {
+    let name = format!("hp-{slug}-{role}");
+    if name.len() <= 32 {
+        name
+    } else {
+        let hash = crate::thread::sha256_hex(slug.as_bytes());
+        format!("hp-{}-{role}", &hash[..16])
+    }
+}
+
 pub(crate) const MIN_AGENT_START_TIMEOUT_MS: u64 = 3_001;
 const MAX_AGENT_START_TIMEOUT_MS: u64 = 300_000;
 
@@ -820,6 +832,53 @@ pub(crate) const SOURCE: &str = "herdr-ade";
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn project_names_fit_the_fork_for_coordinators_and_lanes() {
+        use crate::runner::fake::{FakeRunner, ok};
+        let runner = FakeRunner::new();
+        runner.on(
+            "agent start",
+            ok(r#"{"result":{"agent":{"pane_id":"w1:p1","tab_id":"w1:t1","workspace_id":"w1"}}}"#),
+        );
+        let herdr = Herdr::new("herdr", "/test.sock", &runner);
+        let long = "a-project-name-long-enough";
+        for name in [
+            crate::coordinator::agent_name("demo"),
+            crate::coordinator::agent_name(long),
+            crate::thread::agent_name("demo", "t-0001"),
+            crate::thread::agent_name(long, "t-0001"),
+        ] {
+            herdr
+                .agent_start_opts(&AgentStart {
+                    name: &name,
+                    kind: "pi",
+                    pane: "w1:p1",
+                    agent_args: &[],
+                    launch_bin: None,
+                    parent: None,
+                    ready_timeout_ms: 30_000,
+                })
+                .unwrap();
+            assert!(name.len() <= 32);
+        }
+        assert_eq!(
+            crate::coordinator::agent_name("demo"),
+            "hp-demo-coordinator"
+        );
+        assert_eq!(
+            crate::thread::agent_name("demo", "t-0001"),
+            "hp-demo-t-0001"
+        );
+        assert_ne!(
+            project_agent_name(long, "coordinator"),
+            project_agent_name(&format!("{long}-other"), "coordinator")
+        );
+        assert_ne!(
+            crate::thread::agent_name(long, "t-0001"),
+            crate::thread::agent_name(long, "t-0002")
+        );
+    }
 
     #[test]
     fn agent_timeouts_follow_the_forks_operation_specific_bounds() {

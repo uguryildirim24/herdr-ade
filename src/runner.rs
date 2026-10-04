@@ -601,6 +601,10 @@ pub(crate) fn first_line(output: &Output) -> String {
 }
 
 #[cfg(test)]
+#[path = "runner/fake_herdr.rs"]
+mod fake_herdr;
+
+#[cfg(test)]
 pub(crate) mod fake {
     use super::*;
     use std::cell::RefCell;
@@ -677,18 +681,10 @@ pub(crate) mod fake {
     impl Runner for FakeRunner {
         fn run(&self, cmd: &Cmd) -> Result<Output> {
             self.calls.borrow_mut().push(cmd.clone());
-            // Mirror the fork's app/agents.rs validation before scripted replies.
-            // In particular, a fake successful launch must not hide invalid timeouts.
-            if cmd.args.windows(2).any(|args| args == ["agent", "start"])
-                && let Some(timeout) = cmd.args.windows(2).find(|args| args[0] == "--timeout")
-                && !timeout[1]
-                    .parse::<u64>()
-                    .is_ok_and(|ms| ms > 3_000 && ms <= 300_000)
-            {
-                return Ok(fail(
-                    1,
-                    r#"{"error":{"code":"invalid_agent_timeout","message":"agent start timeout must be greater than 3000ms and at most 300000ms"}}"#,
-                ));
+            // Fail even if the caller would swallow a herdr error. Scripted
+            // successes and failures must both use arguments the fork accepts.
+            if let Err(error) = super::fake_herdr::validate(cmd) {
+                panic!("fake herdr rejected `{}`: {error}", cmd.display());
             }
             for (matcher, answer) in self.rules.borrow().iter() {
                 if matcher(cmd) {

@@ -237,13 +237,17 @@ fn one_agent_start_per_project_per_tick_and_missing_agent_state_stays_unknown() 
     let project = world.project("demo", "a.sock");
     let cwd = world.home.path().to_path_buf();
     let cwd_text = cwd.to_string_lossy().into_owned();
-    world.thread(&project, &cwd, |t| t.prompt_pending = true);
+    world.thread(&project, &cwd, |t| {
+        t.prompt_pending = true;
+        t.launch.kind = "claude".into();
+    });
     let second = thread::allocate(&project, |t| {
         t.status = Status::Open;
         t.kind = Kind::Tab;
         t.prompt_pending = true;
         t.agent = "claude".into();
         t.agent_name = "hp-demo-t-0002".into();
+        t.launch.kind = "claude".into();
         t.workspace_id = "w1".into();
         t.tab_id = "w1:t2".into();
         t.pane_id = "w1:p2".into();

@@ -29,4 +29,5 @@ name = "herdr-rundown"
 path = "src/bin/herdr-rundown.rs"
 
 [dev-dependencies]
+regex = "1"
 tempfile = "3"

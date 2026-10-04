@@ -673,7 +673,7 @@ pub(crate) fn branch_name(slug: &str, id: &str, title: &str) -> String {
 }
 
 pub(crate) fn agent_name(slug: &str, id: &str) -> String {
-    format!("hp-{slug}-{id}")
+    crate::herdr::project_agent_name(slug, id)
 }
 
 /// `<agent working directory>/.herdr-project/<slug>-<id>`, for every kind.
