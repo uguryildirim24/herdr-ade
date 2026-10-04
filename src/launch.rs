@@ -586,10 +586,59 @@ pub(crate) fn apply_execution(
 /// Freeze the backend outside writable work. Remote writes use the same
 /// hash-verified runtime-file transport as briefs, not a credential transfer.
 /// Arguments are stored on the launch, so retries retain their chosen mode.
+#[cfg(test)]
 pub(crate) fn bind_execution(
     ctx: &Ctx,
     record: &crate::thread::Thread,
     machine: Option<&crate::remote::MachineDeclaration>,
+) -> Result<ExecutionBinding> {
+    bind_execution_with_evidence(ctx, record, machine, &[])
+}
+
+/// Only packet-pinned member reports and this lane's frozen inputs are exposed.
+/// Remote report paths match the packet's root substitution in freeze_start.
+pub(crate) fn execution_evidence(
+    project: &Project,
+    record: &crate::thread::Thread,
+    root: &str,
+) -> Result<Vec<Value>> {
+    let mut files = BTreeMap::new();
+    if !record.launch.brief_hash.is_empty() {
+        files.insert(
+            format!("{}/brief.md", record.thread_dir),
+            record.launch.brief_hash.clone(),
+        );
+    }
+    for (name, hash) in &record.attachments {
+        files.insert(
+            format!("{}/attachments/{name}", record.thread_dir),
+            hash.clone(),
+        );
+    }
+    if record.role == "reviewer" && !record.review_id.is_empty() {
+        for member in crate::review::load(project, &record.review_id)?.members {
+            // Verify producer-side immutable bytes before freezing the allowlist.
+            crate::thread::artifact(project, &member.artifact)?;
+            files.insert(
+                format!(
+                    "{root}/{}/.state/artifacts/{}",
+                    project.slug, member.artifact
+                ),
+                member.artifact,
+            );
+        }
+    }
+    Ok(files
+        .into_iter()
+        .map(|(path, hash)| json!({"path": path, "hash": hash}))
+        .collect())
+}
+
+pub(crate) fn bind_execution_with_evidence(
+    ctx: &Ctx,
+    record: &crate::thread::Thread,
+    machine: Option<&crate::remote::MachineDeclaration>,
+    evidence: &[Value],
 ) -> Result<ExecutionBinding> {
     if record.launch.execution == "advisory" {
         anyhow::ensure!(
@@ -662,7 +711,7 @@ pub(crate) fn bind_execution(
         !Path::new(&state).starts_with(&record.worktree_path),
         "execution_root_exposed: runtime state must be outside the writable worktree"
     );
-    let policy = json!({"root": root, "ade": ade, "cwd": record.worktree_path, "branch": record.branch, "role": record.role, "state": state, "network": execution_network(&record.launch)});
+    let policy = json!({"root": root, "ade": ade, "cwd": record.worktree_path, "branch": record.branch, "role": record.role, "state": state, "network": execution_network(&record.launch), "evidence": evidence});
     let source = include_str!("../assets/pi-execution-boundary.mjs")
         .replace("__ADE_EXECUTION_POLICY__", &serde_json::to_string(&policy)?);
     let hash = crate::thread::sha256_hex(source.as_bytes());
@@ -979,6 +1028,92 @@ mod tests {
     }
 
     #[test]
+    fn reviewer_evidence_allowlist_matches_packet_paths_not_the_control_directory() {
+        let world = World::new();
+        let project = world.project("demo", "a.sock");
+        let report = crate::thread::store_artifact(&project, b"member report").unwrap();
+        let unrelated =
+            crate::thread::store_artifact(&project, b"unrelated control evidence").unwrap();
+        let review = format!(
+            "id = 'review-1'\nrepo = 'repo'\nintegration = 'main'\nbase = 'base'\ngates = []\nselected_gates = []\nphase = 'reviewing'\nverdict_event = ''\nreviewer_after = ''\nchecked_event = ''\nretry_generation = 0\nmoved = 0\ninstall_required = false\nfast_forward = false\npush = false\ninstall = false\nclose = false\nprune = false\nattention = ''\n[[members]]\nthread = 't-1'\nattempt = 1\nevent = 't-1-1-1'\nsha = 'sha'\nbranch = 'lane'\nartifact = '{report}'\n"
+        );
+        std::fs::create_dir_all(crate::review::dir(&project)).unwrap();
+        std::fs::write(crate::review::path(&project, "review-1"), review).unwrap();
+        let record = crate::thread::Thread {
+            role: "reviewer".into(),
+            review_id: "review-1".into(),
+            thread_dir: "/work/.herdr-project/demo-t-2".into(),
+            attachments: BTreeMap::from([("attachment-hash".into(), "attachment-hash".into())]),
+            launch: Launch {
+                brief_hash: "brief-hash".into(),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let files = execution_evidence(&project, &record, "/box/root").unwrap();
+        assert_eq!(files.len(), 3);
+        assert!(files.contains(
+            &json!({"path": format!("/box/root/demo/.state/artifacts/{report}"), "hash": report})
+        ));
+        assert!(files.contains(
+            &json!({"path": "/work/.herdr-project/demo-t-2/brief.md", "hash": "brief-hash"})
+        ));
+        assert!(files.contains(&json!({"path": "/work/.herdr-project/demo-t-2/attachments/attachment-hash", "hash": "attachment-hash"})));
+        assert!(!serde_json::to_string(&files).unwrap().contains(&unrelated));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn authorized_publication_probe_failure_keeps_new_lanes_advisory_once() {
+        let world = World::new();
+        let project = world.project("demo", "a.sock");
+        world
+            .runner
+            .on("/usr/bin/bwrap", crate::runner::fake::ok(""));
+        let mut output = crate::doctor::pi_execution_fixture();
+        output.stdout = output.stdout.replace(
+            "ADE_AUTHORIZED_PUBLICATION=passed",
+            "ADE_AUTHORIZED_PUBLICATION=failed: credential helper unavailable",
+        );
+        world.runner.on("ade-boundary-probe.mjs", output);
+        for _ in 0..2 {
+            let record = crate::thread::allocate(&project, |lane| {
+                lane.launch
+                    .env
+                    .push(format!("HERDR_ADE_EXECUTION={EXECUTION_BACKEND}"));
+            })
+            .unwrap();
+            let binding = bind_execution(&world.ctx(), &record, None).unwrap();
+            assert!(
+                binding
+                    .advisory
+                    .as_ref()
+                    .unwrap()
+                    .contains("authorized publication dry run")
+            );
+            crate::thread::update(&project, &record.id, |lane| {
+                apply_execution(&project, lane, &binding)
+            })
+            .unwrap();
+        }
+        assert_eq!(
+            crate::thread::list(&project)
+                .iter()
+                .map(|lane| lane.start_notices.len())
+                .sum::<usize>(),
+            1
+        );
+        assert!(
+            world
+                .runner
+                .calls
+                .borrow()
+                .iter()
+                .any(|cmd| cmd.display().contains("--ade-publication-probe"))
+        );
+    }
+
+    #[test]
     fn unsupported_remote_is_advisory_but_a_stored_boundary_cannot_downgrade() {
         let world = World::new();
         world.runner.on(
@@ -1274,18 +1409,30 @@ mod tests {
         std::fs::create_dir(&root).unwrap();
         std::fs::write(root.join("records"), "protected").unwrap();
         std::fs::write(dir.path().join("credential"), "synthetic-secret").unwrap();
+        let evidence = [
+            root.join(".state/artifacts/member-report"),
+            work.join(".herdr-project/brief.md"),
+            work.join(".herdr-project/attachments/member"),
+        ];
+        for file in &evidence {
+            std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+            std::fs::write(file, "packet-pinned evidence\n").unwrap();
+        }
+        let host_config = dir.path().join("host.gitconfig");
+        std::fs::write(&host_config, "[ade]\ntrial = trusted-host\n").unwrap();
         let ade = dir.path().join("trusted-ade");
         std::fs::write(
             &ade,
             format!(
-                "#!/bin/sh\nprintf '%s\\n' \"$@\" > '{}'\n",
-                dir.path().join("authorized-call").display()
+                "#!/bin/sh\nprintf '%s\\n' \"$@\" > '{}'\ngit config --global --get ade.trial > '{}'\n",
+                dir.path().join("authorized-call").display(),
+                dir.path().join("authorized-environment").display()
             ),
         )
         .unwrap();
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(&ade, std::fs::Permissions::from_mode(0o700)).unwrap();
-        let policy = json!({"root": root, "ade": ade, "cwd": work, "branch": "lane/trial", "state": root.join("backend"), "network": network});
+        let policy = json!({"root": root, "ade": ade, "cwd": work, "branch": "lane/trial", "state": root.join("backend"), "network": network, "evidence": evidence.iter().map(|file| json!({"path":file, "hash":crate::thread::sha256_hex(b"packet-pinned evidence\n")})).collect::<Vec<_>>()});
         let source = include_str!("../assets/pi-execution-boundary.mjs")
             .replace("__ADE_EXECUTION_POLICY__", &policy.to_string())
             .replace("import { Type } from '@sinclair/typebox';", "");
@@ -1297,6 +1444,7 @@ mod tests {
             .arg(&script)
             .env("ADE_TRIAL_ROOT", dir.path())
             .env("FAKE_PROVIDER_TOKEN", "must-not-inherit")
+            .env("GIT_CONFIG_GLOBAL", &host_config)
             .output()
             .unwrap();
         assert!(
@@ -1395,6 +1543,24 @@ await assert.rejects(seal('done')); // untracked artifacts must not be silently 
 await run('rm -f escape');
 await seal('done');
 assert.equal(fs.readFileSync(process.env.ADE_TRIAL_ROOT + '/authorized-call', 'utf8'), '--root\n' + policy.root + '\ndone\n');
+assert.equal(fs.readFileSync(process.env.ADE_TRIAL_ROOT + '/authorized-environment', 'utf8'), 'trusted-host\n');
+await assert.rejects(run('git config --global --get ade.trial'));
+"#,
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn namespace_exposes_only_pinned_evidence_read_only() {
+        isolated_trial(
+            r#"
+for (const {path: file} of policy.evidence) {
+  assert.equal(await run('cat "' + file + '"'), 'packet-pinned evidence\n');
+  await assert.rejects(run('echo changed > "' + file + '"'));
+  await assert.rejects(run('rm "' + file + '"'));
+}
+await assert.rejects(run('cat "' + policy.root + '/records"'));
+await assert.rejects(run('ls "' + policy.root + '/.state/lanes"'));
 "#,
         );
     }

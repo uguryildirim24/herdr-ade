@@ -1068,7 +1068,19 @@ fn bind_terminal(ctx: &Ctx, project: &Project, view: &SessionView, record: &Thre
         None
     };
     let herdr = view.herdr.on_machine(record.machine_route());
-    let execution = crate::launch::bind_execution(ctx, record, machine.as_ref())?;
+    let evidence = if crate::launch::execution_requested(&record.launch) {
+        crate::launch::execution_evidence(
+            project,
+            record,
+            &machine
+                .as_ref()
+                .map_or_else(|| ctx.root.display().to_string(), |m| m.root.clone()),
+        )?
+    } else {
+        Vec::new()
+    };
+    let execution =
+        crate::launch::bind_execution_with_evidence(ctx, record, machine.as_ref(), &evidence)?;
     let mut spec = crate::contracts::RoleSpec {
         kind: record.launch.kind.clone(),
         args: execution.args.clone(),

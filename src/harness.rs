@@ -1216,7 +1216,26 @@ fn execution_prerequisite_script(bwrap: &str, profile: &str) -> String {
 /// Lane binding repeats this same check and uses the durable one-notice machine
 /// fallback; no recipe edits or retrofit of already bounded lanes is needed.
 fn installed_box_pi_execution(ctx: &Ctx, machine: &remote::MachineDeclaration) -> String {
-    let command = crate::doctor::pi_execution_probe_command(Path::new(&machine.root));
+    let target = repos(&ctx.config_dir)
+        .ok()
+        .into_iter()
+        .flatten()
+        .find_map(|repo| {
+            let mapped = machine.repos.iter().find(|row| row.path == repo.path);
+            let path = mapped
+                .and_then(|row| row.box_path.as_deref())
+                .or(repo.box_path.as_deref())?;
+            let url = mapped
+                .and_then(|row| row.publish_url.as_deref())
+                .or(repo.publish_url.as_deref())?;
+            Some((path.to_string(), url.to_string()))
+        });
+    let command = match target {
+        Some((repo, url)) => {
+            crate::doctor::pi_publication_probe_for(Path::new(&machine.root), &repo, &url)
+        }
+        None => crate::doctor::pi_authorized_publication_probe_command(Path::new(&machine.root)),
+    };
     let script = remote::with_path(
         &machine.path,
         &format!("export PI_OFFLINE=1\n{}", command.args[1]),
@@ -1228,9 +1247,9 @@ fn installed_box_pi_execution(ctx: &Ctx, machine: &remote::MachineDeclaration) -
         command.stdin.as_deref(),
         command.timeout,
     )
-    .and_then(|output| crate::doctor::pi_execution_probe_result(&output));
+    .and_then(|output| crate::doctor::pi_authorized_publication_probe_result(&output));
     match result {
-        Ok(()) => "bounded Pi CLI tool probe passed".into(),
+        Ok(()) => "bounded Pi CLI tool probe passed; authorized publication dry run passed".into(),
         Err(error) => format!(
             "advisory: {error:#}; new lanes use advisory execution with one machine notice; already bounded launches fail closed"
         ),
