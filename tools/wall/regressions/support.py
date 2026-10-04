@@ -1,11 +1,13 @@
 """Instance-scoped live repro utilities. Never addresses ubuntu's ADE root."""
+import argparse
 import json
 from pathlib import Path
 import shlex
 import subprocess
+import tempfile
 import time
 
-REPO = Path(__file__).resolve().parents[4]
+REPO = Path(__file__).resolve().parents[3]
 WALL = REPO / 'tools/wall/wall'
 INSTANCE = None
 
@@ -15,9 +17,22 @@ def set_instance(number):
     INSTANCE = number
 
 
+def repro_args(description):
+    parser = argparse.ArgumentParser(description=description)
+    parser.add_argument('--instance', type=int, choices=range(1, 9), required=True)
+    parser.add_argument('--evidence', type=Path, help='new host evidence directory')
+    args = parser.parse_args()
+    set_instance(args.instance)
+    if args.evidence is None:
+        cache = Path.home() / '.cache/herdr-wall-regressions'
+        cache.mkdir(parents=True, exist_ok=True)
+        args.evidence = Path(tempfile.mkdtemp(prefix=f'instance-{args.instance}-', dir=cache)) / 'capture'
+    print('Evidence:', args.evidence, flush=True)
+    return args
+
+
 def wall_command(*args):
-    return ['sudo', str(WALL), *(['--instance', str(INSTANCE)] if INSTANCE else []),
-            *map(str, args)]
+    return ['sudo', '-n', str(WALL), '--instance', str(INSTANCE), *map(str, args)]
 
 
 def wall(*args, check=True, timeout=180):

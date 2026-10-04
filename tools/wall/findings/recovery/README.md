@@ -4,7 +4,33 @@
 or diagnosis they cost Rolf. This is Linux local + local-SSH box testing, not Mac
 or real-model acceptance. No production Rust was changed.
 
-## Build and reproduction
+## Permanent regressions
+
+The fixed findings now run in the sandbox gate:
+
+- R01 / D37: `tools/wall/regressions/D37/repro`
+- R03 / D38: `tools/wall/regressions/D38/repro`
+- R02 / D39: `tools/wall/regressions/D39/repro`
+
+They share `tools/wall/regressions/support.py`. Each requires `--instance N`,
+resets only that instance, prints EXPECTED/ACTUAL and exits nonzero unless the
+recovery is established. Optional `--evidence DIR` selects a new host capture;
+otherwise captures go under `~/.cache/herdr-wall-regressions/`. Run only in an
+available numbered instance with the candidate installed, for example:
+
+```sh
+tools/wall/regressions/D37/repro --instance 3
+tools/wall/regressions/D38/repro --instance 3
+tools/wall/regressions/D39/repro --instance 3
+sudo tools/wall/wall --instance 3 reset
+```
+
+The gate discovers these alongside D27 and D30 in its locked instance 5.
+The rest of this document is the original historical wall-1 campaign: its
+build, default-instance commands, evidence names and unfixed observations are
+not instructions to run the permanent regressions on the default instance.
+
+## Historical build and reproduction
 
 All confirmed runs used this lane's own build:
 
@@ -32,9 +58,10 @@ From this repository, with the above build installed:
 
 ```sh
 L="$PWD/.herdr-project/adeherdr-t-0794/library"
-tools/wall/findings/recovery/repro-01 --evidence "$L/new-r01"
-tools/wall/findings/recovery/repro-02 --evidence "$L/new-r02"
-tools/wall/findings/recovery/repro-03 --evidence "$L/new-r03"
+# Historical names (removed after promotion):
+# repro-01 --evidence "$L/new-r01"
+# repro-02 --evidence "$L/new-r02"
+# repro-03 --evidence "$L/new-r03"
 # Repros leave their evidence-bearing state available for inspection.
 sudo tools/wall/wall reset
 ```
