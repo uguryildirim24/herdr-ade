@@ -1,0 +1,7 @@
+#!/bin/sh
+# Canonical executable used by herdr's pi process detection. Scripted recipes
+# opt in explicitly; ordinary pi args always launch the real, pinned package.
+case "$*" in
+  *--wall-*) exec "$HOME/bin/node" "$HOME/tools/scripted-agent.js" "$@" ;;
+  *) exec "$HOME/.herdr-ade/pi/bin/pi" "$@" ;;
+esac

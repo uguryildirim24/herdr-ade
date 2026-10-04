@@ -1,0 +1,11 @@
+#!/usr/bin/python3
+"""Sandbox-only timing seam: delay real git inside a sealing helper."""
+import os
+import sys
+import time
+
+delay = float(os.environ.get('WALL_GIT_DELAY_SECONDS', '0'))
+if not 0 <= delay <= 30:
+    sys.exit('WALL_GIT_DELAY_SECONDS must be 0..30')
+time.sleep(delay)
+os.execv('/usr/bin/git', ['/usr/bin/git', *sys.argv[1:]])
