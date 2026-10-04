@@ -339,17 +339,22 @@ def regression_d27():
 
 
 def regression_d30():
-    lane()
-    row = records()[-1]
+    row = lane()
     file = PROJECT / '.state/threads' / (row['id'] + '.toml')
+    # Brief staging precedes delivery acknowledgement. Let the launch path
+    # finish its pending prompt write before this crash-consistency check.
+    def settled():
+        current = tomllib.loads(file.read_text())
+        return current.get('brief_submitted') and not current.get('prompt_pending', True)
+    poll('lane prompt acknowledgement', settled, seconds=60)
     # Use a real started lane, not a fixture the harness never produced.
     for invalid in ['{invalid wall record\n', 'id = "cut', '']:
         file.write_text(invalid)
-        print(f'EXPECTED: Unreadable lane and {file} in overview (damage={invalid!r})', flush=True)
+        print(f'EXPECTED: Unreadable lane and {file} in overview (bytes={invalid!r})', flush=True)
         result = subprocess.check_output(['ha', 'overview', 'wall'], text=True)
         print('ACTUAL:', result, flush=True)
         if 'Unreadable lane' not in result or str(file) not in result:
-            raise RuntimeError('corrupt lane omitted or not identified as unreadable')
+            raise RuntimeError('unreadable lane omitted or not identified')
 
 
 def gate_review(thread):
