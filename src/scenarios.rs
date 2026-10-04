@@ -2550,6 +2550,10 @@ fn harness_install_runs_the_box_steps_only_when_buildbox_is_saved() {
         "ADE execution prerequisites",
         ok("bounded: provisioning=ok; doctor namespace probe passed\n"),
     );
+    with_box.runner.on(
+        "ade-boundary-probe.mjs",
+        crate::doctor::pi_execution_fixture(),
+    );
     with_box.runner.on("ssh", ok(""));
     with_box.runner.on(
         "machine list --json",
@@ -2558,8 +2562,8 @@ fn harness_install_runs_the_box_steps_only_when_buildbox_is_saved() {
     let outcome = crate::harness::install(&with_box.ctx()).unwrap();
     assert_eq!(
         with_box.runner.count("ssh"),
-        6,
-        "one box prerequisite/probe, build per repo, lane settings, pi guard, and running-process check: {outcome:?}"
+        7,
+        "box namespace and real-CLI probes, build per repo, lane settings, pi guard, and running-process check: {outcome:?}"
     );
     let calls = with_box.runner.calls.borrow();
     let local_guard = calls

@@ -685,28 +685,36 @@ pub(crate) fn bind_execution(
     if let Some(index) = args.iter().position(|arg| arg == "--no-extensions") {
         args.truncate(index);
     }
-    args.extend([
+    args.extend(bounded_pi_args(&root, &state, &path));
+    Ok(ExecutionBinding {
+        args,
+        advisory: None,
+        notice: ExecutionNotice::None,
+    })
+}
+
+/// Shared by real launches and the real-CLI doctor/contract probe. In Pi 0.99.1
+/// --no-tools is an EMPTY ALLOWLIST, not merely an inactive initial loadout.
+/// --no-builtin-tools leaves extension tools activatable and host tools inactive.
+pub(crate) fn bounded_pi_args(root: &str, state: &str, path: &str) -> Vec<String> {
+    let mut args = vec![
         "--no-extensions".into(),
-        "--no-tools".into(),
+        "--no-builtin-tools".into(),
         "--no-approve".into(),
         "--no-prompt-templates".into(),
         "--no-themes".into(),
         "--session-dir".into(),
         format!("{state}/sessions"),
         "--extension".into(),
-        path,
-    ]);
+        path.into(),
+    ];
     for extension in ["herdr-agent-state.ts", "herdr-pi-guard.ts"] {
         args.extend([
             "--extension".into(),
             format!("{root}/pi/agent/extensions/{extension}"),
         ]);
     }
-    Ok(ExecutionBinding {
-        args,
-        advisory: None,
-        notice: ExecutionNotice::None,
-    })
+    args
 }
 
 /// Append-only dispatch journal. No network call is made while holding its lock.
@@ -935,8 +943,12 @@ mod tests {
             world
                 .runner
                 .on("/usr/bin/bwrap", crate::runner::fake::ok(""));
+            world.runner.on(
+                "ade-boundary-probe.mjs",
+                crate::doctor::pi_execution_fixture(),
+            );
             let args = bind_execution(&world.ctx(), &record, None).unwrap().args;
-            assert!(args.contains(&"--no-tools".into()));
+            assert!(args.contains(&"--no-builtin-tools".into()));
             assert!(!args.contains(&"--tools".into()));
             assert!(args.contains(&"--no-extensions".into()));
             assert!(args.contains(&"--no-approve".into()));
@@ -1074,10 +1086,67 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
+    fn missing_cli_tools_fall_back_once_and_do_not_retrofit_bounded_lanes() {
+        let world = World::new();
+        let project = world.project("demo", "a.sock");
+        world
+            .runner
+            .on("/usr/bin/bwrap", crate::runner::fake::ok(""));
+        world.runner.on(
+            "ade-boundary-probe.mjs",
+            crate::runner::fake::ok("ADE_BOUNDARY_TOOLS=[]"),
+        );
+        for _ in 0..2 {
+            let record = crate::thread::allocate(&project, |lane| {
+                lane.launch
+                    .env
+                    .push(format!("HERDR_ADE_EXECUTION={EXECUTION_BACKEND}"));
+                lane.launch.args = vec!["--no-skills".into()];
+            })
+            .unwrap();
+            let binding = bind_execution(&world.ctx(), &record, None).unwrap();
+            assert!(
+                binding
+                    .advisory
+                    .as_ref()
+                    .unwrap()
+                    .contains("bash, read, write, edit, ade")
+            );
+            assert_eq!(binding.notice, ExecutionNotice::Machine);
+            let mut historical = record.clone();
+            historical.launch.args.push("--no-extensions".into());
+            assert!(
+                bind_execution(&world.ctx(), &historical, None)
+                    .unwrap_err()
+                    .to_string()
+                    .contains("cannot downgrade")
+            );
+            let saved = crate::thread::update(&project, &record.id, |lane| {
+                apply_execution(&project, lane, &binding)
+            })
+            .unwrap();
+            assert!(!execution_requested(&saved.launch));
+            assert_eq!(saved.launch.args, vec!["--no-skills"]);
+        }
+        assert_eq!(
+            crate::thread::list(&project)
+                .iter()
+                .map(|lane| lane.start_notices.len())
+                .sum::<usize>(),
+            1
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
     fn passed_probe_binds_but_a_started_boundary_cannot_downgrade() {
         let world = World::new();
         let denied = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let signal = denied.clone();
+        world.runner.on(
+            "ade-boundary-probe.mjs",
+            crate::doctor::pi_execution_fixture(),
+        );
         world.runner.on_fn(
             |cmd| cmd.program == "/usr/bin/bwrap",
             move |_| {
@@ -1113,6 +1182,52 @@ mod tests {
         );
         assert!(record.launch.args.contains(&"--no-extensions".into()));
         assert!(execution_requested(&record.launch));
+    }
+
+    #[test]
+    fn real_pi_cli_bounded_launch_contract() {
+        use crate::runner::{RealRunner, Runner};
+        match std::process::Command::new("pi").arg("--version").output() {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                // Bypass libtest's successful-test capture: a skipped real CLI
+                // witness must remain visible even under `cargo test -q`.
+                writeln!(
+                    std::io::stderr().lock(),
+                    "SKIP real_pi_cli_bounded_launch_contract: pi is absent from PATH"
+                )
+                .unwrap();
+                return;
+            }
+            Err(error) => panic!("pi exists but could not start: {error}"),
+            Ok(output) => assert!(output.status.success(), "pi --version failed"),
+        }
+        let root = std::env::var_os("HERDR_ADE_ROOT")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| {
+                std::path::PathBuf::from(std::env::var_os("HOME").unwrap()).join(".herdr-ade")
+            });
+        let mut command = crate::doctor::pi_execution_probe_command(&root);
+        // The defect's actual recipe prefix, not an SDK session. The suffix is
+        // generated by exactly the same function used in bind_execution.
+        command.args[1] = command.args[1].replace(
+            "pi --no-skills",
+            "pi --provider openai-codex --model gpt-6.1-sol --thinking high --no-skills",
+        );
+        let output = RealRunner.run(&command).unwrap();
+        crate::doctor::pi_execution_probe_result(&output).unwrap_or_else(|error| {
+            panic!(
+                "{error:#}\nstdout: {}\nstderr: {}",
+                output.stdout, output.stderr
+            )
+        });
+        // Reproduce #10's exact CLI mistake: tools cannot be reactivated.
+        let mut broken = command;
+        for arg in &mut broken.args {
+            *arg = arg.replace("--no-builtin-tools", "--no-tools");
+        }
+        let output = RealRunner.run(&broken).unwrap();
+        let error = crate::doctor::pi_execution_probe_result(&output).unwrap_err();
+        assert!(error.to_string().contains("bash, read, write, edit, ade"));
     }
 
     // These run without root when Linux permits unprivileged namespaces. The
@@ -1177,7 +1292,7 @@ mod tests {
         let backend = dir.path().join("backend.mjs");
         std::fs::write(&backend, source).unwrap();
         let script = dir.path().join("trial.mjs");
-        std::fs::write(&script, format!("import assert from 'node:assert/strict';\nimport fs from 'node:fs';\nimport {{runSandbox, seal, policy}} from './backend.mjs';\nconst run = command => runSandbox(['/bin/bash', '--noprofile', '--norc', '-c', command]);\n{code}")).unwrap();
+        std::fs::write(&script, format!("import assert from 'node:assert/strict';\nimport fs from 'node:fs';\nimport {{runSandbox, seal, policy, validateMutationPath}} from './backend.mjs';\nconst run = command => runSandbox(['/bin/bash', '--noprofile', '--norc', '-c', command]);\n{code}")).unwrap();
         let output = Command::new("node")
             .arg(&script)
             .env("ADE_TRIAL_ROOT", dir.path())
@@ -1223,6 +1338,9 @@ try {
         isolated_trial(
             r#"
 await run('cc source.c -o /build/trial && /build/trial && mkdir -p .herdr-project/library && echo artifact > .herdr-project/library/result');
+assert.throws(() => validateMutationPath(policy.root + '/records'), /execution_control_write_denied/);
+assert.throws(() => validateMutationPath('../control/records'), /execution_control_write_denied/);
+validateMutationPath('.herdr-project/report.md');
 for (const target of [policy.root + '/records', process.env.ADE_TRIAL_ROOT + '/unrelated/records']) {
   await assert.rejects(run(`bash -c 'echo hostile > "${target}"'`));
   await assert.rejects(run(`ln -sf '${target}' escape; echo hostile > escape`));

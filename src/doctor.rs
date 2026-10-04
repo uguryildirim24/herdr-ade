@@ -537,6 +537,17 @@ pub(crate) fn execution_probe_command(network: &str) -> Cmd {
     cmd
 }
 
+#[cfg(test)]
+pub(crate) fn pi_execution_fixture() -> Output {
+    let tools: Vec<_> = ["bash", "read", "write", "edit", "ade"].iter().map(|name|
+        serde_json::json!({"name": name, "source": {"path": "/runtime/ade-boundary-probe.mjs"}})
+    ).collect();
+    crate::runner::fake::ok(&format!(
+        "ADE_BOUNDARY_TOOLS={}\n",
+        serde_json::to_string(&tools).unwrap()
+    ))
+}
+
 /// Use the doctor's actual probe on the target, not presence/OS heuristics.
 pub(crate) fn lane_execution(
     ctx: &Ctx,
@@ -571,6 +582,75 @@ pub(crate) fn lane_execution(
         .context("execution_boundary_unavailable: no namespace observation")
 }
 
+/// Execute the installed Pi CLI, not the SDK: the CLI's allowlist semantics
+/// caused D40. No model/provider request or namespace operation is needed here.
+pub(crate) fn pi_execution_probe_command(root: &Path) -> Cmd {
+    let root = root.display().to_string();
+    let policy = serde_json::json!({"root": root, "ade": "/usr/bin/true", "cwd": "/tmp", "branch": "probe", "role": "lane", "state": "/tmp", "network": "denied"});
+    let source = include_str!("../assets/pi-execution-boundary.mjs")
+        .replace("__ADE_EXECUTION_POLICY__", &policy.to_string());
+    let args =
+        crate::launch::bounded_pi_args(&root, "__STATE__", "__STATE__/ade-boundary-probe.mjs")
+            .iter()
+            .map(|arg| match arg.strip_prefix("__STATE__") {
+                Some(suffix) => format!("\"$state\"{}", crate::remote::quote(suffix)),
+                None => crate::remote::quote(arg),
+            })
+            .collect::<Vec<_>>()
+            .join(" ");
+    let script = format!(
+        "set -eu\nmkdir -p {runtime}\nstate=$(mktemp -d {template})\ntrap 'rm -rf -- \"$state\"' EXIT\ncat > \"$state/ade-boundary-probe.mjs\"\npi --no-skills {args} --mode rpc --ade-execution-probe </dev/null\n",
+        runtime = crate::remote::quote(&format!("{root}/.execution")),
+        template = crate::remote::quote(&format!("{root}/.execution/probe.XXXXXX")),
+    );
+    Cmd::new("bash", Duration::from_secs(30))
+        .args(["-c", &script])
+        .env("PI_OFFLINE", "1")
+        .stdin(source)
+        .cwd("/tmp")
+        .own_group()
+}
+
+pub(crate) fn pi_execution_probe_result(output: &Output) -> Result<()> {
+    let expected = ["bash", "read", "write", "edit", "ade"];
+    let tools: Vec<serde_json::Value> = output
+        .stdout
+        .lines()
+        .chain(output.stderr.lines())
+        .find_map(|line| line.strip_prefix("ADE_BOUNDARY_TOOLS="))
+        .and_then(|line| serde_json::from_str(line).ok())
+        .unwrap_or_default();
+    let missing: Vec<_> = expected
+        .iter()
+        .filter(|name| {
+            !tools.iter().any(|tool| {
+                tool["name"].as_str() == Some(**name)
+                    && tool["source"]["path"]
+                        .as_str()
+                        .is_some_and(|path| path.ends_with("/ade-boundary-probe.mjs"))
+            })
+        })
+        .copied()
+        .collect();
+    anyhow::ensure!(
+        missing.is_empty(),
+        "bounded Pi CLI missing boundary tools: {}; {}",
+        missing.join(", "),
+        output.error_text()
+    );
+    anyhow::ensure!(
+        output.success() && tools.len() == expected.len(),
+        "bounded Pi CLI exposed unexpected tools or failed: {}",
+        output.error_text()
+    );
+    anyhow::ensure!(
+        !output.stderr.contains("Failed to load extension"),
+        "bounded Pi CLI extension load error: {}",
+        output.stderr
+    );
+    Ok(())
+}
+
 fn execution_row(ctx: &Ctx, id: &str, backend: &str, network: &str) -> crate::pi::doctor::Row {
     use crate::pi::doctor::Row;
     let label = format!("recipe {id} execution");
@@ -580,13 +660,27 @@ fn execution_row(ctx: &Ctx, id: &str, backend: &str, network: &str) -> crate::pi
     }
     let output = ctx.runner.run(&execution_probe_command(network));
     match output {
-        Ok(output) if output.success() => Row::ok(
-            label,
-            detail.replace(
-                "(availability probed separately)",
-                "(namespace probe passed)",
-            ),
-        ),
+        Ok(output) if output.success() => {
+            let probe = ctx
+                .runner
+                .run(&pi_execution_probe_command(&ctx.root))
+                .and_then(|output| pi_execution_probe_result(&output));
+            match probe {
+                Ok(()) => Row::ok(
+                    label,
+                    detail.replace(
+                        "(availability probed separately)",
+                        "(namespace and bounded Pi CLI tool probes passed)",
+                    ),
+                ),
+                Err(error) => Row::fail(
+                    label,
+                    format!(
+                        "advisory: execution_boundary_unavailable: {error:#}; new lanes use advisory execution; already bounded launches fail closed"
+                    ),
+                ),
+            }
+        }
         Ok(output) => Row::fail(
             label,
             format!(
@@ -2960,6 +3054,7 @@ recipe = "claude_fable_xhigh"
         )
         .unwrap();
         let runner = runner_with_herdr("herdr 0.9.1\n");
+        runner.on("ade-boundary-probe.mjs", pi_execution_fixture());
         runner.on("/usr/bin/bwrap", ok(""));
 
         let ctx = Ctx {
@@ -3184,6 +3279,7 @@ recipe = "claude_fable_xhigh"
         runner.on("session list --json", ok(r#"{"sessions":[]}"#));
         runner.on("git --version", ok("git version 2.50.0\n"));
         runner.on("df -Pk", fail(1, "df failed"));
+        runner.on("ade-boundary-probe.mjs", pi_execution_fixture());
         runner.on("/usr/bin/bwrap", ok(""));
 
         let (text, healthy, checks) = report_with_checks(
@@ -3645,10 +3741,57 @@ recipe = "claude_fable_xhigh"
             ready_world
                 .runner
                 .on("/usr/bin/bwrap", crate::runner::fake::ok(""));
+            ready_world
+                .runner
+                .on("ade-boundary-probe.mjs", pi_execution_fixture());
             let ready = execution_row(&ready_world.ctx(), "pi", backend, "allowed");
             assert_eq!(ready.level, crate::pi::doctor::Level::Ok);
-            assert!(ready.detail.contains("namespace probe passed"));
+            assert!(
+                ready
+                    .detail
+                    .contains("namespace and bounded Pi CLI tool probes passed")
+            );
         }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn doctor_fails_and_names_missing_or_host_backed_boundary_tools() {
+        for name in ["bash", "read", "write", "edit", "ade"] {
+            let world = crate::scenarios::World::new();
+            world.runner.on("/usr/bin/bwrap", ok(""));
+            let mut output = pi_execution_fixture();
+            // Same name is insufficient: built-in file/shell tools are unsafe.
+            output.stdout = output.stdout.replace(
+                &format!("\"name\":\"{name}\",\"source\":{{\"path\":\"/runtime/ade-boundary-probe.mjs\"}}"),
+                &format!("\"name\":\"{name}\",\"source\":{{\"path\":\"builtin:{name}\"}}"),
+            );
+            world.runner.on("ade-boundary-probe.mjs", output);
+            let row = execution_row(
+                &world.ctx(),
+                "pi",
+                crate::launch::EXECUTION_BACKEND,
+                "allowed",
+            );
+            assert_eq!(row.level, crate::pi::doctor::Level::Fail);
+            assert!(
+                row.detail
+                    .contains(&format!("missing boundary tools: {name};")),
+                "{}",
+                row.detail
+            );
+        }
+        let mut extra = pi_execution_fixture();
+        extra.stdout = extra.stdout.replace(
+            "]",
+            ",{\"name\":\"find\",\"source\":{\"path\":\"builtin:find\"}}]",
+        );
+        assert!(
+            pi_execution_probe_result(&extra)
+                .unwrap_err()
+                .to_string()
+                .contains("unexpected tools")
+        );
     }
 
     #[test]

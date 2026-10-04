@@ -1212,6 +1212,31 @@ fn execution_prerequisite_script(bwrap: &str, profile: &str) -> String {
         .replace("__PROBE__", &command)
 }
 
+/// Observe the newly installed real CLI, not just bubblewrap prerequisites.
+/// Lane binding repeats this same check and uses the durable one-notice machine
+/// fallback; no recipe edits or retrofit of already bounded lanes is needed.
+fn installed_box_pi_execution(ctx: &Ctx, machine: &remote::MachineDeclaration) -> String {
+    let command = crate::doctor::pi_execution_probe_command(Path::new(&machine.root));
+    let script = remote::with_path(
+        &machine.path,
+        &format!("export PI_OFFLINE=1\n{}", command.args[1]),
+    );
+    let result = remote::ssh(
+        ctx.runner,
+        &machine.target,
+        &script,
+        command.stdin.as_deref(),
+        command.timeout,
+    )
+    .and_then(|output| crate::doctor::pi_execution_probe_result(&output));
+    match result {
+        Ok(()) => "bounded Pi CLI tool probe passed".into(),
+        Err(error) => format!(
+            "advisory: {error:#}; new lanes use advisory execution with one machine notice; already bounded launches fail closed"
+        ),
+    }
+}
+
 fn provision_box_execution(ctx: &Ctx, machine: &remote::MachineDeclaration) -> String {
     let script = remote::with_path(
         &machine.path,
@@ -1638,6 +1663,10 @@ fn install_for(ctx: &Ctx, current: Option<(&str, &str)>) -> Result<InstallOutcom
                         reason: format!("{error:#}"),
                     });
                 }
+                result.execution.push_str("; ");
+                result
+                    .execution
+                    .push_str(&installed_box_pi_execution(ctx, &machine));
                 result.process = box_process_proofs(
                     ctx,
                     &machine,
@@ -2634,6 +2663,8 @@ mod tests {
                         Ok(fail(1, "fetch failed"))
                     } else if display.contains("ADE execution prerequisites") {
                         Ok(ok("bubblewrap already installed\nAppArmor profile loaded; global restriction unchanged\nbounded: provisioning=ok; doctor namespace probe passed\n"))
+                    } else if display.contains("ade-boundary-probe.mjs") {
+                        Ok(crate::doctor::pi_execution_fixture())
                     } else if display.contains("ticker status") {
                         Ok(ok(&current_receipt()))
                     } else if display.contains("git fetch") {
@@ -2680,12 +2711,45 @@ mod tests {
             );
             assert_eq!(runner.count("git fetch"), 2);
             assert_eq!(runner.count("ADE execution prerequisites"), 2);
+            assert_eq!(runner.count("ade-boundary-probe.mjs"), 2);
+            assert!(
+                outcome
+                    .boxes
+                    .iter()
+                    .all(|b| b.execution.contains("bounded Pi CLI tool probe passed"))
+            );
             assert!(outcome.boxes.iter().all(|b| b.settings_installed && b.execution.contains("namespace probe passed")));
             for label in ["alpha", "beta"] {
                 assert!(outcome.message().contains(&format!("execution {label}:")));
                 assert!(outcome.summary().contains(&format!("execution {label}:")));
             }
         }
+    }
+
+    #[test]
+    fn installed_box_checks_real_cli_and_reports_advisory_when_tools_are_missing() {
+        let world = crate::scenarios::World::new();
+        world
+            .runner
+            .on("ade-boundary-probe.mjs", ok("ADE_BOUNDARY_TOOLS=[]"));
+        let machine = remote::MachineDeclaration {
+            target: "box".into(),
+            root: "/home/agent/ade".into(),
+            path: "/home/agent/bin:/usr/bin:/bin".into(),
+            ..Default::default()
+        };
+        let detail = installed_box_pi_execution(&world.ctx(), &machine);
+        assert!(detail.contains("missing boundary tools: bash, read, write, edit, ade"));
+        assert!(detail.contains("new lanes use advisory execution with one machine notice"));
+        let calls = world.runner.calls.borrow();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].program, "ssh");
+        assert!(calls[0].display().contains("--no-builtin-tools"));
+        assert!(
+            calls[0]
+                .display()
+                .contains("/home/agent/ade/pi/agent/extensions/herdr-pi-guard.ts")
+        );
     }
 
     #[test]
