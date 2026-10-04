@@ -24,6 +24,35 @@ fn wall_selection_cannot_be_narrowed_away_for_harness_paths() {
 }
 
 #[test]
+fn moving_a_source_out_of_the_forced_paths_still_selects_the_wall_gate() {
+    let fx = configured();
+    let base = commit_file(&fx.repo, "src/moved.rs", "source\n", "source before rename");
+    std::fs::create_dir_all(fx.repo.join("docs")).unwrap();
+    git(&fx.repo, &["mv", "src/moved.rs", "docs/moved.rs"]);
+    git(
+        &fx.repo,
+        &["commit", "-qm", "move source outside the forced paths"],
+    );
+    let tip = git(&fx.repo, &["rev-parse", "HEAD"]);
+    let repository = Git::new(&fx.world.runner, fx.repo.to_str().unwrap());
+    let wall = project::Gate {
+        command: "tools/wall/gate".into(),
+        paths: Some(vec!["never/**".into()]),
+        ..Default::default()
+    };
+    for changed in [
+        files(&repository, &base, &tip).unwrap(),
+        member_files(&repository, &base, &tip).unwrap(),
+    ] {
+        assert!(changed.contains(&"src/moved.rs".to_owned()));
+        assert_eq!(
+            selected(std::slice::from_ref(&wall), &changed),
+            vec![wall.clone()]
+        );
+    }
+}
+
+#[test]
 fn wall_reuses_the_reviewer_target_without_changing_other_gate_environments() {
     let mut gate = project::Gate {
         command: "tools/wall/gate".into(),

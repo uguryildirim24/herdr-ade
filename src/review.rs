@@ -678,14 +678,20 @@ fn selected(gates: &[project::Gate], files: &[String]) -> Vec<project::Gate> {
 }
 fn files(git: &Git<'_>, base: &str, tip: &str) -> Result<Vec<String>> {
     Ok(git
-        .run(&["diff", "--name-only", base, tip, "--"])?
+        .run(&["diff", "--name-only", "--no-renames", base, tip, "--"])?
         .lines()
         .map(str::to_owned)
         .collect())
 }
 fn member_files(git: &Git<'_>, base: &str, tip: &str) -> Result<Vec<String>> {
     Ok(git
-        .run(&["diff", "--name-only", &format!("{base}...{tip}"), "--"])?
+        .run(&[
+            "diff",
+            "--name-only",
+            "--no-renames",
+            &format!("{base}...{tip}"),
+            "--",
+        ])?
         .lines()
         .map(str::to_owned)
         .collect())
