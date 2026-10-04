@@ -456,16 +456,17 @@ impl View {
         let mut seal_rows = BTreeMap::new();
         let mut needs_you = Vec::new();
         let mut needs_you_items = Vec::new();
-        if let Some(line) = crate::steps::goal_check::attention(project) {
+        let goal_check = crate::steps::goal_check::load(project);
+        let open_waits = crate::steps::goal_check::open_waits_with_evidence(project, &evidence);
+        if let Some(line) = crate::steps::goal_check::attention_with_waits(project, &open_waits) {
             needs_you.push(line);
         }
-        let goal_check = crate::steps::goal_check::load(project);
         if goal_check.disposition == Some(crate::steps::goal_check::Disposition::NeedsRolf)
             && !goal_check.evidence.is_empty()
         {
             needs_you_items.push(goal_check.evidence.clone());
         }
-        for (wait, _) in &goal_check.waits {
+        for (wait, _) in &open_waits {
             if let crate::steps::goal_check::Disposition::Wait {
                 party, condition, ..
             } = wait
@@ -474,18 +475,24 @@ impl View {
                 needs_you_items.push(condition.clone());
             }
         }
+        // Retired explicit waits must not fall back to guessing responsibility
+        // from an old lane's text. Open waits override their historical entries.
         let explicit_parties: BTreeMap<_, _> = goal_check
-            .waits
-            .into_iter()
-            .flat_map(|(wait, _)| match wait {
-                crate::steps::goal_check::Disposition::Wait { tasks, party, .. } => tasks
+            .waits.into_iter().map(|(wait, _)| (wait, false))
+            .chain(open_waits.iter().cloned().map(|(wait, _)| {
+                let personal = matches!(&wait, crate::steps::goal_check::Disposition::Wait { party, .. }
+                    if party.eq_ignore_ascii_case("Rolf"));
+                (wait, personal)
+            }))
+            .flat_map(|(wait, personal)| match wait {
+                crate::steps::goal_check::Disposition::Wait { tasks, .. } => tasks
                     .into_iter()
                     .flat_map(move |id| {
                         crate::task::load(project, &id)
                             .ok()
                             .into_iter()
                             .flat_map(|task| task.attempts)
-                            .map(|id| (id, party.clone()))
+                            .map(|id| (id, personal))
                             .collect::<Vec<_>>()
                     })
                     .collect::<Vec<_>>(),
@@ -499,10 +506,9 @@ impl View {
         {
             let t = &row.thread;
             let personal_wait = |text: &str| {
-                explicit_parties.get(&t.id).map_or_else(
-                    || personal_wait(text),
-                    |party| party.eq_ignore_ascii_case("Rolf"),
-                )
+                explicit_parties
+                    .get(&t.id)
+                    .map_or_else(|| personal_wait(text), |personal| *personal)
             };
             if (t.status == Status::Failed
                 || !t.provider_wait_started.is_empty()
@@ -753,7 +759,7 @@ impl View {
             ));
         }
         let mut steps = Vec::new();
-        if let Some(line) = crate::steps::goal_check::status(project) {
+        if let Some(line) = crate::steps::goal_check::status_with_waits(project, &open_waits) {
             steps.push(entry("goal-check", line));
         }
         if plan["present"] == true {

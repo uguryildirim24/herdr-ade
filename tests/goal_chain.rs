@@ -155,6 +155,57 @@ impl Chain {
 }
 
 #[test]
+fn cli_answer_keeps_evidence_and_wait_history_without_changing_plan_counts() {
+    let f = Chain::new();
+    let task = f.job(1, "Choose route", "Route chosen");
+    f.ok(&["plan", "set", "demo", "--does", "A chosen route"]);
+    f.ok(&[
+        "plan",
+        "step",
+        "add",
+        "demo",
+        "Choose route",
+        "--task",
+        &task,
+    ]);
+    f.ok(&[
+        "plan",
+        "check",
+        "demo",
+        "wait",
+        "Rolf",
+        "--task",
+        &task,
+        "--condition",
+        "Choose a route",
+        "--evidence",
+        "Consequential choice pending",
+    ]);
+    let before = f.plan();
+    assert_eq!(f.check()["waits"].as_array().unwrap().len(), 1);
+    f.ok(&[
+        "plan",
+        "check",
+        "demo",
+        "answer",
+        "Rolf",
+        "--evidence",
+        "request:q-answer chooses route A",
+    ]);
+    let check = f.check();
+    assert_eq!(check["waits"].as_array().unwrap().len(), 1);
+    assert_eq!(check["retired_waits"], json!([0]));
+    assert_eq!(
+        check["answers"][0]["evidence"],
+        "request:q-answer chooses route A"
+    );
+    assert_eq!(check["answers"][0]["party"], "Rolf");
+    assert_eq!(f.plan(), before);
+    let overview = f.ok(&["overview", "demo"]);
+    assert_eq!(overview["data"]["result"]["needs_you"], "");
+}
+
+#[test]
 fn cli_articulates_revises_extends_and_closes_preserving_accepted_results() {
     let f = Chain::new();
     assert!(!f.state.join("plan.toml").exists());
