@@ -23,6 +23,9 @@ pub(crate) struct Check {
     /// Scoped waits survive independent actions; existing lane seals still own
     /// lane input/retry effects. A goal-only wait has an empty task list.
     pub(crate) waits: Vec<(Disposition, String)>,
+    /// Indices into the append-only wait history.
+    retired_waits: Vec<usize>,
+    answers: Vec<Answer>,
     pub(crate) disposition: Option<Disposition>,
     pub(crate) evidence: String,
     queued: bool,
@@ -48,6 +51,13 @@ pub(crate) enum Disposition {
         condition: String,
     },
     NeedsRolf,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+struct Answer {
+    party: String,
+    evidence: String,
+    waits: Vec<usize>,
 }
 
 fn path(project: &Project) -> std::path::PathBuf {
@@ -167,11 +177,13 @@ fn wait_answers(project: &Project, check: &Check) -> Vec<String> {
         return Vec::new();
     }
     let (tasks, _) = crate::task::list_with_errors(project);
+    let open = open_indices(project, check);
     let events = crate::events::list(project);
     let mut answers: Vec<_> = crate::thread::list(project)
         .into_iter()
         .filter(|lane| {
-            check.waits.iter().any(|(wait, _)| {
+            open.iter().any(|index| {
+                let wait = &check.waits[*index].0;
                 matches!(wait, Disposition::Wait { tasks: ids, .. } if ids.is_empty() || tasks.iter().any(|task| ids.contains(&task.id) && task.attempts.contains(&lane.id)))
             })
         })
@@ -211,7 +223,7 @@ pub(crate) fn reconcile(project: &Project, agent: Option<&Agent>, now: u64) -> R
     {
         let task = action.split(':').next().unwrap().to_string();
         let record = crate::task::load(project, &task)?;
-        check.waits.retain(|(wait, _)| !wait_affects(wait, &task));
+        retire(&mut check, |wait| wait_affects(wait, &task));
         check.disposition = Some(Disposition::Action { task });
         check.evidence = format!(
             "{}; acceptance: {}",
@@ -394,22 +406,37 @@ pub(crate) fn record(project: &Project, disposition: Disposition, evidence: &str
     check.request = snapshot.request;
     check.effects = snapshot.effects;
     check.actions = snapshot.actions;
+    // This is a later recorded judgment, not merely a reconciliation tick.
+    let settled: Vec<_> = check
+        .waits
+        .iter()
+        .enumerate()
+        .filter(|(_, (wait, _))| party_answered(project, wait))
+        .map(|(index, _)| index)
+        .collect();
+    for index in settled {
+        if !check.retired_waits.contains(&index) {
+            check.retired_waits.push(index);
+        }
+    }
     match &disposition {
         Disposition::Wait { tasks, .. } => {
-            check.waits.retain(|(wait, _)| match wait {
-                Disposition::Wait { tasks: old, .. } => old != tasks,
+            retire(&mut check, |wait| match wait {
+                Disposition::Wait { tasks: old, .. } => {
+                    (old.is_empty() && tasks.is_empty()) || tasks.iter().any(|id| old.contains(id))
+                }
                 _ => false,
             });
             check
                 .waits
                 .push((disposition.clone(), evidence.trim().into()));
         }
-        Disposition::Action { task } => check.waits.retain(|(wait, _)| !wait_affects(wait, task)),
-        Disposition::Closed { .. } => check.waits.clear(),
+        Disposition::Action { task } => retire(&mut check, |wait| wait_affects(wait, task)),
+        Disposition::Closed { .. } => retire(&mut check, |_| true),
         _ => {}
     }
-    check.wait_answers = Some(wait_answers(project, &check));
     check.disposition = Some(disposition);
+    check.wait_answers = Some(wait_answers(project, &check));
     check.evidence = evidence.trim().into();
     save(project, &check)
 }
@@ -418,11 +445,162 @@ fn wait_affects(wait: &Disposition, task: &str) -> bool {
     matches!(wait, Disposition::Wait { tasks, .. } if tasks.is_empty() || tasks.iter().any(|id| id == task))
 }
 
+fn retire(check: &mut Check, affects: impl Fn(&Disposition) -> bool) {
+    for (index, (wait, _)) in check.waits.iter().enumerate() {
+        if affects(wait) && !check.retired_waits.contains(&index) {
+            check.retired_waits.push(index);
+        }
+    }
+}
+
+/// Positive lane evidence only; a free-text condition is not guessed from a prompt.
+fn party_answered(project: &Project, wait: &Disposition) -> bool {
+    let Disposition::Wait { party, .. } = wait else {
+        return false;
+    };
+    let Ok(lane) = crate::thread::load(project, party) else {
+        return false;
+    };
+    lane.status == crate::thread::Status::Resolved
+        || crate::events::latest_event(&crate::events::list(project), &lane.id, lane.attempt.max(1))
+            .is_some_and(|event| {
+                event.payload.done.is_some()
+                    || (event.payload.waiting.is_some() && lane.answered_waiting_event == event.id)
+            })
+}
+
+fn open_indices(project: &Project, check: &Check) -> Vec<usize> {
+    if check.waits.is_empty() {
+        return Vec::new();
+    }
+    open_indices_with_evidence(
+        project,
+        check,
+        &crate::task::EvidenceSnapshot::load(project),
+    )
+}
+
+fn open_indices_with_evidence(
+    project: &Project,
+    check: &Check,
+    evidence: &crate::task::EvidenceSnapshot,
+) -> Vec<usize> {
+    check
+        .waits
+        .iter()
+        .enumerate()
+        .filter_map(|(index, (wait, _))| {
+            let Disposition::Wait { tasks, .. } = wait else {
+                return None;
+            };
+            if check.retired_waits.contains(&index) {
+                return None;
+            }
+            // A current wait must still cover unfinished work, even in old files.
+            if tasks.is_empty()
+                || tasks.iter().all(|id| {
+                    crate::task::load(project, id).is_ok_and(|task| {
+                        crate::task::view_with_evidence(project, task, evidence)
+                            .terminal_with_evidence(project, evidence)
+                    })
+                })
+            {
+                return None;
+            }
+            let supersedes = |newer: &Disposition| match newer {
+                Disposition::Action { task } => wait_affects(wait, task),
+                Disposition::Wait { tasks: newer, .. } => {
+                    (tasks.is_empty() && newer.is_empty())
+                        || newer.iter().any(|id| tasks.contains(id))
+                }
+                Disposition::Closed { .. } => true,
+                Disposition::NeedsRolf => false,
+            };
+            if check.waits[index + 1..]
+                .iter()
+                .any(|(newer, _)| supersedes(newer))
+            {
+                return None;
+            }
+            // Historical files have no retirement indices. Their last/current judgment
+            // still establishes supersession, but the wait's own disposition does not.
+            if check
+                .disposition
+                .as_ref()
+                .or_else(|| check.last.as_ref().map(|(d, _)| d))
+                .is_some_and(|newer| newer != wait && supersedes(newer))
+            {
+                return None;
+            }
+            Some(index)
+        })
+        .collect()
+}
+
+#[cfg(test)]
+pub(crate) fn open_waits(project: &Project) -> Vec<(Disposition, String)> {
+    let check = load(project);
+    open_indices(project, &check)
+        .into_iter()
+        .map(|index| check.waits[index].clone())
+        .collect()
+}
+
+pub(crate) fn open_waits_with_evidence(
+    project: &Project,
+    evidence: &crate::task::EvidenceSnapshot,
+) -> Vec<(Disposition, String)> {
+    let check = load(project);
+    open_indices_with_evidence(project, &check, evidence)
+        .into_iter()
+        .map(|index| check.waits[index].clone())
+        .collect()
+}
+
+/// An answer is outside evidence: owe a new judgment, retaining its source and waits.
+pub(crate) fn answer(project: &Project, party: &str, evidence: &str) -> Result<()> {
+    if party.trim().is_empty() || evidence.trim().is_empty() {
+        bail!("goal_check: answer needs a party and evidence");
+    }
+    let _lock = lock(project)?;
+    let mut check = load(project);
+    let waits: Vec<_> = open_indices(project, &check)
+        .into_iter()
+        .filter(|index| {
+            matches!(&check.waits[*index].0, Disposition::Wait { party: waiting, .. }
+            if waiting.eq_ignore_ascii_case(party.trim()))
+        })
+        .collect();
+    check.retired_waits.extend(&waits);
+    check.answers.push(Answer {
+        party: party.trim().into(),
+        evidence: evidence.trim().into(),
+        waits,
+    });
+    if let Some(previous) = check.disposition.take() {
+        check.last = Some((previous, std::mem::take(&mut check.evidence)));
+    }
+    check.generation += 1;
+    check.queued = false;
+    check.delivered_at = 0;
+    check.working = false;
+    check.unchanged = 0;
+    save(project, &check)
+}
+
 #[cfg(test)]
 mod tests;
 
 /// Coordinator obligations belong in the plan, not in Rolf's action list.
+#[cfg(test)]
 pub(crate) fn status(project: &Project) -> Option<String> {
+    status_with_waits(project, &open_waits(project))
+}
+
+pub(crate) fn status_with_waits(
+    project: &Project,
+    waits: &[(Disposition, String)],
+) -> Option<String> {
     let check = load(project);
     if check.generation == 0 {
         return None;
@@ -432,9 +610,10 @@ pub(crate) fn status(project: &Project) -> Option<String> {
         Some(Disposition::NeedsRolf) => check.evidence.clone(),
         Some(Disposition::Action { task }) => format!("Goal check action {task}: {}", check.evidence),
         Some(Disposition::Closed { outcome, .. }) => format!("Goal check closed: {outcome}; {}", check.evidence),
-        Some(Disposition::Wait { .. }) => "Goal check waiting; next check on outside evidence, exhaustion, or wait answer.".into(),
+        Some(Disposition::Wait { .. }) if !waits.is_empty() => "Goal check waiting; next check on outside evidence, exhaustion, or wait answer.".into(),
+        Some(Disposition::Wait { .. }) => "Goal check wait retired; awaiting the next outcome judgment.".into(),
     };
-    for (wait, evidence) in &check.waits {
+    for (wait, evidence) in waits {
         if let Disposition::Wait {
             tasks,
             party,
@@ -451,13 +630,21 @@ pub(crate) fn status(project: &Project) -> Option<String> {
 }
 
 /// Only escalation and explicitly personal waits require Rolf's attention.
+#[cfg(test)]
 pub(crate) fn attention(project: &Project) -> Option<String> {
+    attention_with_waits(project, &open_waits(project))
+}
+
+pub(crate) fn attention_with_waits(
+    project: &Project,
+    waits: &[(Disposition, String)],
+) -> Option<String> {
     let check = load(project);
     let mut lines = Vec::new();
     if check.disposition == Some(Disposition::NeedsRolf) {
         lines.push(check.evidence);
     }
-    for (wait, _) in check.waits {
+    for (wait, _) in waits {
         if let Disposition::Wait {
             tasks,
             party,

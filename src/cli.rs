@@ -348,6 +348,12 @@ enum PlanCommand {
 
 #[derive(Subcommand)]
 enum GoalCheckCommand {
+    /// Record a party's answer and retire its open waits, keeping the evidence
+    Answer {
+        party: String,
+        #[arg(long)]
+        evidence: String,
+    },
     Action {
         task: String,
         #[arg(long)]
@@ -531,6 +537,15 @@ fn run_plan_command(ctx: &Ctx, command: PlanCommand) -> Result<()> {
             let project = Project::load(&ctx.root, &slug)?;
             goal_check::reconcile(&project, None, jiff::Timestamp::now().as_second() as u64)?;
             let (disposition, evidence) = match command {
+                GoalCheckCommand::Answer { party, evidence } => {
+                    goal_check::answer(&project, &party, &evidence)?;
+                    crate::output::insert(
+                        "goal_check",
+                        serde_json::to_value(goal_check::load(&project))?,
+                    );
+                    println!("goal check answer recorded");
+                    return Ok(());
+                }
                 GoalCheckCommand::Action { task, evidence } => {
                     (Disposition::Action { task }, evidence)
                 }
