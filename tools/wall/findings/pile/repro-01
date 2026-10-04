@@ -1,0 +1,4 @@
+#!/usr/bin/env bash
+# PILE-01: dropping a sealed task while its review is open still publishes it.
+set -euo pipefail
+exec "$(dirname "$0")/run" "$@" drop-review
