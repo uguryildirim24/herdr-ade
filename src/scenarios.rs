@@ -2273,10 +2273,7 @@ fn a_project_recipe_is_stored_and_used_again_for_a_coordinator_relaunch() {
     *world.panes.borrow_mut() = format!("[{}]", world.coordinator_pane(&project));
     world.runner.on(
         "agent start hp-demo-coordinator",
-        fail(
-            1,
-            r#"{"error":{"code":"timeout","message":"still starting"}}"#,
-        ),
+        ok(r#"{"result":{"agent":{"pane_id":"w1:p1","tab_id":"w1:t1","workspace_id":"w1","agent_status":"starting"}}}"#),
     );
 
     let mut options = crate::coordinator::OpenOptions {
@@ -2353,10 +2350,7 @@ fn open_reopens_a_closed_coordinator_and_a_new_message_requests_reopen() {
     );
     world.runner.on(
         "agent start hp-demo-coordinator",
-        fail(
-            1,
-            r#"{"error":{"code":"timeout","message":"still starting"}}"#,
-        ),
+        ok(r#"{"result":{"agent":{"pane_id":"w2:p1","tab_id":"w2:t1","workspace_id":"w2","agent_status":"starting"}}}"#),
     );
     world.runner.on("tab list", ok(r#"{"result":{"tabs":[]}}"#));
     world.runner.on(

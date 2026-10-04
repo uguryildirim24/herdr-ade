@@ -155,6 +155,29 @@ impl std::fmt::Display for HerdrError {
 impl std::error::Error for HerdrError {}
 
 pub(crate) const AGENT_START_TIMEOUT: Duration = Duration::from_secs(20);
+pub(crate) const MIN_AGENT_START_TIMEOUT_MS: u64 = 3_001;
+const MAX_AGENT_START_TIMEOUT_MS: u64 = 300_000;
+
+enum AgentTimeout {
+    Start,
+    Wait,
+}
+
+/// Fork validation: app/agents.rs requires start >3000 and <=300000 ms.
+/// cli/agent.rs and api/wait.rs impose no bounds on wait or prompt-wait u64s.
+/// Use the same effective value for herdr and the enclosing process deadline.
+fn agent_timeout(timeout_ms: u64, operation: AgentTimeout) -> (String, Duration) {
+    let timeout_ms = match operation {
+        AgentTimeout::Start => {
+            timeout_ms.clamp(MIN_AGENT_START_TIMEOUT_MS, MAX_AGENT_START_TIMEOUT_MS)
+        }
+        AgentTimeout::Wait => timeout_ms,
+    };
+    (
+        timeout_ms.to_string(),
+        Duration::from_millis(timeout_ms) + Duration::from_secs(5),
+    )
+}
 
 #[derive(Debug, Clone, Deserialize, PartialEq, Default)]
 pub(crate) struct Workspace {
@@ -560,7 +583,7 @@ impl<'a> Herdr<'a> {
     }
 
     fn agent_start_command(&self, opts: &AgentStart<'_>) -> (Vec<String>, Cmd) {
-        let timeout_ms = opts.ready_timeout_ms.to_string();
+        let (timeout_ms, wait) = agent_timeout(opts.ready_timeout_ms, AgentTimeout::Start);
         let mut args = vec![
             "agent".to_string(),
             "start".to_string(),
@@ -584,7 +607,6 @@ impl<'a> Herdr<'a> {
             args.push("--".into());
             args.extend(opts.agent_args.iter().cloned());
         }
-        let wait = Duration::from_millis(opts.ready_timeout_ms) + Duration::from_secs(5);
         let command = self.cmd(wait).args(args.iter().cloned());
         (args, command)
     }
@@ -637,7 +659,7 @@ impl<'a> Herdr<'a> {
         target: &str,
         timeout_ms: u64,
     ) -> Result<Agent, HerdrError> {
-        let timeout = timeout_ms.to_string();
+        let (timeout, wait) = agent_timeout(timeout_ms, AgentTimeout::Wait);
         let result = self.call(
             &[
                 "agent",
@@ -650,7 +672,7 @@ impl<'a> Herdr<'a> {
                 "--timeout",
                 &timeout,
             ],
-            Duration::from_millis(timeout_ms) + Duration::from_secs(5),
+            wait,
         )?;
         serde_json::from_value(result["agent"].clone()).map_err(|error| HerdrError {
             code: "failed".into(),
@@ -686,7 +708,7 @@ impl<'a> Herdr<'a> {
         text: &str,
         timeout_ms: u64,
     ) -> Result<(), HerdrError> {
-        let timeout = timeout_ms.to_string();
+        let (timeout, wait) = agent_timeout(timeout_ms, AgentTimeout::Wait);
         self.call(
             &[
                 "agent",
@@ -701,7 +723,7 @@ impl<'a> Herdr<'a> {
                 "--timeout",
                 &timeout,
             ],
-            Duration::from_millis(timeout_ms) + Duration::from_secs(5),
+            wait,
         )
         .map(|_| ())
     }
@@ -798,6 +820,76 @@ pub(crate) const SOURCE: &str = "herdr-ade";
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn agent_timeouts_follow_the_forks_operation_specific_bounds() {
+        use crate::runner::fake::{FakeRunner, ok};
+        let runner = FakeRunner::new();
+        runner.on(
+            "agent start",
+            ok(r#"{"result":{"agent":{"pane_id":"w1:p1","tab_id":"w1:t1","workspace_id":"w1"}}}"#),
+        );
+        runner.on(
+            "agent wait",
+            ok(r#"{"result":{"agent":{"pane_id":"w1:p1","tab_id":"w1:t1","workspace_id":"w1"}}}"#),
+        );
+        runner.on("agent prompt", ok(r#"{"result":{}}"#));
+        let herdr = Herdr::new("herdr", "/test.sock", &runner);
+        for (requested, effective) in [
+            (0, 3_001),
+            (1_000, 3_001),
+            (3_000, 3_001),
+            (3_001, 3_001),
+            (30_000, 30_000),
+            (300_000, 300_000),
+            (300_001, 300_000),
+            (u64::MAX, 300_000),
+        ] {
+            herdr
+                .agent_start_opts(&AgentStart {
+                    name: "coordinator",
+                    kind: "claude",
+                    pane: "w1:p1",
+                    agent_args: &[],
+                    launch_bin: None,
+                    parent: None,
+                    ready_timeout_ms: requested,
+                })
+                .unwrap();
+            let calls = runner.calls.borrow();
+            let command = calls.last().unwrap();
+            assert!(
+                command
+                    .args
+                    .windows(2)
+                    .any(|args| args == ["--timeout", &effective.to_string()])
+            );
+            assert_eq!(
+                command.timeout,
+                Duration::from_millis(effective) + Duration::from_secs(5)
+            );
+        }
+        // Waits do not inherit start's settle delay or five-minute maximum.
+        for requested in [0, 1_000, 300_001, u64::MAX] {
+            herdr.agent_wait_ready("w1:p1", requested).unwrap();
+            herdr
+                .agent_prompt_wait_started("w1:p1", "hello", requested)
+                .unwrap();
+            let calls = runner.calls.borrow();
+            for command in calls.iter().rev().take(2) {
+                assert!(
+                    command
+                        .args
+                        .windows(2)
+                        .any(|args| args == ["--timeout", &requested.to_string()])
+                );
+                assert_eq!(
+                    command.timeout,
+                    Duration::from_millis(requested) + Duration::from_secs(5)
+                );
+            }
+        }
+    }
 
     #[test]
     fn no_recorded_session_refuses_every_local_command_before_running_herdr() {

@@ -677,6 +677,19 @@ pub(crate) mod fake {
     impl Runner for FakeRunner {
         fn run(&self, cmd: &Cmd) -> Result<Output> {
             self.calls.borrow_mut().push(cmd.clone());
+            // Mirror the fork's app/agents.rs validation before scripted replies.
+            // In particular, a fake successful launch must not hide invalid timeouts.
+            if cmd.args.windows(2).any(|args| args == ["agent", "start"])
+                && let Some(timeout) = cmd.args.windows(2).find(|args| args[0] == "--timeout")
+                && !timeout[1]
+                    .parse::<u64>()
+                    .is_ok_and(|ms| ms > 3_000 && ms <= 300_000)
+            {
+                return Ok(fail(
+                    1,
+                    r#"{"error":{"code":"invalid_agent_timeout","message":"agent start timeout must be greater than 3000ms and at most 300000ms"}}"#,
+                ));
+            }
             for (matcher, answer) in self.rules.borrow().iter() {
                 if matcher(cmd) {
                     return answer(cmd);
