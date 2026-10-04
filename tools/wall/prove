@@ -32,6 +32,7 @@ snapshot > "$evidence/ubuntu-before.txt"
 for fault in ${WALL_PROVE_FAULTS:-kill-pane kill-process ticker disconnect reboot fill corrupt clock install}; do
   dir="$evidence/$fault"
   mkdir "$dir"
+  round_started=$SECONDS
   exec 3>&1
   {
     set -x
@@ -55,8 +56,11 @@ for fault in ${WALL_PROVE_FAULTS:-kill-pane kill-process ticker disconnect reboo
       ticker) wall fault ticker --when t-0001 before-seal ;;
       disconnect)
         wall fault disconnect 3 & injector=$!
-        sleep 0.5
-        wall enter "timeout 1 ssh $machine true" && exit 1 || test $? = 1
+        # Observe the actual transport timeout instead of guessing when the
+        # concurrent injector has paused SSH. Preserve the one-second probe.
+        until wall enter "set +e; timeout 1 ssh $machine true; code=\$?; set -e; test \$code = 124"; do
+          kill -0 "$injector" || exit 1
+        done
         wait "$injector"
         wall enter --box 'python3 "$HOME/tools/guest.py" wait t-0001 before-seal; herdr agent list'
         ;;
@@ -85,7 +89,9 @@ for fault in ${WALL_PROVE_FAULTS:-kill-pane kill-process ticker disconnect reboo
     snapshot > "$dir/ubuntu-after.txt"
     set +x
   } > "$dir/commands.log" 2>&1
-  echo "instance $instance $fault: injected and evidence captured" >&3
+  duration=$((SECONDS - round_started))
+  printf '%s\t%ss\n' "$fault" "$duration" >> "$evidence/round-durations.tsv"
+  echo "instance $instance $fault: injected and evidence captured; duration ${duration}s" >&3
   exec 3>&-
 done
 snapshot > "$evidence/ubuntu-after.txt"

@@ -25,7 +25,8 @@ tools/wall/regressions/D39/repro --instance 3
 sudo tools/wall/wall --instance 3 reset
 ```
 
-The gate discovers these alongside D27 and D30 in its locked instance 5.
+The gate discovers these alongside D27 and D30, with isolated workers on its
+locked instances 6–8 while prove runs on locked instance 5.
 The shared helper wakes the existing tickers while awaiting setup/recovery,
 using their normal `.ticker.wake` signal; it never edits lifecycle records or
 changes the clock/backoff algorithm. D38 leaves the ticker's normal cadence
