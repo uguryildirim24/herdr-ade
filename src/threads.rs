@@ -163,7 +163,21 @@ pub struct StartArgs {
 /// Validate and freeze a placement intent. The ticker owns checkout creation,
 /// terminal binding, the lane card, agent submission and initial input.
 pub fn start(ctx: &Ctx, slug: &str, args: StartArgs) -> Result<Thread> {
+    start_with_attachments(ctx, slug, args, BTreeMap::new())
+}
+
+/// Internal pile starts reuse members' already-frozen blobs, not their original
+/// host paths or the coordinator's per-lane input-file size budget.
+pub(crate) fn start_with_attachments(
+    ctx: &Ctx,
+    slug: &str,
+    args: StartArgs,
+    mut attachments: BTreeMap<String, String>,
+) -> Result<Thread> {
     let project = Project::load(&ctx.root, slug)?;
+    for hash in attachments.values() {
+        thread::artifact(&project, hash)?;
+    }
     if args.workflow.as_deref() == Some("reviewer") && args.review_id.is_empty() {
         bail!(
             "workflow_reserved: reviewer lanes are started by ha review. For an independent check use --workflow critic (verdict = \"PASS\"|\"FAIL\" front matter); for a specific recipe use --recipe <id>."
@@ -382,7 +396,6 @@ pub fn start(ctx: &Ctx, slug: &str, args: StartArgs) -> Result<Thread> {
         let (_, url) = box_repo_candidate(&ctx.config_dir, &machine, Some(&repo), listed)?;
         remote::remote_for_url(ctx.runner, &repo, &url)?;
     }
-    let mut attachments = BTreeMap::new();
     let mut remaining = LINKED_FILES_CAP;
     for path in &args.attach {
         let path = Path::new(path);

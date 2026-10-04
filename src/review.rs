@@ -883,6 +883,23 @@ fn task(project: &Project, review: &Review) -> String {
     out.push_str(&format!("\nWrite a report with TOML front matter:\n+++\nreview = \"{}\"\nverdict = \"MERGE\" # or REJECT\ncandidate = \"<your exact HEAD>\"\n# Gate execution receipts are recorded by ADE, not declared here.\n# Optional: without = {{ t-0001 = \"one-line reason\" }}\n# For REJECT solely because the review packet or member records are incomplete/unreadable:\n# evidence_only = true\n# Never use evidence_only for implementation defects, failed criteria, or mixed reasons.\n\n# Repeat for each included task's required criterion not withdrawn:\n[[acceptance]]\nthread = \"<member thread>\"\nevent = \"<member seal from the packet>\"\ncriterion = 1\ncondition = \"<exact original acceptance condition>\"\nestablished = true # false means not established; fix or exclude this member\nevidence = \"<durable artifact and behavior/journey references>\"\n+++\n\nIf excluding lanes, rebuild from the integration base without those lanes; their commits must not remain ancestors of your candidate. For every original required criterion not withdrawn, cite durable artifact/behavior evidence or say not established; gates alone do not prove semantics. Keep original criterion numbers. Withdrawn conditions are not required and must not be judged; any acceptance row for a withdrawn criterion is ignored, never a reason to reject. Include findings and actual journey evidence. Commit repository changes if any, leave runtime deliverables untracked, then `ha done`. Output in another repository belongs in the report.\n", review.id));
     out
 }
+/// Use the content hash as the reviewer's filename: different member names
+/// cannot collide, and identical content travels only once. Missing or corrupt
+/// blobs are described in the member packet, not passed to attachment staging.
+fn pile_attachments(project: &Project, review: &Review) -> BTreeMap<String, String> {
+    let mut attachments = BTreeMap::new();
+    for member in &review.members {
+        if let Ok(lane) = thread::load(project, &member.thread) {
+            for hash in lane.attachments.values() {
+                if !attachments.contains_key(hash) && thread::artifact(project, hash).is_ok() {
+                    attachments.insert(hash.clone(), hash.clone());
+                }
+            }
+        }
+    }
+    attachments
+}
+
 /// This text becomes part of the reviewer's own immutable launch brief. Never
 /// substitute today's task wording for the intent frozen at member launch.
 fn member_packet(project: &Project, member: &Member) -> String {
@@ -890,6 +907,23 @@ fn member_packet(project: &Project, member: &Member) -> String {
         "  Durable evidence: seal `{}` (attempt {}), report artifact `{}`.\n",
         member.event, member.attempt, member.artifact
     );
+    match thread::load(project, &member.thread) {
+        Ok(lane) => {
+            for (name, hash) in &lane.attachments {
+                match thread::artifact(project, hash) {
+                    Ok(_) => out.push_str(&format!(
+                        "  Member attachment: name `{name}`, hash `{hash}`, reviewer-side path `attachments/{hash}` (relative to the directory containing your own brief.md, not the member's checkout).\n"
+                    )),
+                    Err(error) => out.push_str(&format!(
+                        "  Member attachment: name `{name}`, hash `{hash}` — unavailable in the content store ({error}); attachment evidence not established.\n"
+                    )),
+                }
+            }
+        }
+        Err(error) => out.push_str(&format!(
+            "  Member attachments: not established ({error}).\n"
+        )),
+    }
     let brief = thread::load(project, &member.thread).and_then(|lane| {
         let hash = &lane.launch.brief_hash;
         let bytes = thread::artifact(project, hash)?;
@@ -997,7 +1031,7 @@ fn prepare(ctx: &Ctx, project: &Project, review: &mut Review) -> Result<()> {
         let reviewer = if let Some(t) = unbound.first() {
             t.clone()
         } else {
-            crate::threads::start(
+            crate::threads::start_with_attachments(
                 ctx,
                 &project.slug,
                 crate::threads::StartArgs {
@@ -1020,6 +1054,7 @@ fn prepare(ctx: &Ctx, project: &Project, review: &mut Review) -> Result<()> {
                     attach: Vec::new(),
                     paths: Vec::new(),
                 },
+                pile_attachments(project, review),
             )?
         };
         review.reviewer = Some(reviewer.id);
@@ -2215,7 +2250,8 @@ pub(crate) fn retry(ctx: &Ctx, slug: &str, repo: Option<&str>) -> Result<Option<
     // Preserve the reviewer's checkout, conflicts and fixes when replacing its
     // process. Persist the new review phase before a parked lane is reopened.
     if let Some(id) = &record.reviewer {
-        let lane = thread::load(&home, id)?;
+        let attachments = pile_attachments(&home, &record);
+        let lane = thread::update(&home, id, |t| t.attachments = attachments)?;
         // Thread retries normally preserve their frozen launch brief. A review
         // retry deliberately refreshes its contract, while keeping member
         // briefs/seals frozen and preserving the reviewer's checkout.

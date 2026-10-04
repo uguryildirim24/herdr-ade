@@ -1,6 +1,7 @@
 use super::*;
 use crate::testkit::{Fx, commit_file, fixture, git};
 
+mod attachments;
 mod holds;
 mod starts;
 mod withdrawals;
