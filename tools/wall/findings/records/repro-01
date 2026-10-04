@@ -1,0 +1,45 @@
+#!/usr/bin/env python3
+"""R01: an empty persisted plan must not silently erase completed progress."""
+import json
+import sys
+from support import Sandbox
+
+box = Sandbox()
+box.reset()
+box.guest(r'''
+import json, sys, tomllib
+sys.path.insert(0, str(home/'tools'))
+import guest
+config = home/'.config/herdr-ade/config.toml'
+config.write_text(config.read_text().replace('[adapters.pi]',
+    '[[routing.rules]]\nworkflow = "reviewer"\nrecipe = "wall_lane"\n\n[adapters.pi]'))
+(home/'control.json').write_text(json.dumps({'hold':['before-seal'],'gate_review':True}))
+guest.run('ha','ticker','start')
+lane = guest.lane()
+guest.run('ha','plan','set','wall','--does','Durable progress')
+guest.run('ha','plan','step','add','wall','Keep progress','--task','job-0001')
+guest.wait(lane['id'],'before-seal')
+(home/'release/before-seal').touch()
+guest.poll('sealed event',lambda: list((state/'events').glob('*.toml')))
+guest.run('ha','review','wall')
+def landed():
+    rows = [tomllib.loads(p.read_text()) for p in (state/'reviews').glob('*.toml')]
+    for row in rows:
+        if row.get('attention'):
+            raise RuntimeError(row['attention'])
+    return any(r['phase']=='complete' and r['push'] and r['fast_forward'] for r in rows)
+guest.poll('fixture reviewed and published',landed,seconds=240)
+guest.run('ha','ticker','stop')
+''')
+before = json.loads(box.ha('plan','show','wall','--json').stdout)['data']['result']
+assert len(before['steps']) == 1 and before['steps'][0]['state'] == 'done', before
+box.apply_condition('plan.toml', 'empty')
+result = box.ha('plan','show','wall','--json',check=False)
+bug = False
+if result.returncode == 0:
+    after = json.loads(result.stdout)['data']['result']
+    bug = not after['steps'] and after['revision'] == 0 and after.get('present') is True
+print('EXPECTED: unreadable-plan diagnostic; never turn persisted completed progress into an empty successful card')
+print('ACTUAL:', 'R01 reproduced: done/total 1/1 -> 0/0, successful revision 0, present=true' if bug else 'R01 signature absent; see command result')
+box.evidence()
+sys.exit(1 if bug else 0)

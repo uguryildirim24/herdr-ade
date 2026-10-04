@@ -1,0 +1,37 @@
+#!/usr/bin/env python3
+"""R03: storage-full cancellation reports success without recording cancellation."""
+import sys
+from support import Sandbox
+
+box = Sandbox()
+box.reset()
+result = box.guest(r'''
+import json, subprocess, sys, tomllib
+sys.path.insert(0,str(home/'tools'))
+import guest
+(home/'control.json').write_text(json.dumps({'hold':['working']}))
+guest.run('ha','ticker','start')
+lane = guest.lane()
+guest.wait(lane['id'],'working')
+guest.run('ha','ticker','stop')
+path = state/'threads'/f"{lane['id']}.toml"
+before = path.read_bytes()
+try:
+    guest.fault('fill',[])
+    p = subprocess.run(['ha','thread','cancel','wall',lane['id'],'--reason','Storage-full cancellation check'],
+                       text=True,stdout=subprocess.PIPE,stderr=subprocess.STDOUT,timeout=45)
+    after = path.read_bytes()
+    current = tomllib.loads(after.decode())
+    print('CANCEL exit',p.returncode,p.stdout,flush=True)
+    bug = p.returncode == 0 and 'cancelled;' in p.stdout and before == after and current['status']=='open' and not current['cancellation_reason']
+    print('EXPECTED: nonzero cancellation failure, or a durably cancelled lane before reporting success')
+    print('ACTUAL:','R03 reproduced: exit 0 says cancelled; record byte-identical, status=open, cancellation_reason empty' if bug else 'R03 signature absent; inspect command and record')
+finally:
+    (home/'disk-full').unlink(missing_ok=True)
+print('RECORD',path.read_text(),flush=True)
+if bug:
+    subprocess.run(['herdr','pane','process-info','--pane',lane['pane_id']],check=True)
+sys.exit(1 if bug else 0)
+''',check=False)
+box.evidence()
+sys.exit(result.returncode)

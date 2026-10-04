@@ -1,0 +1,43 @@
+#!/usr/bin/env python3
+"""Read representative historical records without rewriting the Rust loaders."""
+from support import Sandbox, SETUP
+
+box = Sandbox()
+box.reset()
+box.guest(SETUP)
+box.guest(r'''
+import json, subprocess
+
+def read(*args):
+    p = subprocess.run(['ha',*args,'--json'],text=True,stdout=subprocess.PIPE,stderr=subprocess.STDOUT,timeout=60)
+    print('COMMAND',args,'EXIT',p.returncode,p.stdout,flush=True)
+    assert p.returncode == 0
+    return json.loads(p.stdout)
+
+# Removed PR-era fields: preserve the real lane's required identity fields.
+p = state/'threads/t-0001.toml'; original = p.read_text()
+p.write_text('pr = "fixture-pr"\npr_state = "OPEN"\npr_review = "APPROVED"\npr_note = ""\npr_summary = {state="OPEN", comments=[]}\n'+original)
+lane = read('thread','show','wall','t-0001')['data']['record']
+assert lane['id'] == 't-0001' and lane['title'] == 'Scripted fault lane'
+p.write_text(original)
+print('EXPECTED: PR-era lane remains readable; ACTUAL: identity and title retained')
+
+# Historical outcome fields remain readable when `does` is absent.
+p = state/'plan.toml'; original = p.read_text()
+p.write_text('kind = "Historical work"\nwhat_you_get = "Historical result"\n'+'\n'.join(line for line in original.splitlines() if not line.startswith('does = '))+'\n')
+plan = read('plan','show','wall')['data']['result']
+assert plan['what_you_get'] == 'Historical result' and len(plan['steps']) == 1
+p.write_text(original)
+print('EXPECTED: historical outcome and steps retained; ACTUAL: retained')
+
+# The old append-only note journal retains complete rows across an interrupted tail.
+p = state/'notes/n-0001.json'; original = p.read_text()
+journal = state/'notes.jsonl'
+journal.write_text(json.dumps(json.loads(original))+'\n'+ '{"schema":1,"id":"n-0002","text":')
+p.unlink()
+context = read('context','wall','--peek')
+assert 'Keep measured results' in context['message'] and 'interrupted journal' in context.get('warnings','')
+p.write_text(original); journal.unlink()
+print('EXPECTED: complete old note retained and partial tail diagnosed; ACTUAL: both observed')
+''')
+box.evidence()
