@@ -163,7 +163,21 @@ pub struct StartArgs {
 /// Validate and freeze a placement intent. The ticker owns checkout creation,
 /// terminal binding, the lane card, agent submission and initial input.
 pub fn start(ctx: &Ctx, slug: &str, args: StartArgs) -> Result<Thread> {
+    start_with_attachments(ctx, slug, args, BTreeMap::new())
+}
+
+/// Internal pile starts reuse members' already-frozen blobs, not their original
+/// host paths or the coordinator's per-lane input-file size budget.
+pub(crate) fn start_with_attachments(
+    ctx: &Ctx,
+    slug: &str,
+    args: StartArgs,
+    mut attachments: BTreeMap<String, String>,
+) -> Result<Thread> {
     let project = Project::load(&ctx.root, slug)?;
+    for hash in attachments.values() {
+        thread::artifact(&project, hash)?;
+    }
     if args.workflow.as_deref() == Some("reviewer") && args.review_id.is_empty() {
         bail!(
             "workflow_reserved: reviewer lanes are started by ha review. For an independent check use --workflow critic (verdict = \"PASS\"|\"FAIL\" front matter); for a specific recipe use --recipe <id>."
@@ -382,7 +396,6 @@ pub fn start(ctx: &Ctx, slug: &str, args: StartArgs) -> Result<Thread> {
         let (_, url) = box_repo_candidate(&ctx.config_dir, &machine, Some(&repo), listed)?;
         remote::remote_for_url(ctx.runner, &repo, &url)?;
     }
-    let mut attachments = BTreeMap::new();
     let mut remaining = LINKED_FILES_CAP;
     for path in &args.attach {
         let path = Path::new(path);
@@ -1055,12 +1068,18 @@ fn bind_terminal(ctx: &Ctx, project: &Project, view: &SessionView, record: &Thre
         None
     };
     let herdr = view.herdr.on_machine(record.machine_route());
-    let spec = crate::contracts::RoleSpec {
+    let execution = crate::launch::bind_execution(ctx, record, machine.as_ref())?;
+    let mut spec = crate::contracts::RoleSpec {
         kind: record.launch.kind.clone(),
-        args: record.launch.args.clone(),
+        args: execution.args.clone(),
         env: record.launch.env.clone(),
         ready_timeout_ms: record.launch.ready_timeout_ms,
     };
+    if execution.advisory.is_some() {
+        spec.env
+            .retain(|value| !value.starts_with("HERDR_ADE_EXECUTION="));
+        spec.env.push("HERDR_ADE_EXECUTION=advisory".into());
+    }
     let attempt = record.attempt.max(1);
     let env = project::tab_env(
         &project.slug,
@@ -1120,6 +1139,7 @@ fn bind_terminal(ctx: &Ctx, project: &Project, view: &SessionView, record: &Thre
     // can now close this exact workspace instead of leaking an unrecorded one.
     thread::update(project, &record.id, |t| {
         t.cwd = cwd.clone();
+        crate::launch::apply_execution(project, t, &execution);
         t.workspace_id = created.workspace_id.clone();
         t.tab_id = created.tab_id.clone();
         t.pane_id = created.pane_id.clone();
@@ -1856,6 +1876,25 @@ pub struct CancelOutcome {
 /// not complete. The resolved record is written before external cleanup, so
 /// no ticker can relaunch it while its session is unreachable.
 pub fn cancel(ctx: &Ctx, slug: &str, id: &str, reason: &str) -> Result<CancelOutcome> {
+    cancel_with_retention(ctx, slug, id, reason, false)
+}
+
+pub(crate) fn cancel_preserving_checkout(
+    ctx: &Ctx,
+    slug: &str,
+    id: &str,
+    reason: &str,
+) -> Result<CancelOutcome> {
+    cancel_with_retention(ctx, slug, id, reason, true)
+}
+
+fn cancel_with_retention(
+    ctx: &Ctx,
+    slug: &str,
+    id: &str,
+    reason: &str,
+    keep_checkout: bool,
+) -> Result<CancelOutcome> {
     let project = Project::load(&ctx.root, slug)?;
     let reason = reason.trim();
     if reason.is_empty() {
@@ -1872,6 +1911,7 @@ pub fn cancel(ctx: &Ctx, slug: &str, id: &str, reason: &str) -> Result<CancelOut
     let recorded_reason = record.cancellation_reason.clone();
     let request = record.retirement_request(RetirementRequest {
         authority: RetirementAuthority::Cancel,
+        keep_checkout,
         ..Default::default()
     });
     let outcome = retire(
@@ -2009,6 +2049,17 @@ pub(crate) fn follow_up_pending_for_seal(
                     && !f.after_seal.is_empty()
                     && latest.is_some_and(|event| event.id == f.after_seal))
     })
+}
+
+/// Enter steers pi at its next tool boundary. Other adapters have not proven
+/// that contract, so keep their working-turn input in the durable queue.
+pub(crate) fn can_steer(record: &Thread, state: &str) -> bool {
+    let kind = if record.launch.kind.is_empty() {
+        &record.agent
+    } else {
+        &record.launch.kind
+    };
+    state == "working" && kind == "pi"
 }
 
 fn awaiting_follow_up(record: &Thread) -> bool {
@@ -2268,7 +2319,7 @@ pub(crate) fn send_lane_input(
             return Ok(PromptOutcome::Queued { attempt });
         }
     }
-    if queued {
+    if queued || (state == "working" && !can_steer(&record, &state)) {
         return Ok(PromptOutcome::Queued { attempt });
     }
     let Some((index, follow_up)) = record
@@ -2312,7 +2363,13 @@ pub(crate) fn send_lane_input(
             .herdr
             .on_machine(record.machine_route())
     };
-    let result = if state == "blocked" {
+    let steering = can_steer(&record, &state);
+    let result = if steering {
+        // The API acknowledges only after the paste AND encoded Enter have
+        // been written. Waiting for "working" here would merely observe the
+        // already-active turn, not strengthen that submission receipt.
+        herdr.agent_prompt(&record.pane_id, &follow_up.text)
+    } else if state == "blocked" {
         herdr.pane_submit_text(&record.pane_id, &follow_up.text)
     } else {
         herdr.agent_prompt_wait_started(
@@ -2333,7 +2390,7 @@ pub(crate) fn send_lane_input(
                     saved.state = FollowUpState::Queued;
                 }
             })?;
-        } else {
+        } else if !steering {
             let _ = crate::inbox::write(
                 project,
                 "prompt-uncertain",
@@ -2343,6 +2400,18 @@ pub(crate) fn send_lane_input(
                 ),
                 "",
             );
+        }
+        if steering {
+            let _ = crate::inbox::write(
+                project,
+                "steering-queued",
+                id,
+                &format!(
+                    "{id} attempt {attempt}: steering delivery unconfirmed; the note remains queued ({error})"
+                ),
+                "",
+            );
+            return Ok(PromptOutcome::Queued { attempt });
         }
         return Err(anyhow::anyhow!("{error}"));
     }
@@ -2750,7 +2819,9 @@ fn retire(
         // than trying to read links from the now-absent checkout.
         let preservation_complete =
             request.preserved && (already_removed || record.worktree_path.is_empty());
-        let mut removal_refusal = None;
+        let mut removal_refusal = request
+            .keep_checkout
+            .then(|| "diagnostic retention: checkout and ref kept".to_string());
         let (mut final_copy, mut copy_notes) = if preservation_complete && !request.skip_copy {
             ("complete".to_string(), Vec::new())
         } else if request.skip_copy {
@@ -2772,6 +2843,14 @@ fn retire(
                     }
                     ("partial".to_string(), notes)
                 }
+                CopyOutcome::Failed(error) if request.keep_checkout => {
+                    // Preservation is retryable; it must not keep a cancelled
+                    // agent running. Its untouched checkout is still evidence.
+                    (
+                        "pending".into(),
+                        vec![format!("final copy pending: {error}")],
+                    )
+                }
                 CopyOutcome::Failed(error) => {
                     bail!(
                         "the final copy failed ({error}); not resolving. `--skip-copy` resolves without it."
@@ -2792,7 +2871,7 @@ fn retire(
             removal_refusal = Some(detail);
             true
         } else {
-            false
+            final_copy == "pending"
         };
 
         if removable && !already_removed {
@@ -2868,11 +2947,13 @@ fn retire(
             }
             thread::update(project, id, |t| t.worktree_path.clear())?;
         }
-        if already_removed || removal_refusal.is_none() {
+        if !request.keep_checkout && (already_removed || removal_refusal.is_none()) {
             crate::branches::resolved_thread(ctx, project, &resolved)?;
         }
-        remove_finished_build_folder(ctx, project, &resolved)?;
-        remove_scratch_session(ctx, &resolved)?;
+        if !request.keep_checkout {
+            remove_finished_build_folder(ctx, project, &resolved)?;
+            remove_scratch_session(ctx, &resolved)?;
+        }
         thread::update(project, id, |t| {
             t.cleanup_pending = preservation_pending;
             t.cleanup_reason = if preservation_pending {
@@ -2880,7 +2961,7 @@ fn retire(
             } else {
                 String::new()
             };
-            if !preservation_pending {
+            if !preservation_pending && !request.keep_checkout {
                 t.retirement = None;
             }
         })?;
@@ -6298,6 +6379,278 @@ mod tests {
     }
 
     #[test]
+    fn working_pi_notes_are_steering_on_local_and_box_routes() {
+        use crate::runner::fake::ok;
+        use crate::scenarios::{World, agent_json};
+        for machine in ["", "box"] {
+            let world = World::new();
+            let project = world.project("demo", "a.sock");
+            let lane = world.thread(&project, world.home.path(), |t| {
+                t.agent = "pi".into();
+                t.launch.kind = "pi".into();
+                t.machine = machine.into();
+                t.prompt_pending = false;
+                t.bootstrap = "acknowledged".into();
+            });
+            let agents: Vec<Agent> = serde_json::from_str(&format!(
+                "[{}]",
+                agent_json(
+                    "w2",
+                    "w2:t1",
+                    "w2:p1",
+                    &lane.cwd,
+                    &lane.agent_name,
+                    "working"
+                )
+                .replace("\"claude\"", "\"pi\"")
+            ))
+            .unwrap();
+            *world.agents.borrow_mut() = serde_json::to_string(&agents).unwrap();
+            world.runner.on("agent prompt", ok(r#"{"result":{}}"#));
+            let herdr = Herdr::new(world.env.herdr_bin(), "a.sock", &world.runner);
+            let outcome = if machine.is_empty() {
+                prompt(&world.ctx(), "demo", &lane.id, "steer at next boundary").unwrap()
+            } else {
+                send_lane_input(
+                    &world.ctx(),
+                    &project,
+                    &lane.id,
+                    Some("steer at next boundary"),
+                    Some((&herdr, &agents, &lane)),
+                )
+                .unwrap()
+            };
+            assert_eq!(
+                outcome,
+                PromptOutcome::Sent {
+                    attempt: 1,
+                    agent_state: "working".into()
+                }
+            );
+            let saved = thread::load(&project, &lane.id).unwrap();
+            assert_eq!(saved.follow_ups[0].state, FollowUpState::Delivered);
+            let calls = world.runner.calls.borrow();
+            let call = calls
+                .iter()
+                .find(|c| c.display().contains("agent prompt"))
+                .unwrap();
+            assert!(!call.args.iter().any(|a| a == "--wait" || a == "--steer"));
+            assert_eq!(call.args.iter().any(|a| a == "--machine"), machine == "box");
+            assert!(!calls.iter().any(|c| c.display().contains("pane send-text")));
+        }
+    }
+
+    #[test]
+    fn unconfirmed_pi_steering_is_retained_and_reported() {
+        use crate::runner::fake::{fail, timeout};
+        use crate::scenarios::{World, agent_json};
+        for (reply, expected) in [
+            (
+                fail(
+                    1,
+                    r#"{"error":{"code":"agent_blocked","message":"dialog opened"}}"#,
+                ),
+                FollowUpState::Queued,
+            ),
+            (timeout(), FollowUpState::Uncertain),
+        ] {
+            let world = World::new();
+            let project = world.project("demo", "a.sock");
+            let lane = world.thread(&project, world.home.path(), |t| {
+                t.agent = "pi".into();
+                t.launch.kind = "pi".into();
+                t.prompt_pending = false;
+                t.bootstrap = "acknowledged".into();
+            });
+            *world.agents.borrow_mut() = format!(
+                "[{}]",
+                agent_json(
+                    "w2",
+                    "w2:t1",
+                    "w2:p1",
+                    &lane.cwd,
+                    &lane.agent_name,
+                    "working"
+                )
+            );
+            world.runner.on("agent prompt", reply);
+            assert_eq!(
+                prompt(&world.ctx(), "demo", &lane.id, "do not lose me").unwrap(),
+                PromptOutcome::Queued { attempt: 1 }
+            );
+            let saved = thread::load(&project, &lane.id).unwrap();
+            assert_eq!(saved.follow_ups[0].state, expected);
+            assert_eq!(saved.follow_ups[0].text, "do not lose me");
+            assert!(saved.follow_ups[0].delivered_at.is_empty());
+            assert!(
+                crate::inbox::unhandled(&project)
+                    .iter()
+                    .any(|i| i.summary.contains("steering delivery unconfirmed"))
+            );
+            if expected == FollowUpState::Uncertain {
+                assert_eq!(
+                    send_lane_input(&world.ctx(), &project, &lane.id, None, None).unwrap(),
+                    PromptOutcome::Queued { attempt: 1 }
+                );
+                assert_eq!(world.runner.count("agent prompt"), 1);
+            }
+        }
+    }
+
+    #[test]
+    fn working_claude_keeps_the_queue() {
+        use crate::scenarios::{World, agent_json};
+        let world = World::new();
+        let project = world.project("demo", "a.sock");
+        let lane = world.thread(&project, world.home.path(), |t| {
+            t.prompt_pending = false;
+            t.bootstrap = "acknowledged".into();
+        });
+        *world.agents.borrow_mut() = format!(
+            "[{}]",
+            agent_json(
+                "w2",
+                "w2:t1",
+                "w2:p1",
+                &lane.cwd,
+                &lane.agent_name,
+                "working"
+            )
+        );
+        assert_eq!(
+            prompt(&world.ctx(), "demo", &lane.id, "later").unwrap(),
+            PromptOutcome::Queued { attempt: 1 }
+        );
+        assert_eq!(world.runner.count("agent prompt"), 0);
+        assert_eq!(
+            thread::load(&project, &lane.id).unwrap().follow_ups[0].state,
+            FollowUpState::Queued
+        );
+    }
+
+    #[test]
+    fn answered_post_seal_notes_confirm_once_only_with_unchanged_clean_head() {
+        use crate::testkit::{commit_file, fixture};
+        for role in ["worker", "reviewer"] {
+            for change in ["none", "commit", "dirty", "seal", "queued", "recent"] {
+                let fx = fixture();
+                let (id, sha) = fx.lane(1);
+                let seal = fx.seal_done(
+                    &id,
+                    1,
+                    1,
+                    &sha,
+                    if role == "reviewer" {
+                        "MERGE"
+                    } else {
+                        "finished"
+                    },
+                );
+                let lane = thread::update(&fx.project, &id, |t| {
+                    t.role = role.into();
+                    t.review_after = seal.clone();
+                    t.follow_ups.push(FollowUp {
+                        attempt: 1,
+                        text: "already fixed?".into(),
+                        state: FollowUpState::Delivered,
+                        after_seal: seal.clone(),
+                        delivered_at: "2026-09-18T11:00:00Z".into(),
+                        ..Default::default()
+                    });
+                    if change == "queued" {
+                        t.follow_ups[0].state = FollowUpState::Queued;
+                    }
+                    if change == "recent" {
+                        t.follow_ups[0].delivered_at = project::now();
+                    }
+                })
+                .unwrap();
+                let folder = Path::new(&lane.worktree_path);
+                if change == "commit" {
+                    commit_file(folder, "correction.txt", "new", "correction");
+                }
+                if change == "dirty" {
+                    std::fs::write(folder.join("untracked.txt"), "new").unwrap();
+                }
+                if change == "seal" {
+                    fx.seal_done(&id, 1, 2, &sha, "new verdict");
+                }
+                crate::ticker::restore_unchanged_seal(&fx.world.ctx(), &fx.project, &lane).unwrap();
+                let saved = thread::load(&fx.project, &id).unwrap();
+                if change == "none" {
+                    assert_eq!(saved.follow_ups[0].state, FollowUpState::Closed);
+                    assert!(saved.review_after.is_empty());
+                    assert_eq!(saved.start_notices.len(), 1);
+                    assert!(
+                        saved.start_notices[0]
+                            .line
+                            .contains("confirmed existing seal")
+                    );
+                    let events = crate::events::for_thread(&fx.project, &id);
+                    assert!(!follow_up_pending_for_seal(
+                        &saved,
+                        crate::events::latest_done_event(&events, &id, 1)
+                    ));
+                    assert!(crate::review::sealed(&events, &saved).is_some());
+                    crate::ticker::restore_unchanged_seal(&fx.world.ctx(), &fx.project, &saved)
+                        .unwrap();
+                    assert_eq!(
+                        thread::load(&fx.project, &id).unwrap().start_notices.len(),
+                        1
+                    );
+                } else {
+                    assert_ne!(saved.follow_ups[0].state, FollowUpState::Closed, "{change}");
+                    assert_eq!(saved.review_after, seal);
+                    assert!(saved.start_notices.is_empty());
+                    let events = crate::events::for_thread(&fx.project, &id);
+                    let old = events.iter().find(|e| e.id == seal).unwrap();
+                    assert!(follow_up_pending_for_seal(&saved, Some(old)));
+                    if change == "seal" {
+                        assert!(!follow_up_pending_for_seal(
+                            &saved,
+                            crate::events::latest_done_event(&events, &id, 1)
+                        ));
+                        assert!(crate::review::sealed(&events, &saved).is_some());
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn unreadable_newer_seal_cannot_confirm_an_older_answered_seal() {
+        let fx = crate::testkit::fixture();
+        let (id, sha) = fx.lane(1);
+        let old = fx.seal_done(&id, 1, 1, &sha, "MERGE");
+        let lane = thread::update(&fx.project, &id, |t| {
+            t.role = "reviewer".into();
+            t.review_after = old.clone();
+            t.follow_ups.push(FollowUp {
+                attempt: 1,
+                text: "check the verdict".into(),
+                state: FollowUpState::Delivered,
+                after_seal: old.clone(),
+                delivered_at: "2026-09-18T11:00:00Z".into(),
+                ..Default::default()
+            });
+        })
+        .unwrap();
+        let newer = fx.seal_done(&id, 1, 2, &sha, "REJECT");
+        std::fs::write(
+            crate::events::dir(&fx.project).join(format!("{newer}.toml")),
+            "id = 'truncated",
+        )
+        .unwrap();
+        assert!(
+            crate::ticker::restore_unchanged_seal(&fx.world.ctx(), &fx.project, &lane).is_err()
+        );
+        let saved = thread::load(&fx.project, &id).unwrap();
+        assert_eq!(saved.review_after, old);
+        assert_eq!(saved.follow_ups[0].state, FollowUpState::Delivered);
+        assert!(saved.start_notices.is_empty());
+    }
+
+    #[test]
     fn cli_and_ticker_share_staging_transport_and_receipts() {
         use crate::runner::fake::ok;
         use crate::scenarios::{World, agent_json};
@@ -7173,7 +7526,12 @@ mod tests {
             |cmd| {
                 let script = cmd.args.last().cloned().unwrap_or_default();
                 if crate::box_helper::tests::is_doctor(cmd) {
-                    return Ok(crate::testkit::diagnostic_output(cmd, 99_999_999, None));
+                    return Ok(crate::doctor::boundary_diagnostic_output(
+                        cmd, 99_999_999, None,
+                    ));
+                }
+                if script.contains("uname -s") {
+                    return Ok(ok("Linux\n"));
                 }
                 if script.contains("getconf _NPROCESSORS_ONLN") {
                     return Ok(ok("1.0 16\n"));
@@ -7594,7 +7952,7 @@ mod tests {
         fx.world.runner.on_fn(
             |cmd| cmd.program == "ssh" && crate::box_helper::tests::is_doctor(cmd),
             move |cmd| {
-                Ok(crate::testkit::diagnostic_output(
+                Ok(crate::doctor::boundary_diagnostic_output(
                     cmd,
                     current.get() * 1_000_000,
                     None,
@@ -7888,7 +8246,7 @@ mod tests {
         fx.world.runner.on_fn(
             |cmd| cmd.program == "ssh" && crate::box_helper::tests::is_doctor(cmd),
             move |cmd| {
-                Ok(crate::testkit::diagnostic_output(
+                Ok(crate::doctor::boundary_diagnostic_output(
                     cmd,
                     99_999_999,
                     (!state.get()).then_some("provider readiness probe timed out"),
@@ -8768,7 +9126,7 @@ mod tests {
                         .is_some_and(|input| input.contains("\"kind\":\"claude\""))
             },
             |cmd| {
-                Ok(crate::testkit::diagnostic_output(
+                Ok(crate::doctor::boundary_diagnostic_output(
                     cmd,
                     99_999_999,
                     Some("Usage limit reached"),
@@ -8810,7 +9168,7 @@ mod tests {
                 |cmd| cmd.program == "ssh" && crate::box_helper::tests::is_doctor(cmd),
                 move |cmd| {
                     Ok(if installed.get() {
-                        crate::testkit::diagnostic_output(cmd, 99_999_999, None)
+                        crate::doctor::boundary_diagnostic_output(cmd, 99_999_999, None)
                     } else {
                         crate::runner::fake::ok(r#"{"status":"Skew","build":"0.1.0+old.1"}"#)
                     })

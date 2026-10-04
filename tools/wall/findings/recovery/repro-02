@@ -1,0 +1,34 @@
+#!/usr/bin/env python3
+"""R02: a dead waiting agent stays 'process unknown' despite a reachable shell."""
+import argparse
+from pathlib import Path
+import sys
+import time
+
+from support import enter, evidence, fault, phase, record, records, reset, snapshot, start, until
+
+parser = argparse.ArgumentParser(description=__doc__)
+parser.add_argument('--evidence', type=Path, required=True, help='new host evidence directory')
+args = parser.parse_args()
+reset({'finish': 'waiting', 'hold': []})
+try:
+    lane = start()
+    thread = lane['id']
+    phase(thread, 'seal-end')
+    until(lambda: records(kind='events'), 'waiting seal present')
+    fault('kill-process', thread)
+    time.sleep(35)
+    lane = record(thread)
+    process = enter('herdr pane process-info --pane ' + lane['pane_id']).stdout
+    view = enter('ha overview wall').stdout
+    snapshot()
+    wrong = ('"name":"bash"' in process and 'process unknown; check the connection' in view
+             and lane['status'] == 'open' and lane['failure_class'] == 'unknown')
+    print('EXPECTED: retain the waiting seal, but show the dead agent and thread retry as the recovery.')
+    print('ACTUAL:', {'shell_only': '\"name\":\"bash\"' in process,
+                      'overview_says_process_unknown': 'process unknown; check the connection' in view,
+                      'status': lane['status'], 'failure_class': lane['failure_class']})
+    print('R02 REPRODUCED' if wrong else 'R02 signature absent')
+finally:
+    evidence(args.evidence)
+sys.exit(1 if wrong else 0)

@@ -54,6 +54,9 @@ pub(crate) struct Verdict {
     /// Unclassified historical rejections remain merits rejections.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub evidence_only: bool,
+    /// Harness-classified REJECT judging only withdrawn conditions.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub withdrawn_only: bool,
     #[serde(default)]
     pub without: BTreeMap<String, String>,
     /// Historical declarations remain readable, but are never mechanical proof.
@@ -287,6 +290,28 @@ fn reviewer_ids(project: &Project) -> Result<std::collections::BTreeSet<String>>
     }
     Ok(ids)
 }
+/// Observation failures are verification facts, never a rollback or a lost install.
+pub(crate) fn post_install_result(
+    ctx: &Ctx,
+    slug: &str,
+    id: &str,
+    observation: &str,
+) -> Result<()> {
+    let project = Project::load(&ctx.root, slug)?;
+    let record = load(&project, id)?;
+    let _operation = try_operation_lock(ctx, &record.repo)?
+        .context("review operation busy; post-install result remains in journey notice")?;
+    let mut record = load(&project, id)?;
+    if record.install_result.contains(observation) {
+        return Ok(());
+    }
+    record.install_result = record
+        .install_result
+        .replace("; ticker first full pass pending; journey pending", "");
+    record.install_result.push_str(&format!("; {observation}"));
+    save(&project, &record)
+}
+
 fn queue_notice(review: &mut Review, line: String) {
     if !review.notices.iter().any(|n| n.line == line) {
         review.notices.push(crate::steps::Notice {
@@ -826,7 +851,7 @@ fn start_locked(
 }
 fn task(project: &Project, review: &Review) -> String {
     let mut out = format!(
-        "Run `ha skill reviewer`. Review the whole repository pile {}. Your checkout owns the candidate, starting at frozen integration base `{}`. Merge every included SHA below (preserve any merges/fixes already in a recovered checkout); resolve conflicts, fix small issues, and judge each original acceptance criterion. ADE runs the path-selected gates on your sealed candidate, on your machine, before landing. Do not push or install.\n\n",
+        "Run `ha skill reviewer`. Review the whole repository pile {}. Your checkout owns the candidate, starting at frozen integration base `{}`. Merge every included SHA below (preserve any merges/fixes already in a recovered checkout); resolve conflicts, fix small issues, and judge each original required acceptance criterion not withdrawn. ADE runs the path-selected gates on your sealed candidate, on your machine, before landing. Do not push or install.\n\n",
         review.id, review.base
     );
     for member in &review.members {
@@ -855,9 +880,26 @@ fn task(project: &Project, review: &Review) -> String {
             gate.command, gate.env
         ));
     }
-    out.push_str(&format!("\nWrite a report with TOML front matter:\n+++\nreview = \"{}\"\nverdict = \"MERGE\" # or REJECT\ncandidate = \"<your exact HEAD>\"\n# Gate execution receipts are recorded by ADE, not declared here.\n# Optional: without = {{ t-0001 = \"one-line reason\" }}\n# For REJECT solely because the review packet or member records are incomplete/unreadable:\n# evidence_only = true\n# Never use evidence_only for implementation defects, failed criteria, or mixed reasons.\n\n# Repeat for each included task's required criterion:\n[[acceptance]]\nthread = \"<member thread>\"\nevent = \"<member seal from the packet>\"\ncriterion = 1\ncondition = \"<exact original acceptance condition>\"\nestablished = true # false means not established; fix or exclude this member\nevidence = \"<durable artifact and behavior/journey references>\"\n+++\n\nIf excluding lanes, rebuild from the integration base without those lanes; their commits must not remain ancestors of your candidate. For every original required criterion, cite durable artifact/behavior evidence or say not established; gates alone do not prove semantics. Include findings and actual journey evidence. Commit repository changes if any, leave runtime deliverables untracked, then `ha done`. Output in another repository belongs in the report.\n", review.id));
+    out.push_str(&format!("\nWrite a report with TOML front matter:\n+++\nreview = \"{}\"\nverdict = \"MERGE\" # or REJECT\ncandidate = \"<your exact HEAD>\"\n# Gate execution receipts are recorded by ADE, not declared here.\n# Optional: without = {{ t-0001 = \"one-line reason\" }}\n# For REJECT solely because the review packet or member records are incomplete/unreadable:\n# evidence_only = true\n# Never use evidence_only for implementation defects, failed criteria, or mixed reasons.\n\n# Repeat for each included task's required criterion not withdrawn:\n[[acceptance]]\nthread = \"<member thread>\"\nevent = \"<member seal from the packet>\"\ncriterion = 1\ncondition = \"<exact original acceptance condition>\"\nestablished = true # false means not established; fix or exclude this member\nevidence = \"<durable artifact and behavior/journey references>\"\n+++\n\nIf excluding lanes, rebuild from the integration base without those lanes; their commits must not remain ancestors of your candidate. For every original required criterion not withdrawn, cite durable artifact/behavior evidence or say not established; gates alone do not prove semantics. Keep original criterion numbers. Withdrawn conditions are not required and must not be judged; any acceptance row for a withdrawn criterion is ignored, never a reason to reject. Include findings and actual journey evidence. Commit repository changes if any, leave runtime deliverables untracked, then `ha done`. Output in another repository belongs in the report.\n", review.id));
     out
 }
+/// Use the content hash as the reviewer's filename: different member names
+/// cannot collide, and identical content travels only once. Missing or corrupt
+/// blobs are described in the member packet, not passed to attachment staging.
+fn pile_attachments(project: &Project, review: &Review) -> BTreeMap<String, String> {
+    let mut attachments = BTreeMap::new();
+    for member in &review.members {
+        if let Ok(lane) = thread::load(project, &member.thread) {
+            for hash in lane.attachments.values() {
+                if !attachments.contains_key(hash) && thread::artifact(project, hash).is_ok() {
+                    attachments.insert(hash.clone(), hash.clone());
+                }
+            }
+        }
+    }
+    attachments
+}
+
 /// This text becomes part of the reviewer's own immutable launch brief. Never
 /// substitute today's task wording for the intent frozen at member launch.
 fn member_packet(project: &Project, member: &Member) -> String {
@@ -865,6 +907,23 @@ fn member_packet(project: &Project, member: &Member) -> String {
         "  Durable evidence: seal `{}` (attempt {}), report artifact `{}`.\n",
         member.event, member.attempt, member.artifact
     );
+    match thread::load(project, &member.thread) {
+        Ok(lane) => {
+            for (name, hash) in &lane.attachments {
+                match thread::artifact(project, hash) {
+                    Ok(_) => out.push_str(&format!(
+                        "  Member attachment: name `{name}`, hash `{hash}`, reviewer-side path `attachments/{hash}` (relative to the directory containing your own brief.md, not the member's checkout).\n"
+                    )),
+                    Err(error) => out.push_str(&format!(
+                        "  Member attachment: name `{name}`, hash `{hash}` — unavailable in the content store ({error}); attachment evidence not established.\n"
+                    )),
+                }
+            }
+        }
+        Err(error) => out.push_str(&format!(
+            "  Member attachments: not established ({error}).\n"
+        )),
+    }
     let brief = thread::load(project, &member.thread).and_then(|lane| {
         let hash = &lane.launch.brief_hash;
         let bytes = thread::artifact(project, hash)?;
@@ -889,6 +948,31 @@ fn member_packet(project: &Project, member: &Member) -> String {
             task.id,
             task.authority.join(", ")
         ));
+        for withdrawal in &task.withdrawn {
+            out.push_str(&format!(
+                "  Withdrawn criterion {}: {} — NOT REQUIRED; must not be judged. Reason: {}. Withdrawn via coordinator `ha task drop` at {}; individual identity not recorded.\n",
+                withdrawal.acceptance,
+                task.acceptance[withdrawal.acceptance - 1],
+                withdrawal.reason,
+                withdrawal.at,
+            ));
+        }
+        if !task.withdrawn.is_empty() {
+            let required = (1..=task.acceptance.len())
+                .filter(|criterion| {
+                    !task
+                        .withdrawn
+                        .iter()
+                        .any(|row| row.acceptance == *criterion)
+                })
+                .map(|criterion| criterion.to_string())
+                .collect::<Vec<_>>()
+                .join(", ");
+            out.push_str(&format!(
+                "  Required acceptance rows for {}: {required} (original numbering; omit withdrawn criteria).\n",
+                task.id
+            ));
+        }
         if let Some(judgment) = &task.acceptance_review {
             out.push_str(&format!(
                 "  Coordinator judgment snapshot: {} at {}; seal {}, report artifact {}\n",
@@ -947,7 +1031,7 @@ fn prepare(ctx: &Ctx, project: &Project, review: &mut Review) -> Result<()> {
         let reviewer = if let Some(t) = unbound.first() {
             t.clone()
         } else {
-            crate::threads::start(
+            crate::threads::start_with_attachments(
                 ctx,
                 &project.slug,
                 crate::threads::StartArgs {
@@ -964,12 +1048,13 @@ fn prepare(ctx: &Ctx, project: &Project, review: &mut Review) -> Result<()> {
                     }),
                     task: task(project, review),
                     workflow: Some("reviewer".into()),
-                    recipe: None,
+                    recipe: crate::journey::reviewer_recipe(project),
                     task_id: String::new(),
                     review_id: review.id.clone(),
                     attach: Vec::new(),
                     paths: Vec::new(),
                 },
+                pile_attachments(project, review),
             )?
         };
         review.reviewer = Some(reviewer.id);
@@ -1015,7 +1100,12 @@ fn verdict(
             "evidence_only requires a whole-pile REJECT for missing review input, not exclusions or MERGE"
         );
     }
+    // Do not trust a reviewer-supplied classification. Persist only the
+    // classification derived from the sealed rows and current withdrawals.
+    verdict.withdrawn_only = false;
     if verdict.verdict == "REJECT" {
+        verdict.withdrawn_only = verdict.without.is_empty()
+            && rejection_only_withdrawn(project, review, &crate::task::report_criteria(&text)?);
         return Ok(verdict);
     }
     if verdict.without.len() == review.members.len() {
@@ -1427,8 +1517,55 @@ fn verify_gate_receipts(
     Ok(())
 }
 
+/// Unknown rows, mixed failures and unreadable records cannot turn a merits
+/// rejection into a retry. Missing required judgments still need a fresh review;
+/// this classification never establishes acceptance or authorizes landing.
+fn rejection_only_withdrawn(
+    project: &Project,
+    review: &Review,
+    criteria: &[crate::contracts::CriterionEvidence],
+) -> bool {
+    let (tasks, errors) = crate::task::list_with_errors(project);
+    if !errors.is_empty() {
+        return false;
+    }
+    let failed = criteria
+        .iter()
+        .filter(|row| !row.established || row.evidence.trim().is_empty())
+        .collect::<Vec<_>>();
+    !failed.is_empty()
+        && failed.iter().all(|row| {
+            review.members.iter().any(|member| {
+                member.thread == row.thread
+                    && member.event == row.event
+                    && tasks.iter().any(|task| {
+                        task.attempts.contains(&member.thread)
+                            && row
+                                .criterion
+                                .checked_sub(1)
+                                .and_then(|index| task.acceptance.get(index))
+                                == Some(&row.condition)
+                            && task
+                                .withdrawn
+                                .iter()
+                                .any(|withdrawal| withdrawal.acceptance == row.criterion)
+                    })
+            })
+        })
+}
+
+impl Verdict {
+    fn needs_fresh_review(&self) -> bool {
+        self.evidence_only || self.withdrawn_only
+    }
+}
+
 fn defer_members(project: &Project, review: &Review) -> Result<()> {
-    if review.verdict.as_ref().is_some_and(|v| v.evidence_only) {
+    if review
+        .verdict
+        .as_ref()
+        .is_some_and(Verdict::needs_fresh_review)
+    {
         return Ok(());
     }
     for member in &review.members {
@@ -1620,7 +1757,9 @@ fn advance(ctx: &Ctx, project: &Project, review: &mut Review) -> Result<()> {
                 .verdict
                 .as_ref()
                 .map(|v| {
-                    if v.evidence_only {
+                    if v.withdrawn_only {
+                        "only withdrawn criteria failed; not a failed review; starting a fresh review of the same members with the corrected packet".into()
+                    } else if v.evidence_only {
                         "review evidence incomplete; members remain eligible for a fresh review"
                             .into()
                     } else {
@@ -1631,7 +1770,8 @@ fn advance(ctx: &Ctx, project: &Project, review: &mut Review) -> Result<()> {
                 .unwrap_or_else(|| "reviewer rejected the pile".into());
             queue_notice(review, format!("REVIEW {} rejected: {reason}", review.id));
             // Merits rejections need new member seals. Missing review input
-            // leaves the original seals eligible for a fresh packet/reviewer.
+            // or judgments of withdrawn criteria leave the original seals
+            // eligible for a fresh packet/reviewer.
             defer_members(project, review)?;
             save(project, review)?;
             crate::threads::resolve_automatically(ctx, project, &reviewer.id, "review rejected");
@@ -1965,6 +2105,16 @@ fn prune_candidate(ctx: &Ctx, review: &Review) -> Result<()> {
     Ok(())
 }
 fn cancel_record(ctx: &Ctx, project: &Project, review: &mut Review, reason: &str) -> Result<()> {
+    cancel_record_with_retention(ctx, project, review, reason, false)
+}
+
+fn cancel_record_with_retention(
+    ctx: &Ctx,
+    project: &Project,
+    review: &mut Review,
+    reason: &str,
+    keep_checkout: bool,
+) -> Result<()> {
     if !review.fast_forward && review.phase == Phase::Landing {
         let git = Git::new(ctx.runner, &review.repo);
         let head = git
@@ -1989,18 +2139,42 @@ fn cancel_record(ctx: &Ctx, project: &Project, review: &mut Review, reason: &str
     review.attention = reason.into();
     save(project, review)?;
     if let Some(id) = &review.reviewer {
-        let outcome = crate::threads::cancel(ctx, &project.slug, id, reason)?;
+        let outcome = if keep_checkout {
+            crate::threads::cancel_preserving_checkout(ctx, &project.slug, id, reason)?
+        } else {
+            crate::threads::cancel(ctx, &project.slug, id, reason)?
+        };
         if outcome.state == "cleanup_pending" {
             bail!("reviewer cancellation cleanup pending: {id}");
         }
     }
     review.close = true;
     save(project, review)?;
-    prune_candidate(ctx, review)?;
-    review.prune = true;
+    if !keep_checkout {
+        prune_candidate(ctx, review)?;
+        review.prune = true;
+    }
     review.phase = Phase::Cancelled;
     save(project, review)
 }
+pub(crate) fn cancel_for_diagnosis(ctx: &Ctx, project: &Project, id: &str) -> Result<()> {
+    let record = load(project, id)?;
+    let _lock = try_operation_lock(ctx, &record.repo)?
+        .context("review operation busy; diagnosis cancellation pending")?;
+    let mut record = load(project, id)?;
+    // A landed review's publication/install remain facts and obligations.
+    if record.phase.closed() || record.fast_forward {
+        return Ok(());
+    }
+    cancel_record_with_retention(
+        ctx,
+        project,
+        &mut record,
+        "journey deadline or failure; retained for diagnosis",
+        true,
+    )
+}
+
 pub(crate) fn cancel(ctx: &Ctx, slug: &str, repo: Option<&str>) -> Result<()> {
     let project = Project::load(&ctx.root, slug)?;
     let row = repository(ctx, &project, repo)?;
@@ -2015,7 +2189,7 @@ pub(crate) fn retry(ctx: &Ctx, slug: &str, repo: Option<&str>) -> Result<Option<
     let row = repository(ctx, &project, repo)?;
     let _lock = operation_lock(ctx, &row.path)?;
     let Some((home, mut record)) = active_for_repo(ctx, &row.path)? else {
-        // A decided evidence-only review closed its reviewer, not its members.
+        // A decided input/withdrawal-only review closed its reviewer, not its members.
         // Start a new review under today's contract rather than reopen a
         // resolved process or erase historical verdict evidence.
         if list(&project)?
@@ -2024,7 +2198,10 @@ pub(crate) fn retry(ctx: &Ctx, slug: &str, repo: Option<&str>) -> Result<Option<
             .find(|review| same_repo(&review.repo, &row.path))
             .is_some_and(|review| {
                 review.phase == Phase::Rejected
-                    && review.verdict.as_ref().is_some_and(|v| v.evidence_only)
+                    && review
+                        .verdict
+                        .as_ref()
+                        .is_some_and(Verdict::needs_fresh_review)
             })
         {
             let events = crate::events::checked(&project)?;
@@ -2073,7 +2250,8 @@ pub(crate) fn retry(ctx: &Ctx, slug: &str, repo: Option<&str>) -> Result<Option<
     // Preserve the reviewer's checkout, conflicts and fixes when replacing its
     // process. Persist the new review phase before a parked lane is reopened.
     if let Some(id) = &record.reviewer {
-        let lane = thread::load(&home, id)?;
+        let attachments = pile_attachments(&home, &record);
+        let lane = thread::update(&home, id, |t| t.attachments = attachments)?;
         // Thread retries normally preserve their frozen launch brief. A review
         // retry deliberately refreshes its contract, while keeping member
         // briefs/seals frozen and preserving the reviewer's checkout.
@@ -2334,7 +2512,11 @@ pub(crate) fn mark_hold_submitted(project: &Project, index: usize) -> Result<()>
     }
     Ok(())
 }
-fn record_holds(project: &Project, current: BTreeMap<String, (String, String)>) -> Result<()> {
+fn record_holds(
+    project: &Project,
+    current: BTreeMap<String, (String, String)>,
+    releases: Vec<String>,
+) -> Result<()> {
     let _lock = project.lock()?;
     let mut holds = load_holds(project)?;
     for (repo, (reason, line)) in &current {
@@ -2349,12 +2531,23 @@ fn record_holds(project: &Project, current: BTreeMap<String, (String, String)>) 
         .into_iter()
         .map(|(repo, (reason, _))| (repo, reason))
         .collect();
-    if holds.current != next {
+    let released = !releases.is_empty();
+    holds
+        .notices
+        .extend(releases.into_iter().map(|line| crate::steps::Notice {
+            line,
+            submitted: false,
+        }));
+    if holds.current != next || released {
         holds.current = next;
         project::write_json(&holds_path(project), &holds)?;
     }
     Ok(())
 }
+// Running non-members may delay a ready pile only this long. Corrections
+// to members remain protected by the active-review hold, without a deadline.
+const READY_PILE_WAIT_SECONDS: i64 = 20 * 60;
+
 fn working_hold(
     lane: &Thread,
     events: &[crate::contracts::Event],
@@ -2364,16 +2557,16 @@ fn working_hold(
         return None;
     }
     let latest = crate::events::latest_event(events, &lane.id, lane.attempt.max(1));
-    if crate::threads::follow_up_pending_for_seal(lane, latest)
+    let follow_up = crate::threads::follow_up_pending_for_seal(lane, latest)
         || lane.follow_ups.iter().any(|f| {
             f.attempt == lane.attempt.max(1)
                 && f.state == thread::FollowUpState::Delivered
                 && latest.is_some_and(|event| f.waiting_event == event.id)
-        })
+        });
+    if !follow_up
+        && latest
+            .is_some_and(|event| event.payload.done.is_some() || event.payload.waiting.is_some())
     {
-        return Some("follow-up pending");
-    }
-    if latest.is_some_and(|event| event.payload.done.is_some() || event.payload.waiting.is_some()) {
         None
     } else {
         // Use the earliest recorded start evidence for this attempt, not a
@@ -2396,7 +2589,11 @@ fn working_hold(
         {
             None
         } else {
-            Some("working")
+            Some(if follow_up {
+                "follow-up pending"
+            } else {
+                "working"
+            })
         }
     }
 }
@@ -2410,6 +2607,15 @@ pub(crate) fn tick_observed(
     ctx: &Ctx,
     project: &Project,
     can_advance: impl Fn(&Review) -> bool,
+) -> Result<()> {
+    tick_observed_at(ctx, project, can_advance, jiff::Timestamp::now())
+}
+
+fn tick_observed_at(
+    ctx: &Ctx,
+    project: &Project,
+    can_advance: impl Fn(&Review) -> bool,
+    now: jiff::Timestamp,
 ) -> Result<()> {
     let enabled = project.state_dir().join("reviews-enabled").exists();
     let mut first = None;
@@ -2447,6 +2653,7 @@ pub(crate) fn tick_observed(
             .push(lane);
     }
     let mut holds = BTreeMap::new();
+    let mut releases = Vec::new();
     for mut pile in piles.into_values() {
         let repo = pile[0].repo.clone();
         if repo.is_empty() {
@@ -2485,11 +2692,21 @@ pub(crate) fn tick_observed(
                     .ok()?;
                 Some(oldest.min(created))
             });
+            let wait_expired = oldest_seal
+                .is_some_and(|seal| now.duration_since(seal).as_secs() >= READY_PILE_WAIT_SECONDS);
+            let mut released = Vec::new();
             let mut blockers: Vec<String> = threads
                 .iter()
                 .filter(|t| same_repo(&t.repo, &repo) && !reviewers.contains(&t.id))
                 .filter_map(|t| {
-                    working_hold(t, &events, oldest_seal).map(|why| format!("{} ({why})", t.id))
+                    let why = working_hold(t, &events, oldest_seal)?;
+                    let label = format!("{} ({why})", t.id);
+                    if wait_expired {
+                        released.push(label);
+                        None
+                    } else {
+                        Some(label)
+                    }
                 })
                 .collect();
             let failed: Vec<_> = threads
@@ -2542,7 +2759,25 @@ pub(crate) fn tick_observed(
                 }
             }
             if let Some(row) = configured {
-                start_locked(ctx, project, row, pile.clone(), &events)?;
+                if start_locked(ctx, project, row, pile.clone(), &events)?.is_some()
+                    && !released.is_empty()
+                {
+                    released.sort();
+                    let name = std::path::Path::new(&repo)
+                        .file_name()
+                        .unwrap_or_default()
+                        .to_string_lossy();
+                    let ready = pile
+                        .iter()
+                        .map(|t| t.id.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    releases.push(format!(
+                        "PILE {name}: {ready} ready; {}-minute wait bound reached; starting review without {}",
+                        READY_PILE_WAIT_SECONDS / 60,
+                        released.join(", ")
+                    ));
+                }
                 Ok(None)
             } else {
                 Ok(Some(unconfigured.join(", ")))
@@ -2583,6 +2818,6 @@ pub(crate) fn tick_observed(
             );
         }
     }
-    record_holds(project, holds)?;
+    record_holds(project, holds, releases)?;
     first.map_or(Ok(()), Err)
 }

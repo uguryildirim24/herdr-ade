@@ -42,6 +42,7 @@ mod harness;
 mod herdr;
 mod hook;
 mod inbox;
+mod journey;
 mod lane;
 mod launch;
 mod lifecycle;

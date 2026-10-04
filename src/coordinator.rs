@@ -394,7 +394,7 @@ pub(crate) fn current_prefix(root: &Path) -> Result<String> {
 }
 
 pub(crate) fn agent_name(slug: &str) -> String {
-    format!("hp-{slug}-coordinator")
+    crate::herdr::project_agent_name(slug, "coordinator")
 }
 
 /// One line, carrying the full prefix, so the coordinator reads no file outside
@@ -746,7 +746,9 @@ pub(crate) fn open(ctx: &Ctx, slug: &str, options: &OpenOptions) -> Result<()> {
                 println!("the priming prompt is pending ({error})");
             }
         }
-        Err(error) if error.code == "command_failed" => return Err(error.into()),
+        Err(error) if !matches!(error.code.as_str(), "timeout" | "agent_not_ready") => {
+            bail!("the coordinator did not start ({error}); retry with `{prefix} open {slug}`");
+        }
         Err(error) => println!(
             "the coordinator agent is not ready yet ({error}). If it shows a dialog, answer it in pane {}; the ticker sends the priming prompt once it is ready.",
             record.pane_id
@@ -767,7 +769,7 @@ pub(crate) fn open(ctx: &Ctx, slug: &str, options: &OpenOptions) -> Result<()> {
 }
 
 /// Keep readiness waits short enough to inspect an already-visible shell failure.
-/// Other startup blocks remain pending for the existing ticker delivery path.
+/// Readiness timeouts remain pending for the existing ticker delivery path.
 fn start_coordinator(
     herdr: &Herdr<'_>,
     name: &str,
@@ -782,13 +784,15 @@ fn start_coordinator(
         agent_args: &launch.args,
         launch_bin: None,
         parent: None,
-        ready_timeout_ms: launch.ready_timeout_ms.min(1_000),
+        ready_timeout_ms: launch
+            .ready_timeout_ms
+            .min(crate::herdr::MIN_AGENT_START_TIMEOUT_MS),
     });
     loop {
         if result.is_ok() {
             return result;
         }
-        if let Ok(screen) = herdr.pane_read_text(pane, "screen")
+        if let Ok(screen) = herdr.pane_read_text(pane, "visible")
             && let Some(line) = screen.lines().find(|line| {
                 line.contains("command not found")
                     || line.contains(": not found")
@@ -802,7 +806,7 @@ fn start_coordinator(
             });
         }
         let error = result.as_ref().unwrap_err();
-        // An interactive block is not a timeout and still needs input in its pane.
+        // Only readiness failures can be polled; other errors need a fresh start.
         if !matches!(error.code.as_str(), "timeout" | "agent_not_ready")
             || started.elapsed().as_millis() >= u128::from(launch.ready_timeout_ms)
         {
@@ -1325,6 +1329,51 @@ mod tests {
     }
 
     #[test]
+    fn fresh_long_project_slug_opens_with_a_valid_registered_name() {
+        use crate::runner::fake::ok;
+        let world = crate::scenarios::World::new();
+        let slug = "a-project-name-long-enough";
+        let project = project::create(&world.root, slug, "", vec![]).unwrap();
+        let name = agent_name(slug);
+        world.runner.on("workspace create", ok(r#"{"result":{"root_pane":{"workspace_id":"w1","tab_id":"w1:t1","pane_id":"w1:p1"}}}"#));
+        world.runner.on("tab rename", ok(r#"{"result":{}}"#));
+        world.runner.on("tab list", ok(r#"{"result":{"tabs":[]}}"#));
+        world.runner.on(
+            "plugin pane open",
+            ok(r#"{"result":{"plugin_pane":{"pane":{"tab_id":"w1:t2"}}}}"#),
+        );
+        world.runner.on("agent prompt", ok(r#"{"result":{}}"#));
+        world.runner.on(
+            "agent start",
+            ok(&serde_json::json!({"result":{"agent": {
+                "pane_id":"w1:p1", "tab_id":"w1:t1", "workspace_id":"w1",
+                "cwd":project.canonical_dir(), "name":name, "agent_status":"idle"
+            }}})
+            .to_string()),
+        );
+        open(
+            &world.ctx(),
+            slug,
+            &OpenOptions {
+                session: SessionFlags {
+                    session: None,
+                    socket: Some(world.home.path().join("fixture.sock")),
+                },
+                reprime: false,
+                rebind: false,
+                recipe: None,
+                recipe_basis: None,
+            },
+        )
+        .unwrap();
+        let record = project.coordinator().unwrap();
+        assert_eq!(record.agent_name, name);
+        assert!(record.agent_name.len() <= 32);
+        assert!(record.prime_sent);
+        assert_eq!(world.runner.count("agent prompt"), 1);
+    }
+
+    #[test]
     fn coordinator_start_surfaces_a_missing_command_without_the_ready_window() {
         use crate::runner::fake::{FakeRunner, fail, ok};
         let runner = FakeRunner::new();
@@ -1348,7 +1397,7 @@ mod tests {
             runner.calls.borrow()[0]
                 .args
                 .windows(2)
-                .any(|args| args == ["--timeout", "1000"])
+                .any(|args| args == ["--timeout", "3001"])
         );
     }
 
@@ -1367,6 +1416,7 @@ mod tests {
         );
         let herdr = Herdr::new("herdr", "/test.sock", &runner);
         let launch = crate::contracts::Launch {
+            kind: "claude".into(),
             ready_timeout_ms: 300_000,
             ..Default::default()
         };
@@ -1644,7 +1694,7 @@ mod tests {
         world.runner.on("workspace create", ok(r#"{"result":{"root_pane":{"workspace_id":"w1","tab_id":"w1:t1","pane_id":"w1:p1"}}}"#));
         world.runner.on(
             "agent start hp-demo-coordinator",
-            crate::runner::fake::timeout(),
+            ok(r#"{"result":{"agent":{"pane_id":"w1:p1","tab_id":"w1:t1","workspace_id":"w1","agent_status":"starting"}}}"#),
         );
         world.runner.on("tab rename", ok(r#"{"result":{}}"#));
         world.runner.on("tab list", ok(r#"{"result":{"tabs":[]}}"#));

@@ -300,6 +300,11 @@ enum ReviewCommand {
 enum HarnessCommand {
     /// Build every repository in `[harness]` and install it, then the saved box
     Install,
+    /// Run the real, bounded post-install journey in a throwaway project
+    Journey {
+        #[arg(long, hide = true)]
+        review: Option<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -1956,6 +1961,13 @@ fn dispatch_with_start(
             )
         }
         Command::Harness { command } => match command {
+            HarnessCommand::Journey { review } => {
+                let review = review
+                    .as_deref()
+                    .map(|value| value.split_once('/').context("expected PROJECT/REVIEW"))
+                    .transpose()?;
+                crate::journey::run(&ctx, review)
+            }
             HarnessCommand::Install => {
                 let result = crate::harness::install(&ctx)?;
                 let failed = result.box_failed();

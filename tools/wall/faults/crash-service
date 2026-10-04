@@ -1,0 +1,45 @@
+#!/usr/bin/env python3
+"""SIGKILL one default-wall service, from its unprivileged SSH account.
+
+The v1 wall has no instance selector. Reject every numbered instance rather
+than routing it to the default sandbox accidentally. Never accepts a PID.
+"""
+import argparse
+from pathlib import Path
+import shlex
+import subprocess
+
+parser = argparse.ArgumentParser(description=__doc__)
+parser.add_argument('--instance', choices=['default'], default='default')
+parser.add_argument('--box', action='store_true')
+parser.add_argument('service', choices=['server', 'ticker'])
+args = parser.parse_args()
+wall = Path(__file__).resolve().parents[1] / 'wall'
+code = r'''
+import os, pathlib, signal
+home = pathlib.Path(os.environ['HOME'])
+assert str(home) in ('/home/wall', '/home/wall/box') and os.geteuid() != 0
+service = SERVICE
+binary = home / 'bin' / ('herdr' if service == 'server' else 'herdr-ade')
+matches = []
+for proc in pathlib.Path('/proc').glob('[0-9]*'):
+    try:
+        if proc.stat().st_uid != os.getuid() or (proc/'exe').resolve() != binary:
+            continue
+        argv = (proc/'cmdline').read_bytes().split(b'\0')
+        env = dict(row.split(b'=', 1) for row in (proc/'environ').read_bytes().split(b'\0') if b'=' in row)
+        if env.get(b'HOME') != str(home).encode():
+            continue
+        wanted = b'server' in argv if service == 'server' else b'run' in argv and b'ticker' in argv
+        if wanted:
+            matches.append((int(proc.name), argv))
+    except (FileNotFoundError, PermissionError, ProcessLookupError):
+        pass
+assert len(matches) == 1, matches
+pid, argv = matches[0]
+os.kill(pid, signal.SIGKILL)
+print('INJECTED SIGKILL', service, 'pid=', pid, 'home=', home, 'argv=', argv)
+'''.replace('SERVICE', repr(args.service))
+command = ['sudo', str(wall), 'enter', *(['--box'] if args.box else []),
+           'python3 -c ' + shlex.quote(code)]
+subprocess.run(command, check=True)

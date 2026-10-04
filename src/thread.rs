@@ -88,6 +88,8 @@ pub(crate) struct RetirementRequest {
     pub skip_copy: bool,
     pub discard_uncopied: bool,
     pub keep_pane: bool,
+    /// Stop processes but retain the checkout/ref and build evidence for diagnosis.
+    pub keep_checkout: bool,
 }
 
 /// `threads/<id>.toml`. An empty string means "not set". Paths are stored as
@@ -261,9 +263,12 @@ impl Thread {
     pub(crate) fn retirement_request(&self, mut request: RetirementRequest) -> RetirementRequest {
         if let Some(saved) = &self.retirement {
             if saved.authority == RetirementAuthority::Retained {
-                return saved.clone();
+                let mut pinned = saved.clone();
+                pinned.keep_checkout |= request.keep_checkout;
+                return pinned;
             }
             request.preserved = saved.preserved;
+            request.keep_checkout |= saved.keep_checkout;
         }
         request
     }
@@ -385,9 +390,15 @@ pub(crate) fn load(project: &Project, id: &str) -> Result<Thread> {
     #[cfg(test)]
     THREAD_READS.with(|count| count.set(count.get() + 1));
     let text = std::fs::read_to_string(&path)
-        .with_context(|| format!("no thread `{id}` in `{}`", project.slug))?;
+        .with_context(|| format!("could not read thread `{id}` at {}", path.display()))?;
     let mut record: Thread =
         toml::from_str(&text).with_context(|| format!("{} does not parse", path.display()))?;
+    anyhow::ensure!(
+        record.id == id,
+        "{} is incomplete or has a mismatched id: expected `{id}`, found `{}`",
+        path.display(),
+        record.id
+    );
     // Historical pins lived in prose. Decode once at the record boundary;
     // execution and ref verification only consume the typed request.
     if record.retirement.is_none()
@@ -432,7 +443,9 @@ pub(crate) fn list_with_errors(project: &Project) -> (Vec<Thread>, Vec<anyhow::E
         };
         match load(project, id) {
             Ok(thread) => threads.push(thread),
-            Err(error) => errors.push(error),
+            Err(error) => {
+                errors.push(error.context(format!("unreadable {}", entry.path().display())))
+            }
         }
     }
     threads.sort_by(|a, b| a.id.cmp(&b.id));
@@ -495,6 +508,20 @@ pub(crate) fn snapshot(project: &Project) -> std::rc::Rc<Vec<Thread>> {
             })
         })
         .unwrap_or_else(|| std::rc::Rc::new(list_with_errors(project).0))
+}
+
+/// Read failures are evidence too; use the ticker cache without discarding them.
+pub(crate) fn read_errors(project: &Project) -> Vec<anyhow::Error> {
+    TICKER_LISTS
+        .with(|cache| {
+            cache.borrow_mut().as_mut().map(|cache| {
+                cache
+                    .records
+                    .read(threads_dir(project), |id| load(project, id))
+                    .1
+            })
+        })
+        .unwrap_or_else(|| list_with_errors(project).1)
 }
 
 pub(crate) fn list(project: &Project) -> Vec<Thread> {
@@ -673,7 +700,7 @@ pub(crate) fn branch_name(slug: &str, id: &str, title: &str) -> String {
 }
 
 pub(crate) fn agent_name(slug: &str, id: &str) -> String {
-    format!("hp-{slug}-{id}")
+    crate::herdr::project_agent_name(slug, id)
 }
 
 /// `<agent working directory>/.herdr-project/<slug>-<id>`, for every kind.

@@ -237,13 +237,17 @@ fn one_agent_start_per_project_per_tick_and_missing_agent_state_stays_unknown() 
     let project = world.project("demo", "a.sock");
     let cwd = world.home.path().to_path_buf();
     let cwd_text = cwd.to_string_lossy().into_owned();
-    world.thread(&project, &cwd, |t| t.prompt_pending = true);
+    world.thread(&project, &cwd, |t| {
+        t.prompt_pending = true;
+        t.launch.kind = "claude".into();
+    });
     let second = thread::allocate(&project, |t| {
         t.status = Status::Open;
         t.kind = Kind::Tab;
         t.prompt_pending = true;
         t.agent = "claude".into();
         t.agent_name = "hp-demo-t-0002".into();
+        t.launch.kind = "claude".into();
         t.workspace_id = "w1".into();
         t.tab_id = "w1:t2".into();
         t.pane_id = "w1:p2".into();
@@ -2273,10 +2277,7 @@ fn a_project_recipe_is_stored_and_used_again_for_a_coordinator_relaunch() {
     *world.panes.borrow_mut() = format!("[{}]", world.coordinator_pane(&project));
     world.runner.on(
         "agent start hp-demo-coordinator",
-        fail(
-            1,
-            r#"{"error":{"code":"timeout","message":"still starting"}}"#,
-        ),
+        ok(r#"{"result":{"agent":{"pane_id":"w1:p1","tab_id":"w1:t1","workspace_id":"w1","agent_status":"starting"}}}"#),
     );
 
     let mut options = crate::coordinator::OpenOptions {
@@ -2353,10 +2354,7 @@ fn open_reopens_a_closed_coordinator_and_a_new_message_requests_reopen() {
     );
     world.runner.on(
         "agent start hp-demo-coordinator",
-        fail(
-            1,
-            r#"{"error":{"code":"timeout","message":"still starting"}}"#,
-        ),
+        ok(r#"{"result":{"agent":{"pane_id":"w2:p1","tab_id":"w2:t1","workspace_id":"w2","agent_status":"starting"}}}"#),
     );
     world.runner.on("tab list", ok(r#"{"result":{"tabs":[]}}"#));
     world.runner.on(
@@ -2548,6 +2546,10 @@ fn harness_install_runs_the_box_steps_only_when_buildbox_is_saved() {
     with_box
         .runner
         .on("--version", ok(&format!("herdr-ade {}\n", crate::VERSION)));
+    with_box.runner.on(
+        "ADE execution prerequisites",
+        ok("bounded: provisioning=ok; doctor namespace probe passed\n"),
+    );
     with_box.runner.on("ssh", ok(""));
     with_box.runner.on(
         "machine list --json",
@@ -2556,8 +2558,8 @@ fn harness_install_runs_the_box_steps_only_when_buildbox_is_saved() {
     let outcome = crate::harness::install(&with_box.ctx()).unwrap();
     assert_eq!(
         with_box.runner.count("ssh"),
-        5,
-        "one box build per repo plus lane settings, the pi guard, and the running-process check: {outcome:?}"
+        6,
+        "one box prerequisite/probe, build per repo, lane settings, pi guard, and running-process check: {outcome:?}"
     );
     let calls = with_box.runner.calls.borrow();
     let local_guard = calls

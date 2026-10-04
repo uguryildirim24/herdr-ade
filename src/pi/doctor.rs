@@ -1194,6 +1194,28 @@ args = ["--provider=opencode-go", "--model=deepseek-custom", "--thinking=low", "
     }
 
     #[test]
+    fn doctor_reports_the_owned_empty_provider_even_for_codex_and_setup_clears_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let layout = installed_layout(dir.path());
+        let env = Env::for_test(dir.path(), &[]);
+        link_into(&env, &layout);
+        let original = r#"{"providers":{"opencode-go":{"modelOverrides":{}}}}"#;
+        std::fs::write(layout.models(), original).unwrap();
+        let runner = scripted(&env);
+        runner.on("auth check", ok(r#"{"status":"ready"}"#));
+        let rows =
+            doctor_rows_with_models(&env, &layout, &runner, &[("openai-codex", "gpt-6.1-sol")]);
+        assert!(rows.iter().any(|row| row.level == Level::Fail
+            && row.detail.contains("exactly-empty")
+            && row.detail.contains("herdr-pi setup")));
+        assert_eq!(std::fs::read_to_string(layout.models()).unwrap(), original);
+        provider::write_overrides(&layout.models(), &[]).unwrap();
+        let rows =
+            doctor_rows_with_models(&env, &layout, &runner, &[("openai-codex", "gpt-6.1-sol")]);
+        assert!(healthy(&rows), "{rows:?}");
+    }
+
+    #[test]
     fn a_caret_pin_and_a_true_trust_entry_fail() {
         let dir = tempfile::tempdir().unwrap();
         let layout = installed_layout(dir.path());

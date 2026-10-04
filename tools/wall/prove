@@ -1,0 +1,93 @@
+#!/bin/bash
+# Live oci proof. Runtime evidence stays outside git and outside the full disk.
+set -euo pipefail
+if [[ $EUID != 0 ]]; then echo 'Run sudo tools/wall/wall [--instance N] prove <new evidence dir> <alternate build dir>' >&2; exit 2; fi
+instance=0
+if [[ ${1:-} == --instance ]]; then instance=${2:?instance}; shift 2; fi
+[[ $instance =~ ^[0-8]$ ]] || { echo 'instance must be 0..8' >&2; exit 2; }
+controller=$(dirname "$(readlink -f "$0")")/wall
+wall() {
+  if [[ $1 == enter ]]; then
+    local command="${@: -1}"
+    if [[ ${2:-} == --box ]]; then
+      set -- enter --box "set -e; $command"
+    else
+      set -- enter "set -e; $command"
+    fi
+  fi
+  if [[ $instance == 0 ]]; then "$controller" "$@"; else "$controller" --instance "$instance" "$@"; fi
+}
+machine=wall-box
+if [[ $instance != 0 ]]; then machine=wall-box-$instance; fi
+evidence=$(realpath -m "${1:?new evidence directory}")
+alternate=$(realpath "${2:?alternate build directory}")
+mkdir "$evidence"
+snapshot() {
+  date -u
+  ls -la /home/ubuntu/.herdr-ade
+  ls -ld /home/ubuntu/.config/herdr /home/ubuntu/.config/herdr/herdr.sock
+  ps -u ubuntu -o pid,lstart,comm | grep -E 'herdr|node|pi' || true
+}
+snapshot > "$evidence/ubuntu-before.txt"
+for fault in ${WALL_PROVE_FAULTS:-kill-pane kill-process ticker disconnect reboot fill corrupt clock install}; do
+  dir="$evidence/$fault"
+  mkdir "$dir"
+  exec 3>&1
+  {
+    set -x
+    wall reset
+    wall enter 'id; test ! -e /home/ubuntu && test ! -r /root/.ssh && findmnt -n -o TARGET,FSTYPE,SIZE --target "$HOME" && findmnt -n -o TARGET,FSTYPE,SIZE --target /tmp && git -C "$HOME/repo" remote -v && ha ticker status'
+    if [[ $fault == disconnect || $fault == reboot ]]; then
+      wall enter 'python3 "$HOME/tools/guest.py" remote-lane'
+      wall enter --box 'python3 "$HOME/tools/guest.py" wait t-0001 before-seal; herdr agent list; ha ticker status'
+    else
+      if [[ $fault == kill-process ]]; then
+        wall enter 'printf "%s\n" "{\"hold\":[\"before-seal\"],\"seal_delay_ms\":5000}" > "$HOME/control.json"'
+      fi
+      wall enter 'python3 "$HOME/tools/guest.py" lane; python3 "$HOME/tools/guest.py" wait t-0001 before-seal; herdr agent list'
+    fi
+    case $fault in
+      kill-pane) wall fault kill-pane t-0001 --when t-0001 before-seal ;;
+      kill-process)
+        wall enter 'touch "$HOME/release/before-seal"'
+        wall fault kill-process t-0001 seal --when t-0001 seal-helper
+        ;;
+      ticker) wall fault ticker --when t-0001 before-seal ;;
+      disconnect)
+        wall fault disconnect 3 & injector=$!
+        sleep 0.5
+        wall enter "timeout 1 ssh $machine true" && exit 1 || test $? = 1
+        wait "$injector"
+        wall enter --box 'python3 "$HOME/tools/guest.py" wait t-0001 before-seal; herdr agent list'
+        ;;
+      reboot)
+        wall fault reboot 1
+        wall enter --box 'herdr agent list; ha ticker status; git -C "$HOME/repo/.worktrees/t-0001" log -1 --oneline'
+        ;;
+      fill)
+        wall fault fill --when t-0001 before-seal
+        wall enter 'df -h "$HOME"; printf x > "$HOME/should-fail"' && exit 1 || test $? = 1
+        wall enter 'rm "$HOME/disk-full"; df -h "$HOME"'
+        ;;
+      corrupt)
+        wall fault corrupt .state/threads/t-0001.toml garbage --when t-0001 before-seal
+        wall enter 'ha overview wall'
+        wall enter 'ha thread show wall t-0001' && exit 1 || test $? = 1
+        ;;
+      clock) wall fault clock 3600 --when t-0001 before-seal ;;
+      install)
+        wall enter 'ha --version; sha256sum "$HOME/bin/herdr-ade"'
+        wall fault install "$alternate" --when t-0001 before-seal
+        wall enter 'ha --version; sha256sum "$HOME/bin/herdr-ade"; herdr agent list'
+        ;;
+    esac
+    wall evidence "$dir/capture"
+    snapshot > "$dir/ubuntu-after.txt"
+    set +x
+  } > "$dir/commands.log" 2>&1
+  echo "instance $instance $fault: injected and evidence captured" >&3
+  exec 3>&-
+done
+snapshot > "$evidence/ubuntu-after.txt"
+wall reset > "$evidence/final-reset.log" 2>&1
+echo "Proof artifacts: $evidence"

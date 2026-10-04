@@ -528,13 +528,14 @@ fn record_bootstrap(binding: &Binding, launch: &project::LaunchEnv, pane: String
             return Ok(());
         }
         // Parking keeps the attempt and frozen task, but a fresh reopen earns
-        // a receipt for the newly bound pane. The binding above, not the old
-        // receipt's pane, is authority for that process.
+        // a receipt for the newly bound pane. Review retry also deliberately
+        // refreshes the packet within the same attempt. The validated binding
+        // above, not the previous receipt, authenticates that review packet.
         if receipt.attempt > attempt
             || (receipt.attempt == attempt
                 && (receipt.project != project
                     || receipt.thread != thread
-                    || receipt.brief_hash != brief_hash))
+                    || (receipt.brief_hash != brief_hash && lane.role != "reviewer")))
         {
             bail!("bootstrap_mismatch: a different receipt is already recorded");
         }
@@ -639,6 +640,75 @@ mod tests {
         assert_eq!(bounded_waiting("  need\nhelp\0 ").unwrap(), "needhelp");
         assert!(bounded_waiting("\n\0").is_err());
         assert!(bounded_waiting(&"x".repeat(501)).is_err());
+    }
+
+    #[test]
+    fn refreshed_review_packets_replace_only_a_current_authenticated_receipt() {
+        for remote in [false, true] {
+            for role in ["lane", "reviewer"] {
+                let world = crate::scenarios::World::new();
+                let project = world.project("demo", "a.sock");
+                let lane = world.thread(&project, world.home.path(), |t| {
+                    t.role = role.into();
+                    t.launch.brief_hash = "rebuilt-packet".into();
+                });
+                let dir = project.state_dir().join("bootstrap");
+                std::fs::create_dir_all(&dir).unwrap();
+                let path = dir.join(format!("{}.json", lane.id));
+                let mut receipt = BootstrapReceipt {
+                    project: project.slug.clone(),
+                    thread: lane.id.clone(),
+                    attempt: lane.attempt.max(1),
+                    brief_hash: "previous-packet".into(),
+                    pane: "old:pane".into(),
+                    acknowledged: project::now(),
+                };
+                project::write_json(&path, &receipt).unwrap();
+                let launch = project::LaunchEnv {
+                    project: project.slug.clone(),
+                    thread: lane.id.clone(),
+                    attempt: lane.attempt.max(1),
+                    brief_hash: lane.launch.brief_hash.clone(),
+                };
+                let binding = Binding {
+                    project,
+                    thread: lane.clone(),
+                    card: remote.then(LaneCard::default),
+                };
+                let stale = project::LaunchEnv {
+                    brief_hash: "previous-packet".into(),
+                    ..launch.clone()
+                };
+                assert!(record_bootstrap(&binding, &stale, lane.pane_id.clone()).is_err());
+                assert!(record_bootstrap(&binding, &launch, "old:pane".into()).is_err());
+                for mismatch in ["project", "thread", "newer-attempt"] {
+                    let mut wrong = BootstrapReceipt {
+                        project: receipt.project.clone(),
+                        thread: receipt.thread.clone(),
+                        attempt: receipt.attempt,
+                        brief_hash: receipt.brief_hash.clone(),
+                        pane: receipt.pane.clone(),
+                        acknowledged: receipt.acknowledged.clone(),
+                    };
+                    match mismatch {
+                        "project" => wrong.project = "other".into(),
+                        "thread" => wrong.thread = "other".into(),
+                        _ => wrong.attempt += 1,
+                    }
+                    project::write_json(&path, &wrong).unwrap();
+                    assert!(record_bootstrap(&binding, &launch, lane.pane_id.clone()).is_err());
+                }
+                project::write_json(&path, &receipt).unwrap();
+                let result = record_bootstrap(&binding, &launch, lane.pane_id.clone());
+                assert_eq!(result.is_ok(), role == "reviewer");
+                if role == "reviewer" {
+                    receipt = project::read_json(&path).unwrap();
+                    assert_eq!(receipt.brief_hash, "rebuilt-packet");
+                    assert_eq!(receipt.pane, lane.pane_id);
+                    record_bootstrap(&binding, &launch, lane.pane_id.clone()).unwrap();
+                }
+            }
+        }
     }
 
     #[test]

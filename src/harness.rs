@@ -23,6 +23,7 @@ pub(crate) const DEVELOPER_DIR: &str = "/Library/Developer/CommandLineTools";
 
 const BUILD_TIMEOUT: Duration = Duration::from_secs(1800);
 const BOX_BUILD_TIMEOUT: Duration = Duration::from_secs(3600);
+const BOX_PREREQUISITE_TIMEOUT: Duration = Duration::from_secs(300);
 const INSTALL_TIMEOUT: Duration = Duration::from_secs(120);
 const VERSION_TIMEOUT: Duration = Duration::from_secs(30);
 const PROCESS_WAIT: Duration = Duration::from_secs(5);
@@ -391,6 +392,7 @@ pub(crate) struct BoxInstall {
     pub(crate) machine: String,
     pub(crate) target: String,
     pub(crate) settings_installed: bool,
+    pub(crate) execution: String,
     pub(crate) errors: Vec<InstallFailure>,
     pub(crate) process: ProcessProof,
 }
@@ -435,6 +437,12 @@ impl InstallOutcome {
                 } else {
                     "pending"
                 }
+            ));
+        }
+        for result in &self.boxes {
+            message.push_str(&format!(
+                "execution {}: {}\n",
+                result.machine, result.execution
             ));
         }
         for hook in &self.coordinator_hooks {
@@ -1189,6 +1197,60 @@ fn refresh_box_guard(ctx: &Ctx, target: &str, machine: &remote::MachineDeclarati
     Ok(())
 }
 
+/// The same exact argv as doctor. Paths are fixed in production; parameters
+/// let the rootless provisioning regression use private package/profile stubs.
+fn execution_prerequisite_script(bwrap: &str, profile: &str) -> String {
+    let probe = crate::doctor::execution_probe_command("allowed");
+    let command = std::iter::once(bwrap)
+        .chain(probe.args.iter().map(String::as_str))
+        .map(remote::quote)
+        .collect::<Vec<_>>()
+        .join(" ");
+    include_str!("../assets/linux-execution-prerequisites.sh")
+        .replace("__BWRAP__", &remote::quote(bwrap))
+        .replace("__PROFILE__", &remote::quote(profile))
+        .replace("__PROBE__", &command)
+}
+
+fn provision_box_execution(ctx: &Ctx, machine: &remote::MachineDeclaration) -> String {
+    let script = remote::with_path(
+        &machine.path,
+        &execution_prerequisite_script("/usr/bin/bwrap", "/etc/apparmor.d/ade-bwrap"),
+    );
+    match remote::ssh(
+        ctx.runner,
+        &machine.target,
+        &script,
+        None,
+        BOX_PREREQUISITE_TIMEOUT,
+    ) {
+        Ok(output) if output.success() => {
+            let lines: Vec<_> = output.stdout.lines().collect();
+            let Some(index) = lines
+                .iter()
+                .rposition(|line| line.starts_with("bounded:") || line.starts_with("advisory:"))
+            else {
+                return "advisory: prerequisite/probe observation missing".into();
+            };
+            // Keep package chatter out of the coordinator notice, but retain
+            // provisioning facts and actual probe/provisioning failure reasons.
+            std::iter::once(lines[index])
+                .chain(lines[..index].iter().copied().filter(|line| {
+                    line.starts_with("bubblewrap ") || line.starts_with("AppArmor ")
+                }))
+                .chain(lines[index + 1..].iter().copied())
+                .chain(output.stderr.lines())
+                .collect::<Vec<_>>()
+                .join("; ")
+        }
+        Ok(output) => format!(
+            "advisory: prerequisite/probe provisioning failed: {}",
+            output.error_text()
+        ),
+        Err(error) => format!("advisory: prerequisite/probe provisioning unavailable: {error:#}"),
+    }
+}
+
 fn install_box(
     ctx: &Ctx,
     label: &str,
@@ -1365,6 +1427,7 @@ fn install_for(ctx: &Ctx, current: Option<(&str, &str)>) -> Result<InstallOutcom
             machine: label.clone(),
             target: String::new(),
             settings_installed: false,
+            execution: "advisory: machine not reached for prerequisite provisioning".into(),
             errors: Vec::new(),
             process: ProcessProof::Unknown {
                 machine: label.clone(),
@@ -1378,6 +1441,7 @@ fn install_for(ctx: &Ctx, current: Option<(&str, &str)>) -> Result<InstallOutcom
                 result.target = profile.target.clone();
                 machine.target = profile.target.clone();
                 machine.id = profile.id.clone();
+                result.execution = provision_box_execution(ctx, &machine);
                 let mut box_plugin_installed = false;
                 for ((repo, kind), installed_repo) in repos.iter().zip(&kinds).zip(&mut installed) {
                     if let Some(box_path) = box_repo_path(&machine, repo) {
@@ -1449,6 +1513,26 @@ fn install_for(ctx: &Ctx, current: Option<(&str, &str)>) -> Result<InstallOutcom
     checks.result = format!("installed on {}; {}", machines.join(", "), checks.summary());
     if boxes.iter().any(BoxInstall::pending) {
         checks.result.push_str("; boxes pending");
+    }
+    checks
+        .result
+        .push_str("; ticker first full pass pending; journey pending");
+    if let Err(error) = crate::journey::after_install(ctx, current) {
+        checks
+            .result
+            .push_str(&format!("; post-install checks FAIL: {error:#}"));
+        if let Err(delivery) = crate::journey::launch_failed(ctx, current, &error) {
+            checks
+                .result
+                .push_str(&format!("; journey notice pending: {delivery:#}"));
+        }
+    }
+    for result in &boxes {
+        checks.result.push_str(&format!(
+            "; execution {}: {}",
+            result.machine,
+            result.execution.replace('\n', "; ")
+        ));
     }
     checks.record(&ctx.config_dir)?;
     Ok(InstallOutcome {
@@ -1593,6 +1677,7 @@ mod tests {
             machine: "buildbox".into(),
             target: "box".into(),
             settings_installed: true,
+            execution: "bounded: fixture".into(),
             errors: vec![],
             process: proof,
         });
@@ -2130,6 +2215,95 @@ mod tests {
     }
 
     #[test]
+    fn execution_prerequisites_are_idempotent_and_probe_failures_do_not_stop_install() {
+        let root = tempfile::tempdir().unwrap();
+        let bin = root.path().join("bin");
+        std::fs::create_dir(&bin).unwrap();
+        let executable = |name: &str, body: &str| {
+            let path = bin.join(name);
+            std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        };
+        executable("uname", "echo Linux");
+        executable(
+            "sudo",
+            "echo \"sudo:$*\" >> \"$MOCK_LOG\"; test \"$1\" = -n && shift; exec \"$@\"",
+        );
+        executable(
+            "apt-get",
+            "echo \"apt:$*\" >> \"$MOCK_LOG\"; if [ \"$1\" = install ]; then cp \"$MOCK_TEMPLATE\" \"$MOCK_BINARY\"; chmod 0755 \"$MOCK_BINARY\"; fi",
+        );
+        executable("apparmor_parser", "echo \"parser:$*\" >> \"$MOCK_LOG\"");
+        executable(
+            "probe-template",
+            "echo \"probe:$*\" >> \"$MOCK_LOG\"; if [ \"$MOCK_DENY\" = 1 ]; then echo 'user namespaces denied' >&2; exit 1; fi",
+        );
+        let binary = bin.join("bwrap");
+        let profile = root.path().join("apparmor.d/ade-bwrap");
+        let enabled = root.path().join("apparmor-enabled");
+        std::fs::write(&enabled, "Y\n").unwrap();
+        let script =
+            execution_prerequisite_script(binary.to_str().unwrap(), profile.to_str().unwrap())
+                .replace(
+                    "/sys/module/apparmor/parameters/enabled",
+                    enabled.to_str().unwrap(),
+                );
+        let run = |deny: bool| {
+            let output = std::process::Command::new("sh")
+                .args(["-c", &script])
+                .env("PATH", format!("{}:/usr/bin:/bin", bin.display()))
+                .env("MOCK_LOG", root.path().join("log"))
+                .env("MOCK_TEMPLATE", bin.join("probe-template"))
+                .env("MOCK_BINARY", &binary)
+                .env("MOCK_DENY", if deny { "1" } else { "0" })
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            String::from_utf8(output.stdout).unwrap()
+        };
+        assert!(run(false).contains("bounded: provisioning=ok; doctor namespace probe passed"));
+        let before = std::fs::metadata(&profile).unwrap().modified().unwrap();
+        let second = run(false);
+        assert!(second.contains("bubblewrap already installed"));
+        assert!(second.contains("AppArmor profile already installed"));
+        assert_eq!(
+            std::fs::metadata(&profile).unwrap().modified().unwrap(),
+            before
+        );
+        let policy = std::fs::read_to_string(&profile).unwrap();
+        assert!(policy.contains("profile ade_bwrap /usr/bin/bwrap flags=(unconfined)"));
+        assert!(policy.contains("userns,"));
+        let failed = run(true);
+        assert!(failed.contains("advisory: provisioning=ok; doctor namespace probe failed"));
+        assert!(failed.contains("user namespaces denied"));
+        let log = std::fs::read_to_string(root.path().join("log")).unwrap();
+        assert_eq!(
+            log.lines()
+                .filter(|line| line.starts_with("apt:install"))
+                .count(),
+            1
+        );
+        assert_eq!(
+            log.lines()
+                .filter(|line| line.starts_with("parser:"))
+                .count(),
+            3
+        );
+        let expected = format!(
+            "probe:{}",
+            crate::doctor::execution_probe_command("allowed")
+                .args
+                .join(" ")
+        );
+        assert_eq!(log.lines().filter(|line| *line == expected).count(), 3);
+        assert!(!script.contains("sysctl -w"));
+    }
+
+    #[test]
     fn install_visits_both_declared_boxes_even_when_first_build_fails() {
         // Separate installs must not reuse a lock briefly inherited by a
         // concurrently forked child from another test.
@@ -2183,6 +2357,8 @@ mod tests {
                     let display = cmd.display();
                     if fail_first && display.contains("alpha") && display.contains("git fetch") {
                         Ok(fail(1, "fetch failed"))
+                    } else if display.contains("ADE execution prerequisites") {
+                        Ok(ok("bubblewrap already installed\nAppArmor profile loaded; global restriction unchanged\nbounded: provisioning=ok; doctor namespace probe passed\n"))
                     } else if display.contains("ticker status") {
                         Ok(ok(&current_receipt()))
                     } else if display.contains("git fetch") {
@@ -2228,7 +2404,12 @@ mod tests {
                         && r.path == "/home/beta/fork")
             );
             assert_eq!(runner.count("git fetch"), 2);
-            assert!(outcome.boxes.iter().all(|b| b.settings_installed));
+            assert_eq!(runner.count("ADE execution prerequisites"), 2);
+            assert!(outcome.boxes.iter().all(|b| b.settings_installed && b.execution.contains("namespace probe passed")));
+            for label in ["alpha", "beta"] {
+                assert!(outcome.message().contains(&format!("execution {label}:")));
+                assert!(outcome.summary().contains(&format!("execution {label}:")));
+            }
         }
     }
 
@@ -2583,6 +2764,7 @@ mod tests {
             machine: "buildbox".into(),
             target: "box".into(),
             settings_installed: true,
+            execution: "bounded: fixture".into(),
             errors: vec![],
             process: proofs,
         };

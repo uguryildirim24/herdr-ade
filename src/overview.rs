@@ -94,6 +94,100 @@ mod tests {
     use crate::scenarios::World;
 
     #[test]
+    fn unreadable_lane_records_survive_the_shared_overview_handoff_and_rundown_view() {
+        for damaged in [
+            "not valid TOML at all!",
+            "id = \"t-0001\"\ntitle = \"cut",
+            "",
+            "title = \"missing id\"",
+        ] {
+            let world = World::new();
+            let project = world.project("demo", "a.sock");
+            let bad = world.thread(&project, world.home.path(), |_| {});
+            let good = world.thread(&project, world.home.path(), |t| {
+                t.title = "Readable lane".into();
+            });
+            let path = crate::thread::threads_dir(&project).join(format!("{}.toml", bad.id));
+            std::fs::write(&path, damaged).unwrap();
+            let counts = crate::plan::counts(&project).unwrap();
+            let error = format!("{:#}", crate::thread::load(&project, &bad.id).unwrap_err());
+            assert!(error.contains(&path.display().to_string()));
+            for history in [None, Some(10), Some(usize::MAX)] {
+                let view =
+                    crate::project_view::View::load(&world.ctx(), &project, history).unwrap();
+                // This exact section is rendered by overview and handed to
+                // handoff's budgeter; neither may silently render None.
+                let work = view
+                    .sections
+                    .iter()
+                    .find(|s| s.name == "Current work")
+                    .unwrap();
+                assert_eq!(work.rows.len(), 2);
+                let text = work.render();
+                assert!(text.contains("Unreadable lane"), "{text}");
+                assert!(text.contains(&path.display().to_string()), "{text}");
+                assert!(
+                    text.contains(&crate::project_view::one_line(&error)),
+                    "{text}"
+                );
+                assert!(
+                    text.contains(&good.id) && text.contains("Readable lane"),
+                    "{text}"
+                );
+                assert!(!text.contains("None."), "{text}");
+                let rundown = view.rundown();
+                assert!(rundown["actions"].to_string().contains("Unreadable lane"));
+                assert!(rundown["actions"].to_string().contains("Readable lane"));
+                assert!(rundown["work"].as_str().unwrap().contains("1 unreadable"));
+                assert_eq!(crate::plan::counts(&project).unwrap(), counts);
+            }
+        }
+    }
+
+    #[test]
+    fn reviewer_first_readiness_check_stays_starting_without_an_observation() {
+        for remote in [false, true] {
+            let world = World::new();
+            let project = world.project("demo", "a.sock");
+            let lane = world.thread(&project, world.home.path(), |t| {
+                t.role = "reviewer".into();
+                t.status = thread::Status::Starting;
+                t.startup_wait_started = project::now();
+                if remote {
+                    t.machine = "oci".into();
+                }
+            });
+            let view = crate::project_view::View::load(&world.ctx(), &project, None).unwrap();
+            assert_eq!(view.lanes[0].group, thread::Group::Working);
+            assert!(
+                view.render(&["Current work"])
+                    .contains("starting (checking agent readiness)")
+            );
+            assert!(!view.render(&["Current work"]).contains("[Unknown]"));
+            assert!(view.work_summary().contains("1 starting"));
+            assert!(!view.work_summary().contains("unknown"));
+            // Recorded-only context must agree with the live projection.
+            let view = crate::project_view::View::capture(
+                &project,
+                &project::Settings::default(),
+                None,
+                None,
+            );
+            assert_eq!(view.lanes[0].group, thread::Group::Working);
+            assert!(view.work_summary().contains("1 starting"));
+            // A real failed remote observation isn't a first check pending.
+            if remote {
+                crate::thread::update(&project, &lane.id, |t| {
+                    t.observation_error = "connection lost".into()
+                })
+                .unwrap();
+                let view = crate::project_view::View::load(&world.ctx(), &project, None).unwrap();
+                assert_eq!(view.lanes[0].group, thread::Group::Unknown);
+            }
+        }
+    }
+
+    #[test]
     fn attention_uses_failure_evidence_not_a_stored_pane_as_a_personal_request() {
         let world = World::new();
         let project = world.project("demo", "a.sock");

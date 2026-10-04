@@ -1,0 +1,62 @@
+#!/usr/bin/env python3
+"""Pause only the default wall-box SSH transports, not its agents or server.
+
+Unlike v1's disconnect fault, tolerate a short-lived SSH child disappearing
+while the target list is collected. Linux pidfds also prevent signaling a
+recycled PID. Takes no unit, port, account, path or PID from the caller.
+"""
+import argparse
+import os
+from pathlib import Path
+import signal
+import subprocess
+import time
+
+parser = argparse.ArgumentParser(description=__doc__)
+parser.add_argument('--instance', choices=['default'], default='default')
+parser.add_argument('seconds', type=float)
+args = parser.parse_args()
+if os.geteuid() != 0:
+    parser.error('run with sudo on the host')
+if not 0 <= args.seconds <= 300:
+    parser.error('seconds must be 0..300')
+unit = 'herdr-wall-22286.service'
+cgroup = subprocess.check_output(['systemctl', 'show', '-p', 'ControlGroup',
+                                  '--value', unit], text=True).strip()
+if cgroup != '/system.slice/' + unit:
+    raise RuntimeError(f'default sandbox unit is not running in its fixed cgroup: {cgroup!r}')
+held = []
+try:
+    for file in (Path('/sys/fs/cgroup') / cgroup.lstrip('/')).rglob('cgroup.procs'):
+        for value in file.read_text().split():
+            fd = None
+            try:
+                pid = int(value)
+                fd = os.pidfd_open(pid)
+                proc = Path('/proc') / value
+                # Validate after opening the pidfd; a later PID reuse cannot
+                # change the process referred to by this file descriptor.
+                belongs = any(row.split(':', 2)[-1] == cgroup
+                              for row in (proc / 'cgroup').read_text().splitlines())
+                if belongs and (proc / 'comm').read_text().strip() == 'sshd':
+                    signal.pidfd_send_signal(fd, signal.SIGSTOP)
+                    held.append((pid, fd))
+                    fd = None
+            except (FileNotFoundError, ProcessLookupError):
+                pass
+            finally:
+                if fd is not None:
+                    os.close(fd)
+    if not held:
+        raise RuntimeError('no default wall-box SSH transport found')
+    print('INJECTED SSH transport pause', [pid for pid, _ in held], flush=True)
+    time.sleep(args.seconds)
+finally:
+    for pid, fd in held:
+        try:
+            signal.pidfd_send_signal(fd, signal.SIGCONT)
+        except ProcessLookupError:
+            pass
+        finally:
+            os.close(fd)
+    print('RESTORED SSH transport', [pid for pid, _ in held], flush=True)

@@ -1,0 +1,54 @@
+#!/usr/bin/env python3
+"""R03: a proven SSH outage disappears from health during poll backoff."""
+import argparse
+from pathlib import Path
+import subprocess
+import sys
+import time
+
+from support import WALL, enter, evidence, phase, quiet_py, record, reset, start, until
+
+parser = argparse.ArgumentParser(description=__doc__)
+parser.add_argument('--evidence', type=Path, required=True, help='new host evidence directory')
+args = parser.parse_args()
+reset({'hold': ['working']}, box=True)
+transport = None
+try:
+    lane = start(box=True)
+    phase(lane['id'], 'working', box=True)
+    until(lambda: record()['last_state'] == 'working', 'working courier observation')
+    transport = subprocess.Popen(['sudo', str(WALL.parent / 'faults/pause-transport'),
+                                  '--instance', 'default', '95'])
+    def health():
+        return quiet_py('import pathlib,os,json; '
+                        'p=pathlib.Path(os.environ["HOME"])/".herdr-ade/.ticker.health"; '
+                        'print(p.read_text())')
+    until(lambda: [e for e in health()['failures'] if 'unreachable' in e],
+          'courier proved connection failure', seconds=65)
+    failed = record()
+    enter('ha overview wall; ha ticker status')
+    time.sleep(20)  # One 15-second tick, still inside the 95-second outage.
+    # The injected outage is still active; there cannot have been a successful
+    # observation. An empty observation_error is not proof of reconnection.
+    assert transport.poll() is None, 'outage ended before assertion'
+    later = record()
+    view = enter('ha overview wall; ha ticker status').stdout
+    wrong = (failed['observation_error'] == later['observation_error'] == ''
+             and failed['last_observed'] == later['last_observed']
+             and 'next check pending' in view and not health()['failures'])
+    print('EXPECTED: retain known connection failure until a successful poll; never infer process death.')
+    print('ACTUAL:', {'health_failures': health()['failures'],
+                      'outage_still_active': transport.poll() is None,
+                      'lane_observation_error': later['observation_error']})
+    print('RECORD:', {k: later[k] for k in ('last_observed', 'observation_attempted',
+          'observation_error', 'failure_class', 'last_state')})
+    print('R03 REPRODUCED' if wrong else 'R03 signature absent', flush=True)
+finally:
+    try:
+        if transport is not None:
+            transport.wait(timeout=120)
+    finally:
+        evidence(args.evidence)
+    if transport is not None and transport.returncode:
+        raise RuntimeError('disconnect injection failed')
+sys.exit(1 if wrong else 0)

@@ -1,0 +1,37 @@
+#!/usr/bin/env python3
+"""R01: a remote retry acknowledges the previous attempt's bootstrap."""
+import argparse
+from pathlib import Path
+import sys
+import time
+
+from support import enter, evidence, fault, phase, record, reset, snapshot, start, until
+
+parser = argparse.ArgumentParser(description=__doc__)
+parser.add_argument('--evidence', type=Path, required=True, help='new host evidence directory')
+args = parser.parse_args()
+reset({'hold': ['working']}, box=True)
+try:
+    lane = start(box=True)
+    thread = lane['id']
+    phase(thread, 'working', box=True)
+    fault('kill-process', thread, box=True)
+    until(lambda: record(thread)['status'] == 'failed', 'process death classified')
+    enter(f'ha thread retry wall {thread} --reason "R01 killed the remote agent"')
+    until(lambda: record(thread)['attempt'] == 2 and not record(thread)['recovery_pending'],
+          'replacement placed')
+    # At least two courier passes; this is longer than the 30s ready timeout.
+    time.sleep(40)
+    lane = record(thread)
+    snapshot()
+    process = enter('herdr pane process-info --pane ' + lane['pane_id'], box=True).stdout
+    stuck = (lane['bootstrap'] == 'acknowledged' and not lane['prompt_pending']
+             and not lane['brief_submitted'] and lane['launch_attempts'] == 0
+             and lane['status'] == 'open' and '"name":"bash"' in process)
+    print('EXPECTED: retry launches one agent and delivers the brief, or reports a bounded failure.')
+    print('ACTUAL:', {k: lane.get(k) for k in ('attempt', 'status', 'bootstrap',
+          'launch_attempts', 'brief_submitted', 'prompt_pending', 'startup_wait_started')})
+    print('R01 REPRODUCED' if stuck else 'R01 signature absent')
+finally:
+    evidence(args.evidence)
+sys.exit(1 if stuck else 0)

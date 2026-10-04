@@ -1,0 +1,119 @@
+#!/usr/bin/python3
+"""Live cross-instance regressions. Only the two explicitly numbered slots reset."""
+import argparse
+import json
+import os
+from pathlib import Path
+import shlex
+import subprocess
+import tarfile
+
+from instance import AUTH, Instance
+
+parser = argparse.ArgumentParser(description=__doc__)
+parser.add_argument('--instance', type=int, choices=range(1, 9), required=True)
+parser.add_argument('--peer', type=int, choices=range(1, 9), required=True)
+parser.add_argument('destination')
+args = parser.parse_args()
+if os.geteuid() != 0 or args.instance == args.peer:
+    parser.error('sudo and two different numbered instances required')
+output = Path(args.destination).resolve()
+output.mkdir(parents=True, exist_ok=False)
+controller = Path(__file__).with_name('wall')
+
+
+def wall(n, *command, check=True):
+    argv = [str(controller), '--instance', str(n), *command]
+    result = subprocess.run(argv, check=False, text=True, capture_output=True)
+    with (output / 'commands.log').open('a') as log:
+        log.write('$ ' + shlex.join(argv) + '\n' + result.stdout + result.stderr +
+                  f'\nexit={result.returncode}\n')
+    if check:
+        result.check_returncode()
+    return result
+
+
+def guest(n, command, box=False, check=True):
+    return wall(n, 'enter', *(['--box'] if box else []), command, check=check)
+
+
+def identity(n, box=False):
+    # Stable server plus ticker identities, not short-lived SSH probes.
+    rows = guest(n, 'ps -u "$(id -u)" -o pid=,comm=,lstart=', box).stdout.splitlines()
+    return [row.strip() for row in rows if row.split()[1] in ['herdr', 'herdr-ade']]
+
+
+def unchanged(n, expected, box=False):
+    assert identity(n, box) == expected, f'instance {n} server/ticker changed'
+
+
+def evidence(n, name):
+    directory = output / name
+    wall(n, 'evidence', str(directory))
+    for file in directory.glob('*.tar'):
+        with tarfile.open(file) as archive:
+            assert not any('auth.json' in member.name for member in archive.getmembers())
+            for member in archive.getmembers():
+                if member.isfile():
+                    assert b'wall-reset-sentinel-not-a-credential' not in archive.extractfile(member).read()
+
+
+n, peer = args.instance, args.peer
+fixture = False
+try:
+    wall(n, 'reset')
+    wall(peer, 'reset')
+    for instance in [n, peer]:
+        limits = subprocess.check_output(['systemctl', 'show', Instance(instance).slice,
+                                          '-p', 'MemoryMax', '-p', 'TasksMax'], text=True)
+        assert 'MemoryMax=2147483648' in limits and 'TasksMax=512' in limits
+    guest(n, 'node "$HOME/tools/auth-proof.js" add')
+    fixture = True
+    guest(peer, 'node "$HOME/tools/auth-proof.js" check', box=True)
+    before = identity(peer)
+    box_before = identity(peer, True)
+    peer_pid = guest(peer, 'nohup sleep 600 >/dev/null 2>&1 </dev/null & echo $!', box=True).stdout.strip()
+    guest(peer, 'touch "$HOME/peer-marker"', box=True)
+    for instance in [n, n, peer]:
+        guest(instance, 'python3 "$HOME/tools/guest.py" lane')
+    guest(n, 'python3 "$HOME/tools/guest.py" wait t-0002 before-seal')
+    guest(peer, 'python3 "$HOME/tools/guest.py" wait t-0001 before-seal')
+    assert wall(peer, 'fault', 'kill-pane', 't-0002', check=False).returncode != 0
+    assert wall(peer, 'fault', 'kill-process', 't-0002', check=False).returncode != 0
+    guest(peer, 'python3 "$HOME/tools/guest.py" wait t-0001 before-seal')
+    # Neither another home's files nor its processes are accessible.
+    other = Instance(n)
+    other_pid = identity(n)[0].split()[0]
+    guest(peer, f'test ! -e {other.home}; ! kill -0 {other_pid} 2>/dev/null')
+    wall(n, 'fault', 'disconnect', '0.2')
+    unchanged(peer, before)
+    unchanged(peer, box_before, True)
+    wall(n, 'fault', 'reboot', '0')
+    unchanged(peer, before)
+    unchanged(peer, box_before, True)
+    guest(peer, f'kill -0 {peer_pid}; test -f "$HOME/peer-marker"', box=True)
+    evidence(n, 'instance-before-reset')
+    evidence(peer, 'peer-before-reset')
+    wall(n, 'reset')
+    unchanged(peer, before)
+    unchanged(peer, box_before, True)
+    guest(peer, f'kill -0 {peer_pid}; test -f "$HOME/peer-marker"', box=True)
+    guest(n, 'node "$HOME/tools/auth-proof.js" check')
+    n_before, n_box_before = identity(n), identity(n, True)
+    wall(peer, 'reset')
+    unchanged(n, n_before)
+    unchanged(n, n_box_before, True)
+    guest(peer, 'node "$HOME/tools/auth-proof.js" check', box=True)
+    assert (AUTH.stat().st_mode & 0o7777) == 0o2770
+    assert ((AUTH / 'auth.json').stat().st_mode & 0o777) == 0o660
+    assert subprocess.run(['sudo', '-u', 'ubuntu', 'test', '-r', str(AUTH / 'auth.json')]).returncode != 0
+    (output / 'result.json').write_text(json.dumps(dict(
+        result='PASS', instance=n, peer=peer, cross_reset=True, scoped_disconnect=True,
+        scoped_reboot=True, foreign_threads_refused=True, shared_auth_survives_reset=True,
+        shared_auth_excluded_from_evidence=True, homes_hidden=True, signals_denied=True), indent=2) + '\n')
+finally:
+    if fixture:
+        guest(n, 'node "$HOME/tools/auth-proof.js" remove')
+    wall(n, 'reset')
+    wall(peer, 'reset')
+print(f'Isolation regressions PASS: {output}')

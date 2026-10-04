@@ -1,8 +1,10 @@
 use super::*;
 use crate::testkit::{Fx, commit_file, fixture, git};
 
+mod attachments;
 mod holds;
 mod starts;
+mod withdrawals;
 use std::path::Path;
 
 fn configured() -> Fx {
@@ -103,6 +105,7 @@ fn landing_verdict(review: &mut Review, candidate: &str) {
         gates: vec![],
         gates_note: String::new(),
         evidence_only: false,
+        withdrawn_only: false,
     });
     review.phase = Phase::Landing;
 }
@@ -147,6 +150,7 @@ fn seal_verdict(
         review: review.id.clone(),
         candidate: candidate.into(),
         evidence_only: false,
+        withdrawn_only: false,
         without,
         gates,
         gates_note: String::new(),
@@ -673,13 +677,10 @@ fn idle_unchanged_follow_up_restores_reviewer_seal_and_verdict_in_same_pass() {
 }
 
 #[test]
-fn box_follow_up_restores_only_after_box_checkout_and_report_match() {
+fn box_follow_up_restores_only_after_box_checkout_is_unchanged_and_clean() {
     let fx = configured();
     let (id, sha) = lane(&fx, 1);
     let event_id = fx.seal_done(&id, 1, 1, &sha, "report\n");
-    let event = crate::events::latest_done_event(&crate::events::list(&fx.project), &id, 1)
-        .unwrap()
-        .clone();
     thread::update(&fx.project, &id, |lane| {
         lane.machine = "box".into();
         lane.machine_id = "box".into();
@@ -696,13 +697,9 @@ fn box_follow_up_restores_only_after_box_checkout_and_report_match() {
     fx.world
         .runner
         .on("machine list --json", crate::runner::fake::ok("[]"));
-    fx.world.runner.on(
-        "ssh",
-        crate::runner::fake::ok(&format!(
-            "{sha}\n{}  report.md\n",
-            event.payload.done.unwrap().artifact
-        )),
-    );
+    fx.world
+        .runner
+        .on("ssh", crate::runner::fake::ok(&format!("{sha}\n")));
     crate::ticker::restore_unchanged_seal(
         &fx.world.ctx(),
         &fx.project,
@@ -737,6 +734,12 @@ fn committed_follow_up_keeps_old_reviewer_seal_void() {
     let checkout = thread::load(&fx.project, reviewer).unwrap().worktree_path;
     let path = post_seal_follow_up(&fx, reviewer, &sealed_event);
     std::fs::write(&path, "changed report").unwrap();
+    commit_file(
+        Path::new(&checkout),
+        "new.txt",
+        "change",
+        "follow-up changed HEAD",
+    );
     crate::ticker::restore_unchanged_seal(
         &fx.world.ctx(),
         &fx.project,
@@ -746,21 +749,6 @@ fn committed_follow_up_keeps_old_reviewer_seal_void() {
     assert_eq!(
         thread::load(&fx.project, reviewer).unwrap().review_after,
         sealed_event.id
-    );
-    std::fs::write(
-        &path,
-        thread::artifact(
-            &fx.project,
-            &sealed_event.payload.done.as_ref().unwrap().artifact,
-        )
-        .unwrap(),
-    )
-    .unwrap();
-    commit_file(
-        Path::new(&checkout),
-        "new.txt",
-        "change",
-        "follow-up changed HEAD",
     );
     crate::ticker::restore_unchanged_seal(
         &fx.world.ctx(),
@@ -1833,6 +1821,77 @@ fn landing_recovers_ref_before_marker_and_install_failure_without_early_task_don
         panic!("install replayed")
     })
     .unwrap();
+}
+
+#[test]
+fn journey_d22_needs_an_independent_review_while_the_later_lane_is_unsealed() {
+    let fx = configured();
+    lane(&fx, 1);
+    let mut review = prepared(&fx);
+    assert!(!crate::journey::independent_review(None, "later", false).unwrap());
+    assert!(crate::journey::independent_review(Some(&review), "later", false).unwrap());
+    assert!(crate::journey::independent_review(Some(&review), "later", true).is_err());
+    let mut later = review.members[0].clone();
+    later.thread = "later".into();
+    review.members.push(later);
+    assert!(crate::journey::independent_review(Some(&review), "later", false).is_err());
+}
+
+#[test]
+fn journey_d22_starts_automatically_only_after_the_later_lane_exists() {
+    let fx = configured();
+    assert!(start(&fx.world.ctx(), "demo", None).unwrap().is_none());
+    let lock = try_operation_lock(&fx.world.ctx(), fx.repo.to_str().unwrap())
+        .unwrap()
+        .unwrap();
+    let (mac, _) = lane(&fx, 1);
+    let now = "2026-09-18T10:01:05Z".parse().unwrap();
+    tick_observed_at(&fx.world.ctx(), &fx.project, |_| true, now).unwrap();
+    assert!(list(&fx.project).unwrap().is_empty());
+    let (later, _) = lane_unsealed(&fx, 2);
+    thread::update(&fx.project, &later, |t| {
+        t.created = "2026-09-18T10:01:02Z".into()
+    })
+    .unwrap();
+    // Reuse the allocation-before-binding fixture; this is not a manual start.
+    let reviewer = fx.thread("pile reviewer");
+    thread::update(&fx.project, &reviewer, |t| {
+        t.role = "reviewer".into();
+        t.review_id = "review-1".into();
+        t.pane_id.clear();
+    })
+    .unwrap();
+    drop(lock);
+    tick_observed_at(&fx.world.ctx(), &fx.project, |_| true, now).unwrap();
+    let review = list(&fx.project).unwrap().remove(0);
+    assert_eq!(review.members.len(), 1);
+    assert_eq!(review.members[0].thread, mac);
+    assert!(crate::journey::independent_review(Some(&review), &later, false).unwrap());
+}
+
+#[test]
+fn post_install_observation_failure_reports_without_undoing_landing_facts_or_counts() {
+    let fx = configured();
+    lane(&fx, 1);
+    let mut review = prepared(&fx);
+    review.fast_forward = true;
+    review.push = true;
+    review.install_required = true;
+    review.install = true;
+    review.install_result = "installed on mac; plan counts unchanged; records load; ticker first full pass pending; journey pending".into();
+    save(&fx.project, &review).unwrap();
+    let counts = crate::plan::counts(&fx.project).unwrap();
+    let result = "REVIEW demo/review-1: ticker first full pass: FAIL: session EINVAL; transient: cleared by second full pass; JOURNEY PASS";
+    post_install_result(&fx.world.ctx(), &fx.project.slug, &review.id, result).unwrap();
+    post_install_result(&fx.world.ctx(), &fx.project.slug, &review.id, result).unwrap();
+    let record = load(&fx.project, &review.id).unwrap();
+    assert!(record.fast_forward && record.push && record.install);
+    assert_eq!(crate::plan::counts(&fx.project).unwrap(), counts);
+    assert!(record.attention.is_empty());
+    assert!(record.landing_summary().contains("FAIL: session EINVAL"));
+    assert!(record.landing_summary().contains("transient"));
+    assert!(!record.landing_summary().contains("pending"));
+    assert_eq!(record.install_result.matches(result).count(), 1);
 }
 
 #[test]
