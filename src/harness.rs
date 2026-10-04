@@ -1410,7 +1410,16 @@ fn rundown_screen_error(
         .lines()
         .map(|line| line.trim().trim_matches('│').trim())
         .collect();
-    let Some(at) = lines.iter().position(|line| *line == title) else {
+    // The renderer folds whitespace and clips long rows with an ellipsis.
+    // Clipping is normal, not a parse failure or an installation regression.
+    let matches = |rendered: &str, expected: &str| {
+        let expected = expected.split_whitespace().collect::<Vec<_>>().join(" ");
+        rendered == expected
+            || rendered
+                .strip_suffix('…')
+                .is_some_and(|prefix| !prefix.is_empty() && expected.starts_with(prefix))
+    };
+    let Some(at) = lines.iter().position(|line| matches(line, title)) else {
         return Some("project title not rendered".into());
     };
     let Some(first) = lines.get(at + 1).filter(|line| !line.is_empty()) else {
@@ -1418,12 +1427,12 @@ fn rundown_screen_error(
     };
     // The normal first row is current work (or Needs you). Any extra row here
     // is the renderer's error slot, including serde and command-read failures.
-    if expected.is_empty() || !(expected.starts_with(first) || first.starts_with(expected)) {
+    if expected.is_empty() || !matches(first, expected) {
         return Some((*first).to_string());
     }
     let progress_at = if expected != work {
         let next = lines.get(at + 2).copied().unwrap_or_default();
-        if next.is_empty() || !(work.starts_with(next) || next.starts_with(work)) {
+        if next.is_empty() || !matches(next, work) {
             return Some(next.to_string());
         }
         at + 3
@@ -1742,6 +1751,41 @@ mod tests {
         .unwrap();
         assert_eq!(reopened_rundown_check(&world.ctx()).unwrap(), None);
         assert_eq!(world.runner.count("pane read"), 1);
+    }
+
+    #[test]
+    fn reopened_rundown_screen_accepts_clipped_rows() {
+        let work = "2 running · 0 waiting · 1 awaiting review · 1 awaiting installation";
+        assert_eq!(
+            rundown_screen_error(
+                "Adeherdr\n2 running · 0 waiting · 1 awaiting…\n████ 1 of 3",
+                "Adeherdr",
+                work,
+                work,
+                "1 of 3",
+            ),
+            None
+        );
+        assert_eq!(
+            rundown_screen_error(
+                "Adeherdr\nNeeds you: finish the browser…\n2 running · 0 waiting · 1 awaiting…\n████ 1 of 3",
+                "Adeherdr",
+                "Needs you: finish the browser login before continuing",
+                work,
+                "1 of 3",
+            ),
+            None
+        );
+        assert_eq!(
+            rundown_screen_error(
+                "A long project…\n2 running\n████ 1 of 3",
+                "A long project title",
+                "2  running",
+                "2  running",
+                "1 of 3",
+            ),
+            None
+        );
     }
 
     #[test]
