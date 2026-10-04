@@ -606,7 +606,8 @@ fn scoped_wait_survives_independent_work_and_replacement_then_answer_rechecks_on
     assert!(
         matches!(load(&f.project).disposition, Some(Disposition::Action { task }) if task == "job-0001")
     );
-    assert!(load(&f.project).waits.is_empty());
+    assert_eq!(load(&f.project).waits.len(), 1, "retired history remains");
+    assert!(open_waits(&f.project).is_empty());
     reconcile(&f.project, None, 80).unwrap();
     assert!(notice(&f.project).is_none());
 }
@@ -671,6 +672,285 @@ fn explicit_wait_party_replaces_phrase_inferred_responsibility() {
         view.render(&["Plan"])
             .contains("choose the authorized route")
     );
+}
+
+fn set_terminal(f: &Fx, id: &str, installed: bool) {
+    let mut record = crate::task::load(&f.project, id).unwrap();
+    if installed {
+        record.installed.push(crate::task::Evidence {
+            at: "2026-10-04T06:40:00Z".into(),
+            command: "review-installed".into(),
+            acceptance: vec![],
+            machine: None,
+            build: None,
+        });
+    } else {
+        record.dropped.push(crate::task::DropEvidence {
+            at: "2026-10-04T06:40:00Z".into(),
+            reason: "Settled choice".into(),
+        });
+    }
+    std::fs::write(
+        f.project.record_dir("tasks").join(format!("{id}.toml")),
+        toml::to_string(&record).unwrap(),
+    )
+    .unwrap();
+}
+
+#[test]
+fn all_installed_or_dropped_waits_retire_without_rewriting_history_or_plan() {
+    let f = fixture();
+    done_plan(&f);
+    task(&f, "job-0001", vec![]);
+    task(&f, "job-0002", vec![]);
+    reconcile(&f.project, None, 10).unwrap();
+    record(
+        &f.project,
+        Disposition::Wait {
+            tasks: vec!["job-0001".into(), "job-0002".into()],
+            party: "Rolf".into(),
+            condition: "Pick the held work".into(),
+        },
+        "Choice pending",
+    )
+    .unwrap();
+    let history = std::fs::read(path(&f.project)).unwrap();
+    let plan = std::fs::read(crate::plan::plan_path(&f.project)).unwrap();
+    set_terminal(&f, "job-0001", true);
+    assert!(
+        attention(&f.project).is_some(),
+        "one unfinished task keeps the wait open"
+    );
+    set_terminal(&f, "job-0002", false);
+    assert!(open_waits(&f.project).is_empty());
+    assert!(attention(&f.project).is_none());
+    assert!(!status(&f.project).unwrap().contains("Wait for Rolf"));
+    assert_eq!(history, std::fs::read(path(&f.project)).unwrap());
+    assert_eq!(
+        plan,
+        std::fs::read(crate::plan::plan_path(&f.project)).unwrap()
+    );
+    record(
+        &f.project,
+        Disposition::Wait {
+            tasks: vec![],
+            party: "Rolf".into(),
+            condition: "Unscoped historical choice".into(),
+        },
+        "No unfinished tasks covered",
+    )
+    .unwrap();
+    assert!(
+        attention(&f.project).is_none(),
+        "empty scope has no unfinished task"
+    );
+}
+
+#[test]
+fn newer_action_or_overlapping_wait_supersedes_the_whole_wait() {
+    let f = fixture();
+    for id in ["job-0001", "job-0002"] {
+        task(&f, id, vec![]);
+        crate::plan::step_add(&f.world.ctx(), "demo", id, vec![id.into()], vec![], None).unwrap();
+    }
+    reconcile(&f.project, None, 10).unwrap();
+    let wait = Disposition::Wait {
+        tasks: vec!["job-0001".into(), "job-0002".into()],
+        party: "Rolf".into(),
+        condition: "Old choice".into(),
+    };
+    record(&f.project, wait.clone(), "Old evidence").unwrap();
+    record(
+        &f.project,
+        Disposition::Action {
+            task: "job-0001".into(),
+        },
+        "Decided route",
+    )
+    .unwrap();
+    assert!(open_waits(&f.project).is_empty());
+    assert_eq!(
+        load(&f.project).waits[0],
+        (wait.clone(), "Old evidence".into())
+    );
+    record(&f.project, wait, "New question").unwrap();
+    assert_eq!(
+        open_waits(&f.project).len(),
+        1,
+        "an earlier action cannot retire a later wait"
+    );
+    record(
+        &f.project,
+        Disposition::Wait {
+            tasks: vec!["job-0002".into()],
+            party: "upstream".into(),
+            condition: "New condition".into(),
+        },
+        "Superseding evidence",
+    )
+    .unwrap();
+    assert_eq!(load(&f.project).waits.len(), 3);
+    assert_eq!(open_waits(&f.project).len(), 1);
+    assert!(attention(&f.project).is_none());
+}
+
+#[test]
+fn answer_retires_only_that_partys_open_waits_and_keeps_evidence() {
+    let f = fixture();
+    let lane = f.thread("Rolf choice");
+    f.seal_waiting(&lane, 1, 1, "Need Rolf to choose a route");
+    for (id, party) in [("job-0001", "Rolf"), ("job-0002", "upstream")] {
+        task(
+            &f,
+            id,
+            if party == "Rolf" {
+                vec![lane.clone()]
+            } else {
+                vec![]
+            },
+        );
+        reconcile(&f.project, None, 10).unwrap();
+        record(
+            &f.project,
+            Disposition::Wait {
+                tasks: vec![id.into()],
+                party: party.into(),
+                condition: "Choice".into(),
+            },
+            "Pending",
+        )
+        .unwrap();
+    }
+    let generation = load(&f.project).generation;
+    assert!(answer(&f.project, "Rolf", " ").is_err());
+    answer(
+        &f.project,
+        "rolf",
+        "request:q-answer chose the reversible route",
+    )
+    .unwrap();
+    let check = load(&f.project);
+    assert_eq!(check.waits.len(), 2);
+    assert_eq!(check.answers[0].waits, vec![0]);
+    assert_eq!(
+        check.answers[0].evidence,
+        "request:q-answer chose the reversible route"
+    );
+    assert_eq!(check.generation, generation + 1);
+    assert!(notice(&f.project).is_some());
+    assert!(attention(&f.project).is_none());
+    assert_eq!(open_waits(&f.project).len(), 1);
+    let (settings, _) = f.project.read_project_md().unwrap();
+    let view = crate::project_view::View::capture(&f.project, &settings, None, None);
+    assert!(
+        view.needs_you.is_empty(),
+        "retired wait cannot return via old lane text"
+    );
+    reconcile(&f.project, None, 20).unwrap();
+    assert_eq!(load(&f.project), check);
+    record(
+        &f.project,
+        Disposition::Wait {
+            tasks: vec!["job-0001".into()],
+            party: "Rolf".into(),
+            condition: "A later question".into(),
+        },
+        "New evidence",
+    )
+    .unwrap();
+    assert!(attention(&f.project).unwrap().contains("A later question"));
+}
+
+#[test]
+fn later_recorded_check_retires_a_settled_lane_party_even_with_unfinished_tasks() {
+    let f = fixture();
+    let lane = f.thread("Waiting party");
+    task(&f, "job-0001", vec![]);
+    reconcile(&f.project, None, 10).unwrap();
+    record(
+        &f.project,
+        Disposition::Wait {
+            tasks: vec!["job-0001".into()],
+            party: lane.clone(),
+            condition: "Lane seals".into(),
+        },
+        "Not ready",
+    )
+    .unwrap();
+    f.seal_done(&lane, 1, 1, "", "Party's result");
+    reconcile(&f.project, None, 20).unwrap();
+    assert_eq!(
+        open_waits(&f.project).len(),
+        1,
+        "outside evidence owes a judgment first"
+    );
+    task(&f, "job-0002", vec![]);
+    record(
+        &f.project,
+        Disposition::Wait {
+            tasks: vec!["job-0002".into()],
+            party: "result".into(),
+            condition: "Next evidence".into(),
+        },
+        "Lane condition met; recorded next judgment",
+    )
+    .unwrap();
+    assert_eq!(open_waits(&f.project).len(), 1);
+    assert!(
+        !status(&f.project)
+            .unwrap()
+            .contains(&format!("Wait for {lane}"))
+    );
+    assert_eq!(load(&f.project).waits.len(), 2);
+}
+
+#[test]
+fn historical_seven_wait_shape_loads_and_projects_no_stale_needs_you() {
+    let f = fixture();
+    done_plan(&f);
+    let rows = [
+        (vec!["job-0276", "job-0278", "job-0280"], "t-0771"),
+        (vec!["job-0283", "job-0281", "job-0282"], "t-0776"),
+        (vec!["job-0281", "job-0282"], "t-0776"),
+        (vec!["job-0284", "job-0286", "job-0285"], "t-0779"),
+        (vec!["job-0284", "job-0285", "job-0286"], "t-0781"),
+        (vec!["job-0207", "job-0241"], "Rolf"),
+        (vec!["job-0207"], "Rolf"),
+    ];
+    let mut waits = Vec::new();
+    for (ids, party) in rows {
+        for id in &ids {
+            task(&f, id, vec![]);
+            set_terminal(&f, id, *id != "job-0241");
+        }
+        waits.push((
+            Disposition::Wait {
+                tasks: ids.into_iter().map(String::from).collect(),
+                party: party.into(),
+                condition: "Historical question settled".into(),
+            },
+            "Historical evidence".to_string(),
+        ));
+    }
+    // Old persisted tuple representation: no new retirement/answer fields.
+    project::write_json(
+        &path(&f.project),
+        &serde_json::json!({
+            "generation": 7, "waits": waits, "wait_answers": []
+        }),
+    )
+    .unwrap();
+    let before = std::fs::read(path(&f.project)).unwrap();
+    assert_eq!(load(&f.project).waits.len(), 7);
+    assert!(open_waits(&f.project).is_empty());
+    assert!(attention(&f.project).is_none());
+    let (settings, _) = f.project.read_project_md().unwrap();
+    let view = crate::project_view::View::capture(&f.project, &settings, None, None);
+    assert!(view.needs_you.is_empty());
+    assert_eq!(view.rundown()["needs_you"], "");
+    assert_eq!(view.rundown()["needs_you_items"], serde_json::json!([]));
+    assert!(!view.render(&["Plan"]).contains("Wait for"));
+    assert_eq!(before, std::fs::read(path(&f.project)).unwrap());
 }
 
 #[test]
