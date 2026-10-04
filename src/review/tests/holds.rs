@@ -1,5 +1,16 @@
 use super::*;
 
+// Existing hold tests exercise the pre-deadline behavior independently of the
+// wall clock. The bounded-wait regression below advances time explicitly.
+fn tick(ctx: &Ctx, project: &Project) -> Result<()> {
+    let now = crate::events::list(project)
+        .iter()
+        .filter_map(|event| event.created.parse::<jiff::Timestamp>().ok())
+        .max()
+        .unwrap_or_else(jiff::Timestamp::now);
+    tick_observed_at(ctx, project, |_| true, now)
+}
+
 fn enable(fx: &Fx) {
     project::write_atomic(
         &fx.project.state_dir().join("reviews-enabled"),
@@ -114,6 +125,8 @@ fn waiting_lane_with_unanswered_follow_up_still_holds() {
         let (waiting, _) = lane_unsealed(&fx, 2);
         let event = fx.seal_waiting(&waiting, 1, 1, "need input");
         thread::update(&fx.project, &waiting, |t| {
+            // An unrelated continuation now obeys the ordinary start-time rule.
+            t.created = "2026-09-18T10:00:00Z".into();
             t.follow_ups.push(thread::FollowUp {
                 attempt: 1,
                 state,
@@ -337,6 +350,171 @@ fn working_hold_uses_attempt_times_and_keeps_unknown_history() {
             );
             assert_eq!(working_hold(&lane, &[], None), Some("working"));
         }
+    }
+}
+
+#[test]
+fn ready_pile_releases_long_running_and_unrelated_follow_up_at_bound() {
+    for state in [
+        thread::FollowUpState::Queued,
+        thread::FollowUpState::Delivered,
+    ] {
+        let fx = configured();
+        enable(&fx);
+        let (ready, sha) = lane_unsealed(&fx, 1); // live t-0782
+        seal_at(&fx, &ready, &sha, "2026-10-04T01:00:00Z");
+        let (working, working_sha) = lane_unsealed(&fx, 2); // large lane
+        let (follow_up, follow_up_sha) = lane_unsealed(&fx, 3); // live t-0713
+        let waiting = fx.seal_waiting(&follow_up, 1, 1, "continuation requested");
+        for id in [&working, &follow_up] {
+            thread::update(&fx.project, id, |t| {
+                t.created = "2026-10-03T18:00:00Z".into();
+            })
+            .unwrap();
+        }
+        thread::update(&fx.project, &follow_up, |t| {
+            t.follow_ups.push(thread::FollowUp {
+                attempt: 1,
+                state,
+                waiting_event: waiting,
+                ..Default::default()
+            });
+        })
+        .unwrap();
+        coordinator(&fx);
+        let before = "2026-10-04T01:19:59.999999999Z".parse().unwrap();
+        for _ in 0..3 {
+            tick_observed_at(&fx.world.ctx(), &fx.project, |_| false, before).unwrap();
+            crate::steps::deliver_transition_notices(&fx.world.ctx(), &fx.project).unwrap();
+        }
+        assert!(list(&fx.project).unwrap().is_empty());
+        let notices = hold_notices(&fx.project).unwrap();
+        assert_eq!(notices.len(), 1);
+        assert!(notices[0].line.contains(&format!("{working} (working)")));
+        assert!(
+            notices[0]
+                .line
+                .contains(&format!("{follow_up} (follow-up pending)"))
+        );
+
+        allocated_reviewer(&fx, "review-1");
+        let deadline = "2026-10-04T01:20:00Z".parse().unwrap();
+        for _ in 0..3 {
+            tick_observed_at(&fx.world.ctx(), &fx.project, |_| false, deadline).unwrap();
+            crate::steps::deliver_transition_notices(&fx.world.ctx(), &fx.project).unwrap();
+        }
+        let mut review = list(&fx.project).unwrap().remove(0);
+        assert_eq!(review.members.len(), 1);
+        assert_eq!(review.members[0].thread, ready);
+        assert!(current_holds(&fx.project).unwrap().is_empty());
+        let notices = hold_notices(&fx.project).unwrap();
+        assert_eq!(notices.len(), 2);
+        assert!(notices.iter().all(|notice| notice.submitted));
+        assert!(notices[1].line.contains("20-minute wait bound reached"));
+        assert!(notices[1].line.contains(&working));
+        assert!(notices[1].line.contains(&follow_up));
+        assert_eq!(
+            fx.world
+                .runner
+                .calls
+                .borrow()
+                .iter()
+                .filter(|cmd| {
+                    cmd.display().contains("agent prompt") && cmd.display().contains("PILE")
+                })
+                .count(),
+            2
+        );
+
+        // Running lanes are not lost: they seal into the next pile.
+        review.phase = Phase::Complete;
+        save(&fx.project, &review).unwrap();
+        thread::update(&fx.project, &ready, |t| t.status = Status::Resolved).unwrap();
+        fx.seal_done(&working, 1, 1, &working_sha, "finished later\n");
+        fx.seal_done(&follow_up, 1, 2, &follow_up_sha, "continuation finished\n");
+        thread::update(&fx.project, &follow_up, |t| {
+            t.follow_ups[0].state = thread::FollowUpState::Closed;
+        })
+        .unwrap();
+        allocated_reviewer(&fx, "review-2");
+        tick_observed_at(&fx.world.ctx(), &fx.project, |_| false, deadline).unwrap();
+        let reviews = list(&fx.project).unwrap();
+        assert_eq!(reviews.len(), 2);
+        let members: std::collections::BTreeSet<_> = reviews[1]
+            .members
+            .iter()
+            .map(|member| member.thread.clone())
+            .collect();
+        assert_eq!(members, [working, follow_up].into_iter().collect());
+    }
+}
+
+#[test]
+fn member_correction_and_active_review_do_not_expire_with_running_work() {
+    let fx = configured();
+    enable(&fx);
+    let (member, sha) = lane(&fx, 1);
+    allocated_reviewer(&fx, "review-1");
+    tick(&fx.world.ctx(), &fx.project).unwrap();
+    let event = crate::events::latest_done_event(&crate::events::list(&fx.project), &member, 1)
+        .unwrap()
+        .clone();
+    post_seal_follow_up(&fx, &member, &event);
+    let (later, _) = lane(&fx, 2);
+    let now = "2026-10-04T03:20:00Z".parse().unwrap();
+    for _ in 0..3 {
+        tick_observed_at(&fx.world.ctx(), &fx.project, |_| false, now).unwrap();
+    }
+    assert!(
+        sealed(
+            &crate::events::list(&fx.project),
+            &thread::load(&fx.project, &member).unwrap()
+        )
+        .is_none()
+    );
+    let reviews = list(&fx.project).unwrap();
+    assert_eq!(reviews.len(), 1);
+    assert_eq!(reviews[0].members[0].thread, member);
+    let notices = hold_notices(&fx.project).unwrap();
+    assert_eq!(notices.len(), 1);
+    assert!(notices[0].line.contains(&format!("{later} ready")));
+    assert!(notices[0].line.contains("active review review-1"));
+    assert!(!notices[0].line.contains("wait bound reached"));
+    fx.seal_done(&member, 1, 2, &sha, "correction finished\n");
+    assert!(
+        sealed(
+            &crate::events::list(&fx.project),
+            &thread::load(&fx.project, &member).unwrap()
+        )
+        .is_some()
+    );
+}
+
+#[test]
+fn later_unrelated_follow_up_obeys_the_start_time_rule() {
+    let seal = "2026-10-04T01:00:00Z".parse().unwrap();
+    for state in [
+        thread::FollowUpState::Queued,
+        thread::FollowUpState::Delivered,
+    ] {
+        let fx = configured();
+        let (id, _) = lane_unsealed(&fx, 1);
+        let event = fx.seal_waiting(&id, 1, 1, "continuation requested");
+        thread::update(&fx.project, &id, |t| {
+            t.created = "2026-10-04T01:01:00Z".into();
+            t.follow_ups.push(thread::FollowUp {
+                attempt: 1,
+                state,
+                waiting_event: event,
+                ..Default::default()
+            });
+        })
+        .unwrap();
+        let lane = thread::load(&fx.project, &id).unwrap();
+        assert_eq!(
+            working_hold(&lane, &crate::events::list(&fx.project), Some(seal)),
+            None
+        );
     }
 }
 

@@ -2334,7 +2334,11 @@ pub(crate) fn mark_hold_submitted(project: &Project, index: usize) -> Result<()>
     }
     Ok(())
 }
-fn record_holds(project: &Project, current: BTreeMap<String, (String, String)>) -> Result<()> {
+fn record_holds(
+    project: &Project,
+    current: BTreeMap<String, (String, String)>,
+    releases: Vec<String>,
+) -> Result<()> {
     let _lock = project.lock()?;
     let mut holds = load_holds(project)?;
     for (repo, (reason, line)) in &current {
@@ -2349,12 +2353,23 @@ fn record_holds(project: &Project, current: BTreeMap<String, (String, String)>) 
         .into_iter()
         .map(|(repo, (reason, _))| (repo, reason))
         .collect();
-    if holds.current != next {
+    let released = !releases.is_empty();
+    holds
+        .notices
+        .extend(releases.into_iter().map(|line| crate::steps::Notice {
+            line,
+            submitted: false,
+        }));
+    if holds.current != next || released {
         holds.current = next;
         project::write_json(&holds_path(project), &holds)?;
     }
     Ok(())
 }
+// Running non-members may delay a ready pile only this long. Corrections
+// to members remain protected by the active-review hold, without a deadline.
+const READY_PILE_WAIT_SECONDS: i64 = 20 * 60;
+
 fn working_hold(
     lane: &Thread,
     events: &[crate::contracts::Event],
@@ -2364,16 +2379,16 @@ fn working_hold(
         return None;
     }
     let latest = crate::events::latest_event(events, &lane.id, lane.attempt.max(1));
-    if crate::threads::follow_up_pending_for_seal(lane, latest)
+    let follow_up = crate::threads::follow_up_pending_for_seal(lane, latest)
         || lane.follow_ups.iter().any(|f| {
             f.attempt == lane.attempt.max(1)
                 && f.state == thread::FollowUpState::Delivered
                 && latest.is_some_and(|event| f.waiting_event == event.id)
-        })
+        });
+    if !follow_up
+        && latest
+            .is_some_and(|event| event.payload.done.is_some() || event.payload.waiting.is_some())
     {
-        return Some("follow-up pending");
-    }
-    if latest.is_some_and(|event| event.payload.done.is_some() || event.payload.waiting.is_some()) {
         None
     } else {
         // Use the earliest recorded start evidence for this attempt, not a
@@ -2396,7 +2411,11 @@ fn working_hold(
         {
             None
         } else {
-            Some("working")
+            Some(if follow_up {
+                "follow-up pending"
+            } else {
+                "working"
+            })
         }
     }
 }
@@ -2410,6 +2429,15 @@ pub(crate) fn tick_observed(
     ctx: &Ctx,
     project: &Project,
     can_advance: impl Fn(&Review) -> bool,
+) -> Result<()> {
+    tick_observed_at(ctx, project, can_advance, jiff::Timestamp::now())
+}
+
+fn tick_observed_at(
+    ctx: &Ctx,
+    project: &Project,
+    can_advance: impl Fn(&Review) -> bool,
+    now: jiff::Timestamp,
 ) -> Result<()> {
     let enabled = project.state_dir().join("reviews-enabled").exists();
     let mut first = None;
@@ -2447,6 +2475,7 @@ pub(crate) fn tick_observed(
             .push(lane);
     }
     let mut holds = BTreeMap::new();
+    let mut releases = Vec::new();
     for mut pile in piles.into_values() {
         let repo = pile[0].repo.clone();
         if repo.is_empty() {
@@ -2485,11 +2514,21 @@ pub(crate) fn tick_observed(
                     .ok()?;
                 Some(oldest.min(created))
             });
+            let wait_expired = oldest_seal
+                .is_some_and(|seal| now.duration_since(seal).as_secs() >= READY_PILE_WAIT_SECONDS);
+            let mut released = Vec::new();
             let mut blockers: Vec<String> = threads
                 .iter()
                 .filter(|t| same_repo(&t.repo, &repo) && !reviewers.contains(&t.id))
                 .filter_map(|t| {
-                    working_hold(t, &events, oldest_seal).map(|why| format!("{} ({why})", t.id))
+                    let why = working_hold(t, &events, oldest_seal)?;
+                    let label = format!("{} ({why})", t.id);
+                    if wait_expired {
+                        released.push(label);
+                        None
+                    } else {
+                        Some(label)
+                    }
                 })
                 .collect();
             let failed: Vec<_> = threads
@@ -2542,7 +2581,25 @@ pub(crate) fn tick_observed(
                 }
             }
             if let Some(row) = configured {
-                start_locked(ctx, project, row, pile.clone(), &events)?;
+                if start_locked(ctx, project, row, pile.clone(), &events)?.is_some()
+                    && !released.is_empty()
+                {
+                    released.sort();
+                    let name = std::path::Path::new(&repo)
+                        .file_name()
+                        .unwrap_or_default()
+                        .to_string_lossy();
+                    let ready = pile
+                        .iter()
+                        .map(|t| t.id.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    releases.push(format!(
+                        "PILE {name}: {ready} ready; {}-minute wait bound reached; starting review without {}",
+                        READY_PILE_WAIT_SECONDS / 60,
+                        released.join(", ")
+                    ));
+                }
                 Ok(None)
             } else {
                 Ok(Some(unconfigured.join(", ")))
@@ -2583,6 +2640,6 @@ pub(crate) fn tick_observed(
             );
         }
     }
-    record_holds(project, holds)?;
+    record_holds(project, holds, releases)?;
     first.map_or(Ok(()), Err)
 }
