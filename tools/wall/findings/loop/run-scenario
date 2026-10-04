@@ -1,0 +1,34 @@
+#!/usr/bin/env python3
+"""Reset one assigned sandbox, run a plain script, capture before another reset."""
+import argparse
+from pathlib import Path
+import subprocess
+import sys
+import tempfile
+
+HERE = Path(__file__).resolve().parent
+REPO = HERE.parents[3]
+sys.path.insert(0, str(REPO / 'tools/wall/regressions'))
+import support
+
+parser = argparse.ArgumentParser()
+parser.add_argument('scenario', choices=['goal-wait', 'journey', 'recovery', 'notice-probe'])
+parser.add_argument('--instance', type=int, choices=range(1, 9), required=True)
+parser.add_argument('--evidence', type=Path, help='new host capture directory')
+args = parser.parse_args()
+if args.evidence is None:
+    cache = Path.home() / '.cache/herdr-wall-loop'
+    cache.mkdir(parents=True, exist_ok=True)
+    args.evidence = Path(tempfile.mkdtemp(prefix=f'instance-{args.instance}-', dir=cache)) / 'capture'
+support.set_instance(args.instance)
+support.wall('reset')
+support.enter('ha --version; sha256sum "$HOME/bin/herdr-ade"')
+subprocess.run(support.wall_command('enter', 'tee "$HOME/loop-scenarios.py" >/dev/null'),
+               input=(HERE / 'guest-scenarios.py').read_text(), text=True, check=True)
+try:
+    result = support.enter('mkdir -p "$HOME/runs"; set -o pipefail; python3 -u "$HOME/loop-scenarios.py" ' + args.scenario
+                           + ' 2>&1 | tee "$HOME/runs/loop-scenario.log"',
+                           check=False, timeout=1000)
+finally:
+    support.evidence(args.evidence)
+sys.exit(result.returncode)
