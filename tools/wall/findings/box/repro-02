@@ -1,0 +1,53 @@
+#!/usr/bin/env python3
+"""B02: a simulated network outage leaves start intent without a lane."""
+import argparse
+import json
+import subprocess
+import time
+from pathlib import Path
+from support import Sandbox, WALL
+
+parser = argparse.ArgumentParser(description=__doc__)
+parser.add_argument('--instance', type=int, required=True, choices=range(1, 9))
+parser.add_argument('--evidence', type=Path, required=True)
+args = parser.parse_args()
+s = Sandbox(args.instance)
+s.wall('reset')
+s.enter('ha --version; sha256sum "$HOME/bin/herdr-ade"')
+s.open()
+s.control({'hold': ['working']})
+command = ['sudo', str(WALL), '--instance', str(args.instance), 'fault', 'disconnect', '65']
+print('+', ' '.join(command), flush=True)
+fault = subprocess.Popen(command)
+try:
+    time.sleep(1)
+    # Use the real CLI directly: unlike guest.lane, do not require a returned lane.
+    started = s.enter('printf "%s\\n" "Read the frozen brief, commit a scratch file, write the report and seal." > "$HOME/task.md"; '
+        'ha thread start wall --task-file "$HOME/task.md" --title "Box outage start" '
+        '--repo "$HOME/repo" --recipe wall_lane --request "$(< "$HOME/request")" '
+        '--acceptance "Scripted fault plumbing observed" --machine ' + s.machine, check=False)
+    assert fault.poll() is None, 'outage ended before start completed'
+finally:
+    fault.wait(timeout=100)
+assert fault.returncode == 0, 'simulated network outage did not complete'
+s.enter('ha --version', box=True)  # positive reconnect evidence
+if started.returncode:
+    assert 'unreachable:' in started.stdout, 'start failed for an unrelated reason'
+# Give the restored ticker real opportunities; this is observation, not a timing SLA.
+time.sleep(35)
+records = s.records()
+tasks = json.loads(s.py('from pathlib import Path; import json,tomllib; '
+    'print(json.dumps([tomllib.loads(p.read_text()) for p in '
+    '(Path.home()/".herdr-ade/wall/.state/tasks").glob("*.toml")]))'))
+assert len(tasks) == 1, 'expected exactly the requested task'
+lost = not records
+s.enter('ha overview wall; ha task list wall')
+print('EXPECTED: retain one recoverable box start intent through a transient SSH outage')
+print('ACTUAL:', json.dumps({'start_returncode': started.returncode,
+                            'tasks': tasks, 'lanes': [r['id'] for r in records]}), flush=True)
+s.evidence(args.evidence)
+if not lost:
+    s.wait(lambda: s.record().get('brief_submitted'), seconds=120)
+    s.phase('working')
+print('B02 REPRODUCED' if lost else 'B02 absent; recorded start resumed', flush=True)
+raise SystemExit(1 if lost else 0)
