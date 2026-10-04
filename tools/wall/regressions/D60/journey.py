@@ -17,7 +17,7 @@ def main():
         return any(e.get('thread') == member['id'] and e.get('payload', {}).get('done', {}).get('sha')
                    for e in events)
     guest.poll('member seal', sealed)
-    guest.HOME.joinpath('control.json').write_text(json.dumps({'hold': ['mid-review']}))
+    guest.HOME.joinpath('control.json').write_text(json.dumps({'hold': ['mid-review'], 'gate_review': True}))
     config = guest.HOME / '.config/herdr-ade/config.toml'
     with config.open('a') as out:
         out.write(f'\n[dispatch]\nmachine = "{guest.INSTANCE.machine}"\n')
@@ -39,6 +39,14 @@ def main():
     if 'Reviewer machine: `local`' not in packet or '- Machine: local.' not in packet:
         raise RuntimeError('D60 reviewer packet omitted machine')
     print('EXPECTED: packet names local review machine; ACTUAL: local named in frozen packet', flush=True)
+    (guest.HOME / 'release/mid-review').touch()
+    review_path = guest.PROJECT / '.state/reviews' / (review['id'] + '.toml')
+    guest.poll('local fixture review and gates', lambda: tomllib.loads(review_path.read_text())['phase'] == 'complete')
+    receipts = [tomllib.loads(p.read_text()) for p in (guest.PROJECT / '.state').rglob('receipt.toml')]
+    local = [r for r in receipts if r.get('review') == review['id']]
+    print(f'EXPECTED: successful local gate receipt; ACTUAL: {[(r["machine"], r.get("exit")) for r in local]}', flush=True)
+    if not local or any(r['machine'] != 'local' or r.get('exit') != 0 for r in local):
+        raise RuntimeError('D60 pile gates did not execute locally')
 
 
 if __name__ == '__main__':
