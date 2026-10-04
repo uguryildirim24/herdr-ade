@@ -104,6 +104,8 @@ impl Runner for LocalJourney<'_> {
                     let lane = thread::allocate(&project, |lane| {
                         lane.repo = repo.to_string_lossy().into_owned();
                         lane.status = thread::Status::Resolved;
+                        lane.launch_attempts = 1;
+                        lane.startup_wait_started = project::now();
                     })?;
                     let fx = crate::testkit::Fx {
                         world: World::new(),
@@ -241,10 +243,12 @@ fn local_journey(missing_pi: bool) {
     if missing_pi {
         assert_eq!(lanes, 0);
         assert!(notice.contains("SKIP open and prime coordinator: no enabled small recipe"));
-        assert!(notice.contains("SKIP Mac lane seals: no enabled small recipe"));
+        assert!(notice.contains("SKIP Mac lane launched: no enabled small recipe"));
+        assert!(notice.contains("SKIP Mac lane seals: Mac launch probe was skipped"));
     } else {
         assert_eq!(lanes, 1);
         assert!(notice.contains("PASS open and prime coordinator"));
+        assert!(notice.contains("Mac lane launched after 0 s"));
         assert!(notice.contains("PASS Mac lane seals"));
         assert!(notice.contains("PASS reviewer merges, landing pushes"));
         let repo = scratch.join("repo");
@@ -825,6 +829,56 @@ fn deadline_shutdown(pending: bool) {
             .all(|c| c.timeout <= Duration::from_secs(30)),
         "shutdown commands must share the cleanup deadline"
     );
+}
+
+#[test]
+fn mac_seal_window_starts_at_launch_claim_not_placement() {
+    let world = World::new();
+    let project = world.project("journey-launch-window", "owned.sock");
+    let now = jiff::Timestamp::now();
+    let queued = now - jiff::SignedDuration::from_secs(161);
+    let lane = thread::allocate(&project, |lane| {
+        lane.created = queued.to_string();
+        lane.startup_wait_started = queued.to_string();
+        lane.status = thread::Status::Open;
+    })
+    .unwrap();
+    // A placed shell is not an agent start, despite the placement timestamp.
+    assert!(launch_claim(&project, &lane.id).unwrap().0.is_none());
+    thread::update(&project, &lane.id, |lane| {
+        lane.launch_attempts = 1;
+        lane.startup_wait_started = now.to_string();
+    })
+    .unwrap();
+    let (seal_deadline, seconds) = launch_claim(&project, &lane.id).unwrap().0.unwrap();
+    assert_eq!(seconds, 161);
+    assert!(seal_deadline.saturating_duration_since(Instant::now()) > Duration::from_secs(178));
+
+    // Polling late must not grant a fresh 180-second window.
+    thread::update(&project, &lane.id, |lane| {
+        lane.startup_wait_started = (now - jiff::SignedDuration::from_secs(181)).to_string();
+    })
+    .unwrap();
+    let (seal_deadline, _) = launch_claim(&project, &lane.id).unwrap().0.unwrap();
+    assert!(seal_deadline <= Instant::now());
+}
+
+#[test]
+fn queued_mac_lane_hits_launch_deadline_not_seal_deadline() {
+    let world = World::new();
+    let project = world.project("journey-launch-deadline", "owned.sock");
+    let lane = thread::allocate(&project, |lane| {
+        lane.status = thread::Status::Open;
+        lane.startup_wait_started = project::now();
+    })
+    .unwrap();
+    let error = poll("Mac launch claim", Duration::ZERO, || {
+        launch_claim(&project, &lane.id)
+    })
+    .unwrap_err();
+    assert!(error.to_string().contains("Mac launch claim deadline"));
+    assert!(error.to_string().contains("launch claim not observed"));
+    assert_eq!(LAUNCH, Duration::from_secs(300));
 }
 
 #[test]
