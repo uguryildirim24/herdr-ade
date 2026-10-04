@@ -72,6 +72,22 @@ pub fn diagnostic_output(
     ))
 }
 
+/// A failed courier updates observation evidence, never lane lifecycle or work.
+pub fn assert_failed_observation_only(before: &thread::Thread, after: &thread::Thread) {
+    assert_eq!(after.observation_source, "courier");
+    assert!(!after.observation_attempted.is_empty());
+    assert!(after.observation_error.contains("unreachable"));
+    let mut normalized = after.clone();
+    normalized.observation_source = before.observation_source.clone();
+    normalized.observation_attempted = before.observation_attempted.clone();
+    normalized.observation_error = before.observation_error.clone();
+    normalized.updated = before.updated.clone();
+    assert_eq!(
+        toml::to_string(&normalized).unwrap(),
+        toml::to_string(before).unwrap()
+    );
+}
+
 pub struct Fx {
     pub world: World,
     pub project: Project,

@@ -1,48 +1,79 @@
 #!/usr/bin/env python3
-"""R03: a proven SSH outage disappears from health during poll backoff."""
+"""D38/R03: a proven SSH outage stays visible during poll backoff."""
 import argparse
 from pathlib import Path
+import shlex
 import subprocess
 import sys
 import time
 
-from support import WALL, enter, evidence, phase, quiet_py, record, reset, start, until
+from support import (enter, evidence, phase, quiet_py, record, reset, set_instance,
+                     start, until, wall_command)
 
 parser = argparse.ArgumentParser(description=__doc__)
+parser.add_argument('--instance', type=int, choices=range(1, 9))
 parser.add_argument('--evidence', type=Path, required=True, help='new host evidence directory')
 args = parser.parse_args()
+set_instance(args.instance)
 reset({'hold': ['working']}, box=True)
 transport = None
 try:
     lane = start(box=True)
     phase(lane['id'], 'working', box=True)
     until(lambda: record()['last_state'] == 'working', 'working courier observation')
-    transport = subprocess.Popen(['sudo', str(WALL.parent / 'faults/pause-transport'),
-                                  '--instance', 'default', '95'])
+    before = record()
+    # The numbered wall dispatcher confines disconnect to this instance.
+    command = wall_command('fault', 'disconnect', '95') if args.instance else [
+        'sudo', str(Path(__file__).resolve().parents[2] / 'faults/pause-transport'),
+        '--instance', 'default', '95']
+    print('+', shlex.join(command), flush=True)
+    transport = subprocess.Popen(command)
+
     def health():
         return quiet_py('import pathlib,os,json; '
                         'p=pathlib.Path(os.environ["HOME"])/".herdr-ade/.ticker.health"; '
                         'print(p.read_text())')
+
     until(lambda: [e for e in health()['failures'] if 'unreachable' in e],
           'courier proved connection failure', seconds=65)
     failed = record()
     enter('ha overview wall; ha ticker status')
     time.sleep(20)  # One 15-second tick, still inside the 95-second outage.
-    # The injected outage is still active; there cannot have been a successful
-    # observation. An empty observation_error is not proof of reconnection.
     assert transport.poll() is None, 'outage ended before assertion'
     later = record()
     view = enter('ha overview wall; ha ticker status').stdout
-    wrong = (failed['observation_error'] == later['observation_error'] == ''
-             and failed['last_observed'] == later['last_observed']
-             and 'next check pending' in view and not health()['failures'])
-    print('EXPECTED: retain known connection failure until a successful poll; never infer process death.')
+    held = (failed['observation_error'] == later['observation_error'] != ''
+            and failed['observation_attempted'] == later['observation_attempted']
+            and failed['last_observed'] == later['last_observed']
+            and 'box unreachable since' in view and 'retrying' in view
+            and any('unreachable' in e for e in health()['failures'])
+            and later['status'] == 'open' and later['attempt'] == before['attempt'])
+    print('EXPECTED: known connection failure persists through backoff; never infer process death.')
     print('ACTUAL:', {'health_failures': health()['failures'],
                       'outage_still_active': transport.poll() is None,
                       'lane_observation_error': later['observation_error']})
     print('RECORD:', {k: later[k] for k in ('last_observed', 'observation_attempted',
-          'observation_error', 'failure_class', 'last_state')})
-    print('R03 REPRODUCED' if wrong else 'R03 signature absent', flush=True)
+          'observation_error', 'failure_class', 'last_state')}, flush=True)
+    transport.wait(timeout=120)
+    assert transport.returncode == 0, 'disconnect injection failed'
+    recovered = until(lambda: (r if (r := record())['observation_error'] == ''
+                              and r['last_observed'] != before['last_observed'] else None),
+                      'fresh successful observation after transport restoration')
+    # Lane records are committed during the pass; health is published at its
+    # end. Wait for both instead of racing the health snapshot with that write.
+    until(lambda: not any('unreachable' in e for e in health()['failures']),
+          'successful pass cleared outage health')
+    recovered_view = enter('ha overview wall; ha ticker status').stdout
+    passed = (held and recovered['attempt'] == before['attempt']
+              and recovered['identity']['process'] == before['identity']['process']
+              and recovered['last_state'] == 'working'
+              and not any('unreachable' in e for e in health()['failures'])
+              and 'box unreachable since' not in recovered_view)
+    print('RECOVERY:', {'held_through_backoff': held,
+                        'same_attempt': recovered['attempt'] == before['attempt'],
+                        'same_process': recovered['identity']['process'] == before['identity']['process'],
+                        'health_failures': health()['failures']})
+    print('R03 PASS' if passed else 'R03 FAIL', flush=True)
 finally:
     try:
         if transport is not None:
@@ -51,4 +82,4 @@ finally:
         evidence(args.evidence)
     if transport is not None and transport.returncode:
         raise RuntimeError('disconnect injection failed')
-sys.exit(1 if wrong else 0)
+sys.exit(0 if passed else 1)
