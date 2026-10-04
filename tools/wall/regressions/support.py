@@ -1,11 +1,13 @@
 """Instance-scoped live repro utilities. Never addresses ubuntu's ADE root."""
+import argparse
 import json
 from pathlib import Path
 import shlex
 import subprocess
+import tempfile
 import time
 
-REPO = Path(__file__).resolve().parents[4]
+REPO = Path(__file__).resolve().parents[3]
 WALL = REPO / 'tools/wall/wall'
 INSTANCE = None
 
@@ -15,9 +17,22 @@ def set_instance(number):
     INSTANCE = number
 
 
+def repro_args(description):
+    parser = argparse.ArgumentParser(description=description)
+    parser.add_argument('--instance', type=int, choices=range(1, 9), required=True)
+    parser.add_argument('--evidence', type=Path, help='new host evidence directory')
+    args = parser.parse_args()
+    set_instance(args.instance)
+    if args.evidence is None:
+        cache = Path.home() / '.cache/herdr-wall-regressions'
+        cache.mkdir(parents=True, exist_ok=True)
+        args.evidence = Path(tempfile.mkdtemp(prefix=f'instance-{args.instance}-', dir=cache)) / 'capture'
+    print('Evidence:', args.evidence, flush=True)
+    return args
+
+
 def wall_command(*args):
-    return ['sudo', str(WALL), *(['--instance', str(INSTANCE)] if INSTANCE else []),
-            *map(str, args)]
+    return ['sudo', '-n', str(WALL), '--instance', str(INSTANCE), *map(str, args)]
 
 
 def wall(*args, check=True, timeout=180):
@@ -49,7 +64,15 @@ def quiet_py(code, box=False):
     return json.loads(result.stdout)
 
 
-def until(check, label, seconds=150):
+def wake_ticker(box=False):
+    # This is the ticker's existing wake signal, not a state-record edit or a
+    # clock override. Normal passes still own placement, launch and backoff.
+    quiet_py('import pathlib,os,json; '
+             '(pathlib.Path(os.environ["HOME"])/".herdr-ade/.ticker.wake").touch(); '
+             'print(json.dumps(None))', box)
+
+
+def until(check, label, seconds=150, wake=True):
     deadline = time.monotonic() + seconds
     last = None
     while time.monotonic() < deadline:
@@ -57,6 +80,9 @@ def until(check, label, seconds=150):
         if last:
             print('OBSERVED', label, json.dumps(last), flush=True)
             return last
+        if wake:
+            wake_ticker()
+            wake_ticker(box=True)
         time.sleep(1)
     raise RuntimeError(f'timeout waiting for {label}: {last!r}')
 
@@ -102,6 +128,12 @@ def phase(thread, name, box=False):
     if box:
         until(lambda: any(r['thread'] == thread and r['pane_id'] == record(thread)['pane_id']
                           for r in records(True, 'lanes')), 'box lane card provisioned')
+    pane = record(thread)['pane_id']
+    until(lambda: quiet_py('import pathlib,os,json; '
+          'rows=[json.loads(line) for f in (pathlib.Path(os.environ["HOME"])/"runs").glob("*.jsonl") '
+          'for line in f.read_text().splitlines()]; '
+          f'print(json.dumps([r for r in rows if r["pane"] == {pane!r} '
+          f'and r["phase"] == {name!r}]))', box), name)
     enter('python3 "$HOME/tools/guest.py" wait ' + shlex.join([thread, name]), box)
 
 

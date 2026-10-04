@@ -1,16 +1,14 @@
 #!/usr/bin/env python3
-"""R01: a remote retry acknowledges the previous attempt's bootstrap."""
-import argparse
+"""D37: a remote retry must discard the previous attempt's bootstrap."""
 import json
 from pathlib import Path
 import sys
 import time
 
-from support import enter, evidence, fault, phase, quiet_py, record, reset, snapshot, start, until
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from support import enter, evidence, fault, phase, quiet_py, record, repro_args, reset, snapshot, start, until, wake_ticker
 
-parser = argparse.ArgumentParser(description=__doc__)
-parser.add_argument('--evidence', type=Path, required=True, help='new host evidence directory')
-args = parser.parse_args()
+args = repro_args(__doc__)
 reset({'hold': ['working']}, box=True)
 try:
     lane = start(box=True)
@@ -20,20 +18,27 @@ try:
     original = record(thread)
     fault('kill-process', thread, box=True)
     until(lambda: record(thread)['status'] == 'failed', 'process death classified')
-    enter(f'ha thread retry wall {thread} --reason "R01 killed the remote agent"')
+    enter(f'ha thread retry wall {thread} --reason "D37 killed the remote agent"')
     until(lambda: record(thread)['attempt'] == 2 and not record(thread)['recovery_pending'],
           'replacement placed')
-    # At least two courier passes; this is longer than the 30s ready timeout.
-    time.sleep(40)
-    lane = record(thread)
+    # Allow the same >30s readiness window on broken builds, but stop waiting
+    # once the real replacement has received its brief and reached working.
+    deadline = time.monotonic() + 40
+    while True:
+        lane = record(thread)
+        working = quiet_py('import pathlib,os,json; '
+              'rows=[json.loads(line) for f in (pathlib.Path(os.environ["HOME"])/"runs").glob("*.jsonl") '
+              'for line in f.read_text().splitlines()]; '
+              f'print(json.dumps([r for r in rows if r["pane"] == {lane["pane_id"]!r} '
+              'and r["phase"] == "working"]))', box=True)
+        if (lane['bootstrap'] == 'acknowledged' and lane['brief_submitted'] and working) or time.monotonic() >= deadline:
+            break
+        wake_ticker()
+        wake_ticker(box=True)
+        time.sleep(1)
     snapshot()
     process = enter('herdr pane process-info --pane ' + lane['pane_id'], box=True).stdout
     foreground = json.loads(process)['result']['process_info']['foreground_processes']
-    working = quiet_py('import pathlib,os,json; '
-          'rows=[json.loads(line) for f in (pathlib.Path(os.environ["HOME"])/"runs").glob("*.jsonl") '
-          'for line in f.read_text().splitlines()]; '
-          f'print(json.dumps([r for r in rows if r["pane"] == {lane["pane_id"]!r} '
-          'and r["phase"] == "working"]))', box=True)
     fixed = (lane['attempt'] == 2 and lane['status'] == 'open'
              and lane['bootstrap'] == 'acknowledged' and lane['brief_submitted']
              and not lane['prompt_pending'] and lane['launch_attempts'] == 1
@@ -49,7 +54,7 @@ try:
     print('ACTUAL:', {k: lane.get(k) for k in ('attempt', 'status', 'bootstrap',
           'launch_attempts', 'brief_submitted', 'prompt_pending', 'startup_wait_started')})
     print('WORKING:', working)
-    print('R01 FIXED' if fixed else ('R01 REPRODUCED' if stuck else 'R01 recovery not established'))
+    print('D37 PASS' if fixed else ('D37 REPRODUCED' if stuck else 'D37 recovery not established'), flush=True)
 finally:
     evidence(args.evidence)
 sys.exit(0 if fixed else 1)
