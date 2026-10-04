@@ -951,6 +951,7 @@ fn tick_with_steps(
     memory: &mut Memory,
     step: &mut impl FnMut(&str) -> bool,
 ) -> Option<bool> {
+    let pass_started = jiff::Timestamp::now().to_string();
     let mut health = Health::begin(&ctx.root, 0);
     if !step("project discovery") {
         return None;
@@ -1199,7 +1200,7 @@ fn tick_with_steps(
         }
     }
     health.publish(&ctx.root, log);
-    if let Err(error) = crate::journey::ticker_pass(&ctx.root, &health.failures) {
+    if let Err(error) = crate::journey::ticker_pass(&ctx.root, &pass_started, &health.failures) {
         log.line(&format!(
             "could not publish first-pass install evidence: {error:#}"
         ));

@@ -63,7 +63,8 @@ impl Source {
         let root = var("HERDR_ADE_ROOT")
             .map(PathBuf::from)
             .context("HERDR_ADE_ROOT is not set")?;
-        // The herdr-ade built next to this binary, so both come from one commit.
+        // The plugin runs ~/.local/bin/herdr-rundown. Its installed sibling
+        // follows the same atomic installation and rollback, not cargo builds.
         let ade = std::env::current_exe()?.with_file_name("herdr-ade");
         Ok(Source { slug, root, ade })
     }
