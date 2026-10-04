@@ -1,9 +1,7 @@
 #!/usr/bin/env python3
 """Permanent pile recovery regression, promoted from the live pile findings."""
 import argparse
-import base64
 from pathlib import Path
-import shlex
 import subprocess
 
 parser = argparse.ArgumentParser()
@@ -12,7 +10,6 @@ args = parser.parse_args()
 here = Path(__file__).resolve().parent
 command = ['sudo', '-n', str(here.parents[1] / 'wall'), '--instance', str(args.instance)]
 subprocess.run(command + ['reset'], check=True)
-source = base64.b64encode((here / 'scenarios.py').read_bytes()).decode()
-guest = f"import base64; exec(compile(base64.b64decode({source!r}), 'pile-regression.py', 'exec'))"
-result = subprocess.run(command + ['enter', 'python3 -c ' + shlex.quote(guest) + ' cancel-projection'])
+result = subprocess.run(command + ['enter',
+    'python3 "$HOME/tools/regressions/D53/scenarios.py" cancel-projection'])
 raise SystemExit(result.returncode)

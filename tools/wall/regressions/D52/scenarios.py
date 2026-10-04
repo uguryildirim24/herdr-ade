@@ -1,4 +1,5 @@
 """Unprivileged live scenarios; fixture acceptance only, never a model review."""
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -86,7 +87,7 @@ def drop_review():
     print(result.stdout + result.stderr, flush=True)
     dropped = next(t for t in read_records('tasks') if t['id'] == task['id'])
     assert result.returncode == 0 and dropped['dropped'], 'task drop did not succeed'
-    print('INJECTION', json.dumps({'dropped': dropped['dropped'], 'lane_status': g.target(worker['id'])['status']}), flush=True)
+    print('OBSERVATION', json.dumps({'dropped': dropped['dropped'], 'lane_status': g.target(worker['id'])['status']}), flush=True)
     current_review = next(r for r in reviews() if r['id'] == review['id'])
     if current_review['phase'] != 'cancelled':
         # Original failure scenario: the stale reviewer can still publish its seal.
@@ -101,9 +102,11 @@ def drop_review():
         raise SystemExit(1)
     check('the frozen review is cancelled before the task drop returns',
           current_review['phase'], current_review['phase'] == 'cancelled')
-    check('the seal and report remain durable history', retained_seal['id'],
+    report_hash = retained_seal['payload']['done']['artifact']
+    report = (P / '.state/artifacts' / report_hash).read_bytes()
+    check('the seal and exact report remain durable history', retained_seal['id'],
           retained_seal in read_records('events')
-          and bool(retained_seal['payload']['done']['artifact']))
+          and hashlib.sha256(report).hexdigest() == report_hash)
     checkout = Path(worker['worktree_path'])
     check('unique dropped work stays in its checkout and branch', str(checkout),
           checkout.exists() and subprocess.check_output(

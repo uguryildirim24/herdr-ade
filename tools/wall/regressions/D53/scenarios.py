@@ -1,4 +1,5 @@
 """Unprivileged live scenarios; fixture acceptance only, never a model review."""
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -109,7 +110,7 @@ def cancel_projection():
     result = subprocess.check_output(['ha', 'task', 'show', 'wall', task['id']], text=True)
     current = g.target(worker['id'])
     active = [r['id'] for r in reviews() if r['phase'] not in ['complete', 'cancelled', 'rejected']]
-    print('INJECTION:', json.dumps({'status': current['status'], 'cancellation_reason': current['cancellation_reason'],
+    print('OBSERVATION:', json.dumps({'status': current['status'], 'cancellation_reason': current['cancellation_reason'],
                                    'active_reviews': active}), flush=True)
     check('a cancelled sealed lane names a new attempt or explicit task retirement',
           result, current['status'] == 'resolved' and not active
@@ -117,8 +118,11 @@ def cancel_projection():
           and 'review the repository pile' not in result)
     retained = [e for e in read_records('events') if e.get('thread') == worker['id']
                 and 'done' in e.get('payload', {})]
-    check('cancellation retains the seal and report artifact', retained,
-          bool(retained) and bool(retained[-1]['payload']['done']['artifact']))
+    assert retained, 'cancelled attempt lost its seal'
+    report_hash = retained[-1]['payload']['done']['artifact']
+    report = (P / '.state/artifacts' / report_hash).read_bytes()
+    check('cancellation retains the seal and exact report artifact', retained,
+          hashlib.sha256(report).hexdigest() == report_hash)
     command('ha', 'task', 'drop', 'wall', task['id'], '--reason', 'Fixture explicit retirement')
     dropped = next(t for t in read_records('tasks') if t['id'] == task['id'])
     check('the offered retirement action succeeds and retains history', dropped,
