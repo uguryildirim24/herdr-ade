@@ -31,7 +31,7 @@ try:
               'for line in f.read_text().splitlines()]; '
               f'print(json.dumps([r for r in rows if r["pane"] == {lane["pane_id"]!r} '
               'and r["phase"] == "working"]))', box=True)
-        if (lane['brief_submitted'] and working) or time.monotonic() >= deadline:
+        if (lane['bootstrap'] == 'acknowledged' and lane['brief_submitted'] and working) or time.monotonic() >= deadline:
             break
         wake_ticker()
         wake_ticker(box=True)
