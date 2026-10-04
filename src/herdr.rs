@@ -595,7 +595,8 @@ impl<'a> Herdr<'a> {
     }
 
     fn agent_start_command(&self, opts: &AgentStart<'_>) -> (Vec<String>, Cmd) {
-        let (timeout_ms, wait) = agent_timeout(opts.ready_timeout_ms, AgentTimeout::Start);
+        let timeout_ms = opts.ready_timeout_ms.to_string();
+        let wait = Duration::from_millis(opts.ready_timeout_ms) + Duration::from_secs(5);
         let mut args = vec![
             "agent".to_string(),
             "start".to_string(),

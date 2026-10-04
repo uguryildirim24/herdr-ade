@@ -784,9 +784,7 @@ fn start_coordinator(
         agent_args: &launch.args,
         launch_bin: None,
         parent: None,
-        ready_timeout_ms: launch
-            .ready_timeout_ms
-            .min(crate::herdr::MIN_AGENT_START_TIMEOUT_MS),
+        ready_timeout_ms: launch.ready_timeout_ms.min(1_000),
     });
     loop {
         if result.is_ok() {
