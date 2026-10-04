@@ -1,0 +1,3 @@
+#!/bin/sh
+# H02: the fake accepts blank notification titles rejected by real Herdr.
+exec "$(dirname "$0")/run-scenario" empty-notification "$@"

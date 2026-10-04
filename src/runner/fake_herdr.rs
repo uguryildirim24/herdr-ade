@@ -775,6 +775,24 @@ mod tests {
     use std::time::Duration;
 
     #[test]
+    #[ignore = "wall H02: real Herdr rejects blank notification titles; findings/herdr/repro-02"]
+    fn wall_h02_empty_notification_title() {
+        for title in ["", " ", "\n", "\u{2003}"] {
+            let cmd = Cmd::new("herdr", Duration::from_secs(1)).args([
+                "notification",
+                "show",
+                title,
+                "--body",
+                "wall contract",
+            ]);
+            assert!(
+                validate(&cmd).is_err(),
+                "EXPECTED fake rejection, matching live invalid_params; ACTUAL accepted {title:?}"
+            );
+        }
+    }
+
+    #[test]
     fn metadata_boundaries_follow_normalization_not_invented_value_limits() {
         let check = |extra: Vec<String>| {
             let cmd = Cmd::new("herdr", Duration::from_secs(1))
