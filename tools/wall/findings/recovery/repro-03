@@ -44,7 +44,7 @@ try:
     view = enter('ha overview wall; ha ticker status').stdout
     held = (failed['observation_error'] == later['observation_error'] != ''
             and failed['observation_attempted'] == later['observation_attempted']
-            and before['last_observed'] == later['last_observed']
+            and failed['last_observed'] == later['last_observed']
             and 'box unreachable since' in view and 'retrying' in view
             and any('unreachable' in e for e in health()['failures'])
             and later['status'] == 'open' and later['attempt'] == before['attempt'])
@@ -59,13 +59,18 @@ try:
     recovered = until(lambda: (r if (r := record())['observation_error'] == ''
                               and r['last_observed'] != before['last_observed'] else None),
                       'fresh successful observation after transport restoration')
+    # Lane records are committed during the pass; health is published at its
+    # end. Wait for both instead of racing the health snapshot with that write.
+    until(lambda: not any('unreachable' in e for e in health()['failures']),
+          'successful pass cleared outage health')
     recovered_view = enter('ha overview wall; ha ticker status').stdout
     passed = (held and recovered['attempt'] == before['attempt']
               and recovered['identity']['process'] == before['identity']['process']
               and recovered['last_state'] == 'working'
               and not any('unreachable' in e for e in health()['failures'])
               and 'box unreachable since' not in recovered_view)
-    print('RECOVERY:', {'same_attempt': recovered['attempt'] == before['attempt'],
+    print('RECOVERY:', {'held_through_backoff': held,
+                        'same_attempt': recovered['attempt'] == before['attempt'],
                         'same_process': recovered['identity']['process'] == before['identity']['process'],
                         'health_failures': health()['failures']})
     print('R03 PASS' if passed else 'R03 FAIL', flush=True)
