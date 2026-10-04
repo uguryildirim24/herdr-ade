@@ -1,19 +1,15 @@
 #!/usr/bin/env python3
 """D39/R02: a dead waiting agent needs retry advice, not a connection check."""
-import argparse
 import json
 from pathlib import Path
 import sys
 import time
 
-from support import (control, enter, evidence, fault, phase, record, records, reset,
-                     set_instance, snapshot, start, until)
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from support import (control, enter, evidence, fault, phase, record, records, repro_args,
+                     reset, snapshot, start, until)
 
-parser = argparse.ArgumentParser(description=__doc__)
-parser.add_argument('--instance', type=int, choices=range(1, 9))
-parser.add_argument('--evidence', type=Path, required=True, help='new host evidence directory')
-args = parser.parse_args()
-set_instance(args.instance)
+args = repro_args(__doc__)
 reset({'finish': 'waiting', 'hold': []})
 try:
     lane = start()
@@ -62,7 +58,7 @@ try:
         print('RETRY:', {'replacement_agent': replacement['identity']['process'],
                          'same_worktree': replacement['worktree_path'] == before['worktree_path'],
                          'waiting_seal_kept': records(kind='events') == seals})
-    print('R02 PASS' if passed else 'R02 FAIL', flush=True)
+    print('D39 PASS' if passed else 'D39 FAIL', flush=True)
 finally:
     evidence(args.evidence)
 sys.exit(0 if passed else 1)
