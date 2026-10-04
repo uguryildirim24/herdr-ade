@@ -1,0 +1,49 @@
+#!/usr/bin/env python3
+"""D62: a deferred box start waits for release of its saved machine hold."""
+import json
+import sys
+import time
+from pathlib import Path
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+import support as s
+
+args = s.repro_args(__doc__)
+s.reset({'hold': ['working']}, box=True)
+# A genuine other-commit build already staged by wall, never a fabricated ID.
+current = s.enter('ha --version').stdout.split('+', 1)[1].split('.', 1)[0].removesuffix('-dirty')
+alternate = next((p.parent / 'bin' for p in sorted(Path('/var/lib/herdr-wall-builds').glob('*/build.json'))
+                  if not json.loads(p.read_text())['commit'].startswith(current)), None)
+assert alternate is not None, 'a genuinely different staged ADE build is required'
+s.wall('fault', 'install', alternate, '--box')
+s.enter('ha --version', box=True)
+s.enter('python3 -c \'import sys; from pathlib import Path; '
+        'sys.path.insert(0,str(Path.home()/"tools")); import guest; '
+        'guest.lane(remote=True,wait_ready=False)\'')
+before = s.record()
+assert before.get('provider_wait_started') and 'version_skew:' in before.get('error', ''), 'did not establish deferred version skew'
+assert not before.get('pane_id') and not before.get('worktree_path'), 'already placed'
+s.enter('ha machine hold wall-box-' + str(args.instance))
+s.wall('fault', 'install', f'/var/lib/herdr-wall-{args.instance}/bin', '--box')
+# Observe several real placement passes after restoring matching builds.
+deadline = time.monotonic() + 70
+while time.monotonic() < deadline:
+    after = s.record()
+    if after.get('pane_id') or after.get('worktree_path'):
+        break
+    s.wake_ticker()
+    time.sleep(2)
+held = s.quiet_py('from pathlib import Path; import json; '
+    'print(json.dumps([p.name for p in (Path.home()/".herdr-ade/.machines").glob("*.hold")]))')
+surface = s.enter('ha overview wall; ha task list wall').stdout
+print('EXPECTED: held box gets no new checkout/pane/agent; pending start says why; release resumes it')
+print('ACTUAL:', json.dumps({'hold_files': held, 'lane': after, 'held_visible': 'start pending: box held' in surface}), flush=True)
+s.evidence(args.evidence)
+assert before['machine_id'] + '.hold' in held, 'saved machine hold lost'
+assert not after.get('pane_id') and not after.get('worktree_path') and not after.get('brief_submitted'), 'placed on held machine'
+assert 'start pending: box held' in surface, 'hold reason invisible'
+s.enter('ha machine release wall-box-' + str(args.instance))
+s.until(lambda: s.record().get('brief_submitted'), 'release resumes the same deferred start', seconds=180)
+s.phase(before['id'], 'working', box=True)
+assert len(s.records()) == 1 and s.record()['attempt'] == before['attempt'], 'duplicate after release'
+s.evidence(args.evidence / 'released')
+print('ACTUAL: release placed the same start once', flush=True)

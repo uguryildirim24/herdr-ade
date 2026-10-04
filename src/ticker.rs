@@ -1577,6 +1577,13 @@ pub(crate) fn resume_provider_starts(
         if let Err(error) = ready {
             // Installation skew is deferred placement, not provider failure:
             // no auth notice, expiry, or evidence of a dead lane.
+            if error.contains("machine_held:") {
+                if let Err(update) = thread::update(project, &lane.id, |t| t.error = error.clone())
+                {
+                    report(update);
+                }
+                continue;
+            }
             if error.contains("version_skew:") {
                 continue;
             }
@@ -1642,6 +1649,9 @@ pub(crate) fn resume_provider_starts(
                 }
             }
             Err(error) => {
+                if format!("{error:#}").contains("machine_held:") {
+                    continue;
+                }
                 if crate::remote::is_unreachable(&format!("{error:#}")) {
                     reachable = false;
                     report(error);
@@ -3135,6 +3145,17 @@ fn launch_pass(
             if !format!("{error:#}").starts_with("plan_prerequisite:") {
                 errors.push(error.context(format!("{}: plan gate", t.id)));
             }
+            continue;
+        }
+        // A hold can arrive after terminal placement, before agent submission.
+        if let Err(error) = threads::check_placement_hold(pass.ctx, t) {
+            errors.extend(
+                thread::update(pass.project, &t.id, |record| {
+                    record.error = format!("{error:#}");
+                    record.startup_wait_started.clear();
+                })
+                .err(),
+            );
             continue;
         }
         // Disk can fill after placement. Keep the attempt queued until it recovers.
@@ -4955,6 +4976,60 @@ mod tests {
         .unwrap();
         assert_eq!(world.runner.count("agent prompt"), 1);
         assert_eq!(thread::load(&project, &lane.id).unwrap(), replacement);
+    }
+
+    #[test]
+    fn held_box_does_not_submit_an_agent_to_an_already_placed_terminal() {
+        use crate::scenarios::{World, pane_json};
+        let world = World::new();
+        let project = world.project("demo", "a.sock");
+        let cwd = world.home.path().join("lane");
+        let lane = world.thread(&project, &cwd, |record| {
+            record.machine = "box".into();
+            record.machine_id = "box-id".into();
+            record.prompt_pending = true;
+            record.error = "provider ready".into();
+            record.launch.kind = "claude".into();
+            record.startup_wait_started = "2020-01-01T00:00:00Z".into();
+        });
+        world.runner.on("machine list --json", ok(r#"[{"id":"box-id","label":"box","target":"box","session":"default","enabled":true}]"#));
+        world.runner.on(
+            "agent start",
+            ok(r#"{"result":{"agent":{"pane_id":"w2:p1","tab_id":"w2:t1","workspace_id":"w2"}}}"#),
+        );
+        let ctx = world.ctx();
+        project::machine_hold(&ctx.root, "box-id").unwrap();
+        let herdr = Herdr::new(
+            ctx.env.herdr_bin(),
+            &project.coordinator().unwrap().socket,
+            &world.runner,
+        )
+        .on_machine("box-id");
+        let panes = serde_json::from_str::<Vec<Pane>>(&format!(
+            "[{}]",
+            pane_json("w2", "w2:t1", "w2:p1", &cwd.to_string_lossy())
+        ))
+        .unwrap();
+        let mut errors = Vec::new();
+        launch_pass(
+            &LaunchPass {
+                ctx: &ctx,
+                project: &project,
+                herdr: &herdr,
+                threads: std::slice::from_ref(&lane),
+                agents: &[],
+                panes: &panes,
+            },
+            &mut true,
+            false,
+            &mut errors,
+        );
+        assert!(errors.is_empty(), "{errors:?}");
+        assert_eq!(world.runner.count("agent start"), 0);
+        let held = thread::load(&project, &lane.id).unwrap();
+        assert_eq!(held.launch_attempts, 0);
+        assert!(held.startup_wait_started.is_empty());
+        assert!(held.error.contains("machine_held:"));
     }
 
     #[test]

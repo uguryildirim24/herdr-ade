@@ -1,0 +1,52 @@
+#!/usr/bin/env python3
+"""D61: a box start survives a simulated network outage without duplicates."""
+import json
+import subprocess
+import sys
+import time
+from pathlib import Path
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+import support as s
+
+args = s.repro_args(__doc__)
+s.reset({'hold': ['working']}, box=True)
+fault = subprocess.Popen(s.wall_command('fault', 'disconnect', '65'))
+try:
+    time.sleep(1)
+    started = s.enter('printf "%s\\n" "Read the frozen brief, commit a scratch file, write the report and seal." > "$HOME/task.md"; '
+        'ha thread start wall --task-file "$HOME/task.md" --title "Box outage start" '
+        '--repo "$HOME/repo" --recipe wall_lane --request "$(< "$HOME/request")" '
+        '--acceptance "Scripted fault plumbing observed" --machine wall-box-' + str(args.instance), check=False)
+    assert fault.poll() is None, 'simulated network outage ended before start completed'
+    during = s.records()
+    jobs = s.quiet_py('from pathlib import Path; import json,tomllib; '
+        'print(json.dumps([tomllib.loads(p.read_text()) for p in '
+        '(Path.home()/".herdr-ade/wall/.state/tasks").glob("*.toml")]))')
+    surface = s.enter('ha overview wall; ha task list wall').stdout
+    visible = 'start pending: box unreachable since ' in surface
+finally:
+    fault.wait(timeout=100)
+assert fault.returncode == 0, 'simulated network outage did not complete'
+s.enter('ha --version', box=True)
+print('EXPECTED: one linked pending start visible during connection loss, placed once after reconnect')
+print('ACTUAL:', json.dumps({'start_returncode': started.returncode, 'pending_lanes': during,
+                            'jobs': jobs, 'pending_visible': visible}), flush=True)
+if not during or not visible:
+    s.evidence(args.evidence)
+    raise SystemExit(1)
+s.until(lambda: s.record().get('brief_submitted'), 'same start resumed after reconnect', seconds=180)
+s.phase('t-0001', 'working', box=True)
+# Multiple further passes cannot allocate or submit a second lane.
+for _ in range(3):
+    s.wake_ticker()
+    time.sleep(2)
+after = s.records()
+lanes = s.records(True, 'lanes')
+agents = s.quiet_py('import subprocess,json; '
+    'r=json.loads(subprocess.check_output(["herdr","agent","list"])); '
+    'print(json.dumps([a for a in r["result"]["agents"] if a.get("name")=="hp-wall-t-0001"]))', box=True)
+s.evidence(args.evidence)
+assert len(jobs) == 1 and jobs[0]['attempts'] == [during[0]['id']], 'pending start not linked to job'
+assert len(after) == len(lanes) == len(agents) == 1, 'duplicate lane/card/agent'
+assert after[0]['id'] == during[0]['id'] and after[0]['attempt'] == 1, 'start identity changed'
+print('ACTUAL: reconnect placed the same linked start exactly once', flush=True)

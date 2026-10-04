@@ -298,7 +298,8 @@ pub(crate) fn start_with_attachments(
         Ok(placement) => (placement, None),
         Err(error)
             if provider_readiness_error(&format!("{error:#}"))
-                || format!("{error:#}").contains("version_skew:") =>
+                || format!("{error:#}").contains("version_skew:")
+                || remote::is_unreachable(&format!("{error:#}")) =>
         {
             // Save an unplaced attempt on its requested machine. No pane or
             // worktree exists until a later readiness probe succeeds.
@@ -714,12 +715,62 @@ pub(crate) fn box_launch_ready_for(
 ) -> Result<()> {
     let profile =
         remote::machine_profile(ctx.runner, &ctx.env.herdr_bin(), &ctx.config_dir, machine)?;
+    check_machine_hold(ctx, &profile.id, &profile.label)?;
     box_launch_ready(ctx, &profile, launch)
+}
+
+fn check_machine_hold(ctx: &Ctx, id: &str, label: &str) -> Result<()> {
+    if project::machine_held(&ctx.root, id) {
+        bail!("machine_held: `{label}` is held; the start waits for `ha machine release {label}`");
+    }
+    Ok(())
+}
+
+pub(crate) fn check_placement_hold(ctx: &Ctx, record: &Thread) -> Result<()> {
+    if record.is_remote() {
+        let profile = remote::machine_profile(
+            ctx.runner,
+            &ctx.env.herdr_bin(),
+            &ctx.config_dir,
+            record.machine_route(),
+        )?;
+        check_machine_hold(ctx, &profile.id, &profile.label)?;
+    }
+    Ok(())
+}
+
+/// Visible intent comes from the job's linked, unplaced attempt, not a second
+/// queue with its own identity or a provider diagnosis.
+pub(crate) fn pending_start_note(t: &Thread) -> Option<String> {
+    let unplaced = t.status == Status::Starting && t.recovery_pending;
+    let awaiting_launch = t.status == Status::Open
+        && t.prompt_pending
+        && !t.brief_submitted
+        && t.launch_attempts == 0;
+    if !unplaced && !awaiting_launch {
+        return None;
+    }
+    if t.error.contains("machine_held:") {
+        return Some(format!("start pending: box held; {}", t.error));
+    }
+    if remote::is_unreachable(&t.error) {
+        return Some(format!(
+            "start pending: box unreachable since {}; {}",
+            if t.provider_wait_started.is_empty() {
+                &t.created
+            } else {
+                &t.provider_wait_started
+            },
+            t.error
+        ));
+    }
+    None
 }
 
 /// Steps 2 to 5 of starting a thread, also used when recovery must place it.
 fn place_and_brief(ctx: &Ctx, project: &Project, view: &SessionView, id: &str) -> Result<Thread> {
     let record = thread::load(project, id)?;
+    check_placement_hold(ctx, &record)?;
     prepare_checkout(ctx, project, &record)?;
     let placed = thread::load(project, id)?;
     write_brief(ctx, project, &placed)?;
@@ -1054,6 +1105,7 @@ fn prepare_checkout(ctx: &Ctx, project: &Project, record: &Thread) -> Result<()>
 
 /// The one terminal/card binding path, regardless of how placement was queued.
 fn bind_terminal(ctx: &Ctx, project: &Project, view: &SessionView, record: &Thread) -> Result<()> {
+    check_placement_hold(ctx, record)?;
     let runner = ctx.runner;
     let (settings, _) = project.read_project_md()?;
     let label = project::display_name(&settings.name, &project.slug);
@@ -1144,9 +1196,36 @@ fn bind_terminal(ctx: &Ctx, project: &Project, view: &SessionView, record: &Thre
         if matching.len() > 1 {
             bail!("remote_workspace_duplicate: multiple workspaces for {label}");
         }
-        match matching.first() {
-            Some(w) => herdr.tab_create_env(&w.workspace_id, folder, &record.id, false, &env)?,
-            None => herdr.workspace_create_env(folder, &label, false, &env)?,
+        // A create can reach the box while its reply is lost. The frozen
+        // lane checkout is unique within this project's workspace. Reclaim
+        // that terminal rather than issuing a second create after reconnect.
+        let panes = herdr.pane_list()?;
+        let existing: Vec<_> = panes
+            .into_iter()
+            .filter(|p| {
+                p.cwd == record.worktree_path
+                    && matching.iter().any(|w| w.workspace_id == p.workspace_id)
+            })
+            .collect();
+        if existing.len() > 1 {
+            bail!(
+                "placement_identity_mismatch: multiple terminals for {}",
+                record.id
+            );
+        }
+        if let Some(pane) = existing.into_iter().next() {
+            crate::herdr::Created {
+                workspace_id: pane.workspace_id,
+                tab_id: pane.tab_id,
+                pane_id: pane.pane_id,
+            }
+        } else {
+            match matching.first() {
+                Some(w) => {
+                    herdr.tab_create_env(&w.workspace_id, folder, &record.id, false, &env)?
+                }
+                None => herdr.workspace_create_env(folder, &label, false, &env)?,
+            }
         }
     } else {
         let coord = project
@@ -1452,6 +1531,10 @@ fn lists_for(view: &SessionView, record: &Thread) -> Result<(Vec<Agent>, Vec<Pan
 pub fn place_recovery(ctx: &Ctx, project: &Project, record: &Thread) -> Result<()> {
     if record.kind == Kind::Adopted {
         bail!("an adopted thread is not placed by the binary");
+    }
+    if let Err(error) = check_placement_hold(ctx, record) {
+        thread::update(project, &record.id, |t| t.error = format!("{error:#}"))?;
+        return Err(error);
     }
     if !record.provider_wait_started.is_empty() {
         return Ok(());
@@ -5132,6 +5215,13 @@ fn row(t: &Thread, view: Option<&SessionView>, now: jiff::Timestamp) -> Row {
             thread: t.clone(),
             group: Group::Parked,
             note: "pane parked until requested".into(),
+        };
+    }
+    if let Some(note) = pending_start_note(t) {
+        return Row {
+            thread: t.clone(),
+            group: recorded,
+            note,
         };
     }
     if t.recovery_pending && t.provider_wait_started.is_empty() {
@@ -9486,31 +9576,205 @@ mod tests {
     }
 
     #[test]
-    fn an_unreachable_box_defers_without_fallback_or_refusal() {
-        let (fx, _remote) = box_fixture();
+    fn unreachable_box_start_is_visible_and_reconnect_places_one_linked_attempt() {
+        let (fx, _) = box_fixture();
         write_config(&fx, &lane_config());
+        let connected = std::rc::Rc::new(std::cell::Cell::new(false));
+        let connection = connected.clone();
         fx.world.runner.on_fn(
-            |cmd| {
-                cmd.program == "ssh"
-                    && cmd
-                        .stdin
-                        .as_ref()
-                        .is_some_and(|input| input.contains("\"kind\":\"claude\""))
+            |cmd| cmd.program == "ssh" && crate::box_helper::tests::is_doctor(cmd),
+            move |cmd| {
+                Ok(if connection.get() {
+                    crate::doctor::boundary_diagnostic_output(cmd, 99_999_999, None)
+                } else {
+                    crate::runner::fake::fail(255, "connection refused")
+                })
             },
-            |_| Ok(crate::runner::fake::fail(255, "connection refused")),
         );
         stub_box(&fx);
-        let error = start(
+        crate::prompt::record_test_request(&fx.project, "q-outage", "Start on the box.").unwrap();
+        let job = crate::task::add(
+            &fx.project,
+            "Box start",
+            vec!["request:q-outage".into()],
+            vec!["Reconnect starts it once.".into()],
+            Some(fx.repo.to_string_lossy().into_owned()),
+            None,
+        )
+        .unwrap();
+        let mut args = start_args(
+            Some(fx.repo.to_string_lossy().into_owned()),
+            Some("buildbox".into()),
+        );
+        args.task_id = job.id.clone();
+        let waiting = start(&fx.world.ctx(), "demo", args).unwrap();
+        assert_eq!(waiting.machine_id, "buildbox-id");
+        assert!(waiting.pane_id.is_empty());
+        assert!(waiting.worktree_path.is_empty());
+        let note = row(&waiting, None, jiff::Timestamp::now()).note;
+        assert!(
+            note.starts_with("start pending: box unreachable since "),
+            "{note}"
+        );
+        assert_eq!(
+            crate::task::view(
+                &fx.project,
+                crate::task::load(&fx.project, &job.id).unwrap()
+            )
+            .next,
+            note
+        );
+        // Connection loss is not a one-hour provider wait expiry.
+        thread::update(&fx.project, &waiting.id, |t| {
+            t.provider_wait_started = "2020-01-01T00:00:00Z".into()
+        })
+        .unwrap();
+        crate::ticker::resume_provider_starts(
+            &fx.world.ctx(),
+            &fx.project,
+            &mut BTreeMap::new(),
+            |e| panic!("{e:#}"),
+        );
+        assert_eq!(
+            thread::load(&fx.project, &waiting.id).unwrap().status,
+            Status::Starting
+        );
+        connected.set(true);
+        std::fs::remove_dir_all(fx.world.ctx().root.join(".readiness")).unwrap();
+        for _ in 0..2 {
+            crate::ticker::resume_provider_starts(
+                &fx.world.ctx(),
+                &fx.project,
+                &mut BTreeMap::new(),
+                |e| panic!("{e:#}"),
+            );
+        }
+        let placed = thread::load(&fx.project, &waiting.id).unwrap();
+        assert!(!placed.pane_id.is_empty(), "{placed:#?}");
+        assert_eq!(placed.attempt, 1);
+        assert_eq!(thread::list(&fx.project).len(), 1);
+        assert_eq!(
+            crate::task::load(&fx.project, &job.id).unwrap().attempts,
+            vec![waiting.id]
+        );
+        assert_eq!(fx.world.runner.count("workspace create"), 1);
+    }
+
+    #[test]
+    fn recovery_reclaims_box_terminal_when_create_reply_was_lost() {
+        let (fx, _) = box_fixture();
+        write_config(&fx, &lane_config());
+        let received = std::rc::Rc::new(std::cell::Cell::new(false));
+        let exists = received.clone();
+        fx.world.runner.on_fn(
+            |cmd| cmd.display().contains("workspace list"),
+            move |_| {
+                Ok(crate::runner::fake::ok(if exists.get() {
+                    r#"{"result":{"workspaces":[{"workspace_id":"w-box","label":"Demo"}]}}"#
+                } else {
+                    r#"{"result":{"workspaces":[]}}"#
+                }))
+            },
+        );
+        fx.world.runner.on_fn(
+            |cmd| cmd.display().contains("workspace create"),
+            move |_| {
+                received.set(true);
+                Ok(crate::runner::fake::fail(
+                    255,
+                    "unreachable: connection loss after create",
+                ))
+            },
+        );
+        stub_box(&fx);
+        let waiting = start(
             &fx.world.ctx(),
             "demo",
-            start_args(Some(fx.repo.to_string_lossy().into_owned()), None),
+            start_args(
+                Some(fx.repo.to_string_lossy().into_owned()),
+                Some("buildbox".into()),
+            ),
         )
-        .unwrap_err();
-        assert!(crate::remote::is_unreachable(&format!("{error:#}")));
-        assert!(thread::list(&fx.project).is_empty());
-        let dispatch = std::fs::read_to_string(fx.project.state_dir().join("dispatch.jsonl"))
-            .unwrap_or_default();
-        assert!(!dispatch.contains("placement-refused"));
+        .unwrap();
+        assert!(place_recovery(&fx.world.ctx(), &fx.project, &waiting).is_err());
+        let pending = thread::load(&fx.project, &waiting.id).unwrap();
+        assert!(pending.pane_id.is_empty());
+        *fx.world.panes.borrow_mut() = r#"[{"workspace_id":"w-box","tab_id":"w-box:t1","pane_id":"w-box:p1","cwd":"/home/agent/projects/repo/.worktrees/t-0001"}]"#.into();
+        place_recovery(&fx.world.ctx(), &fx.project, &pending).unwrap();
+        let placed = thread::load(&fx.project, &waiting.id).unwrap();
+        assert_eq!(placed.pane_id, "w-box:p1");
+        assert_eq!(fx.world.runner.count("workspace create"), 1);
+        assert_eq!(fx.world.runner.count("tab create"), 0);
+        assert_eq!(thread::list(&fx.project).len(), 1);
+    }
+
+    #[test]
+    fn held_box_refuses_deferred_and_recovery_placement_until_release() {
+        let (fx, _) = box_fixture();
+        write_config(&fx, &lane_config());
+        let installed = std::rc::Rc::new(std::cell::Cell::new(false));
+        let ready = installed.clone();
+        fx.world.runner.on_fn(
+            |cmd| cmd.program == "ssh" && crate::box_helper::tests::is_doctor(cmd),
+            move |cmd| {
+                Ok(if ready.get() {
+                    crate::doctor::boundary_diagnostic_output(cmd, 99_999_999, None)
+                } else {
+                    crate::runner::fake::ok(r#"{"status":"Skew","build":"0.1.0+old.1"}"#)
+                })
+            },
+        );
+        stub_box(&fx);
+        let waiting = start(
+            &fx.world.ctx(),
+            "demo",
+            start_args(
+                Some(fx.repo.to_string_lossy().into_owned()),
+                Some("buildbox".into()),
+            ),
+        )
+        .unwrap();
+        project::machine_hold(&fx.world.ctx().root, "buildbox-id").unwrap();
+        installed.set(true);
+        crate::ticker::resume_provider_starts(
+            &fx.world.ctx(),
+            &fx.project,
+            &mut BTreeMap::new(),
+            |e| panic!("{e:#}"),
+        );
+        let held = thread::load(&fx.project, &waiting.id).unwrap();
+        assert!(
+            held.worktree_path.is_empty(),
+            "held box received a checkout"
+        );
+        assert!(
+            row(&held, None, jiff::Timestamp::now())
+                .note
+                .contains("start pending: box held")
+        );
+        assert_eq!(held.launch_attempts, 0);
+        let mut recovering = held.clone();
+        recovering.provider_wait_started.clear();
+        assert!(
+            place_recovery(&fx.world.ctx(), &fx.project, &recovering)
+                .unwrap_err()
+                .to_string()
+                .contains("machine_held:")
+        );
+        assert_eq!(fx.world.runner.count("workspace create"), 0);
+        project::machine_release(&fx.world.ctx().root, "buildbox-id").unwrap();
+        crate::ticker::resume_provider_starts(
+            &fx.world.ctx(),
+            &fx.project,
+            &mut BTreeMap::new(),
+            |e| panic!("{e:#}"),
+        );
+        assert!(
+            !thread::load(&fx.project, &waiting.id)
+                .unwrap()
+                .pane_id
+                .is_empty()
+        );
     }
 
     #[test]
