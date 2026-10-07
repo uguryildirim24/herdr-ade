@@ -559,7 +559,7 @@ fn start_locked(ctx: &Ctx, project: &Project, row: project::Repo) -> Result<Opti
         retry_generation: 0,
         moved: 0,
         refresh_tip: None,
-        push_remote: row.push_remote,
+        push_remote: row.push_remote.filter(|remote| !remote.trim().is_empty()),
         install_required: crate::harness::repos(&ctx.config_dir)?
             .iter()
             .any(|r| same_repo(&r.path, &row.path)),
@@ -1046,6 +1046,15 @@ fn land(ctx: &Ctx, project: &Project, review: &mut Review) -> Result<()> {
     })
 }
 
+// Older review records may have stored an empty push_remote. Treat those as
+// local-only on recovery, without skipping publication for a real remote.
+fn publish_remote(review: &Review) -> Option<&str> {
+    review
+        .push_remote
+        .as_deref()
+        .filter(|remote| !remote.trim().is_empty())
+}
+
 fn land_with_install(
     ctx: &Ctx,
     project: &Project,
@@ -1123,7 +1132,7 @@ fn land_with_install(
     }
     defer_members(project, review)?;
     if !review.push {
-        if let Some(remote) = &review.push_remote {
+        if let Some(remote) = publish_remote(review) {
             let target = format!("refs/heads/{}", review.integration);
             if !remote_contains(&git, remote, &target, &candidate)? {
                 git.run(&["push", remote, &format!("{candidate}:{target}")])?;
@@ -1179,7 +1188,7 @@ fn land_with_install(
         .map(|m| m.thread.as_str())
         .collect::<Vec<_>>()
         .join(", ");
-    let published = if review.push_remote.is_some() {
+    let published = if publish_remote(review).is_some() {
         ", pushed"
     } else {
         ""

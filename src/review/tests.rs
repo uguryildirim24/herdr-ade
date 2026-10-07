@@ -1048,6 +1048,67 @@ fn landing_recovers_ref_before_marker_and_install_failure_without_early_task_don
 }
 
 #[test]
+fn retry_lands_a_local_only_review_with_an_empty_recorded_remote() {
+    let fx = configured();
+    // Empty values in project configuration must not become push destinations.
+    let (mut settings, body) = fx.project.read_project_md().unwrap();
+    settings.repos[0].push_remote = Some(String::new());
+    std::fs::write(
+        fx.project.project_md(),
+        format!("+++\n{}+++\n{body}", toml::to_string(&settings).unwrap()),
+    )
+    .unwrap();
+    assert!(git(&fx.repo, &["remote"]).is_empty());
+    let (id, _) = lane(&fx, 1);
+    let mut review = prepared(&fx);
+    assert!(review.push_remote.is_none());
+    let candidate = git(&fx.repo, &["rev-parse", &review.candidate_branch]);
+    // Recreate the stuck review-1 boundary: FF and merge markers survived,
+    // but the persisted landing record still has an empty push_remote.
+    git(&fx.repo, &["merge", "--ff-only", &candidate]);
+    review.phase = Phase::Landing;
+    review.verdict = Some(Verdict {
+        verdict: "MERGE".into(),
+        review: review.id.clone(),
+        candidate: candidate.clone(),
+        without: BTreeMap::new(),
+        gates: vec![],
+    });
+    review.fast_forward = true;
+    review.push_remote = Some(String::new());
+    thread::update(&fx.project, &id, |t| {
+        t.merged_sha = candidate.clone();
+        t.merged_review = review.id.clone();
+    })
+    .unwrap();
+    save(&fx.project, &review).unwrap();
+
+    retry(&fx.world.ctx(), "demo", None).unwrap();
+    let completed = load(&fx.project, &review.id).unwrap();
+    assert_eq!(completed.phase, Phase::Complete);
+    assert!(completed.push && completed.install && completed.close && completed.prune);
+    assert!(!completed.notices[0].line.contains("pushed"));
+    assert_eq!(git(&fx.repo, &["rev-parse", "main"]), candidate);
+    assert_eq!(
+        thread::load(&fx.project, &id).unwrap().status,
+        Status::Resolved
+    );
+    assert!(
+        Git::new(fx.world.ctx().runner, &fx.repo)
+            .branch_head(&review.candidate_branch)
+            .unwrap()
+            .is_none()
+    );
+    assert!(!fx.world.runner.calls.borrow().iter().any(|cmd| {
+        cmd.program == "git"
+            && cmd
+                .args
+                .windows(2)
+                .any(|args| matches!(args[0].as_str(), "ls-remote" | "push") && args[1].is_empty())
+    }));
+}
+
+#[test]
 fn landing_completes_while_a_merged_member_owes_cleanup() {
     let fx = configured();
     let (id, sha) = lane(&fx, 1);
