@@ -536,24 +536,24 @@ mod tests {
 
     #[test]
     fn historical_lane_card_has_unrestricted_paths() {
-        // Actual oci record: adeherdr/.state/lanes/t-0058.toml (2026-09-19).
+        // Synthetic card without a path restriction.
         let card: LaneCard = toml::from_str(r#"
-project = "adeherdr"
-thread = "t-0058"
+project = "demo"
+thread = "t-0001"
 attempt = 1
-brief_hash = "b30ac4a77438c86faf97c5fb05e10cff6239e9e1c006bf5e82bf6478d113eb2e"
+brief_hash = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 role = "lane"
 kind = "pi"
 pane_id = "w2:p2"
-machine_label = "oci"
+machine_label = "buildbox"
 machine_id = "example-machine"
-box_repo = "/home/ubuntu/projects/herdr-ade"
-box_worktree = "/home/ubuntu/projects/herdr-ade/.worktrees/t-0058"
-brief_commit = "7649a3322cc2b3c19e6d974121249b1a300df8f6"
-branch = "hp/adeherdr/t-0058-round-advance-starts-the-check-again-aft"
-publish_url = "https://github.com/uguryildirim24/herdr-ade.git"
-start_line = "Run /home/ubuntu/.local/bin/herdr-ade --root /home/ubuntu/.herdr-ade skill lane, then read tasks/t-0058.md and do what it says. You run on the cloud box named `oci`; finish with `ha done`, never with a parent prompt."
-created = "2026-09-19T22:39:16Z"
+box_repo = "/home/agent/projects/repo"
+box_worktree = "/home/agent/projects/repo/.worktrees/t-0001"
+brief_commit = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+branch = "hp/demo/t-0001-example"
+publish_url = "https://example.test/repo.git"
+start_line = "Run /home/agent/.local/bin/herdr-ade --root /home/agent/.herdr-ade skill lane, then read tasks/t-0001.md and do what it says. Finish with `ha done`."
+created = "2026-01-01T00:00:00Z"
 [recipient]
 pane = "w1G:p1"
 coordinator_attempt = 1

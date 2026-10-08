@@ -906,7 +906,7 @@ mod tests {
                 .map(|_| "\x1b[0m  ◯ general-purpose  Verifying excluded files · 20m\n")
                 .collect::<String>();
             let screen = format!(
-                "{rule}\n\x1b[0m\x1b[38;2;153;153;153m❯ \x1b[0m                    \n{rule}\n  /home/agent/.herdr-ade/adeherdr > ctx\n  ⏵⏵ bypass permissions on · 1 shell · ← for agents\n\n  ● main\n{panel}"
+                "{rule}\n\x1b[0m\x1b[38;2;153;153;153m❯ \x1b[0m                    \n{rule}\n  /home/agent/.herdr-ade/demo > ctx\n  ⏵⏵ bypass permissions on · 1 shell · ← for agents\n\n  ● main\n{panel}"
             );
             assert!(coordinator_input_clear(&screen), "agents: {count}");
             assert!(!coordinator_input_clear(

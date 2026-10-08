@@ -2626,7 +2626,7 @@ mod tests {
             .unwrap()
             .0;
         assert!(digest.contains("done: abc"), "{digest}");
-        *screen.borrow_mut() = "────────────────────\n❯ \n────────────────────\n  /home/agent/.herdr-ade/adeherdr > ctx\n  ⏵⏵ bypass permissions on · 1 shell · ← for agents\n  ● main\n  ◯ general-purpose  Verifying excluded files · 20m\n".into();
+        *screen.borrow_mut() = "────────────────────\n❯ \n────────────────────\n  /home/agent/.herdr-ade/demo > ctx\n  ⏵⏵ bypass permissions on · 1 shell · ← for agents\n  ● main\n  ◯ general-purpose  Verifying excluded files · 20m\n".into();
         deliver_events(&world.ctx(), &project).unwrap();
         assert!(typed_lines(&world).is_empty());
         assert!(events::states(&project, &event.id).unwrap().is_empty());

@@ -874,7 +874,7 @@ mod tests {
 
     #[test]
     fn historical_event_without_usage_loads_and_new_usage_is_one_optional_table() {
-        // Real adeherdr event t-0058-1-1, sealed before usage existed.
+        // Historical-format event sealed before usage existed.
         let old = r#"id = "t-0058-1-1"
 op = "t-0058-1-1"
 thread = "t-0058"
@@ -885,7 +885,7 @@ pane = "w1G:p1"
 coordinator_attempt = 1
 [payload.done]
 sha = "4f93bfb9d2f103186523577957852a5d1cc4d590"
-report_path = ".herdr-project/adeherdr-t-0058/report.md"
+report_path = ".herdr-project/demo-t-0058/report.md"
 artifact = "ff2346a2702021221a52567a733cc60301ac507dc2da3c6a0629e2c6ca58f75b"
 "#;
         let event: Event = toml::from_str(old).unwrap();
