@@ -1,13 +1,13 @@
 # Getting started
 
-This is the one setup path for macOS and Linux. **The repository is private:** you need GitHub access to `uguryildirim24/herdr-ade`. Anonymous clone and plugin install currently stop at GitHub authentication. Publication is an external release prerequisite, not an installer feature.
+This is the setup path for macOS and Linux. Start from a source clone of `uguryildirim24/herdr-ade`. Repository access is required until publication. Anonymous clone and GitHub plugin installation were not verified during cleanup.
 
 ## 1. Install prerequisites in order
 
 1. Install [Herdr](https://herdr.dev) 0.9.1 or newer using its supported instructions. Run `herdr status` to check the client and running server. Apply server changes through Herdr's live handoff, not by stopping your running sessions.
 2. Install [Rust/Cargo](https://rustup.rs/) **1.89 or newer**, a C compiler (Xcode Command Line Tools on macOS, your distribution's compiler tools on Linux), and [Git](https://git-scm.com/downloads).
-3. Install [Node.js/npm](https://nodejs.org/en/download) (Node 24 is used by development CI). Confirm `node --version` and `npm --version` work in the shell Herdr starts.
-4. Install ADE and its pinned Pi runtime below, then log into `openai-codex` on this machine. This walkthrough uses Pi for coordinator, coding lanes and reviewer, with that single provider login. Use ADE's `herdr-pi setup`, not a separate global Pi installation.
+3. Install [Node.js/npm](https://nodejs.org/en/download), **Node 22.19.0 or newer** (Node 24 is used by development CI). Confirm `node --version` and `npm --version` work in the shell Herdr starts.
+4. Install ADE and its pinned Pi **0.99.1** runtime below, then log into `openai-codex` on this machine. This walkthrough uses Pi for coordinator, coding lanes and reviewer, with that single provider login. Use ADE's `herdr-pi setup`, not a separate global Pi installation.
 
 Claude and Antigravity (`agy`) are optional, not prerequisites for this path. Selecting them later requires their CLI and machine-local login; see [routing](operations.md#task-based-routing). No remote machine is needed.
 
@@ -15,25 +15,24 @@ For deletion, each affected machine needs `/usr/bin/trash` on macOS, or `gio tra
 
 ## 2. Install ADE and set up Pi
 
-With repository access:
+From the source checkout, build and link the plugin. All three links are required by the manifest, including Rundown:
 
 ```bash
-herdr plugin install uguryildirim24/herdr-ade
-```
-
-Herdr clones and runs the locked release build, then registers ADE's actions, bundled Rundown pane and ticker startup. For an unattended install, Herdr's existing `--yes` option accepts its install confirmation; it does not grant GitHub access.
-
-Find the plugin directory with `herdr plugin list`, substitute its actual path below, and make sure `~/.local/bin` is on your shell's `PATH`:
-
-```bash
-PLUGIN_ROOT=/path/to/herdr-ade
-mkdir -p ~/.local/bin ~/.config/herdr-ade
-ln -s "$PLUGIN_ROOT/target/release/herdr-ade" ~/.local/bin/herdr-ade
-ln -s "$PLUGIN_ROOT/target/release/herdr-pi" ~/.local/bin/herdr-pi
+cargo build --release --locked
+PLUGIN_ROOT="$(pwd -P)"
+mkdir -p "$HOME/.local/bin" "$HOME/.config/herdr-ade"
+ln -s "$PLUGIN_ROOT/target/release/herdr-ade" "$HOME/.local/bin/herdr-ade"
+ln -s "$PLUGIN_ROOT/target/release/herdr-pi" "$HOME/.local/bin/herdr-pi"
+ln -s "$PLUGIN_ROOT/target/release/herdr-rundown" "$HOME/.local/bin/herdr-rundown"
 export PATH="$HOME/.local/bin:$PATH"
+herdr plugin link "$PLUGIN_ROOT"
 ```
 
-Persist the PATH change in your shell configuration. No `ha` alias is required. Generated command prefixes include the resolved binary and project root.
+These commands assume a fresh link destination. Inspect an existing executable or link before replacing it. `herdr plugin link` registers the actions, Rundown pane and ticker startup, but does not build the executables. Persist PATH in the shell configuration. No `ha` alias is required for this Pi walkthrough. Generated command prefixes include the resolved binary and project root. The optional Claude handoff mod has separate [executable and default-root requirements](operations.md#threads-on-other-machines).
+
+The hosted alternative is `herdr plugin install uguryildirim24/herdr-ade`. It requires repository access and was not exercised during cleanup. Its checkout still needs all three executable links above; use the actual plugin path reported by `herdr plugin list` for `PLUGIN_ROOT`.
+
+### Pi configuration
 
 Open `~/.config/herdr-ade/config.toml` with your editor (for example `nano` if `$EDITOR` is unset). For a fresh setup, use this local, single-provider configuration. The default covers coordinator and lanes; the separate reviewer uses xhigh. Disabled rows replace shipped rows completely, so their required arguments remain present. On an existing setup, edit the corresponding tables instead of duplicating them; leave `[dispatch] machine` unset for this local journey.
 
@@ -64,7 +63,7 @@ pi_opencode_muse = { enabled = false, kind = "pi", provider = "opencode-go", arg
 herdr-pi setup
 ```
 
-Setup installs ADE's pinned npm package and integration, then prints the wrapper link command. **Run that printed `ln -s … ~/.local/bin/pi` command** so Herdr can launch `pi`. Then use:
+Setup installs ADE's pinned npm package and integration, then prints the wrapper link command. **Run the printed wrapper link command for `~/.local/bin/pi`** so Herdr can launch `pi`. Then use:
 
 ```bash
 herdr-pi login
@@ -81,7 +80,11 @@ Use a trusted existing repository at `~/dev/app` with a committed HEAD and a cle
 herdr-ade new "Billing" --repo ~/dev/app
 ```
 
-In `~/.herdr-ade/billing/PROJECT.md`, add `gates = [{ command = "git diff --check" }]` to its existing `[[repos]]` front-matter table. That is this documentation result's mechanical gate; the reviewer must also check the content. For application work, declare the repository's real test/build gates there. The checked-out branch is the integration branch unless you set `branch`. Add `push_remote = "origin"` only if publication there is authorized and your Git credentials work; otherwise this journey lands locally and reports no remote configured.
+Before enabling review, open `~/.herdr-ade/billing/PROJECT.md` and inspect every generated `[[repos]]` front-matter table. `new` records the checked-out branch as the integration branch and automatically sets `push_remote` when a local repository has exactly one remote. A typical clone therefore gets `push_remote = "origin"` without a separate publication opt-in. Multiple remotes require an explicit choice; no remotes means no inferred destination.
+
+For this local-only journey, remove both `push_remote` and `publish_url` if either is present, including any automatically inferred value. Do this before running `review` below. With neither destination configured, landing stays local and reports no remote configured. Keep or add a destination only when Rolf has authorized publication there and the machine's Git credentials work. Enabling review can otherwise push accepted work automatically, without another approval.
+
+In that repository table, add `gates = [{ command = "git diff --check" }]`. That is this documentation result's mechanical gate; the reviewer must also check the content. For application work, declare the repository's real test/build gates there. Change `branch` only if a different integration branch is intended.
 
 ```bash
 herdr-ade review billing --repo ~/dev/app
@@ -90,7 +93,7 @@ herdr-ade open billing
 
 `review` enables automatic pile reviews project-wide even when the pile is empty. It is the existing opt-in, not a second approval needed later. `open` creates or focuses the coordinator and bundled Rundown tab. No hand-written plan or task brief is needed. For a named Herdr session, pass `--session <name>` to `open` and `doctor` consistently; outside Herdr, pass a session or socket if discovery cannot select one.
 
-Herdr 0.9.1 was verified for project, plan and Rundown setup. Without `agent start --parent`, ADE warns and uses post-start parenting; fresh-install sidebar nesting was not verified. Set `agent_parent_notify = false` in Herdr's `[experimental]` settings so native notices do not bypass ADE's durable notices. Do not launch a raw `herdr-rundown` pane; ADE supplies its project environment.
+The full authenticated journey and fresh-install sidebar nesting were not verified during cleanup. Without `agent start --parent`, ADE warns and uses post-start parenting. Set `agent_parent_notify = false` in Herdr's `[experimental]` settings so native notices do not bypass ADE's durable notices. Do not launch a raw `herdr-rundown` pane; ADE supplies its project environment.
 
 ## 4. Give one goal; come back to the result
 

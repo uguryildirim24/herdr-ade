@@ -1,3 +1,57 @@
+# Rust build output
 /target/
+/.target/
 /.dev-root/
-*.png
+
+# JavaScript and Python dependencies and caches
+node_modules/
+.npm/
+.cache/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+venv/
+coverage/
+
+# Machine-local runtime, worktrees and agent sessions
+/.herdr-ade/
+/.config/
+/runtime/
+.worktrees/
+.herdr-project/
+.pi/
+
+# Generated output and local evidence, not tracked fixtures
+/outputs/
+/runs/
+/evidence/
+/captures/
+/tools/wall/evidence/
+/tools/wall/captures/
+*.log
+*.tar
+*.tar.gz
+*.tgz
+
+# Credentials and local configuration
+.env
+.env.*
+!.env.example
+*.local.toml
+*.local.json
+auth.json
+credentials.json
+secrets/
+.ssh/
+*.pem
+*.key
+id_rsa
+id_ed25519
+
+# Editor and operating-system files
+.DS_Store
+.idea/
+.vscode/
+*.swp
+*.swo

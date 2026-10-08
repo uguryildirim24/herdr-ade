@@ -68,7 +68,7 @@ A project's `[[repos]]` row can set `review_machine = "local"` or a saved machin
 
 ```toml
 [[repos]]
-path = "/home/agent/projects/chainlm"
+path = "/home/agent/projects/app"
 review_machine = "local"
 gates = [{ command = "git diff --check" }]
 ```
@@ -128,6 +128,8 @@ A project's pile contains its open sealed lanes for one repository with changes 
 
 `review <project> [--repo PATH]` starts the ready pile immediately, even while lanes are working, or displays its existing review. Every explicit call enables automatic reviews project-wide. Before that opt-in, the ticker never starts a review of parked work. Afterwards it starts a non-empty pile when no lane of the repository is working. Only one review of a repository runs at a time; later completions wait for the next pile.
 
+`new` automatically records a local repository's sole remote as `push_remote`; multiple remotes require an explicit choice. A typical clone with only `origin` is therefore configured to publish. Inspect the generated `[[repos]]` settings before enabling review. For local-only landing, remove both `push_remote` and `publish_url`. Accepted work can otherwise push to that destination without another approval.
+
 `.state/reviews/review-N.toml` records the member seals, integration base, candidate branch, reviewer, gate policy, verdict, and completion of fast-forward, push, install, close and prune. Each effect is idempotent and resumes automatically on a later pass. Review output and context show merge, publication (verified or no remote configured), and install (pending, completed or not required) separately; lane cleanup debt and notice delivery remain separate. No Git polling is needed while a review waits for its reviewer. Task state and plan completion use the seal and this record; a harness task is installed only after installation succeeds.
 
 The harness merges the pile into a candidate off the integration tip. One reviewer resolves conflicts, fixes small issues and runs the path-selected gates once on the combined result, including paths changed by its fixes. It seals MERGE, MERGE with `without = { lane = "reason" }`, or REJECT. Excluded lanes must be absent from candidate ancestry. Excluded and rejected lanes stay open for a follow-up and a fresh seal. On MERGE, the harness fast-forwards, pushes the configured remote, installs harness repositories, closes the merged lanes and prunes their branches. Kept worktrees still keep their branches to protect data.
@@ -185,7 +187,7 @@ Each launch record and dispatch journal row says `pin`, `default`, `explicit` or
 
 | Runtime | Actual new-lane boundary |
 | --- | --- |
-| Pi on a Linux box (including `oci` and `a2`) | **Bounded when the namespace probe passes**: Pi's supported tool-replacement backend runs commands and all descendants under bubblewrap filesystem, PID and user namespaces, with capabilities dropped and a cleared environment. Tool network is allowed by default; `network = "denied"` adds network isolation. **Advisory when unavailable**, with a FAIL diagnostic and coordinator notice. |
+| Pi on a declared Linux machine | **Bounded when the namespace probe passes**: Pi's supported tool-replacement backend runs commands and all descendants under bubblewrap filesystem, PID and user namespaces, with capabilities dropped and a cleared environment. Tool network is allowed by default; `network = "denied"` adds network isolation. **Advisory when unavailable**, with a FAIL diagnostic and coordinator notice. |
 | Pi on the Mac | **Advisory**. No ADE-enforced Seatbelt/VM boundary. |
 | Claude | **Advisory**. ADE does not declare Claude's optional Bash sandbox a complete filesystem/credential boundary for all tools. Permission bypass remains an unattended-action setting, not security. |
 | Other/custom adapters | **Advisory** unless a supported backend is explicitly declared. |
@@ -213,7 +215,7 @@ The launch pins its backend mode, network policy and arguments. Already-running 
 
 ### Linux prerequisite
 
-`ha harness install` provisions prerequisites on **each declared Linux machine** through the coordinator's authorized `sudo -n` path, before box builds. It installs the distribution's `bubblewrap` package when missing (apt-get/dnf), ensures `/etc/apparmor.d/ade-bwrap` matches the executable-specific profile below, and loads/reloads it when AppArmor is active. If necessary, it installs the AppArmor loader package. Matching package/profile state is retained on repeated installs. No keys or credentials are read or copied, and the global user-namespace restriction is never relaxed.
+`herdr-ade harness install` provisions prerequisites on **each declared Linux machine** through the coordinator's authorized `sudo -n` path, before box builds. It installs the distribution's `bubblewrap` package when missing (apt-get/dnf), ensures `/etc/apparmor.d/ade-bwrap` matches the executable-specific profile below, and loads/reloads it when AppArmor is active. If necessary, it installs the AppArmor loader package. Matching package/profile state is retained on repeated installs. No keys or credentials are read or copied, and the global user-namespace restriction is never relaxed.
 
 ```text
 abi <abi/4.0>,
@@ -225,7 +227,7 @@ profile ade_bwrap /usr/bin/bwrap flags=(unconfined) {
 
 The install then runs doctor's exact namespace-probe argv, even if provisioning failed. Each machine's provisioning/probe outcome appears in the install result and coordinator install notice. A failed probe does not make the box install pending or stop ready new lanes; doctor remains FAIL and those lanes are labelled advisory. Provider, disk, build, settings and process failures retain their existing readiness/install behavior. Transport/protocol failures are not invented successful namespace observations.
 
-On `oci`, the next install keeps its existing bubblewrap and restores this profile persistently. On `a2`, it first installs bubblewrap, then installs/loads the same profile. Both keep `kernel.apparmor_restrict_unprivileged_userns=1`; bounded mode is selected only after the actual probe succeeds. No production installation or fleet restart was performed by the trial. ADE never exposes sudo/install through the lane's bounded tool bridge. This is an OS prerequisite, not a purchased sandbox service.
+For a declared Linux machine, install bubblewrap and, where AppArmor is active, the executable-specific profile above. `herdr-ade harness install` performs this provisioning through authorized passwordless sudo. Keep the host's global user-namespace restrictions in place. Select bounded mode only after the namespace probe succeeds; inspect the install result and run `herdr-ade doctor` to check the configured machine. ADE never exposes sudo or installation through the lane's bounded tool bridge.
 
 ## Inbox notifications
 
@@ -255,7 +257,9 @@ A lane or review tries a remote machine by default when it has a repository, `[d
 
 On a box, `herdr-ade done` publishes the lane's or reviewer's own branch to the recorded `publish_url` with a non-force push, verifies the published ref, and only then seals. A failed push refuses with the Git error; retry after resolving it. Mac `done` does not publish.
 
-Coordinator compaction's `coordinator-handoff` mod forks only the session note, then passes it on stdin to the resolved ADE command prefix's `handoff <project> --note-file -`. The harness renders live records with the same page and action renderers as `context`, includes the latest 12 request files verbatim (oldest first, with ids), and limits finished/dropped history to ten one-line rows with `herdr-ade task list <project>` for the rest. Neither a snapshot nor a saved handoff consumes inbox items, deliveries, wake receipts or the context cursor.
+The optional Claude `coordinator-handoff` mod is separate from the alias-free Pi walkthrough. It only recognizes a coordinator working directly in `~/.herdr-ade/<project>/` with `.state/coordinator.json` present. It hardcodes `~/.local/bin/ha`, not the resolved ADE command prefix. That path must be an executable or symlink to ADE; a shell alias is not enough. The clean installation links `herdr-ade`, `herdr-pi` and `herdr-rundown`, but does not create `ha`. Custom roots are not recognized by the folder guard. Keep the effective ADE root at `~/.herdr-ade/` when using this mod, since its command supplies no `--root`.
+
+At compaction, the mod forks only the session note, then passes it on stdin to `~/.local/bin/ha handoff <project> --note-file -`. Without that executable or a matching default-root coordinator folder, it falls back to normal compaction instead of producing an ADE snapshot. The harness renders live records with the same page and action renderers as `context`, includes the latest 12 request files verbatim (oldest first, with ids), and limits finished/dropped history to ten one-line rows with `herdr-ade task list <project>` for the rest. Neither a snapshot nor a saved handoff consumes inbox items, deliveries, wake receipts or the context cursor.
 
 The 16,000-character budget includes the header, session note and cut notice. Whole sections are cut in this order: recent finished work, inbox, recipes, repositories, facts, task notes, plan. The notice names the cuts and points to `herdr-ade context <project> --peek --full`. Your messages, standing instructions, open tasks and running work are never cut; goal, waits, action rows, reviews and the session note also stay intact. If protected content alone exceeds the budget, it is preserved with an explicit overflow notice. The mod retains its folder guard, subagent pass-through, precompute skip and 120-second fork deadline; exceptions, nonzero exits and empty stdout fall back to normal compaction.
 
@@ -270,17 +274,17 @@ When a coordinator binding changes, the ticker re-links verified live lanes unde
 
 ## Laptop-closed operation
 
-No plugin code is involved: install Herdr and this plugin on an always-on machine, keep the projects root there, open the project there, and attach from your laptop with `herdr --remote <ssh target>` (add `--session <name>` for a named session). The ticker runs on that machine. Checked on a Linux (aarch64) machine from a Mac.
+Install Herdr and this plugin on an always-on machine, keep the projects root there, open the project there, and attach from a laptop with `herdr --remote <ssh target>` (add `--session <name>` for a named session). The ticker runs on the always-on machine. Remote attachment and laptop-closed operation were not exercised during this cleanup.
 
 ## Development
 
-Rust 1.89 is the supported minimum (`Cargo.toml`). Check the Rust gates at that version with `cargo +1.89.0 …` as well as the installed toolchain. CI runs these gates on Linux and macOS:
+Rust 1.89 is the supported minimum (`Cargo.toml`). Check the Rust gates at that version with the `cargo +1.89.0` toolchain selector as well as the installed toolchain. CI runs these gates on Linux and macOS:
 
 ```bash
 cargo fmt --check
-cargo test
-cargo clippy --all-targets -- -D warnings
-cargo build --bin herdr-ade
+cargo test --locked
+cargo clippy --all-targets --locked -- -D warnings
+cargo build --bin herdr-ade --locked
 node --test tests/pi_extension.test.mjs
 claude plugin test mods/coordinator-handoff
 git diff --check
@@ -293,4 +297,35 @@ with the mod-hook environment and the `claude-code/testing` kit. It is not a
 Node test-runner suite and needs no provider login or live model calls. CI
 installs that version via `npm install --global @anthropic-ai/claude-code@2.1.287`.
 
-Never develop against your default session or `~/.herdr-ade`. Use `HERDR_ADE_ROOT` and `XDG_CONFIG_HOME` under `/var/tmp`.
+Never develop against the default session or `~/.herdr-ade`. Set `HERDR_ADE_ROOT`, `XDG_CONFIG_HOME` and `TMPDIR` beneath an ignored local directory such as `target/verification/`. Keep provider logins out of the checkout. On macOS, a long absolute Herdr socket path can exceed the Unix socket length limit.
+
+### Cleanup verification
+
+The scope review ran these checks on macOS arm64 with Rust 1.97.1 and Node 24.19.0. Cached dependencies allowed offline Cargo builds. These are local mechanical checks, not authenticated end-to-end evidence.
+
+| Check | Outcome |
+| --- | --- |
+| `cargo build --release --locked` | Passed |
+| `cargo fmt --check` | Passed |
+| `cargo test --no-run --locked` | All existing Rust tests compiled; full suite not executed |
+| `cargo test --lib contracts::tests:: --locked` | Passed, 4 existing record tests |
+| `cargo test --lib events::tests::historical_event_without_usage_loads_and_new_usage_is_one_optional_table --locked` | Passed, 1 existing event test |
+| `cargo clippy --all-targets --locked -- -D warnings` | Passed |
+| `cargo build --bin herdr-ade --locked` | Passed |
+| `node --test tests/pi_extension.test.mjs` | Passed, 7 existing tests |
+| ADE/Pi help, Rundown version and all three executable links | Passed in an isolated home |
+| `herdr plugin link` | Passed with isolated relative HOME |
+| `herdr-pi setup` with an isolated offline npm cache | Exited 1: `ENOTCACHED`; pinned package installation not verified |
+| Doctors without completed Pi setup or login | Both exited 1 for missing Pi setup; ticker status reported not running |
+| `python3 -m unittest discover -s tools/wall -p 'test_*.py' -v` | 30 tests ran: 28 passed, 1 failure and 1 error |
+| Existing wall Python files | 53 files compiled in memory |
+| Redacted Gitleaks source scan | No findings; Git metadata and ignored build output excluded |
+| `git diff --check` | Passed |
+
+The two wall failures involve GNU `mv -T` and Linux setgid directory permissions. These tools target a prepared Linux host. No portability fallback, new test or runtime fix was added. See [host requirements](../tools/wall/README.md#host-requirements).
+
+Runtime code and wall executable tools match HEAD. Only existing Rust test fixtures and their comments have privacy redactions. Historical reports and reproducers remain in `report.md` and `tools/wall/findings/`; their external archives are not included. The license matches the initial upstream commit byte for byte; see [provenance](provenance.md).
+
+The full Rust suite and live wall campaigns use Git-writing fixtures, so they were skipped under the restriction against Git writes. The live wall gate also has a 1500-second budget, above this review's ten-minute command limit. Network cloning and hosted installation were forbidden. Pi setup was attempted offline and stopped at the empty npm cache. Provider login, live agents, ticker startup and Rust 1.89 checks were not run in this pass. The Claude handoff suite was skipped: the available CLI was 2.1.294, not its documented 2.1.287. No paid inference was used.
+
+Build output and isolated check files were removed after verification. Future output under `target/` is ignored. Current-source scanning does not clear ignored local files, history or other branches. Rolf still needs to check the first-project journey with machine-local login and review every ref intended for publication.
