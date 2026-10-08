@@ -1,4 +1,6 @@
-# Box resilience — wall lane 4
+# Box resilience findings
+
+This historical report describes the builds below, not current test results. External evidence archives are not included. See [host requirements](../../README.md#host-requirements) before using the reproducers.
 
 Two confirmed findings, ranked by the interruption to Rolf's unattended work.
 One separate suspicion. No production changes. Finding IDs B01/B02 are local
@@ -26,12 +28,12 @@ Mixed-version alternate:
   `/var/lib/herdr-wall-builds/00e56e520ff9b25acd71bbc9e43408a2b9a4eacd631f79228af84c8243806405/bin`.
 
 Evidence paths below are relative to the preserved lane library:
-`.herdr-project/adeherdr-t-0826/library/`. Every named evidence directory
+`/path/to/evidence/`. Every named evidence directory
 contains `local.tar` and `box.tar`, captured before its instance was reset.
 The adjacent logs retain commands, versions and observations. They are runtime
 deliverables, intentionally not committed.
 
-Run from the repository on oci; the scripts invoke the existing controller:
+Run from the repository on the prepared Linux host; the scripts invoke the existing controller:
 
 ```sh
 tools/wall/findings/box/repro-02 --instance 1 --evidence /absolute/new/b02

@@ -1,4 +1,6 @@
-# Wall 7 — unattended loop
+# Unattended loop findings
+
+This historical report describes the builds below, not current test results. External evidence archives are not included. See [host requirements](../../README.md#host-requirements) before using the reproducers.
 
 **1 confirmed defect; 0 additional production suspicions.** No production Rust
 changes. Findings are ranked by babysitting cost (only one confirmed here).
@@ -15,12 +17,12 @@ has no installation target. `install=true` on a review with
 
 - Base commit: `05ddf72d057deda9cf707831ca1af7310881589c`.
 - Both sandbox accounts installed from this lane's `cargo build --bins` before
-  scenarios. Instance **2 only**, on oci.
+  scenarios. Instance **2 only**, on the prepared Linux host.
 - Version: `herdr-ade 0.1.0+05ddf72.1791114866`.
 - Installed ADE SHA-256:
   `695cc780c1b8dabc4c311bc0afc8645256e15cf24ca2b989babef5ec22fa3f9c`.
 - Evidence paths below are relative to
-  `.herdr-project/adeherdr-t-0837/library/` in the recorded lane checkout.
+  `/path/to/evidence/` in the recorded lane checkout.
   Each capture directory contains the controller's `local.tar` and `box.tar`.
   All captures preceded the next reset. Runtime evidence is not committed.
 

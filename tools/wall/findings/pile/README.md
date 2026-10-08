@@ -1,4 +1,6 @@
-# Review-pile reliability findings — t-0818
+# Review-pile reliability findings
+
+This historical report describes the builds below, not current test results. External evidence archives are not included. See [host requirements](../../README.md#host-requirements) before using the reproducers.
 
 Scope: real ADE/Herdr/Git binaries in sandbox **instance 2**, local scripted
 workers and reviewers. Fixture reviewers verify the exact scripted file and
@@ -18,11 +20,11 @@ unwanted change and arranging another reviewed change to remove it.
 `d0ed70cbd394dc77d1cea9ae8ba02c17d567fc146cb17e5be14ede3a0ee4e981`.
 The instance already ran this lane's base; it was not replaced by a newer build.
 
-**Exact reproduction:** from this worktree on oci, with instance 2 available:
+**Exact reproduction:** from this worktree on the prepared Linux host, with instance 2 available:
 
 ```sh
 tools/wall/findings/pile/repro-01 --instance 2 \
-  --evidence "$PWD/.herdr-project/adeherdr-t-0818/library/drop-review-new"
+  --evidence "/path/to/evidence/drop-review-new"
 ```
 
 The executable resets the selected instance, prints EXPECTED/ACTUAL and returns
@@ -105,7 +107,7 @@ notice the stalled work and ask for another attempt.
 
 ```sh
 tools/wall/findings/pile/repro-02 --instance 2 \
-  --evidence "$PWD/.herdr-project/adeherdr-t-0818/library/cancel-projection-new"
+  --evidence "/path/to/evidence/cancel-projection-new"
 ```
 
 The executable resets first and returns 1 for the demonstrated wrong next action.
@@ -181,7 +183,7 @@ tools/wall/findings/pile/run --instance 2 --evidence /absolute/new/directory SCE
 ```
 
 Evidence for each run is `<scenario>.log` and `<scenario>/{local,box}.tar` in
-`.herdr-project/adeherdr-t-0818/library/`. A nonzero scenario needs inspection:
+`/path/to/evidence/`. A nonzero scenario needs inspection:
 it can be a confirmed assertion failure or an incomplete fixture/environment
 run. Only PILE-01 and PILE-02 above are promoted to confirmed defects.
 

@@ -1,4 +1,6 @@
-# Real Herdr contract: wall lane t-0819
+# Historical Herdr contract findings
+
+This historical report describes the builds below, not current test results. External evidence archives are not included. See [host requirements](../../README.md#host-requirements) before using the reproducers.
 
 **Three confirmed findings, one separate suspicion.** Ranked by interruption cost
 for Rolf. No production behavior changed; the sole Rust change is an ignored
@@ -22,7 +24,7 @@ All instance-4 findings used the lane's exact base:
   identity above is measured, not inferred from that source comment.
 
 Runtime evidence is intentionally untracked, under the lane's recorded library:
-`.herdr-project/adeherdr-t-0819/library/` (abbreviated **L** below). Each
+`/path/to/evidence/` (abbreviated **L** below). Each
 `evidence-*` directory contains `local.tar`/`box.tar` captured by `wall evidence`
 before reset. The neighboring `.log` records commands and outputs without
 requiring archive extraction. Guest logs are `runs/herdr-contract.jsonl` inside

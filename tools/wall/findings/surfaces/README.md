@@ -1,4 +1,6 @@
-# Wall 6 — state surfaces
+# State surface findings
+
+This historical report describes the builds below, not current test results. External evidence archives are not included. See [host requirements](../../README.md#host-requirements) before using the reproducers.
 
 **1 confirmed finding (two failure scenarios), 3 unpromoted suspicions.**
 Linux instance **1**, scripted agents, no production Rust changes. The required
@@ -18,7 +20,7 @@ fixture acceptance, not real-model review or arbitrary semantic acceptance.
   Initial sandbox version was `0.1.0+b29e2a9.1791104643`; no failures were
   injected until the lane's own base build was installed.
 - Evidence paths below are relative to the untracked lane library:
-  `.herdr-project/adeherdr-t-0831/library/`. Archives are the controller's
+  `/path/to/evidence/`. Archives are the controller's
   allowlisted `local.tar` and `box.tar`, captured before the next reset.
 
 Run only on a free, explicitly assigned instance, with this build installed:

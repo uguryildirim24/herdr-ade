@@ -1,4 +1,6 @@
-# Wall 1 — crashes and recovery
+# Crashes and recovery findings
+
+This historical report describes the builds below, not current test results. External evidence archives are not included. See [host requirements](../../README.md#host-requirements) before using the reproducers.
 
 **3 confirmed defects, 2 suspicions.** Ranked below by how much unattended work
 or diagnosis they cost Rolf. This is Linux local + local-SSH box testing, not Mac
@@ -64,7 +66,7 @@ A corrected implementation should exit 0 when the signature is absent.
 From this repository, with the above build installed:
 
 ```sh
-L="$PWD/.herdr-project/adeherdr-t-0794/library"
+L="/path/to/evidence"
 # Historical names (removed after promotion):
 # repro-01 --evidence "$L/new-r01"
 # repro-02 --evidence "$L/new-r02"
@@ -81,7 +83,7 @@ It also waits for a remote lane card before calling `guest.py wait`.
 Neither `wall` nor `guest.py` was modified.
 
 Evidence locations below are relative to
-`.herdr-project/adeherdr-t-0794/library/` (untracked lane deliverables). Each
+`/path/to/evidence/` (untracked lane deliverables). Each
 named evidence directory contains the controller's allowlisted `local.tar` and
 `box.tar`. Text logs contain exact commands, timestamps and observations. All
 captures preceded the next reset; no provider credentials were used or exported.

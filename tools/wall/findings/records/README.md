@@ -1,4 +1,6 @@
-# Wall 5 — records, storage and concurrency
+# Records, storage and concurrency findings
+
+This historical report describes the builds below, not current test results. External evidence archives are not included. See [host requirements](../../README.md#host-requirements) before using the reproducers.
 
 **3 confirmed findings; 2 separate suspicions.** No production Rust changes.
 These are Linux crash-consistency checks on our own disposable default sandbox.
@@ -24,7 +26,7 @@ require the explicit `RNN reproduced` line. Repros leave the observed state for
 inspection; reset afterwards. No provider/model acceptance is claimed.
 
 ```sh
-L="$PWD/.herdr-project/adeherdr-t-0827/library"
+L="/path/to/evidence"
 tools/wall/findings/records/repro-01 --evidence "$L/new-plan"
 tools/wall/findings/records/repro-02 --evidence "$L/new-inbox"
 tools/wall/findings/records/repro-03 --evidence "$L/new-cancel"

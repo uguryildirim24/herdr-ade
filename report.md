@@ -1,4 +1,6 @@
-# Stranger setup on oci — t-0711
+# Historical isolated setup report
+
+This report describes the pinned builds below. It is not a current setup guide or a new check result. Use [Getting started](docs/getting-started.md) for current instructions.
 
 ## Result
 
@@ -18,7 +20,7 @@ Cleanup is complete. No source code changed. This report is the only repository 
 ## Scope and evidence
 
 - Date: 2026-10-03 UTC. Initial inspection: 05:30:17; first cleanup: 05:45:20. A focused Claude-prerequisite follow-up ran 05:50:54–05:54:05, ending with a second complete cleanup. About 24 minutes total elapsed, including gates and intervening report drafting.
-- Machine: oci, Linux aarch64; fresh account `herdr-stranger`, UID/GID 1002, home `/home/herdr-stranger`.
+- Machine: Linux aarch64 test host; fresh account `herdr-stranger`, UID/GID 1002, home `/home/herdr-stranger`.
 - Runtime-tested commit: `649b5ae3fed451e8d02f11cd4efe5945955934c7`. The worktree HEAD, main, and bundle checkout matched in the first pass. Main advanced concurrently before the follow-up; that checkout was explicitly returned to this pinned commit and rebuilt before any follow-up ADE runtime command.
 - Setup sources: the complete `README.md`, `docs/getting-started.md`, and `docs/operations.md`; herdr.dev and its linked agent guide, installation page, and CLI reference; command help and command output. No private project memory, other project content, or application source was used to find the setup path. Compiler diagnostics were read for the requested gates, after setup.
 - The named public Herdr session was **`scratch-t-0711`**, entirely under the throwaway account. Public installation produced **Herdr 0.9.3**, not the real account's installed 0.9.1 fork. I did not replace or update the real installation.
@@ -518,7 +520,7 @@ No keys were sent to onboarding, no browser flow was opened, and no provider log
 | GitHub repository access | README and setup explicitly require access to the private repository; gh is optional for GitHub operations | Anonymous access failed. No GitHub sign-in; authorized bundle substituted. Publishing removes the install-time private-access step. |
 | ChatGPT/Pi | `herdr-pi setup`, `herdr-pi login`, then doctor; login is local to the machine and credentials must not be copied | Setup completed; doctor names `herdr-pi login openai-codex`. Login help inspected only. No login opened or token transferred. |
 | Other Pi providers | Complete each required login; executable routes live in config | Login help lists opencode-go and kimi-coding too. No unnecessary provider was configured or signed in. |
-| Claude coordinator | Prerequisites say an agent CLI; provider troubleshooting says use that provider's login flow on the same machine; Operations development gives a pinned npm install | Initially absent; follow-up installed CLI 2.1.287 account-locally and opened a Haiku-configured onboarding pane. `claude auth status` remained logged out. No Claude sign-in on oci. The first-project setup still lacks this explicit default-coordinator installation/login sequence. |
+| Claude coordinator | Prerequisites say an agent CLI; provider troubleshooting says use that provider's login flow on the same machine; Operations development gives a pinned npm install | Initially absent; follow-up installed CLI 2.1.287 account-locally and opened a Haiku-configured onboarding pane. `claude auth status` remained logged out. No Claude sign-in on the test host. The first-project setup still lacks this explicit default-coordinator installation/login sequence. |
 | Web research | Starter routes web-research to agy | Not part of this local no-login scratch task; no agy installation, login, or research process attempted. |
 
 ## Repository gates
